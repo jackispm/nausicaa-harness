@@ -1,71 +1,62 @@
-# Architecture Direction
+# Architecture Overview
 
-本文是设计目标，不是已经实现的 API。核心要求是让长期运行、并行协作和恢复能力由清晰的事实层驱动，而不是依赖某个 Agent 对象的内存状态。
+状态：大规模技术架构草案。本文和 `docs/architecture/` 下的文档描述目标边界与不变量，不代表已经实现的 API。
 
-## 分层
+## 一句话模型
 
-```text
-pi-ai adapter
-  provider / model / streaming / usage
-        |
-Nausicaa runtime
-  Ledger + Store + RLM query API + checkpoints
-        |
-lane scheduler
-  main lane / observer lanes / budgets / triggers
-        |
-A2A protocol
-  inbox + advice + task handoff + acknowledgement
-        |
-plugins and execution policies
-  tools / capabilities / permissions / external runtimes
-```
-
-UI、daemon、远程 transport 和具体 sandbox 属于外层产品或部署，不应被塞进最小内核。
-
-## Ledger-first
-
-主线把有意义的状态变化写成结构化事件，而不是只保存一段 transcript：
+Nausicaa 是一个由 **Ledger 驱动的多 lane runtime**：主线推进工作，辅助线以不同的节奏观察和探索；所有 lane 通过可恢复的事实、按需的上下文视图和结构化 A2A 消息协作。
 
 ```text
-goal | decision | artifact-ref | failure | uncertainty |
-open-question | checkpoint | advice-ack
+                    surfaces
+              UI / API / CLI / daemon
+                         |
+                  control protocol
+                         |
+       +-----------------+------------------+
+       |            runtime kernel          |
+       | command admission / policy        |
+       | scheduler / projections / inbox   |
+       | RLM context views / replay        |
+       +-----------------+------------------+
+                         |
+       +-----------------+------------------+
+       | Ledger (facts) | Store (artifacts) |
+       +-----------------+------------------+
+             |              |             |
+          main lane    observer lanes   worker lanes
+             \              |             /
+                  A2A + capability boundary
+                         |
+                 adapters and plugins
+             pi-ai / models / tools / sandbox
 ```
 
-事件保存摘要、标签、时间、版本和引用；完整文件、工具输出和大对象留在 Store。Ledger 是事实源，运行态和 Prompt 都是可重建的投影。
+## 核心原则
 
-## RLM 与上下文视图
+- Ledger 是跨进程、跨 lane 的唯一事实源；Prompt、Agent 对象和缓存只是投影。
+- lane 不共享可变内存或完整 Prompt，只共享事件、产物引用和 A2A 消息。
+- 主线永远拥有优先级；辅助线默认只读、限额、可暂停、可丢弃。
+- 大对象外置，模型按需查询；稳定前缀固定，动态内容增量化。
+- 外部副作用必须可识别、可查询、可恢复，不能依赖“应该只执行一次”的假设。
+- UI 是管理面，不是内核；模型 provider 是适配器，不是产品架构。
 
-RLM 的借鉴点是“上下文外置、函数查询、结果结构化”。每条 lane 只拿自己的 context view：
+## 文档地图
 
-```text
-getGoal()
-listEvents(filter, budget)
-readArtifact(ref, range, budget)
-getOpenQuestions()
-checkpoint()
-```
+1. [`architecture/00-system-boundaries.md`](architecture/00-system-boundaries.md)：对象、边界、进程和依赖方向。
+2. [`architecture/01-ledger-runtime.md`](architecture/01-ledger-runtime.md)：事件、Store、Projection、命令和事实源。
+3. [`architecture/02-lanes-scheduling.md`](architecture/02-lanes-scheduling.md)：主线、辅助线、预算和唤醒策略。
+4. [`architecture/03-rlm-context.md`](architecture/03-rlm-context.md)：RLM、context view、按需查询和缓存。
+5. [`architecture/04-a2a-protocol.md`](architecture/04-a2a-protocol.md)：消息、Advice、Inbox 和交接语义。
+6. [`architecture/05-plugins-execution.md`](architecture/05-plugins-execution.md)：能力、插件、工具和执行边界。
+7. [`architecture/06-replay-recovery.md`](architecture/06-replay-recovery.md)：checkpoint、replay 和副作用恢复。
+8. [`architecture/07-performance-cache.md`](architecture/07-performance-cache.md)：token、延迟、缓存和资源公平。
+9. [`architecture/08-observability-evals.md`](architecture/08-observability-evals.md)：可观测性、对照实验和验收指标。
+10. [`architecture/09-roadmap.md`](architecture/09-roadmap.md)：从协议实验到产品 runtime 的阶段门。
 
-梦境线默认只收到长期目标、最新 checkpoint、事件增量和风险信号。只有发现疑点时才查询局部证据，禁止默认读取完整主线历史。
+## 当前不做的事情
 
-## Lane 协作
+不先建立通用 Agent graph、复杂自治规划器、插件市场、向量数据库、远程 daemon 或 UI 框架。只有当最小协议的实验结果证明需要它们，才把它们加入外层。
 
-主线永远拥有优先级。辅助线在固定 heartbeat、关键决策、失败/重复尝试、目标变化或不确定性升高时被唤醒，并拥有独立的 token、时间和查询预算。它输出结构化 Advice：
+## 仍需实验决定的事项
 
-```text
-kind, claim, evidenceRefs, confidence,
-urgency, suggestedAction, expiresAt
-```
-
-Advice 进入主线 Inbox，在下一个自然边界处理。默认只能温和插入；高风险安全事件才允许升级。主线的 `accept/defer/reject` 和理由必须回写 Ledger，避免辅助线与主线互相触发循环。
-
-## 不变量
-
-- lane 不共享可变 Prompt 或内存状态，只通过 Ledger、Store 和 A2A 通信。
-- 大对象通过引用传递；查询有上限，事件和建议可去重、过期、续跑。
-- 稳定的身份、系统指令和工具 schema 保持在上下文前缀；动态内容只追加增量。
-- 所有关键决策可追溯、可恢复、可重放。
-
-## 尚未决定
-
-事件存储介质、调度精度、模型分层、插件发现/隔离、`pi-agent-core` 是否复用，以及 UI 与 runtime 的进程协议，都必须先用实验和最小协议验证。
+事件存储介质、模型分层、observer 触发阈值、插件隔离方式、`pi-agent-core` 是否作为可选 worker、UI 与 runtime 的控制协议，以及跨机器 A2A transport 都属于可替换决策。
