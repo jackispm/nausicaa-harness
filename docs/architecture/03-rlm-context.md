@@ -14,7 +14,7 @@ Capsule       当前 lane 的短状态、事件增量、未决问题和预算
 Evidence      通过 query/read 按需获取的局部事件、产物和结果
 ```
 
-Main 的 Capsule 可以包含当前计划和可写任务；Observer 的 Capsule 只包含目标、阶段、变化索引、风险和待审问题；Explorer 还可以收到受限的随机采样窗口和历史类比索引。不同 lane 看同一事实层的不同视图。
+Main 的 Capsule 可以包含当前计划和可写任务；Teto 的 Capsule 只包含目标、成功条件、阶段、计划变化、意图风险和待审问题；Explorer 还可以收到受限的随机采样窗口和历史类比索引。不同 lane 看同一事实层的不同视图。
 
 ## 查询边界
 
@@ -32,7 +32,7 @@ publish checkpoint or Advice
 
 函数必须返回结构化小结果、证据引用和截断原因。不能存在默认的 `readEverything()`；查询有事件数、字节数、token、递归深度和 wall-clock 限制。
 
-Explorer 的随机采样也必须通过 runtime 完成：采样范围、seed、去重规则和最大窗口由 policy 提供，不能让模型自行读取全库或改变采样边界。
+Explorer 的随机采样也必须通过 runtime 完成：采样范围、seed、去重规则和最大窗口由 policy 提供，不能让模型自行读取全库或改变采样边界。Teto 的查询范围则优先覆盖目标、决策和未决问题，不自动展开 bug/tool 细节。
 
 ## Context Capsule
 

@@ -57,4 +57,4 @@ requested -> started -> succeeded | failed | cancelled | unknown
 
 ## 恢复验收
 
-至少验证：模型请求中断、工具调用中断、Advice 未处理、Observer 失败、重复消息、损坏 checkpoint、schema 升级和 Store 缺失引用。每种情况都要有明确的继续、暂停、失败或人工确认结果。
+至少验证：模型请求中断、工具调用中断、Advice 未处理、Teto/Explorer 失败、重复消息、损坏 checkpoint、schema 升级和 Store 缺失引用。每种情况都要有明确的继续、暂停、失败或人工确认结果。

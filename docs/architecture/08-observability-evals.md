@@ -41,13 +41,13 @@ latency and outcome
 - checkpoint 恢复成功率。
 - 重复副作用率和 unknown operation 数量。
 - 消息重复、丢失、过期和背压次数。
-- Observer 故障对 Main 的影响。
+- 辅助线故障对 Main 的影响。
 
 ## 对照实验
 
 每个多 lane 机制至少与以下 baseline 比较：
 
-1. 单 loop、无 Observer。
+1. 单 loop、无辅助线。
 2. 单 loop、每轮固定摘要的 Reflection。
 3. 并行 lane、共享完整 transcript。
 4. Nausicaa 的增量 capsule、按需 Evidence 和 Soft Advice。
@@ -60,8 +60,8 @@ latency and outcome
 
 要能够回答：
 
-- 哪个事件触发了 Observer？
-- Observer 实际读取了哪些 refs？
+- 哪个事件触发了 Teto、Explorer 或 Critic？
+- 辅助线实际读取了哪些 refs？
 - Advice 基于什么证据、花费多少预算？
 - Main 在哪个边界看到并处理了它？
 - 采纳后任务是否真的改善？

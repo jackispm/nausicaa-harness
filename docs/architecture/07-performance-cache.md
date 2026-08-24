@@ -37,7 +37,7 @@ dynamic tail: capsule delta, inbox, recent results, current query
 
 ## 并发策略
 
-Main 使用保底资源；Observer 使用可抢占的剩余资源；Worker 受任务级并发限制。调度器需要背压，不能因为事件越积越多就无界创建 lane。并发度由模型延迟、工具类型、预算和 workspace 冲突共同决定。
+Main 使用保底资源；Teto、Explorer 等辅助线使用可抢占的剩余资源；Worker 受任务级并发限制。调度器需要背压，不能因为事件越积越多就无界创建 lane。并发度由模型延迟、工具类型、预算和 workspace 冲突共同决定。
 
 ## 模型分层
 

@@ -4,7 +4,7 @@
 
 ## 一句话模型
 
-Nausicaa 是一个由 **Ledger 驱动的多 lane runtime**：主线推进工作，辅助线以不同的节奏观察和探索；所有 lane 通过可恢复的事实、按需的上下文视图和结构化 A2A 消息协作。
+Nausicaa 是一个由 **Ledger 驱动的异构多 lane graph runtime**：主线推进工作，辅助线以不同的节奏、权限和上下文视图挂接在节点或决策边上；所有 lane 通过可恢复的事实和结构化 A2A 消息协作。
 
 ```text
                     surfaces
@@ -23,8 +23,8 @@ Nausicaa 是一个由 **Ledger 驱动的多 lane runtime**：主线推进工作�
        | Ledger (facts) | Store (artifacts) |
        +-----------------+------------------+
              |              |             |
-          main lane    observer lanes   worker lanes
-             \              |             /
+          main lane    Teto / Explorer   worker lanes
+             \       typed graph edges      /
                   A2A + capability boundary
                          |
                  adapters and plugins
@@ -34,6 +34,7 @@ Nausicaa 是一个由 **Ledger 驱动的多 lane runtime**：主线推进工作�
 ## 核心原则
 
 - Ledger 是跨进程、跨 lane 的唯一事实源；Prompt、Agent 对象和缓存只是投影。
+- 图的核心关系是异构的：`depends-on`、`observes`、`advises`、`delegates`、`joins` 拥有不同的阻塞、权限和生命周期语义。
 - lane 不共享可变内存或完整 Prompt，只共享事件、产物引用和 A2A 消息。
 - 主线永远拥有优先级；辅助线默认只读、限额、可暂停、可丢弃。
 - 大对象外置，模型按需查询；稳定前缀固定，动态内容增量化。
@@ -59,4 +60,4 @@ Nausicaa 是一个由 **Ledger 驱动的多 lane runtime**：主线推进工作�
 
 ## 仍需实验决定的事项
 
-事件存储介质、模型分层、observer 触发阈值、插件隔离方式、`pi-agent-core` 是否作为可选 worker、UI 与 runtime 的控制协议，以及跨机器 A2A transport 都属于可替换决策。
+事件存储介质、模型分层、Teto/Explorer 触发阈值、插件隔离方式、`pi-agent-core` 是否作为可选 worker、UI 与 runtime 的控制协议，以及跨机器 A2A transport 都属于可替换决策。

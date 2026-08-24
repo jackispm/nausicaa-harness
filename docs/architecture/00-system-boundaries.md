@@ -8,9 +8,11 @@
 Workspace
   └─ Run (long-lived goal)
        ├─ Goal and constraints
+       ├─ Lane Graph (typed edges)
        ├─ Lanes
        │    ├─ main
-       │    ├─ observer / dream / critic
+       │    ├─ Teto / IntentNavigator
+       │    ├─ explorer / critic
        │    └─ worker / specialist
        ├─ Ledger and projections
        ├─ Artifact Store
@@ -20,6 +22,7 @@ Workspace
 - **Workspace**：资源、权限和产物的边界，不等于当前任务。
 - **Run**：目标、预算、策略、事件流和恢复点的边界。
 - **Lane**：独立推进或观察的执行线。lane 的身份、上下文、预算和 cursor 可恢复。
+- **Lane Graph**：lane 及其 typed edges 的运行拓扑；边决定是否阻塞、能看什么、能发什么和何时过期。
 - **Step**：一次模型请求及相关工具调用。Step 不要求所有 lane 同步，也不等于一次用户 turn。
 - **Artifact**：文件、模型原始输出、工具结果、摘要或外部引用。大对象不直接进 Ledger。
 
@@ -33,6 +36,18 @@ adapters -> pi-ai / clock / storage / transport / executor
 ```
 
 内核不能依赖 UI、CLI、某个 provider、某种数据库或某个远程 transport。适配器可以依赖内核的窄接口，反向依赖禁止。
+
+## Typed edges
+
+```text
+depends-on  结果依赖，可能阻塞下游
+observes    只读订阅，不阻塞被观察 lane
+advises     发送可接受/延后/拒绝的建议
+delegates   委派有界任务和产物责任
+joins       在明确决策门汇聚结果
+```
+
+Teto 线通常通过 `observes` + `advises` 挂接在 Main 的目标、计划和决策边上；Explorer 可以挂接在某个问题或产物版本上，完成后自然过期。不能把所有关系简化成 `depends-on`。
 
 ## 内核职责
 

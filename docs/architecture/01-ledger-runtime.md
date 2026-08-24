@@ -74,7 +74,7 @@ Projection 可以丢弃、缓存或换实现；事实不能依赖 Projection 才
 
 ## 可见性
 
-事件和产物带有来源与 visibility：`main`、特定 lane、run 内共享、用户可见或敏感。默认最小可见；Observer 只能读到被授权的 projection 和 refs，不能因为拥有 Ledger cursor 就读取秘密。
+事件和产物带有来源与 visibility：`main`、特定 lane、run 内共享、用户可见或敏感。默认最小可见；Teto、Explorer 等辅助线只能读到被授权的 projection 和 refs，不能因为拥有 Ledger cursor 就读取秘密。
 
 ## 写入与一致性
 

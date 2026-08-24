@@ -49,13 +49,15 @@ urgent         满足策略才允许升级
 
 ## Advice 协议
 
-Observer 只能发结构化 Advice：
+Teto、Explorer 和 Critic 等建议型辅助线只能发结构化 Advice：
 
 ```text
 kind, claim, evidenceRefs, confidence,
 risk, suggestedAction, urgency,
 expiresAt, dedupeKey, sourceLane
 ```
+
+Teto 线常用的 `kind` 是 `orientation`、`intent-gap` 和 `method-alternative`；代码质量、测试失败和工具正确性属于 Critic 或 Worker 的职责，不应混入 Teto Advice。
 
 主线在自然决策边界处理 `accept`、`defer` 或 `reject`，并记录理由。Advice 本身不改变 Main 状态，只有处理决定才产生状态事件。
 

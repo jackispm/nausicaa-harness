@@ -4,21 +4,23 @@
 
 ## 定位
 
-Nausicaa 是面向长程工作的 Agent harness。它不是单纯的 CLI、TUI 或多 Agent 面板，而是一个让 Agent 能持续运行、并行思考、互相通信、恢复执行并保持目标聚焦的运行内核。未来可以由独立 UI 管理它。
+Nausicaa 是面向长程工作的 Agent harness。它不是单纯的 CLI、TUI 或多 Agent 面板，而是一个让 Agent 能持续运行、在异构多线图中并行思考、互相通信、恢复执行并保持目标聚焦的运行内核。未来可以由独立 UI 管理它。
 
 ## 核心体验
 
 用户提交一个长期目标后：
 
 1. 主线负责拆解和推进可执行工作。
-2. 辅助线以更短、更稀疏的步长观察主线，寻找偏离、风险、反例和更好方案。
-3. 辅助线只通过结构化 Advice 提醒，不把第二份完整上下文塞进主线。
-4. 主线在决策边界采纳、延后或拒绝建议，并留下可追踪理由。
-5. 任务、消息、产物和决策都可暂停、恢复、审阅和回放。
+2. 第一条辅助线 Teto 线（`IntentNavigator`）以独立步长观察航向、意图完整性和方法选择。
+3. 其他 Explorer、Critic 或 Worker 线按图中的 typed edges 协作，不被强制同步。
+4. 辅助线只通过结构化 Advice 提醒，不把第二份完整上下文塞进主线。
+5. 主线在决策边界采纳、延后或拒绝建议，并留下可追踪理由。
+6. 任务、消息、产物和决策都可暂停、恢复、审阅和回放。
 
 ## 必须具备
 
 - 主线与辅助线的独立预算、步长、上下文视图和生命周期。
+- 具有 `observes`、`advises`、`delegates`、`depends-on`、`joins` 语义的异构多线图，而不是只有串行 loop 或通用 DAG。
 - Ledger-first 的事实记录，以及按需查询的大对象 Store。
 - RLM 风格的查询函数，而非每轮复制全部历史。
 - A2A 消息、Inbox、任务交接、建议确认和幂等语义。
@@ -32,7 +34,7 @@ Nausicaa 是面向长程工作的 Agent harness。它不是单纯的 CLI、TUI �
 
 ## 核心创新假设
 
-“Live Observer Lane + Ledger-native Soft Advice Protocol”是待验证的差异化假设：长期存在的辅助线订阅 Ledger 变化，按需取证，自主判断是否值得提醒，并在安全边界温和地影响主线。Dream、Reflection、并行 Agent 和 A2A 各自已有先例，不能单独作为原创声明。
+“Heterogeneous Lane Graph + Ledger-native Soft Advice Protocol”是待验证的差异化假设：不同 lane 以不同节奏和上下文视图挂接到主线节点或边，通过 typed A2A 关系并行协作。Teto 线是第一种意图航向 lane；Dream、Reflection、并行 Agent 和 A2A 各自已有先例，不能单独作为原创声明。
 
 ## 验证指标
 

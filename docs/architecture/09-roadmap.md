@@ -10,9 +10,9 @@
 
 ## Phase 1: protocol slice
 
-单进程、单 writer、文件 Ledger、内容寻址 Store、一个 Main 和一个 Observer。只验证增量 capsule、受限查询、Advice ack 和 recorded replay。
+单进程、单 writer、文件 Ledger、内容寻址 Store、一个 Main 和一个 Teto。只验证增量 capsule、受限查询、Advice ack 和 recorded replay。
 
-**退出条件**：崩溃可恢复，Observer 不读完整 transcript，Advice 可追踪，预算和去重有效。
+**退出条件**：崩溃可恢复，Teto 不读完整 transcript，Advice 可追踪，预算和去重有效。
 
 ## Phase 2: real model adapter
 
