@@ -30,4 +30,6 @@ boundaries -> ledger -> lanes -> RLM -> A2A
 
 ## 设计纪律
 
-文档中的“主线”“梦境线”“observer”是 lane 类型，不意味着必须创建不同的 Agent 类。优先用同一 runtime 的不同策略和 context view 表达差异，避免概念膨胀。
+文档中的“主线”“Teto”“Explorer”“Critic”是 lane 策略，不意味着必须创建不同的 Agent 类。优先用同一 runtime 的不同策略和 context view 表达差异，避免概念膨胀。
+
+ADR 记录关键取舍：`adr/0001-pi-ai-boundary.md`、`adr/0002-ledger-as-source-of-truth.md`、`adr/0003-intent-navigator-soft-advice.md` 和 `adr/0004-minimal-rlm-boundary.md`。

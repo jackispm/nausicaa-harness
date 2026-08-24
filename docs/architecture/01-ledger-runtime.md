@@ -43,6 +43,16 @@ checkpoint/*      policy/*            plugin/*
 
 必须区分“意图”和“结果”：例如 `tool.requested` 不等于工具已经执行，`advice.issued` 不等于主线已经采纳。
 
+## MVP 不变量
+
+- Ledger 只追加、不修改；每个事件有唯一 `eventId`、版本和因果引用。
+- 同一 Run 的事件顺序由 `globalOffset` 表达；lane cursor 只能向前移动。
+- 固定 Ledger watermark、policy 版本和 visibility 规则，必须生成可重建的同一 Capsule。
+- 查询超出 token、字节、事件数或时间预算时必须显式截断，不得伪装成完整结果。
+- Goal 修改必须追加新版本事件；不能静默覆盖旧目标或让旧 Advice 继续有效。
+- Artifact 通过内容 hash/ref 固定；外部副作用必须拥有 `operationId`。
+- lane 崩溃、重复投递或丢弃 Projection 不能改变事实，恢复只依赖 Ledger、Store 和 checkpoint。
+
 ## Command 到 Event
 
 所有改变事实的动作都走以下边界：

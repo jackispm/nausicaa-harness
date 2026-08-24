@@ -22,7 +22,7 @@ Nausicaa 是面向长程工作的 Agent harness。它不是单纯的 CLI、TUI �
 - 主线与辅助线的独立预算、步长、上下文视图和生命周期。
 - 具有 `observes`、`advises`、`delegates`、`depends-on`、`joins` 语义的异构多线图，而不是只有串行 loop 或通用 DAG。
 - Ledger-first 的事实记录，以及按需查询的大对象 Store。
-- RLM 风格的查询函数，而非每轮复制全部历史。
+- RLM-lite 风格的查询函数，而非每轮复制全部历史；持久代码 runtime 不属于第一阶段必需能力。
 - A2A 消息、Inbox、任务交接、建议确认和幂等语义。
 - 插件化的工具、能力、模型适配和执行策略。
 - 稳定上下文前缀、增量状态和缓存命中观测。

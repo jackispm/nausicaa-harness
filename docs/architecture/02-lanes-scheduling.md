@@ -15,9 +15,24 @@
 
 这些是策略配置，不要求为每种类型建立独立 Agent 实现。
 
+## 最小拓扑
+
+第一阶段只验证两种 lane 和三种关系：
+
+```text
+Run
+ └─ Main spine
+     ├─ checkpoint / decision edge
+     │       └─ observes -> Teto sidecar
+     │                       └─ advises -> next Main boundary
+     └─ task work
+```
+
+Teto 是挂在 Main 上的伴随线，不是 Main 的下游依赖。它可以延后、失败或被取消，Main 仍能继续；Main 只有在自然决策边界主动消费 Advice。Worker、Explorer、Critic 和 `delegates/joins` 边必须等最小拓扑验证后再加入。
+
 ## Explorer 语义
 
-Explorer 是梦境线的一个受控策略，不是一个无边界的“第二主线”。它可以在事件窗口、产物引用或问题集合中做稀疏采样，并使用不同的提示、模型或随机种子生成：
+Explorer 是一种受控的发散策略；“梦境线”只是它未来可能采用的产品化称呼，不是架构原语。它不是无边界的“第二主线”，而是在事件窗口、产物引用或问题集合中做稀疏采样，并使用不同的提示、模型或随机种子生成：
 
 - 主线没有主动考虑的替代方案。
 - 不同领域或历史事件之间的类比。

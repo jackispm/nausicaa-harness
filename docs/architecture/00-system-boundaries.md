@@ -40,14 +40,14 @@ adapters -> pi-ai / clock / storage / transport / executor
 ## Typed edges
 
 ```text
-depends-on  结果依赖，可能阻塞下游
-observes    只读订阅，不阻塞被观察 lane
-advises     发送可接受/延后/拒绝的建议
-delegates   委派有界任务和产物责任
-joins       在明确决策门汇聚结果
+depends-on  结果依赖，可能阻塞下游       [phase 1]
+observes    只读订阅，不阻塞被观察 lane   [phase 1]
+advises     发送可接受/延后/拒绝的建议    [phase 1]
+delegates   委派有界任务和产物责任        [phase 3]
+joins       在明确决策门汇聚结果          [phase 3]
 ```
 
-Teto 线通常通过 `observes` + `advises` 挂接在 Main 的目标、计划和决策边上；Explorer 可以挂接在某个问题或产物版本上，完成后自然过期。不能把所有关系简化成 `depends-on`。
+第一阶段不是通用 graph DSL，而是一个最小的 sidecar topology：Main 是唯一推进 Run 的 spine，Teto 通过 `observes` 挂接到 Main 的 checkpoint/decision edge，再通过 `advises` 返回非阻塞建议。Explorer 可以在后续阶段挂接到问题或产物版本上，完成后自然过期。不能把所有关系简化成 `depends-on`，也不能一开始实现所有边。
 
 ## 内核职责
 
