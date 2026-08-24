@@ -1,0 +1,26 @@
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+*.tgz
+
+# Local configuration and runtime state
+.env
+.env.*
+!.env.example
+.nausicaa/
+*.log
+
+# Local-only agent instructions and working material
+AGENTS.md
+.private/
+.local/
+notes/
+research/
+docs/internal/
+.codex/
+.agents/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
