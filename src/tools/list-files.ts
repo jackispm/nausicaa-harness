@@ -1,10 +1,15 @@
-import { readdir, realpath } from "node:fs/promises";
+import { constants } from "node:fs";
+import { readdir } from "node:fs/promises";
 import path from "node:path";
 
 import type { AgentTool, ToolResult } from "../domain/ports.js";
 import {
+  assertSameFile,
+  openNoFollow,
   relativePath,
+  type ResolvedWorkspacePath,
   resolveExistingWorkspacePath,
+  revalidateExistingWorkspacePath,
 } from "./workspace-path.js";
 
 const DEFAULT_MAX_ENTRIES = 200;
@@ -40,8 +45,24 @@ export const listFilesTool: AgentTool = {
       const entries: Array<{ path: string; type: "file" | "directory" | "symlink" | "other" }> = [];
       let truncated = false;
 
-      const visit = async (directory: string): Promise<void> => {
-        const children = await readdir(directory, { withFileTypes: true });
+      const visit = async (directory: ResolvedWorkspacePath): Promise<void> => {
+        const before = await revalidateExistingWorkspacePath(directory);
+        if (!before.isDirectory()) {
+          throw new Error("Path is not a directory");
+        }
+        const handle = await openNoFollow(directory.absolute, constants.O_RDONLY);
+        let children;
+        try {
+          const opened = await handle.stat();
+          if (!opened.isDirectory()) {
+            throw new Error("Path is not a directory");
+          }
+          assertSameFile(opened, before);
+          children = await readdir(directory.absolute, { withFileTypes: true });
+          assertSameFile(opened, await revalidateExistingWorkspacePath(directory));
+        } finally {
+          await handle.close();
+        }
         children.sort((left, right) => left.name.localeCompare(right.name));
         for (const child of children) {
           throwIfAborted(context.signal);
@@ -49,7 +70,7 @@ export const listFilesTool: AgentTool = {
             truncated = true;
             return;
           }
-          const absolute = path.join(directory, child.name);
+          const absolute = path.join(directory.absolute, child.name);
           const type = child.isFile()
             ? "file"
             : child.isDirectory()
@@ -59,7 +80,10 @@ export const listFilesTool: AgentTool = {
                 : "other";
           entries.push({ path: relativePath(resolved.workspace, absolute), type });
           if (recursive && child.isDirectory()) {
-            await visit(absolute);
+            await visit(await resolveExistingWorkspacePath(
+              resolved.workspace,
+              relativePath(resolved.workspace, absolute),
+            ));
             if (truncated) {
               return;
             }
@@ -67,8 +91,7 @@ export const listFilesTool: AgentTool = {
         }
       };
 
-      const canonical = await realpath(resolved.absolute);
-      await visit(canonical);
+      await visit(resolved);
       return success({ path: resolved.relative, entries, truncated });
     } catch (error: unknown) {
       return failure(error instanceof Error ? error.message : "Directory listing failed");

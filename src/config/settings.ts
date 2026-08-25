@@ -20,6 +20,11 @@ export interface ResolvedSettings {
   dataDir: string;
 }
 
+export interface LoadSettingsOptions {
+  userHome?: string;
+  trustWorkspace?: boolean;
+}
+
 export class SettingsError extends Error {}
 
 const allowedKeys = new Set<keyof Settings>([
@@ -33,9 +38,13 @@ const allowedKeys = new Set<keyof Settings>([
 
 export const loadSettings = async (
   workspace: string,
-  userHome = homedir(),
+  options: LoadSettingsOptions = {},
 ): Promise<Settings> => {
+  const userHome = options.userHome ?? homedir();
   const user = await readSettingsFile(join(userHome, ".nausicaa", "settings.json"));
+  if (options.trustWorkspace !== true) {
+    return user;
+  }
   const project = await readSettingsFile(join(workspace, ".nausicaa", "settings.json"));
   return { ...user, ...project };
 };

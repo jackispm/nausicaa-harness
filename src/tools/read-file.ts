@@ -1,7 +1,12 @@
-import { open } from "node:fs/promises";
+import { constants } from "node:fs";
 
 import type { AgentTool, ToolResult } from "../domain/ports.js";
-import { resolveExistingWorkspacePath } from "./workspace-path.js";
+import {
+  assertSameFile,
+  openNoFollow,
+  resolveExistingWorkspacePath,
+  revalidateExistingWorkspacePath,
+} from "./workspace-path.js";
 
 const DEFAULT_MAX_BYTES = 64 * 1024;
 const HARD_MAX_BYTES = 256 * 1024;
@@ -27,16 +32,19 @@ export const readFileTool: AgentTool = {
       const requestedPath = stringArgument(arguments_.path, "path");
       const maxBytes = boundedInteger(arguments_.maxBytes, "maxBytes", DEFAULT_MAX_BYTES, HARD_MAX_BYTES);
       const resolved = await resolveExistingWorkspacePath(context.workspace, requestedPath);
-      const handle = await open(resolved.absolute, "r");
+      await revalidateExistingWorkspacePath(resolved);
+      const handle = await openNoFollow(resolved.absolute, constants.O_RDONLY);
       try {
         const stat = await handle.stat();
-        if (!stat.isFile()) {
+        if (!stat.isFile() || stat.nlink !== 1) {
           return failure("Path is not a regular file");
         }
+        assertSameFile(stat, await revalidateExistingWorkspacePath(resolved));
         const requested = Math.min(stat.size, maxBytes);
         const buffer = Buffer.alloc(requested);
         const { bytesRead } = await handle.read(buffer, 0, requested, 0);
         throwIfAborted(context.signal);
+        assertSameFile(stat, await revalidateExistingWorkspacePath(resolved));
         return success({
           path: resolved.relative,
           content: new TextDecoder().decode(buffer.subarray(0, bytesRead)),

@@ -70,6 +70,85 @@ describe("Run recovery", () => {
     await expect(recoverRun(ledger, "run-1")).resolves.toMatchObject({ startStep: 2 });
   });
 
+  it("refuses to resume a tool operation whose side-effect outcome is unknown", async () => {
+    const ledger = new MemoryLedger();
+    await append(ledger, "run.created", {
+      goal: { version: 1, statement: "Inspect", successCriteria: [], hardConstraints: [] },
+      workspace: "/workspace",
+      policy,
+    }, "created");
+    await append(ledger, "step.started", { step: 1 }, "step-1");
+    await append(ledger, "tool.requested", {
+      operationId: "operation-unknown",
+      toolCallId: "call-1",
+      name: "external_write",
+      argumentsRef: ref("arguments"),
+    }, "tool-requested");
+    await append(ledger, "step.failed", {
+      step: 1,
+      error: "Process exited before the result was recorded",
+    }, "step-failed");
+    const eventCount = (await ledger.read()).length;
+
+    await expect(recoverRun(ledger, "run-1")).rejects.toThrow(
+      /unknown outcomes: operation-unknown/,
+    );
+    expect((await ledger.read())).toHaveLength(eventCount);
+  });
+
+  it("accounts for completed model usage missing its budget charge", async () => {
+    const ledger = new MemoryLedger();
+    const charged = { input: 10, output: 5, cacheRead: 2, cacheWrite: 1 };
+    const uncharged = {
+      input: 20,
+      output: 7,
+      cacheRead: 3,
+      cacheWrite: 2,
+      costUsd: 0.01,
+    };
+    await append(ledger, "run.created", {
+      goal: { version: 1, statement: "Inspect", successCriteria: [], hardConstraints: [] },
+      workspace: "/workspace",
+      policy,
+    }, "created");
+    await append(ledger, "step.started", { step: 1 }, "step-1-started");
+    await append(ledger, "model.completed", {
+      model: "scripted",
+      responseRef: ref("answer-1"),
+      stopReason: "toolUse",
+      usage: charged,
+    }, "model-1");
+    await append(ledger, "budget.charged", {
+      laneId: "main",
+      usage: charged,
+    }, "budget-1");
+    await append(ledger, "step.completed", {
+      step: 1,
+      hasToolCalls: true,
+    }, "step-1-completed");
+    await append(ledger, "step.started", { step: 2 }, "step-2-started");
+    await append(ledger, "model.completed", {
+      model: "scripted",
+      responseRef: ref("answer-2"),
+      stopReason: "stop",
+      usage: uncharged,
+    }, "model-2");
+    await append(ledger, "step.completed", {
+      step: 2,
+      hasToolCalls: false,
+    }, "step-2-completed");
+
+    const recovered = await recoverRun(ledger, "run-1");
+
+    expect(recovered.priorUsage).toEqual({
+      input: 30,
+      output: 12,
+      cacheRead: 5,
+      cacheWrite: 3,
+      costUsd: 0.01,
+    });
+  });
+
   it("verifies the latest committed projection checkpoint", async () => {
     const ledger = new MemoryLedger();
     await append(ledger, "run.created", {

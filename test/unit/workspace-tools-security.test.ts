@@ -1,0 +1,142 @@
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { listFilesTool, readFileTool, writeFileTool } from "../../src/tools/index.js";
+import {
+  resolveExistingWorkspacePath,
+  resolveWorkspaceWritePath,
+  revalidateExistingWorkspacePath,
+  revalidateWorkspaceParent,
+} from "../../src/tools/workspace-path.js";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
+    recursive: true,
+    force: true,
+  })));
+});
+
+describe("workspace tool path security", () => {
+  it("refuses internal directory and file symlinks without traversing them", async () => {
+    const workspace = await temporaryDirectory("nausicaa-workspace-secure-");
+    const realDirectory = path.join(workspace, "real");
+    await mkdir(realDirectory);
+    await writeFile(path.join(realDirectory, "secret.txt"), "internal secret");
+    await symlink(realDirectory, path.join(workspace, "directory-alias"), "dir");
+    await symlink(
+      path.join(realDirectory, "secret.txt"),
+      path.join(workspace, "file-alias.txt"),
+    );
+    const context = { runId: "run-1", workspace, operationId: "operation-1" };
+
+    const readDirectoryAlias = await readFileTool.execute(
+      { path: "directory-alias/secret.txt" },
+      context,
+    );
+    const readFileAlias = await readFileTool.execute({ path: "file-alias.txt" }, context);
+    const listAlias = await listFilesTool.execute({ path: "directory-alias" }, context);
+    const writeAlias = await writeFileTool.execute({
+      path: "directory-alias/new.txt",
+      content: "must not be written",
+    }, context);
+
+    expect(readDirectoryAlias.isError).toBe(true);
+    expect(readFileAlias.isError).toBe(true);
+    expect(listAlias.isError).toBe(true);
+    expect(writeAlias.isError).toBe(true);
+    await expect(readFile(path.join(realDirectory, "new.txt"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+
+    const rootListing = await listFilesTool.execute({ path: ".", recursive: true }, context);
+    const entries = JSON.parse(rootListing.content).entries as Array<{
+      path: string;
+      type: string;
+    }>;
+    expect(entries).toContainEqual({ path: "directory-alias", type: "symlink" });
+    expect(entries).not.toContainEqual({
+      path: "directory-alias/secret.txt",
+      type: "file",
+    });
+  });
+
+  it("never reads or replaces a final symlink", async () => {
+    const workspace = await temporaryDirectory("nausicaa-workspace-secure-");
+    const outside = await temporaryDirectory("nausicaa-workspace-outside-");
+    const outsideFile = path.join(outside, "outside.txt");
+    await writeFile(outsideFile, "do not expose or replace");
+    await symlink(outsideFile, path.join(workspace, "target.txt"));
+    const context = { runId: "run-1", workspace, operationId: "operation-1" };
+
+    const read = await readFileTool.execute({ path: "target.txt" }, context);
+    const write = await writeFileTool.execute({
+      path: "target.txt",
+      content: "replacement",
+    }, context);
+
+    expect(read.isError).toBe(true);
+    expect(write.isError).toBe(true);
+    await expect(readFile(outsideFile, "utf8")).resolves.toBe("do not expose or replace");
+    expect((await readdir(workspace)).filter((name) => name.startsWith(".nausicaa-")))
+      .toEqual([]);
+  });
+
+  it("rejects a symbolic-link workspace root", async () => {
+    const parent = await temporaryDirectory("nausicaa-workspace-secure-");
+    const workspace = path.join(parent, "real");
+    const alias = path.join(parent, "alias");
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, "file.txt"), "content");
+    await symlink(workspace, alias, "dir");
+    const context = { runId: "run-1", workspace: alias, operationId: "operation-1" };
+
+    await expect(readFileTool.execute({ path: "file.txt" }, context)).resolves.toMatchObject({
+      isError: true,
+    });
+    await expect(listFilesTool.execute({ path: "." }, context)).resolves.toMatchObject({
+      isError: true,
+    });
+    await expect(writeFileTool.execute({ path: "new.txt", content: "new" }, context))
+      .resolves.toMatchObject({ isError: true });
+  });
+
+  it("detects parent and final-component swaps during revalidation", async () => {
+    const workspace = await temporaryDirectory("nausicaa-workspace-secure-");
+    const outside = await temporaryDirectory("nausicaa-workspace-outside-");
+    const nested = path.join(workspace, "nested");
+    await mkdir(nested);
+    await writeFile(path.join(workspace, "read.txt"), "inside");
+    await writeFile(path.join(outside, "read.txt"), "outside");
+
+    const writeResolution = await resolveWorkspaceWritePath(workspace, "nested/new.txt");
+    await rm(nested, { recursive: true });
+    await symlink(outside, nested, "dir");
+    await expect(revalidateWorkspaceParent(writeResolution)).rejects.toThrow(/symbolic-link/i);
+
+    const readResolution = await resolveExistingWorkspacePath(workspace, "read.txt");
+    await unlink(path.join(workspace, "read.txt"));
+    await symlink(path.join(outside, "read.txt"), path.join(workspace, "read.txt"));
+    await expect(revalidateExistingWorkspacePath(readResolution))
+      .rejects.toThrow(/symbolic-link/i);
+  });
+});
+
+async function temporaryDirectory(prefix: string): Promise<string> {
+  const directory = await mkdtemp(path.join(tmpdir(), prefix));
+  temporaryDirectories.push(directory);
+  return directory;
+}

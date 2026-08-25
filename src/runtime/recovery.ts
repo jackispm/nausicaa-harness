@@ -30,6 +30,13 @@ export const recoverRun = async (
   }
   await verifyLatestCheckpoint(events, runId);
 
+  const unresolvedOperations = findUnresolvedToolOperations(events);
+  if (unresolvedOperations.length > 0) {
+    throw new RunRecoveryError(
+      `Run ${runId} has tool operations with unknown outcomes: ${unresolvedOperations.join(", ")}`,
+    );
+  }
+
   const interruptedStep = findInterruptedStep(events);
   if (interruptedStep !== undefined) {
     const started = events.find((event) =>
@@ -73,7 +80,10 @@ export const recoverRun = async (
     startStep: highestStep(events) + 1,
     upperWatermark: projection.run.lastOffset,
     conversationRefs: conversationRefs(events),
-    priorUsage: projection.budget.byLane.main ?? emptyUsage(),
+    priorUsage: recoverMainUsage(
+      events,
+      projection.budget.byLane.main ?? emptyUsage(),
+    ),
     ...(completedAnswerRef === undefined ? {} : { completedAnswerRef }),
     events,
   };
@@ -156,6 +166,20 @@ const highestStep = (events: readonly AnyEvent[]): number => {
   return highest;
 };
 
+const findUnresolvedToolOperations = (
+  events: readonly AnyEvent[],
+): string[] => {
+  const pending = new Set<string>();
+  for (const event of events) {
+    if (event.type === "tool.requested") {
+      pending.add(event.payload.operationId);
+    } else if (event.type === "tool.succeeded" || event.type === "tool.failed") {
+      pending.delete(event.payload.operationId);
+    }
+  }
+  return [...pending].sort();
+};
+
 const conversationRefs = (events: readonly AnyEvent[]): FukaiConversationRef[] => {
   const refs: FukaiConversationRef[] = [];
   const pendingModelMessages: Array<{
@@ -213,3 +237,45 @@ const emptyUsage = (): TokenUsage => ({
   cacheRead: 0,
   cacheWrite: 0,
 });
+
+const recoverMainUsage = (
+  events: readonly AnyEvent[],
+  chargedUsage: TokenUsage,
+): TokenUsage => {
+  const pending: TokenUsage[] = [];
+  for (const event of events) {
+    if (event.type === "model.completed" && event.laneId === "main") {
+      pending.push(event.payload.usage);
+    } else if (
+      event.type === "budget.charged"
+      && event.payload.laneId === "main"
+    ) {
+      const completedIndex = pending.findIndex((usage) =>
+        sameUsage(usage, event.payload.usage)
+      );
+      if (completedIndex >= 0) {
+        pending.splice(completedIndex, 1);
+      }
+    }
+  }
+  return pending.reduce(addUsage, chargedUsage);
+};
+
+const addUsage = (left: TokenUsage, right: TokenUsage): TokenUsage => ({
+  input: left.input + right.input,
+  output: left.output + right.output,
+  cacheRead: left.cacheRead + right.cacheRead,
+  cacheWrite: left.cacheWrite + right.cacheWrite,
+  ...(
+    left.costUsd === undefined && right.costUsd === undefined
+      ? {}
+      : { costUsd: (left.costUsd ?? 0) + (right.costUsd ?? 0) }
+  ),
+});
+
+const sameUsage = (left: TokenUsage, right: TokenUsage): boolean =>
+  left.input === right.input
+  && left.output === right.output
+  && left.cacheRead === right.cacheRead
+  && left.cacheWrite === right.cacheWrite
+  && (left.costUsd ?? 0) === (right.costUsd ?? 0);

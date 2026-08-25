@@ -24,6 +24,7 @@ import {
   type TetoCadenceState,
   type TokenRatioGateState,
 } from "../teto/index.js";
+import { persistedErrorText } from "./redaction.js";
 import type {
   MainAfterStepContext,
   MainBoundaryMessage,
@@ -379,7 +380,7 @@ export class TetoScheduler {
       runId: this.runId,
       laneId: this.tetoLaneId,
       type: "lane.status",
-      payload: { status: "failed", reason: boundedError(error) },
+      payload: { status: "failed", reason: persistedErrorText(error) },
       correlationId: this.runId,
       idempotencyKey: `teto:${scope}:status:failed`,
       visibility: "run",
@@ -614,11 +615,6 @@ function validateOptions(options: TetoSchedulerOptions): void {
     || options.policy.tetoMaxOutputTokens <= 0) {
     throw new Error("tetoMaxOutputTokens must be a positive integer");
   }
-}
-
-function boundedError(error: unknown): string {
-  const value = error instanceof Error ? error.message : String(error);
-  return value.length <= 1_024 ? value : `${value.slice(0, 1_021)}...`;
 }
 
 function asError(error: unknown): Error {

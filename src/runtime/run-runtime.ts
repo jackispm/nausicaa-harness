@@ -34,6 +34,7 @@ import { IntentNavigator, ObservationFrameBuilder } from "../teto/index.js";
 import { createWorkspaceTools } from "../tools/index.js";
 import { createAdviceResponseTool } from "./advice-tool.js";
 import { MainLoop } from "./main-loop.js";
+import { persistedErrorText } from "./redaction.js";
 import {
   commitRunCheckpoint,
   recoverRun,
@@ -90,11 +91,11 @@ export const executeRun = async (
   validateRunId(runId);
   const stateDir = resolve(request.dataDir, "runs", runId);
   const ledger = await JsonlLedger.open(resolve(stateDir, "ledger.jsonl"));
-  const sink = new ObservableEventSink(ledger, deps.onEvent);
-  const store = await FileContentAddressedStore.open(resolve(stateDir, "store"));
   let scheduler: TetoScheduler | undefined;
 
   try {
+    const sink = new ObservableEventSink(ledger, deps.onEvent);
+    const store = await FileContentAddressedStore.open(resolve(stateDir, "store"));
     const recovered = request.resumeRunId === undefined
       ? undefined
       : await recoverRun(ledger, runId);
@@ -218,7 +219,7 @@ export const executeRun = async (
       };
     } catch (error: unknown) {
       await scheduler?.drain();
-      const message = sanitizedError(error);
+      const message = persistedErrorText(error, "Run failed");
       await appendLaneStatus(
         sink,
         runId,
@@ -379,7 +380,11 @@ class ObservableEventSink {
     const event = await this.ledger.append(input);
     if (!this.#seen.has(event.eventId)) {
       this.#seen.add(event.eventId);
-      this.#onEvent?.(event as AnyEvent);
+      try {
+        void Promise.resolve(this.#onEvent?.(event as AnyEvent)).catch(() => undefined);
+      } catch {
+        // Observation is best-effort; the Ledger append is already committed.
+      }
     }
     return event;
   }
@@ -469,11 +474,3 @@ const emptyUsage = (): TokenUsage => ({
   cacheRead: 0,
   cacheWrite: 0,
 });
-
-const sanitizedError = (error: unknown): string => {
-  const message = error instanceof Error ? error.message : "Run failed";
-  return message
-    .replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
-    .replace(/\b(?:sk|sk-or-v1)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]")
-    .slice(0, 1_024);
-};

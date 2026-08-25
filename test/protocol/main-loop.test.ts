@@ -228,6 +228,181 @@ describe("MainLoop", () => {
     expect(requested?.payload.contextWatermark).toBeGreaterThan(0);
     expect(requested?.payload.contextWatermark).toBeLessThan(requested?.globalOffset ?? 0);
   });
+
+  it("redacts persisted model and Step failure text", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const bearer = "bearer-secret-value-123456";
+    const openRouterKey = "sk-or-v1-abcdefghijklmnopqrstuvwxyz012345";
+    const loop = new MainLoop({
+      model: new ScriptedModel([
+        new Error(`Provider rejected Bearer ${bearer} using ${openRouterKey}`),
+      ]),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+    });
+
+    await expect(loop.run({
+      runId: "redacted-model-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    })).rejects.toThrow("Provider rejected");
+
+    const serialized = JSON.stringify(await ledger.read({ runId: "redacted-model-run" }));
+    expect(serialized).not.toContain(bearer);
+    expect(serialized).not.toContain(openRouterKey);
+    expect(serialized).toContain("[REDACTED]");
+    const failureTypes = (await ledger.read({ runId: "redacted-model-run" }))
+      .filter((event) => event.type.endsWith(".failed"))
+      .map((event) => event.type);
+    expect(failureTypes).toEqual(["model.failed", "step.failed"]);
+  });
+
+  it("redacts a failed tool result before storing or returning it to the model", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const bearer = "tool-bearer-secret-123456";
+    const openRouterKey = "sk-or-v1-zyxwvutsrqponmlkjihgfedcba987654";
+    const model = new ScriptedModel([
+      {
+        content: "run the tool",
+        toolCalls: [{ id: "secret-call", name: "secret_tool", arguments: {} }],
+        stopReason: "toolUse",
+        usage: tokenUsage(5, 2),
+      },
+      {
+        content: "done",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(5, 2),
+      },
+    ]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [{
+        definition: {
+          name: "secret_tool",
+          description: "fails with provider details",
+          parameters: { type: "object", additionalProperties: false },
+        },
+        async execute() {
+          throw new Error(`Authorization: Bearer ${bearer}; key=${openRouterKey}`);
+        },
+      }],
+    });
+
+    await loop.run({
+      runId: "redacted-tool-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      initialMessage: "Go",
+    });
+
+    const events = await ledger.read({ runId: "redacted-tool-run" });
+    const failed = events.find((event) => event.type === "tool.failed");
+    expect(failed?.type).toBe("tool.failed");
+    if (failed?.type !== "tool.failed") throw new Error("Missing tool.failed event");
+    const artifact = new TextDecoder().decode(await store.get(failed.payload.resultRef));
+    const persisted = JSON.stringify(events) + artifact;
+    expect(persisted).not.toContain(bearer);
+    expect(persisted).not.toContain(openRouterKey);
+    expect(persisted).toContain("[REDACTED]");
+    expect(JSON.stringify(model.requests[1]?.messages)).not.toContain(bearer);
+    expect(JSON.stringify(model.requests[1]?.messages)).not.toContain(openRouterKey);
+  });
+
+  it("waits for every parallel tool execution before rejecting cancellation", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const controller = new AbortController();
+    let started = 0;
+    let releaseStarted: (() => void) | undefined;
+    let releaseDelayed: (() => void) | undefined;
+    let delayedFinished = false;
+    let runSettled = false;
+    const bothStarted = new Promise<void>((resolve) => { releaseStarted = resolve; });
+    const delayedGate = new Promise<void>((resolve) => { releaseDelayed = resolve; });
+    const markStarted = (): void => {
+      started += 1;
+      if (started === 2) releaseStarted?.();
+    };
+    const tool = (name: string, execute: AgentTool["execute"]): AgentTool => ({
+      definition: {
+        name,
+        description: name,
+        parameters: { type: "object", additionalProperties: false },
+      },
+      execute,
+    });
+    const loop = new MainLoop({
+      model: new ScriptedModel([{
+        content: "run both",
+        toolCalls: [
+          { id: "cancel-call", name: "cancel", arguments: {} },
+          { id: "delayed-call", name: "delayed", arguments: {} },
+        ],
+        stopReason: "toolUse",
+        usage: tokenUsage(5, 2),
+      }]),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [
+        tool("cancel", async () => {
+          markStarted();
+          await bothStarted;
+          controller.abort(new Error("cancelled"));
+          return { content: "cancelled", isError: false };
+        }),
+        tool("delayed", async () => {
+          markStarted();
+          await delayedGate;
+          delayedFinished = true;
+          return { content: "late result", isError: false };
+        }),
+      ],
+    });
+
+    const outcome = loop.run({
+      runId: "cancelled-tools-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      signal: controller.signal,
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    ).finally(() => {
+      runSettled = true;
+    });
+
+    await bothStarted;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(runSettled).toBe(false);
+    expect(delayedFinished).toBe(false);
+
+    releaseDelayed?.();
+    expect(await outcome).toBeInstanceOf(Error);
+    expect(delayedFinished).toBe(true);
+    const watermark = await ledger.watermark();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(await ledger.watermark()).toBe(watermark);
+  });
 });
 
 function policy(maxMainSteps: number) {

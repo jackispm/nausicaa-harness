@@ -40,7 +40,7 @@ npm run test:smoke    # 构建并验证真实 CLI 产物
 npm run check         # 执行完整本地门禁
 ```
 
-真实 OpenRouter 测试不会默认运行。只有同时设置 `NAUSICAA_LIVE_TESTS=1` 和 `OPENROUTER_API_KEY` 时，才会发起显式的最小请求；可用 `NAUSICAA_EVAL_MODEL` 覆盖默认测试模型。
+真实 OpenRouter 测试不会默认运行。只有同时设置 `NAUSICAA_LIVE_TESTS=1`、`OPENROUTER_API_KEY`、`NAUSICAA_EVAL_MODEL` 和正数 `NAUSICAA_EVAL_BUDGET_USD` 时，才会发起一次显式的最小请求。
 
 ## 设计原则
 

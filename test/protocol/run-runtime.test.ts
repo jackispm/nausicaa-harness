@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -121,6 +121,54 @@ describe("executeRun", () => {
     const events = await ledger.read({ runId: resumed.runId });
     expect(events.filter((event) => event.type === "run.resumed")).toHaveLength(1);
     expect(events.filter((event) => event.type === "user.message")).toHaveLength(1);
+    await ledger.close();
+  });
+
+  it("does not let an observer failure undo a committed event", async () => {
+    const root = await temporaryRoot();
+    let observations = 0;
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Complete the task",
+      policy: { maxMainSteps: 1, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([response("Done")]),
+      createRunId: () => "observer-failure-run",
+      onEvent: async () => {
+        observations += 1;
+        throw new Error("observer failed");
+      },
+    });
+
+    expect(result.completed).toBe(true);
+    expect(observations).toBeGreaterThan(0);
+    const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
+    const events = await ledger.read({ runId: result.runId });
+    expect(events.some((event) => event.type === "run.completed")).toBe(true);
+    await ledger.close();
+  });
+
+  it("closes the Ledger when the content Store cannot be opened", async () => {
+    const root = await temporaryRoot();
+    const stateDir = join(root, "state", "runs", "store-open-failure");
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, "store"), "not a directory", "utf8");
+
+    await expect(executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Complete the task",
+      policy: { maxMainSteps: 1, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([response("unused")]),
+      createRunId: () => "store-open-failure",
+    })).rejects.toThrow();
+
+    const ledger = await JsonlLedger.open(join(stateDir, "ledger.jsonl"));
     await ledger.close();
   });
 });

@@ -11,6 +11,10 @@ import {
 } from "./config/index.js";
 import type { AnyEvent } from "./domain/events.js";
 import { executeRun } from "./runtime/index.js";
+import {
+  persistedErrorText,
+  stringifyRedactedJson,
+} from "./runtime/redaction.js";
 
 const VERSION = "0.1.0";
 
@@ -96,18 +100,13 @@ const main = async (): Promise<number> => {
       process.removeListener("SIGINT", abort);
     }
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Nausicaa failed";
-    process.stderr.write(`${redact(message)}\n`);
+    process.stderr.write(`${persistedErrorText(error, "Nausicaa failed")}\n`);
     return error instanceof SettingsError ? 2 : 1;
   }
 };
 
 const writeJson = (value: unknown): void => {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+  process.stdout.write(`${stringifyRedactedJson(value)}\n`);
 };
-
-const redact = (message: string): string => message
-  .replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
-  .replace(/\b(?:sk|sk-or-v1)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]");
 
 process.exitCode = await main();

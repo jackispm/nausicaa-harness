@@ -1,9 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { lstat, open, rename, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import type { Stats } from "node:fs";
+import { lstat, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import type { AgentTool, ToolResult } from "../domain/ports.js";
-import { resolveWorkspaceWritePath } from "./workspace-path.js";
+import {
+  assertSameFile,
+  openNoFollow,
+  type ResolvedWorkspacePath,
+  resolveWorkspaceWritePath,
+  revalidateWorkspaceParent,
+  revalidateWorkspaceWritePath,
+  syncDirectory,
+} from "./workspace-path.js";
 
 const HARD_MAX_BYTES = 1024 * 1024;
 
@@ -24,6 +34,8 @@ export const writeFileTool: AgentTool = {
 
   async execute(arguments_, context): Promise<ToolResult> {
     let temporaryPath: string | undefined;
+    let temporaryStat: Stats | undefined;
+    let resolved: ResolvedWorkspacePath | undefined;
     try {
       throwIfAborted(context.signal);
       const requestedPath = stringArgument(arguments_.path, "path");
@@ -33,10 +45,21 @@ export const writeFileTool: AgentTool = {
         throw new RangeError(`content exceeds the ${HARD_MAX_BYTES}-byte write limit`);
       }
 
-      const resolved = await resolveWorkspaceWritePath(context.workspace, requestedPath);
+      resolved = await resolveWorkspaceWritePath(context.workspace, requestedPath);
       temporaryPath = path.join(path.dirname(resolved.absolute), `.nausicaa-${randomUUID()}.tmp`);
-      const handle = await open(temporaryPath, "wx", 0o600);
+      await revalidateWorkspaceParent(resolved);
+      const handle = await openNoFollow(
+        temporaryPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+        0o600,
+      );
       try {
+        temporaryStat = await handle.stat();
+        if (!temporaryStat.isFile() || temporaryStat.nlink !== 1) {
+          throw new Error("Temporary path is not a private regular file");
+        }
+        await revalidateWorkspaceParent(resolved);
+        assertSameFile(temporaryStat, await lstat(temporaryPath));
         await handle.writeFile(bytes);
         await handle.sync();
       } finally {
@@ -44,19 +67,14 @@ export const writeFileTool: AgentTool = {
       }
       throwIfAborted(context.signal);
 
-      // Recheck immediately before rename so a newly inserted symlink is not
-      // silently replaced after authorization.
-      try {
-        if ((await lstat(resolved.absolute)).isSymbolicLink()) {
-          throw new Error("Refusing to replace a symbolic link");
-        }
-      } catch (error: unknown) {
-        if (!isNotFound(error)) {
-          throw error;
-        }
-      }
+      await revalidateWorkspaceParent(resolved);
+      assertSameFile(temporaryStat, await lstat(temporaryPath));
+      await revalidateWorkspaceWritePath(resolved);
       await rename(temporaryPath, resolved.absolute);
       temporaryPath = undefined;
+      await revalidateWorkspaceParent(resolved);
+      await revalidateWorkspaceWritePath(resolved);
+      await syncDirectory(path.dirname(resolved.absolute));
       return {
         content: JSON.stringify({
           path: resolved.relative,
@@ -73,22 +91,36 @@ export const writeFileTool: AgentTool = {
         isError: true,
       };
     } finally {
-      if (temporaryPath !== undefined) {
-        await unlink(temporaryPath).catch(() => undefined);
+      if (
+        temporaryPath !== undefined
+        && temporaryStat !== undefined
+        && resolved !== undefined
+      ) {
+        await safeUnlinkTemporary(resolved, temporaryPath, temporaryStat);
       }
     }
   },
 };
+
+async function safeUnlinkTemporary(
+  resolved: ResolvedWorkspacePath,
+  temporaryPath: string,
+  expected: Pick<Stats, "dev" | "ino">,
+): Promise<void> {
+  try {
+    await revalidateWorkspaceParent(resolved);
+    assertSameFile(expected, await lstat(temporaryPath));
+    await unlink(temporaryPath);
+  } catch {
+    // A changed parent is no longer safe to clean up by pathname.
+  }
+}
 
 function stringArgument(value: unknown, name: string, allowEmpty = false): string {
   if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
     throw new TypeError(`${name} must be ${allowEmpty ? "a string" : "a non-empty string"}`);
   }
   return value;
-}
-
-function isNotFound(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
