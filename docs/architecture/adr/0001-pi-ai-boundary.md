@@ -8,7 +8,7 @@ Nausicaa 需要 provider、模型、流式响应和 usage/cache 信息，但这�
 
 ## Decision
 
-以 `pi-ai` 作为底层模型适配边界。Nausicaa runtime 自己负责 lane、Ledger、Fukai context、预算、A2A 和恢复。`pi-agent-core` 只能作为可选 worker 实现，必须通过实验确认不会限制 Ledger-first 调度。
+以 `pi-ai` 作为底层模型适配边界。Nausicaa runtime 自己负责 lane、Ledger、Context Contracts、预算、A2A 和恢复；Fukai 是可选 provider，Teto 使用独立 ObservationPort。`pi-agent-core` 只能作为可选 worker 实现，必须通过实验确认不会限制 Ledger-first 调度。
 
 ## Consequences
 

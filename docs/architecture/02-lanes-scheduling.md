@@ -7,9 +7,9 @@
 | 类型 | 目标 | 默认权限 | 节奏 |
 | --- | --- | --- | --- |
 | Main | 直接推进用户目标 | 读写已授权能力 | foreground，优先 |
-| Teto / IntentNavigator | 发现任务脱离、意图缺口和更好方法 | 经 Fukai 取证，发 Advice | 稀疏、事件触发 |
-| Explorer | 低频地产生替代路径、类比和新假设 | 经 Fukai 取证，发 Advice | 随机、稀疏、有界 |
-| Critic | 检查一个明确决策或产物的质量/风险 | 经 Fukai 读取挂接证据 | 一次性或阶段性 |
+| Teto / IntentNavigator | 发现任务脱离、意图缺口和更好方法 | Teto Observation Context，发 Advice | 稀疏、事件触发 |
+| Explorer | 低频地产生替代路径、类比和新假设 | 自己的受限上下文，发 Advice | 随机、稀疏、有界 |
+| Critic | 检查一个明确决策或产物的质量/风险 | 自己的挂接证据视图 | 一次性或阶段性 |
 | Worker | 完成被委派的局部任务 | 任务范围内的工具 | 有界并行 |
 | Coordinator | 汇总任务状态和交接 | 读 lane 状态，发任务消息 | 只在需要时运行 |
 
@@ -51,7 +51,22 @@ Teto 线是 Nausicaa 的第一条标准辅助线。非模型 selector 只根据�
 2. 用户目标或成功条件是否缺失、含糊或互相冲突？
 3. 当前路径之外是否有更简单、更稳妥或更有价值的方法？
 
-Teto 每次启动只收到 `goalRef`、成功条件、触发事件引用、cursor 和本轮预算。它拥有完整的 Fukai Core 操作集，可以多次查询并沿 evidence refs 逐步取证；限制来自 visibility 和预算，而不是阉割查询能力。它不会预先获得 transcript、文件列表、工具日志或“最近所有变化”的索引。只有在判断需要证据时，才请求 Fukai 返回与当前问题相关的局部事件或 Artifact 片段。
+Teto 不依赖 Fukai。Main 在原有模型调用中顺手产生可选的结构化 `navigationDelta`；runtime 再结合已知的工具状态、目标变化和 Advice 结果维护一个轻量 Navigation Projection，不额外调用模型做摘要。多个 step 只合并成“当前航向 + 关键变化 + 未决问题”，不会逐条复制。Teto 每次启动只收到一个固定大小的 `ObservationFrame`：
+
+```text
+mission: goalVersion + goal + successCriteria + hardConstraints
+mainDelta: boundaryId + activeObjective + actionOrDecision
+           + expectedOutcome + outcome/status
+           + uncertainties + openQuestions
+previousAdviceOutcome?
+budget: maxOutputTokens + deadline
+```
+
+这些是 Main 的结构化航向状态，不是 transcript 摘要。内部 cursor、watermark 和事件索引由 runtime 保存，不进入 Teto Prompt。Teto 不获得聊天原文、CoT、文件列表、工具日志或“最近所有变化”的索引。runtime 只有在触发器明确需要时，才附带一个很小的证据片段；否则 Teto 通过 A2A 发窄问题给 Main。这个机制借鉴 Fukai 的按需取证思想，但实现和生命周期独立于 Fukai。
+
+Mission 是稳定、可缓存的前缀；动态 ObservationFrame 默认不超过 600 input tokens，Teto Advice 默认不超过 200 output tokens。超限时丢弃低权重变化并标记 `truncated`，不能自动展开主线历史。
+
+Teto 自己只保留固定大小的短状态：当前 goal version、最多 5 个未决航向问题、最近 3 条 Advice 的处理结果和上次唤醒边界。它不把 ObservationFrame 累积成第二份主线历史。
 
 它不主动修改文件，不执行代码，不承担 bug 检查，也不直接暂停 Main。它只发 `orientation`、`intent-gap` 或 `method-alternative` Advice，并附证据引用、置信度、建议时机和过期时间。
 
@@ -83,17 +98,32 @@ scheduled -> admitted -> context-built -> model-running
 
 ## 唤醒策略
 
-不要规定“主线走 N 步，梦境线走 M 步”。使用事件和资源驱动：
+Teto 不跟随 Main 每一步运行。使用“观察窗口 + 事件权重 + 预算”调度：
 
 - 用户输入、恢复、主线继续：立即唤醒 Main。
-- 关键决策、目标变化、失败、重复尝试、矛盾或不确定性升高：唤醒 Teto、Explorer 或 Critic。
-- 多个普通事件：调度器内部合并为一个 opaque wake signal，再唤醒一次；事件摘要、changedRefs 和索引不进入 Teto capsule。
+- 关键决策或计划改变：提高 Teto wake score；目标变化、重复失败或明显矛盾作为 hard trigger。
+- 多个普通事件：只更新 Navigation Projection；达到阈值后生成一个 ObservationFrame，不传事件列表、changedRefs 或索引。
 - Main 等待工具、消息或用户时：允许辅助线使用较多预算。
 - 低频 heartbeat：用于长期航向检查，不用于每 token 轮询。
 
-Explorer 的 heartbeat 可以比 Teto 更稀疏；它也可以只在 Main 空闲或完成 checkpoint 后运行。不存在固定的“主线一步对应辅助线几步”，每次运行由触发器、剩余预算和 lane 自己的 cursor 决定。
+Explorer 的 heartbeat 可以比 Teto 更稀疏；它也可以只在 Main 空闲或完成 checkpoint 后运行。Teto 的具体步长由下面的 cadence policy 决定，而不是固定绑定某个模型或工具。
 
 每次唤醒都写入原因、watermark、预算和结果。没有触发器时，辅助线不运行。
+
+## Teto cadence policy
+
+一次 Teto wake 只执行一个 observation pass（一次 LLM 请求），不启动自己的长工具 loop。调度器可以观察每个 Main step，但观察和合并只是本地状态更新，不消耗模型调用。默认策略维护上次唤醒后的 Main LLM 调用数和 observation credit：
+
+- 普通完成 step 存入 `1` credit。
+- 关键决策或计划改变存入 `2` credits。
+- 目标改变、重复失败或明显矛盾直接把 credit 提升到 `5`，成为 hard trigger。
+- credit 累计到 `5`，或连续 `7` 个 Main LLM 调用未检查时，合并成一个 ObservationFrame 并唤醒 Teto；唤醒后 credit 归零。
+- 两次 Teto pass 默认至少间隔 `4` 个 Main LLM 调用。
+- 滚动 20 个 Main LLM 调用最多允许 `4` 个 Teto pass；硬触发可以提前占用下一个额度，但不扩大滚动上限。
+
+默认目标是 Teto 调用数约为 Main 的 `15%`～`20%`，Teto token 不超过 Run 模型 token 的 `10%`。因此 20 个普通 Main LLM 调用通常产生 3～4 个 Teto pass。若 Teto 需要更多信息，它发 A2A 问题并等待下一次合资格窗口，不在同一窗口连续调用模型。
+
+这些数字是首个可测量的 policy 默认值，不是写死在 graph kernel 的语义；只有对照实验能证明更好的质量/成本比时才调整。
 
 ## 预算
 
@@ -113,4 +143,4 @@ Teto、Explorer 或其他辅助线超时、预算耗尽或模型失败只影响�
 
 ## 并行安全
 
-lane 不共享可变 Prompt、工具实例状态或临时变量。跨 lane 的事实通过 Ledger，交互通过 A2A，长内容通过 Store；模型访问这些内容必须经过 Fukai。需要竞争同一产物时使用版本、锁或主线决策门，而不是隐式的最后写入获胜。
+lane 不共享可变 Prompt、工具实例状态或临时变量。跨 lane 的事实通过 Ledger，交互通过 A2A，长内容通过 Store；每条 lane 只能通过自己的 context provider 读取被授权内容。需要竞争同一产物时使用版本、锁或主线决策门，而不是隐式的最后写入获胜。

@@ -35,11 +35,13 @@ dynamic tail: capsule delta, inbox, recent results, current query
 - 查询结果带 truncation reason，避免模型把截断误当完整事实。
 - observer 只消费自上次 cursor 的变化，不重复扫描全 Ledger。
 
-事件索引只供 runtime selector 和 Fukai 执行查询，不成为模型上下文。selector 先用事件元数据决定是否唤醒，只把触发引用交给 Teto；后者通过 Fukai 提出具体、有界的查询。这样 Teto 保留完整取证能力，又不需要复制主线索引和推理历史。
+事件索引只供 runtime selector 生成观察帧，不成为模型上下文。selector 先用事件元数据决定是否唤醒，把固定大小的 `ObservationFrame` 交给 Teto；Teto 不扫描索引，也不调用 Fukai。需要额外事实时，runtime 附带一个有界片段，或由 Teto 通过 A2A 向 Main 提问。
 
 ## 并发策略
 
 Main 使用保底资源；Teto、Explorer 等辅助线使用可抢占的剩余资源；Worker 受任务级并发限制。调度器需要背压，不能因为事件越积越多就无界创建 lane。并发度由模型延迟、工具类型、预算和 workspace 冲突共同决定。
+
+Teto 默认使用滚动配额：20 个 Main LLM 调用最多 4 个 Teto pass、两次至少间隔 4 个 Main 调用，总 token 不超过 Run 模型 token 的 10%。关键事件只能提前消费额度，不能绕过成本上限。
 
 ## 模型分层
 

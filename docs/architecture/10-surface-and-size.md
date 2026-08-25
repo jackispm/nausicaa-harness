@@ -49,7 +49,7 @@ TUI 只渲染 runtime projection 并提交命令：Main transcript、Goal、lane
 ## 防膨胀约束
 
 - 首期单 package、单进程、单 writer、固定 Main+Teto。
-- Main 与 Teto 使用同一 Lane Runtime 和 Fukai，只切换 policy。
+- Main 与 Teto 使用同一 Lane Runtime，只切换 policy 和 context contract；Teto 使用 ObservationPort，不依赖 Fukai。
 - 没有第二个真实实现前，不创建通用 repository/ORM 层。
 - 每个新增抽象必须删除重复、保护不变量或服务已经存在的第二个实现。
 - 每个新增 lane 或边必须先通过 Main-only/Main+Teto 对照实验的阶段门。

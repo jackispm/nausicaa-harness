@@ -16,7 +16,7 @@ Nausicaa 是一个由 **Ledger 驱动的异构多 lane graph runtime**：主线�
        |            runtime kernel          |
        | command admission / policy        |
        | scheduler / projections / inbox   |
-       | Fukai context views / replay      |
+       | lane context views / replay       |
        +-----------------+------------------+
                          |
        +-----------------+------------------+
@@ -36,9 +36,9 @@ Nausicaa 是一个由 **Ledger 驱动的异构多 lane graph runtime**：主线�
 - Ledger 是跨进程、跨 lane 的唯一事实源；Prompt、Agent 对象和缓存只是投影。
 - 图的核心关系是异构的：`depends-on`、`observes`、`advises`、`delegates`、`joins` 拥有不同的阻塞、权限和生命周期语义。
 - lane 不共享可变内存或完整 Prompt，只共享事件、产物引用和 A2A 消息。
-- 所有模型 lane 只能经 Fukai 获取事实；Fukai 按角色、触发、权限和预算生成最小视图。
+- 每条模型 lane 都只能看到自己的最小上下文视图；Fukai 是可选的按需取证实现，不是 Teto 的依赖。
 - 主线永远拥有优先级；辅助线默认只读、限额、可暂停、可丢弃。
-- 大对象外置，模型按需查询；稳定前缀固定，动态内容增量化。
+- 大对象外置；只有 Context Contract 明确允许的 lane 才能按需查询，Teto 通过 ObservationFrame 和窄 A2A 问答补充信息。稳定前缀固定，动态内容增量化。
 - 外部副作用必须可识别、可查询、可恢复，不能依赖“应该只执行一次”的假设。
 - 核心机制的待验证假设是模型单调性：更强模型应提升 lane 的判断、查询和协作，而不是让内核积累更多补偿性脚手架。
 - UI 是管理面，不是内核；模型 provider 是适配器，不是产品架构。
@@ -48,7 +48,7 @@ Nausicaa 是一个由 **Ledger 驱动的异构多 lane graph runtime**：主线�
 1. [`architecture/00-system-boundaries.md`](architecture/00-system-boundaries.md)：对象、边界、进程和依赖方向。
 2. [`architecture/01-ledger-runtime.md`](architecture/01-ledger-runtime.md)：事件、Store、Projection、命令和事实源。
 3. [`architecture/02-lanes-scheduling.md`](architecture/02-lanes-scheduling.md)：主线、辅助线、预算和唤醒策略。
-4. [`architecture/03-fukai-context.md`](architecture/03-fukai-context.md)：Fukai、context view、按需查询和缓存。
+4. [`architecture/03-context-contracts.md`](architecture/03-context-contracts.md)：lane 上下文契约、Teto ObservationPort 和可选 Fukai。
 5. [`architecture/04-a2a-protocol.md`](architecture/04-a2a-protocol.md)：消息、Advice、Inbox 和交接语义。
 6. [`architecture/05-plugins-execution.md`](architecture/05-plugins-execution.md)：能力、插件、工具和执行边界。
 7. [`architecture/06-replay-recovery.md`](architecture/06-replay-recovery.md)：checkpoint、replay 和副作用恢复。

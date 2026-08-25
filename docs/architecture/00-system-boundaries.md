@@ -31,7 +31,7 @@ Workspace
 ```text
 surface -> control protocol -> runtime kernel
 runtime kernel -> Ledger / Store / scheduler / projections
-lane runtime -> Fukai context / A2A / capability policy
+lane runtime -> lane context provider / A2A / capability policy
 adapters -> pi-ai / clock / storage / transport / executor
 ```
 
@@ -73,6 +73,6 @@ joins       在明确决策门汇聚结果          [phase 3]
 ## 边界上的决策
 
 - UI 和 runtime 通过命令、事件订阅、投影查询通信，不直接读写 Agent 内存。
-- 模型只看到 Fukai 生成的 Context View，不直接访问 Ledger、Store、主线 transcript 或事件索引。
+- 模型只看到 lane context provider 生成的 Context View，不直接访问 Ledger、Store、主线 transcript 或事件索引。Fukai 可以作为其中一个 provider，但不是内核依赖。
 - 插件只获得声明的 Capability 和 Workspace 子边界。
 - 用户的高优先级命令可以改变 Run policy，但必须通过事件留下来源和时间。

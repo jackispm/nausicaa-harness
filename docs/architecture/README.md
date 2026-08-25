@@ -7,7 +7,7 @@
 先看系统边界，再看事实层和调度，最后看扩展、恢复与评测：
 
 ```text
-boundaries -> ledger -> lanes -> Fukai -> A2A
+boundaries -> ledger -> lanes -> context contracts -> A2A
                     -> plugins -> recovery -> performance -> evaluation
 ```
 
@@ -25,12 +25,13 @@ boundaries -> ledger -> lanes -> Fukai -> A2A
 - **Ledger**：追加写入、可重放的结构化事实流。
 - **Store**：保存大对象和原始结果的内容寻址存储。
 - **Projection**：从 Ledger 计算出的可丢弃视图，例如 Inbox、Budget 和 Context Capsule。
-- **Fukai**：受 RLM 启发的上下文 runtime，也是模型 lane 查询 Ledger/Store 的唯一入口。
+- **Context Contract**：每条 lane 的最小上下文协议；Fukai 是可选的 RLM-inspired provider，Teto 使用 ObservationPort。
+- **Fukai**：受 RLM 启发的按需上下文能力，不是所有 lane 的唯一入口。
 - **Advice**：辅助线给主线的带证据、置信度和 TTL 的建议。
 - **Capability**：插件或工具声明的可调用能力及其权限边界。
 
 ## 设计纪律
 
-文档中的“主线”“Teto”“Explorer”“Critic”是 lane 策略，不意味着必须创建不同的 Agent 类。优先用同一 runtime 的不同策略和 context view 表达差异，避免概念膨胀。
+文档中的“主线”“Teto”“Explorer”“Critic”是 lane 策略，不意味着必须创建不同的 Agent 类。优先用同一 runtime 的不同策略和 context contract 表达差异，避免概念膨胀。
 
-ADR 记录关键取舍：`adr/0001-pi-ai-boundary.md`、`adr/0002-ledger-as-source-of-truth.md`、`adr/0003-intent-navigator-soft-advice.md`、`adr/0004-fukai-boundary.md` 和 `adr/0005-prime-pi-surface.md`。
+ADR 记录关键取舍：`adr/0001-pi-ai-boundary.md`、`adr/0002-ledger-as-source-of-truth.md`、`adr/0003-intent-navigator-soft-advice.md`、`adr/0004-fukai-optional-capability.md` 和 `adr/0005-prime-pi-surface.md`。

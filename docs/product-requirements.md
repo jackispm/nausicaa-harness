@@ -20,9 +20,10 @@ Nausicaa 是面向长程工作的 Agent harness。它不是单纯的 CLI、TUI �
 ## 必须具备
 
 - 主线与辅助线的独立预算、步长、上下文视图和生命周期。
+- Teto 稀疏运行：默认 20 个 Main LLM 调用只触发约 3～4 个单步 Teto pass，且不额外调用模型总结主线。
 - 具有 `observes`、`advises`、`delegates`、`depends-on`、`joins` 语义的异构多线图，而不是只有串行 loop 或通用 DAG。
 - Ledger-first 的事实记录，以及按需查询的大对象 Store。
-- Fukai Core：所有 lane 通过有界查询读取事实，而非每轮复制全部历史；持久代码 runtime 不属于第一阶段必需能力。
+- 窄 Context Contract：每条 lane 只接收当前决策所需的信息；Fukai 是可选的 RLM-inspired 查询能力，Teto 通过 ObservationFrame 工作，不依赖 Fukai。
 - A2A 消息、Inbox、任务交接、建议确认和幂等语义。
 - 插件化的工具、能力、模型适配和执行策略。
 - 稳定上下文前缀、增量状态和缓存命中观测。
@@ -38,7 +39,7 @@ Nausicaa 是面向长程工作的 Agent harness。它不是单纯的 CLI、TUI �
 
 “Heterogeneous Lane Graph + Ledger-native Soft Advice Protocol”是待验证的差异化假设：不同 lane 以不同节奏和上下文视图挂接到主线节点或边，通过 typed A2A 关系并行协作。Teto 线是第一种意图航向 lane；Dream、Reflection、并行 Agent 和 A2A 各自已有先例，不能单独作为原创声明。
 
-产品不以堆叠 Prompt、planner 或启发式纠错来长期补偿模型。核心赌注是：模型越强，越能利用独立 lane 的不同视角、Fukai 的选择性取证和 A2A 协作；这个趋势必须通过跨模型对照实验验证。
+产品不以堆叠 Prompt、planner 或启发式纠错来长期补偿模型。核心赌注是：模型越强，越能利用独立 lane 的不同视角、ObservationFrame、可选的 Fukai 取证和 A2A 协作；这个趋势必须通过跨模型对照实验验证。
 
 ## 验证指标
 

@@ -10,9 +10,9 @@
 
 ## Phase 1: protocol slice
 
-单进程、单 writer、文件 Ledger、内容寻址 Store、一个 Main 和一个 Teto。配合 mock model 验证 `observes`/`advises` sidecar、最小 opaque wake capsule、Fukai Core 的受限查询、Advice ack 和 recorded replay；不做 Worker、Explorer、通用 graph DSL 或持久代码 runtime。
+单进程、单 writer、文件 Ledger、内容寻址 Store、一个 Main 和一个 Teto。配合 mock model 验证 `observes`/`advises` sidecar、固定大小的 Teto ObservationFrame、稀疏 cadence、Advice ack、A2A 窄问答和 recorded replay；Fukai 只作为可选 provider 实验，不是 Teto 运行条件。
 
-**退出条件**：崩溃可恢复，Teto 不读完整 transcript，不阻塞 Main，重复 Advice 可恢复，预算和去重有效；query/read/checkpoint 三类 Fukai Core 能力在恢复后保持 cursor 一致。
+**退出条件**：崩溃可恢复，Teto 在没有 Fukai 实例时仍能运行，不读完整 transcript，不阻塞 Main，重复 Advice 可恢复，预算和去重有效；20 个 Main LLM 调用的常规负载只产生约 3～4 个 Teto pass。
 
 ## Phase 2: real model adapter
 
@@ -22,7 +22,7 @@
 
 ## Phase 3: worker and A2A
 
-加入有界 Worker lane、`delegates/joins` 边、任务交接、Inbox 的 next-step/next-turn 语义、幂等投递和产物引用。只有此阶段才评估 Fukai continuation 的有限 spawn/await。
+加入有界 Worker lane、`delegates/joins` 边、任务交接、Inbox 的 next-step/next-turn 语义、幂等投递和产物引用。只有对应 lane 的实验证明必要时，才评估 Fukai continuation 的有限 spawn/await。
 
 **退出条件**：并行任务不会破坏主线事实；并发上限、背压、公平性、死锁、重复消息和子任务失败可恢复。
 
