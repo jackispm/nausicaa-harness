@@ -31,6 +31,11 @@ export class FukaiContextProvider implements MainContextProvider {
     let artifactBytes = 0;
 
     const systemPrompt = buildSystemPrompt(request);
+    const prefixHash = hashStable({
+      version: 1,
+      systemPrompt,
+      tools: request.tools,
+    });
     const baseTokens = estimateTokens(systemPrompt) + estimateTokens(stableStringify(request.tools));
     if (baseTokens > request.budget.maxInputTokens) {
       throw new FukaiBudgetError(
@@ -229,6 +234,7 @@ export class FukaiContextProvider implements MainContextProvider {
     return {
       systemPrompt,
       messages,
+      prefixHash,
       cacheKey,
       dependencyRefs,
       upperWatermark: request.upperWatermark,

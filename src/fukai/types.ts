@@ -67,6 +67,8 @@ export interface FukaiTruncation {
 export interface FukaiContextView {
   systemPrompt: string;
   messages: ConversationMessage[];
+  /** Hash of the deterministic prompt/tool prefix, excluding dynamic context. */
+  prefixHash: string;
   cacheKey: string;
   dependencyRefs: string[];
   upperWatermark: number;

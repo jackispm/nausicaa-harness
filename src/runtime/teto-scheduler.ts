@@ -95,6 +95,8 @@ export class TetoScheduler {
   private readonly cadence: TetoCadence;
   private tokenGate: TokenRatioGate;
   private readonly signal: AbortSignal | undefined;
+  private readonly stopController = new AbortController();
+  private accepting = true;
   private goal: Goal;
   private previousAdviceOutcome: PreviousAdviceOutcome | undefined;
   private tail: Promise<void> = Promise.resolve();
@@ -131,6 +133,9 @@ export class TetoScheduler {
 
   /** Called from Main's synchronous afterStep hook. */
   enqueue(context: MainAfterStepContext): void {
+    if (!this.accepting) {
+      return;
+    }
     let operation: Promise<void>;
     try {
       const observation = narrowObservation(context);
@@ -190,6 +195,18 @@ export class TetoScheduler {
     }
   }
 
+  /** Stop accepting work and cancel an observation that outlived Main. */
+  async stop(): Promise<void> {
+    this.accepting = false;
+    if (!this.stopController.signal.aborted) {
+      this.stopController.abort(new DOMException(
+        "Teto observation cancelled after Main finished",
+        "AbortError",
+      ));
+    }
+    await this.drain();
+  }
+
   snapshot(): TetoSchedulerState {
     return {
       cadenceState: this.cadence.snapshot(),
@@ -201,19 +218,26 @@ export class TetoScheduler {
   }
 
   private async process(context: QueuedMainObservation): Promise<void> {
-    if (!this.policy.tetoEnabled || context.delta.status === "complete") {
+    if (
+      !this.policy.tetoEnabled
+      || context.delta.status === "complete"
+      || this.stopController.signal.aborted
+    ) {
       return;
     }
 
     let wakePending = false;
+    let mainCallIndex: number | undefined;
     let reservationId: string | undefined;
     let reservationSettled = false;
     let passCommitted = false;
+    let observationSignal: AbortSignal | undefined;
     try {
       assertContextScope(context, this.runId, this.mainLaneId);
       this.acceptGoal(context.goal);
       this.tokenGate.chargeMain(context.usage);
       const decision = this.cadence.recordMainCall(context.delta.triggerKind);
+      mainCallIndex = decision.mainCallIndex;
       if (!decision.shouldWake) {
         return;
       }
@@ -254,12 +278,14 @@ export class TetoScheduler {
       this.cadence.commitPass(decision.mainCallIndex);
       wakePending = false;
       passCommitted = true;
-      const result = await this.navigator.observe({
+      const signal = createObservationSignal(this.signal, this.stopController.signal);
+      observationSignal = signal;
+      const result = await withAbort(() => this.navigator.observe({
         runId: this.runId,
         sessionId: `${this.runId}:${this.tetoLaneId}:${this.model}`,
         frame,
-        signal: observationSignal(this.signal),
-      });
+        signal,
+      }), signal);
 
       await this.eventSink.append({
         runId: this.runId,
@@ -323,13 +349,21 @@ export class TetoScheduler {
           // The original failure remains authoritative; no pending pass remains.
         }
       }
-      await this.recordFailure(`step:${context.step}`, error);
+      if (isSignalAbort(error, observationSignal)) {
+        await this.recordLaneStatus(
+          mainCallIndex ?? context.step,
+          "cancelled",
+          persistedErrorText(error, "Observation cancelled before completion"),
+        );
+      } else {
+        await this.recordFailure(`step:${context.step}`, error);
+      }
     }
   }
 
   private async recordLaneStatus(
     pass: number,
-    status: "running" | "dormant",
+    status: "running" | "dormant" | "cancelled",
     reason?: string,
   ): Promise<void> {
     await this.eventSink.append({
@@ -569,9 +603,48 @@ function estimateTokens(value: string): number {
   return Math.ceil(Buffer.byteLength(value, "utf8") / 4);
 }
 
-function observationSignal(parent: AbortSignal | undefined): AbortSignal {
+function createObservationSignal(
+  parent: AbortSignal | undefined,
+  stop: AbortSignal,
+): AbortSignal {
   const timeout = AbortSignal.timeout(OBSERVATION_DEADLINE_MS);
-  return parent === undefined ? timeout : AbortSignal.any([parent, timeout]);
+  return AbortSignal.any(parent === undefined ? [stop, timeout] : [parent, stop, timeout]);
+}
+
+async function withAbort<T>(start: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    throw abortError(signal);
+  }
+  const pending = start();
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    pending.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted", "AbortError");
+}
+
+function isSignalAbort(error: unknown, signal: AbortSignal | undefined): boolean {
+  if (signal === undefined || !signal.aborted) {
+    return false;
+  }
+  return error === signal.reason
+    || (error instanceof Error && error.name === "AbortError");
 }
 
 function advicePriority(risk: "low" | "medium" | "high"): number {

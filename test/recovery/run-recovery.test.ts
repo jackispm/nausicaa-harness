@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import type { ArtifactRef, RunPolicy } from "../../src/domain/types.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
+import { MemoryContentAddressedStore } from "../../src/store/index.js";
 import {
   commitRunCheckpoint,
   recoverRun,
+  resolvePendingToolOperation,
   RunRecoveryError,
 } from "../../src/runtime/recovery.js";
 
@@ -94,6 +96,69 @@ describe("Run recovery", () => {
       /unknown outcomes: operation-unknown/,
     );
     expect((await ledger.read())).toHaveLength(eventCount);
+  });
+
+  it("settles one unknown operation as an operator-confirmed failure", async () => {
+    const ledger = new MemoryLedger();
+    const store = new MemoryContentAddressedStore();
+    await append(ledger, "run.created", {
+      goal: { version: 1, statement: "Inspect", successCriteria: [], hardConstraints: [] },
+      workspace: "/workspace",
+      policy,
+    }, "created");
+    await append(ledger, "step.started", { step: 1 }, "step-1");
+    await append(ledger, "tool.requested", {
+      operationId: "operation-unknown",
+      toolCallId: "call-1",
+      name: "external_write",
+      argumentsRef: ref("arguments"),
+    }, "tool-requested");
+
+    const beforeResolution = (await ledger.read()).length;
+    await expect(resolvePendingToolOperation(
+      ledger,
+      store,
+      "run-1",
+      "operation-other",
+    )).rejects.toThrow(/not pending/);
+    expect(await ledger.read()).toHaveLength(beforeResolution);
+
+    await resolvePendingToolOperation(
+      ledger,
+      store,
+      "run-1",
+      "operation-unknown",
+      { clock: { now: () => new Date("2026-01-01T00:00:01.000Z") } },
+    );
+
+    const events = await ledger.read();
+    const failed = events.find((event) => event.type === "tool.failed");
+    expect(failed?.type).toBe("tool.failed");
+    if (failed?.type !== "tool.failed") throw new Error("Missing synthetic tool.failed");
+    expect(failed.payload).toMatchObject({
+      operationId: "operation-unknown",
+      toolCallId: "call-1",
+      name: "external_write",
+      error: "Operator resolved unknown tool outcome as failed",
+    });
+    const result = JSON.parse(new TextDecoder().decode(await store.get(failed.payload.resultRef)));
+    expect(result).toMatchObject({
+      role: "tool",
+      toolCallId: "call-1",
+      toolName: "external_write",
+      isError: true,
+    });
+    const afterResolution = events.length;
+    await expect(resolvePendingToolOperation(
+      ledger,
+      store,
+      "run-1",
+      "operation-unknown",
+    )).resolves.toBeUndefined();
+    expect(await ledger.read()).toHaveLength(afterResolution);
+    await expect(recoverRun(ledger, "run-1")).resolves.toMatchObject({
+      startStep: 2,
+    });
   });
 
   it("accounts for completed model usage missing its budget charge", async () => {

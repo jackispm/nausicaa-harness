@@ -101,6 +101,35 @@ describe("settings", () => {
       tetoEnabled: true,
       maxSteps: 3,
       dataDir: "/work/.nausicaa",
+      allowWrite: false,
     });
+  });
+
+  it("keeps writes disabled by default and supports explicit overrides", () => {
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base" },
+      {},
+      {},
+    ).allowWrite).toBe(false);
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base" },
+      { allowWrite: true },
+      {},
+    ).allowWrite).toBe(true);
+  });
+
+  it("validates allowWrite in settings files", async () => {
+    const root = await makeRoot();
+    const home = join(root, "home");
+    await mkdir(join(home, ".nausicaa"), { recursive: true });
+    await writeFile(
+      join(home, ".nausicaa", "settings.json"),
+      JSON.stringify({ model: "openrouter:base", allowWrite: "yes" }),
+    );
+
+    await expect(loadSettings(join(root, "workspace"), { userHome: home }))
+      .rejects.toThrow(/allowWrite.*boolean/i);
   });
 });

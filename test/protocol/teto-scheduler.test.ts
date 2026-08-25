@@ -4,6 +4,7 @@ import { A2AInbox } from "../../src/a2a/index.js";
 import type {
   A2AMessage,
   Goal,
+  ModelPort,
   ModelResponse,
   RunPolicy,
   TokenUsage,
@@ -186,8 +187,29 @@ describe("TetoScheduler", () => {
     const events = await ledger.read({ runId: "run-1" });
     expect(events.some((event) => (
       event.type === "lane.status"
-      && event.payload.status === "failed"
+      && event.payload.status === "cancelled"
       && event.payload.reason?.includes("run cancelled")
+    ))).toBe(true);
+  });
+
+  it("does not start an observer after caller cancellation", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("already cancelled"));
+    let calls = 0;
+    const model: ModelPort = {
+      complete: async () => {
+        calls += 1;
+        return silentResponse();
+      },
+    };
+    const { scheduler, ledger } = setup(model, { signal: controller.signal });
+    enqueueFive(scheduler);
+
+    await scheduler.drain();
+
+    expect(calls).toBe(0);
+    expect((await ledger.read({ runId: "run-1" })).some((event) => (
+      event.type === "lane.status" && event.payload.status === "cancelled"
     ))).toBe(true);
   });
 
@@ -243,7 +265,7 @@ describe("TetoScheduler", () => {
 });
 
 function setup(
-  model: ScriptedModel,
+  model: ModelPort,
   overrides: Partial<TetoSchedulerOptions> & {
     ledger?: MemoryLedger;
     inbox?: A2AInbox;

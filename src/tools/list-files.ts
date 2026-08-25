@@ -5,17 +5,21 @@ import path from "node:path";
 import type { AgentTool, ToolResult } from "../domain/ports.js";
 import {
   assertSameFile,
+  isWorkspacePathAllowed,
   openNoFollow,
   relativePath,
   type ResolvedWorkspacePath,
   resolveExistingWorkspacePath,
   revalidateExistingWorkspacePath,
+  type WorkspacePathPolicy,
 } from "./workspace-path.js";
 
 const DEFAULT_MAX_ENTRIES = 200;
 const HARD_MAX_ENTRIES = 1_000;
 
-export const listFilesTool: AgentTool = {
+export function createListFilesTool(policy: WorkspacePathPolicy = {}): AgentTool {
+  const pathPolicy = snapshotPolicy(policy);
+  return {
   definition: {
     name: "list_files",
     description: "List workspace files in stable order without following directory symlinks.",
@@ -41,7 +45,11 @@ export const listFilesTool: AgentTool = {
         DEFAULT_MAX_ENTRIES,
         HARD_MAX_ENTRIES,
       );
-      const resolved = await resolveExistingWorkspacePath(context.workspace, requestedPath);
+      const resolved = await resolveExistingWorkspacePath(
+        context.workspace,
+        requestedPath,
+        pathPolicy,
+      );
       const entries: Array<{ path: string; type: "file" | "directory" | "symlink" | "other" }> = [];
       let truncated = false;
 
@@ -71,6 +79,9 @@ export const listFilesTool: AgentTool = {
             return;
           }
           const absolute = path.join(directory.absolute, child.name);
+          if (!isWorkspacePathAllowed(resolved.workspace, absolute, pathPolicy)) {
+            continue;
+          }
           const type = child.isFile()
             ? "file"
             : child.isDirectory()
@@ -83,6 +94,7 @@ export const listFilesTool: AgentTool = {
             await visit(await resolveExistingWorkspacePath(
               resolved.workspace,
               relativePath(resolved.workspace, absolute),
+              pathPolicy,
             ));
             if (truncated) {
               return;
@@ -97,7 +109,14 @@ export const listFilesTool: AgentTool = {
       return failure(error instanceof Error ? error.message : "Directory listing failed");
     }
   },
-};
+  };
+}
+
+export const listFilesTool: AgentTool = createListFilesTool();
+
+function snapshotPolicy(policy: WorkspacePathPolicy): WorkspacePathPolicy {
+  return { protectedPaths: [...(policy.protectedPaths ?? [])] };
+}
 
 function optionalString(value: unknown, name: string): string | undefined {
   if (value === undefined) {

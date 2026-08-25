@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -21,6 +21,7 @@ describe("workspace tools", () => {
   it("reads, lists, and atomically writes bounded workspace content", async () => {
     const workspace = await temporaryDirectory("nausicaa-workspace-");
     await writeFile(path.join(workspace, "existing.txt"), "existing", "utf8");
+    await mkdir(path.join(workspace, "nested"));
     const context = { runId: "run-1", workspace, operationId: "op-1" };
 
     const written = await writeFileTool.execute({
@@ -37,6 +38,19 @@ describe("workspace tools", () => {
       path: "nested/new.txt",
       type: "file",
     });
+  });
+
+  it("requires write parents to exist", async () => {
+    const workspace = await temporaryDirectory("nausicaa-workspace-");
+    const context = { runId: "run-1", workspace, operationId: "op-1" };
+
+    const result = await writeFileTool.execute({
+      path: "missing/new.txt",
+      content: "new content",
+    }, context);
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content).error).toContain("Parent directory does not exist");
   });
 
   it("rejects lexical and symlink escapes", async () => {

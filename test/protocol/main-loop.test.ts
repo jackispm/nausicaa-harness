@@ -229,12 +229,51 @@ describe("MainLoop", () => {
     expect(requested?.payload.contextWatermark).toBeLessThan(requested?.globalOffset ?? 0);
   });
 
+  it("records monotonic context and provider latency without wall-clock inference", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const timings = [10, 14, 20, 45];
+    const loop = new MainLoop({
+      model: new ScriptedModel([{
+        content: "done",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: { input: 10, output: 2, cacheRead: 8, cacheWrite: 1 },
+      }]),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+      monotonicNow: () => timings.shift() ?? 45,
+    });
+
+    await loop.run({
+      runId: "telemetry-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    });
+
+    const events = await ledger.read({ runId: "telemetry-run" });
+    const requested = events.find((event) => event.type === "model.requested");
+    const completed = events.find((event) => event.type === "model.completed");
+    expect(requested?.payload).toMatchObject({ contextBuildMs: 4 });
+    expect(requested?.payload.prefixHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(completed?.payload).toMatchObject({
+      modelLatencyMs: 25,
+      cacheOutcome: "hit-write",
+    });
+  });
+
   it("redacts persisted model and Step failure text", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
     const ledger = new MemoryLedger();
     const bearer = "bearer-secret-value-123456";
-    const openRouterKey = "sk-or-v1-abcdefghijklmnopqrstuvwxyz012345";
+    const openRouterKey = "sk" + "-or-v1-" + "a".repeat(32);
     const loop = new MainLoop({
       model: new ScriptedModel([
         new Error(`Provider rejected Bearer ${bearer} using ${openRouterKey}`),
@@ -269,7 +308,7 @@ describe("MainLoop", () => {
     const store = new MemoryContentAddressedStore();
     const ledger = new MemoryLedger();
     const bearer = "tool-bearer-secret-123456";
-    const openRouterKey = "sk-or-v1-zyxwvutsrqponmlkjihgfedcba987654";
+    const openRouterKey = "sk" + "-or-v1-" + "z".repeat(32);
     const model = new ScriptedModel([
       {
         content: "run the tool",

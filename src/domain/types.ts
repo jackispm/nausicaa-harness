@@ -32,6 +32,9 @@ export interface TokenUsage {
   costUsd?: number;
 }
 
+/** Provider cache semantics are deliberately conservative when usage is absent. */
+export type CacheOutcome = "hit" | "write" | "hit-write" | "unknown";
+
 export interface ArtifactRef {
   id: ArtifactId;
   contentHash: string;

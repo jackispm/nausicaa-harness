@@ -4,9 +4,9 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { AgentTool, ModelResponse } from "../../src/domain/index.js";
+import type { AgentTool, ModelPort, ModelResponse } from "../../src/domain/index.js";
 import { JsonlLedger } from "../../src/ledger/index.js";
-import { ScriptedModel } from "../../src/model/index.js";
+import { ScriptedModel, type ScriptedModelStep } from "../../src/model/index.js";
 import { executeRun } from "../../src/runtime/index.js";
 
 const roots: string[] = [];
@@ -50,7 +50,7 @@ describe("executeRun", () => {
 
   it("runs Teto sparsely beside Main and records a silent pass", async () => {
     const root = await temporaryRoot();
-    const mainResponses: ModelResponse[] = Array.from({ length: 5 }, (_, index) => ({
+    const mainResponses: ScriptedModelStep[] = Array.from({ length: 5 }, (_, index) => ({
       ...response(`Step ${index + 1}`, 1_800, 200),
       stopReason: "toolUse",
       toolCalls: [{ id: `call-${index + 1}`, name: "noop", arguments: {} }],
@@ -83,6 +83,204 @@ describe("executeRun", () => {
       event.type === "budget.charged" && event.laneId === "teto",
     )).toHaveLength(1);
     expect(events.some((event) => event.type === "message.sent")).toBe(false);
+    await ledger.close();
+  });
+
+  it("returns Main's answer without waiting for a slow observer tail", async () => {
+    const root = await temporaryRoot();
+    const mainResponses: ScriptedModelStep[] = Array.from({ length: 5 }, (_, index) => ({
+      ...response(`Step ${index + 1}`, 1_000, 200),
+      stopReason: "toolUse",
+      toolCalls: [{ id: `slow-call-${index + 1}`, name: "noop", arguments: {} }],
+    }));
+    mainResponses.push(response("Done", 1_000, 200));
+    const slowTeto = new ScriptedModel([async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+      return response('{"action":"silent"}', 20, 5);
+    }]);
+    const startedAt = Date.now();
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "main-scripted",
+      tetoModel: "teto-scripted",
+      message: "Complete six bounded decisions",
+      policy: { maxMainSteps: 6, maxModelTokens: 50_000 },
+    }, {
+      mainModel: new ScriptedModel(mainResponses),
+      tetoModel: slowTeto,
+      tools: [noopTool],
+      createRunId: () => "run-slow-teto",
+    });
+
+    expect(result).toMatchObject({ completed: true, finalText: "Done" });
+    expect(Date.now() - startedAt).toBeLessThan(700);
+    const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
+    const events = await ledger.read({ runId: result.runId });
+    expect(events.some((event) => event.type === "teto.observed")).toBe(false);
+    expect(events.some((event) =>
+      event.type === "lane.status"
+      && event.laneId === "teto"
+      && event.payload.status === "cancelled",
+    )).toBe(true);
+    await ledger.close();
+  });
+
+  it("closes the Run before an observer that ignores cancellation resolves", async () => {
+    const root = await temporaryRoot();
+    const mainResponses: ScriptedModelStep[] = Array.from({ length: 5 }, (_, index) => ({
+      ...response(`Step ${index + 1}`, 1_000, 200),
+      stopReason: "toolUse",
+      toolCalls: [{ id: `uncooperative-call-${index + 1}`, name: "noop", arguments: {} }],
+    }));
+    mainResponses.push(response("Done", 1_000, 200));
+    let resolveObservation: ((value: ModelResponse) => void) | undefined;
+    const uncooperativeTeto: ModelPort = {
+      complete: async () => new Promise<ModelResponse>((resolve) => {
+        resolveObservation = resolve;
+      }),
+    };
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "main-scripted",
+      tetoModel: "teto-uncooperative",
+      message: "Complete six bounded decisions",
+      policy: { maxMainSteps: 6, maxModelTokens: 50_000 },
+    }, {
+      mainModel: new ScriptedModel(mainResponses),
+      tetoModel: uncooperativeTeto,
+      tools: [noopTool],
+      createRunId: () => "run-uncooperative-teto",
+    });
+
+    expect(result).toMatchObject({ completed: true, finalText: "Done" });
+    expect(resolveObservation).toBeTypeOf("function");
+    const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
+    const before = await ledger.read({ runId: result.runId });
+    expect(before.some((event) => event.type === "teto.observed")).toBe(false);
+    await ledger.close();
+
+    resolveObservation?.(response('{"action":"silent"}', 20, 5));
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    const reopened = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
+    expect(await reopened.read({ runId: result.runId })).toEqual(before);
+    await reopened.close();
+  });
+
+  it("delivers Teto Advice at a later Main boundary and records Main's response", async () => {
+    const root = await temporaryRoot();
+    const mainResponses: ScriptedModelStep[] = Array.from({ length: 5 }, (_, index) => ({
+      ...response(`Step ${index + 1}`, 1_800, 200),
+      stopReason: "toolUse",
+      toolCalls: [{ id: `advice-call-${index + 1}`, name: "noop", arguments: {} }],
+    }));
+    mainResponses.push(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 40));
+      return {
+        ...response("Give the observer time", 1_800, 200),
+        stopReason: "toolUse",
+        toolCalls: [{ id: "advice-call-6", name: "noop", arguments: {} }],
+      };
+    });
+    mainResponses.push((request) => {
+      const adviceText = request.messages.find((message) =>
+        message.role === "user" && message.content.includes("adviceId:"),
+      )?.content;
+      const adviceId = /adviceId: ([^\n]+)/.exec(adviceText ?? "")?.[1];
+      if (adviceId === undefined) throw new Error("Teto Advice was not delivered");
+      return {
+        ...response("Accept the navigation advice", 1_800, 200),
+        stopReason: "toolUse",
+        toolCalls: [{
+          id: "respond-to-advice",
+          name: "respond_to_advice",
+          arguments: {
+            adviceId,
+            disposition: "accept",
+            reason: "It closes a missing intent check",
+          },
+        }],
+      };
+    });
+    mainResponses.push(response("Done with Advice", 1_800, 200));
+    const tetoAdvice = JSON.stringify({
+      kind: "intent-gap",
+      claim: "The installation command still needs a prerequisite check.",
+      evidenceRefs: [],
+      confidence: 0.9,
+      risk: "medium",
+      suggestedAction: "Check the package engines field before concluding.",
+      urgency: "next-step",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      dedupeKey: "check-package-engines",
+    });
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "main-scripted",
+      tetoModel: "teto-scripted",
+      message: "Inspect installation prerequisites",
+      policy: { maxMainSteps: 8, maxModelTokens: 50_000 },
+    }, {
+      mainModel: new ScriptedModel(mainResponses),
+      tetoModel: new ScriptedModel([response(tetoAdvice, 150, 20)]),
+      tools: [noopTool],
+      createRunId: () => "run-advice-round-trip",
+    });
+
+    expect(result).toMatchObject({ completed: true, finalText: "Done with Advice" });
+    const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
+    const events = await ledger.read({ runId: result.runId });
+    expect(events.filter((event) => event.type === "message.sent")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "message.claimed")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "advice.acknowledged")).toHaveLength(1);
+    expect(events.find((event) => event.type === "advice.acknowledged")?.payload)
+      .toMatchObject({ disposition: "accept" });
+    expect(events.filter((event) => event.type === "message.handled")).toHaveLength(1);
+    await ledger.close();
+  });
+
+  it("does not let a slow observer delay Main failure handling", async () => {
+    const root = await temporaryRoot();
+    const mainScript: ScriptedModelStep[] = Array.from({ length: 5 }, (_, index) => ({
+      ...response(`Step ${index + 1}`, 1_000, 200),
+      stopReason: "toolUse",
+      toolCalls: [{ id: `failure-call-${index + 1}`, name: "noop", arguments: {} }],
+    }));
+    mainScript.push(new Error("Main provider failed"));
+    const slowTeto = new ScriptedModel([async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+      return response('{"action":"silent"}', 20, 5);
+    }]);
+    const startedAt = Date.now();
+
+    await expect(executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "main-scripted",
+      tetoModel: "teto-scripted",
+      message: "Reach a bounded failure",
+      policy: { maxMainSteps: 6, maxModelTokens: 50_000 },
+    }, {
+      mainModel: new ScriptedModel(mainScript),
+      tetoModel: slowTeto,
+      tools: [noopTool],
+      createRunId: () => "run-main-failure-slow-teto",
+    })).rejects.toThrow("Main provider failed");
+
+    expect(Date.now() - startedAt).toBeLessThan(700);
+    const ledger = await JsonlLedger.open(join(
+      root,
+      "state",
+      "runs",
+      "run-main-failure-slow-teto",
+      "ledger.jsonl",
+    ));
+    const events = await ledger.read({ runId: "run-main-failure-slow-teto" });
+    expect(events.some((event) => event.type === "run.failed")).toBe(true);
     await ledger.close();
   });
 

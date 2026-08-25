@@ -1,9 +1,22 @@
 import type { AnyEvent } from "../domain/events.js";
-import type { ArtifactRef, Goal, RunId, RunPolicy, TokenUsage } from "../domain/types.js";
+import type { Clock } from "../domain/ports.js";
+import { systemClock } from "../domain/ports.js";
+import type {
+  ArtifactRef,
+  ConversationMessage,
+  Goal,
+  RunId,
+  RunPolicy,
+  TokenUsage,
+} from "../domain/types.js";
 import type { FukaiConversationRef } from "../fukai/types.js";
 import { sha256, stableJson } from "../ledger/hash.js";
 import type { Ledger } from "../ledger/index.js";
 import { projectRun } from "../ledger/index.js";
+import type { ContentAddressedStore } from "../store/store.js";
+
+const CONVERSATION_MESSAGE_MEDIA_TYPE = "application/vnd.nausicaa.conversation-message+json";
+const OPERATOR_RESOLUTION_ERROR = "Operator resolved unknown tool outcome as failed";
 
 export interface RunRecoveryState {
   runId: RunId;
@@ -20,6 +33,20 @@ export interface RunRecoveryState {
 
 export class RunRecoveryError extends Error {}
 
+export class UnknownToolOperationError extends RunRecoveryError {
+  readonly runId: RunId;
+  readonly operationIds: readonly string[];
+
+  constructor(runId: RunId, operationIds: readonly string[]) {
+    super(
+      `Run ${runId} has tool operations with unknown outcomes: ${operationIds.join(", ")}`,
+    );
+    this.name = "UnknownToolOperationError";
+    this.runId = runId;
+    this.operationIds = [...operationIds];
+  }
+}
+
 export const recoverRun = async (
   ledger: Ledger,
   runId: RunId,
@@ -32,9 +59,7 @@ export const recoverRun = async (
 
   const unresolvedOperations = findUnresolvedToolOperations(events);
   if (unresolvedOperations.length > 0) {
-    throw new RunRecoveryError(
-      `Run ${runId} has tool operations with unknown outcomes: ${unresolvedOperations.join(", ")}`,
-    );
+    throw new UnknownToolOperationError(runId, unresolvedOperations);
   }
 
   const interruptedStep = findInterruptedStep(events);
@@ -87,6 +112,73 @@ export const recoverRun = async (
     ...(completedAnswerRef === undefined ? {} : { completedAnswerRef }),
     events,
   };
+};
+
+/**
+ * Resolve exactly one pending tool operation after an operator has confirmed
+ * that its side effect must be treated as failed. The operation is looked up
+ * before writing anything, and the deterministic idempotency key makes a
+ * retried command harmless after the terminal event is committed.
+ */
+export const resolvePendingToolOperation = async (
+  ledger: Ledger,
+  store: ContentAddressedStore,
+  runId: RunId,
+  operationId: string,
+  options: { clock?: Clock } = {},
+): Promise<void> => {
+  if (operationId.length === 0 || operationId.includes("\0")) {
+    throw new RunRecoveryError("Operation id must be a non-empty string without NUL");
+  }
+  const events = await ledger.read({ runId });
+  if (events.length === 0) {
+    throw new RunRecoveryError(`Run ${runId} does not exist`);
+  }
+  await verifyLatestCheckpoint(events, runId);
+  if (hasOperatorResolution(events, operationId)) {
+    return;
+  }
+  const pending = findPendingToolOperation(events, operationId);
+  if (pending === undefined) {
+    const known = findUnresolvedToolOperations(events);
+    if (known.length === 0) {
+      throw new RunRecoveryError(`Tool operation ${operationId} is not pending`);
+    }
+    throw new RunRecoveryError(
+      `Tool operation ${operationId} is not pending; unresolved operations: ${known.join(", ")}`,
+    );
+  }
+
+  const clock = options.clock ?? systemClock;
+  const message: ConversationMessage = {
+    role: "tool",
+    content: OPERATOR_RESOLUTION_ERROR,
+    toolCallId: pending.toolCallId,
+    toolName: pending.name,
+    isError: true,
+    createdAt: clock.now().toISOString(),
+  };
+  const resultRef = await store.put(
+    stableJson(message),
+    CONVERSATION_MESSAGE_MEDIA_TYPE,
+  );
+  await ledger.append({
+    runId,
+    laneId: pending.laneId,
+    type: "tool.failed",
+    payload: {
+      operationId: pending.operationId,
+      toolCallId: pending.toolCallId,
+      name: pending.name,
+      error: OPERATOR_RESOLUTION_ERROR,
+      resultRef,
+    },
+    causationId: pending.eventId,
+    correlationId: pending.correlationId,
+    idempotencyKey: `${pending.laneId}:operation:${pending.operationId}:operator-resolved`,
+    visibility: "run",
+    occurredAt: clock.now().toISOString(),
+  });
 };
 
 export const commitRunCheckpoint = async (
@@ -169,16 +261,53 @@ const highestStep = (events: readonly AnyEvent[]): number => {
 const findUnresolvedToolOperations = (
   events: readonly AnyEvent[],
 ): string[] => {
-  const pending = new Set<string>();
+  return [...findPendingToolOperations(events).keys()].sort();
+};
+
+interface PendingToolOperation {
+  operationId: string;
+  toolCallId: string;
+  name: string;
+  laneId: string;
+  eventId: string;
+  correlationId: string;
+}
+
+const findPendingToolOperations = (
+  events: readonly AnyEvent[],
+): Map<string, PendingToolOperation> => {
+  const pending = new Map<string, PendingToolOperation>();
   for (const event of events) {
     if (event.type === "tool.requested") {
-      pending.add(event.payload.operationId);
+      pending.set(event.payload.operationId, {
+        operationId: event.payload.operationId,
+        toolCallId: event.payload.toolCallId,
+        name: event.payload.name,
+        laneId: event.laneId,
+        eventId: event.eventId,
+        correlationId: event.correlationId,
+      });
     } else if (event.type === "tool.succeeded" || event.type === "tool.failed") {
       pending.delete(event.payload.operationId);
     }
   }
-  return [...pending].sort();
+  return pending;
 };
+
+const findPendingToolOperation = (
+  events: readonly AnyEvent[],
+  operationId: string,
+): PendingToolOperation | undefined => findPendingToolOperations(events).get(operationId);
+
+const hasOperatorResolution = (
+  events: readonly AnyEvent[],
+  operationId: string,
+): boolean => events.some((event) =>
+  event.type === "tool.failed"
+  && event.payload.operationId === operationId
+  && event.payload.error === OPERATOR_RESOLUTION_ERROR
+  && event.idempotencyKey.endsWith(":operator-resolved"),
+);
 
 const conversationRefs = (events: readonly AnyEvent[]): FukaiConversationRef[] => {
   const refs: FukaiConversationRef[] = [];

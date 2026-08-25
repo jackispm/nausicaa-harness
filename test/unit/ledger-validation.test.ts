@@ -121,12 +121,17 @@ const validPayloads = {
     model: "model-1",
     requestHash: "request-hash",
     contextWatermark: 3,
+    prefixHash: "prefix-hash",
+    dependencyRefs: ["artifact-1"],
+    contextBuildMs: 1.5,
   },
   "model.completed": {
     model: "model-1",
     responseRef: artifact,
     stopReason: "stop",
     usage: tokenUsage,
+    modelLatencyMs: 2.5,
+    cacheOutcome: "hit-write",
   },
   "model.failed": { model: "model-1", error: "provider failed" },
   "tool.requested": {
@@ -251,6 +256,17 @@ describe("event payload validation", () => {
 
     await expect(ledger.append(command)).rejects.toBeInstanceOf(LedgerCorruptionError);
     await expect(ledger.watermark()).resolves.toBe(0);
+  });
+
+  it("rejects malformed optional telemetry fields", () => {
+    expect(() => validateEventPayload("model.requested", {
+      ...validPayloads["model.requested"],
+      contextBuildMs: -1,
+    })).toThrow(/contextBuildMs/);
+    expect(() => validateEventPayload("model.completed", {
+      ...validPayloads["model.completed"],
+      cacheOutcome: "miss",
+    })).toThrow(/cacheOutcome/);
   });
 
   it("rejects a malformed payload with a valid content hash during replay", async () => {

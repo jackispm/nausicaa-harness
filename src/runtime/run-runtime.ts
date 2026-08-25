@@ -27,6 +27,10 @@ import {
 import { JsonlLedger, type Ledger } from "../ledger/index.js";
 import { createOpenRouterModelPort } from "../model/index.js";
 import {
+  projectRunMetrics,
+  type RunMetrics,
+} from "../observability/index.js";
+import {
   FileContentAddressedStore,
   type ContentAddressedStore,
 } from "../store/index.js";
@@ -38,6 +42,7 @@ import { persistedErrorText } from "./redaction.js";
 import {
   commitRunCheckpoint,
   recoverRun,
+  resolvePendingToolOperation,
   type RunRecoveryState,
 } from "./recovery.js";
 import { TetoScheduler } from "./teto-scheduler.js";
@@ -50,7 +55,9 @@ export interface RunExecutionRequest {
   message?: string;
   goal?: Goal;
   resumeRunId?: string;
+  resolveOperationId?: string;
   policy?: Partial<RunPolicy>;
+  allowWrite?: boolean;
   signal?: AbortSignal;
 }
 
@@ -69,6 +76,7 @@ export interface RunExecutionResult {
   completed: boolean;
   steps: number;
   usage: TokenUsage;
+  metrics: RunMetrics;
   stateDir: string;
 }
 
@@ -96,6 +104,15 @@ export const executeRun = async (
   try {
     const sink = new ObservableEventSink(ledger, deps.onEvent);
     const store = await FileContentAddressedStore.open(resolve(stateDir, "store"));
+    if (request.resolveOperationId !== undefined) {
+      await resolvePendingToolOperation(
+        ledger,
+        store,
+        runId,
+        request.resolveOperationId,
+        { clock },
+      );
+    }
     const recovered = request.resumeRunId === undefined
       ? undefined
       : await recoverRun(ledger, runId);
@@ -106,6 +123,7 @@ export const executeRun = async (
         completed: true,
         steps: 0,
         usage: emptyUsage(),
+        metrics: projectRunMetrics(recovered.events, runId),
         stateDir,
       };
     }
@@ -127,12 +145,14 @@ export const executeRun = async (
         clock,
       );
       await commitRunCheckpoint(ledger, runId);
+      const metrics = projectRunMetrics(await ledger.read({ runId }), runId);
       return {
         runId,
         finalText: "",
         completed: false,
         steps: 0,
         usage: emptyUsage(),
+        metrics,
         stateDir,
       };
     }
@@ -143,7 +163,10 @@ export const executeRun = async (
       events: setup.events,
       clock,
     });
-    const tools = [...(deps.tools ?? createWorkspaceTools())];
+    const tools = [...(deps.tools ?? createWorkspaceTools({
+      allowWrite: request.allowWrite === true,
+      protectedPaths: [resolve(request.dataDir)],
+    }))];
     if (policy.tetoEnabled) {
       tools.push(createAdviceResponseTool(inbox));
       const tetoModel = deps.tetoModel ?? mainModel;
@@ -198,7 +221,9 @@ export const executeRun = async (
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
 
-      await scheduler?.drain();
+      if (scheduler !== undefined) {
+        await settlesWithin(scheduler.drain(), 25);
+      }
       await appendLaneStatus(
         sink,
         runId,
@@ -208,17 +233,20 @@ export const executeRun = async (
         `main:status:${result.completed ? "completed" : "waiting"}:${setup.startStep}`,
         clock,
       );
+      await scheduler?.stop();
       await commitRunCheckpoint(ledger, runId);
+      const metrics = projectRunMetrics(await ledger.read({ runId }), runId);
       return {
         runId,
         finalText: result.finalText,
         completed: result.completed,
         steps: result.steps,
         usage: result.usage,
+        metrics,
         stateDir,
       };
     } catch (error: unknown) {
-      await scheduler?.drain();
+      await scheduler?.stop();
       const message = persistedErrorText(error, "Run failed");
       await appendLaneStatus(
         sink,
@@ -243,7 +271,7 @@ export const executeRun = async (
       throw error;
     }
   } finally {
-    await scheduler?.drain().catch(() => undefined);
+    await scheduler?.stop().catch(() => undefined);
     await ledger.close();
   }
 };
@@ -457,6 +485,12 @@ const validateRequest = (request: RunExecutionRequest): void => {
   if (request.resumeRunId === undefined && request.message === undefined) {
     throw new Error("A new Run requires a task message");
   }
+  if (request.resolveOperationId !== undefined && request.resumeRunId === undefined) {
+    throw new Error("resolveOperationId requires resumeRunId");
+  }
+  if (request.resolveOperationId !== undefined && request.resolveOperationId.length === 0) {
+    throw new Error("resolveOperationId must not be empty");
+  }
 };
 
 const validateRunId = (runId: string): void => {
@@ -474,3 +508,15 @@ const emptyUsage = (): TokenUsage => ({
   cacheRead: 0,
   cacheWrite: 0,
 });
+
+const delay = async (milliseconds: number): Promise<void> => {
+  await new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+};
+
+const settlesWithin = async (
+  promise: Promise<unknown>,
+  milliseconds: number,
+): Promise<boolean> => Promise.race([
+  promise.then(() => true, () => true),
+  delay(milliseconds).then(() => false),
+]);

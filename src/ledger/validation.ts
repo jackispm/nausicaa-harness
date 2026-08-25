@@ -311,10 +311,21 @@ const payloadValidators = {
     navigationDelta(item.delta, `${path}.delta`);
   },
   "model.requested": (value, path) => {
-    const item = payloadObject(value, path, ["model", "requestHash", "contextWatermark"]);
+    const item = payloadObject(value, path, [
+      "model",
+      "requestHash",
+      "contextWatermark",
+    ]);
     string(item.model, `${path}.model`, false);
     string(item.requestHash, `${path}.requestHash`, false);
     integer(item.contextWatermark, `${path}.contextWatermark`);
+    optionalString(item.prefixHash, `${path}.prefixHash`);
+    if (item.dependencyRefs !== undefined) {
+      stringArray(item.dependencyRefs, `${path}.dependencyRefs`);
+    }
+    if (item.contextBuildMs !== undefined) {
+      finiteNumber(item.contextBuildMs, `${path}.contextBuildMs`);
+    }
   },
   "model.completed": (value, path) => {
     const item = payloadObject(value, path, [
@@ -327,6 +338,17 @@ const payloadValidators = {
     artifactRef(item.responseRef, `${path}.responseRef`);
     string(item.stopReason, `${path}.stopReason`);
     usage(item.usage, `${path}.usage`);
+    if (item.modelLatencyMs !== undefined) {
+      finiteNumber(item.modelLatencyMs, `${path}.modelLatencyMs`);
+    }
+    if (item.cacheOutcome !== undefined) {
+      oneOf(item.cacheOutcome, `${path}.cacheOutcome`, [
+        "hit",
+        "write",
+        "hit-write",
+        "unknown",
+      ] as const);
+    }
   },
   "model.failed": (value, path) => {
     const item = payloadObject(value, path, ["model", "error"]);

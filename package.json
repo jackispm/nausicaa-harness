@@ -31,8 +31,8 @@
     "test:recovery": "vitest run test/recovery",
     "test:smoke": "npm run build && vitest run test/smoke",
     "test:live": "vitest run test/live --passWithNoTests",
-    "eval": "vitest run test/eval --passWithNoTests",
-    "check": "npm run typecheck && npm test && npm run test:smoke"
+    "eval": "vitest run test/eval",
+    "check": "npm run typecheck && npm test && npm run eval && npm run test:smoke"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.84.3"

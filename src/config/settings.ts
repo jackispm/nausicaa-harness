@@ -9,6 +9,7 @@ export interface Settings {
   maxSteps?: number;
   maxModelTokens?: number;
   dataDir?: string;
+  allowWrite?: boolean;
 }
 
 export interface ResolvedSettings {
@@ -18,6 +19,7 @@ export interface ResolvedSettings {
   maxSteps: number;
   maxModelTokens: number;
   dataDir: string;
+  allowWrite: boolean;
 }
 
 export interface LoadSettingsOptions {
@@ -34,6 +36,7 @@ const allowedKeys = new Set<keyof Settings>([
   "maxSteps",
   "maxModelTokens",
   "dataDir",
+  "allowWrite",
 ]);
 
 export const loadSettings = async (
@@ -76,6 +79,7 @@ export const resolveSettings = (
       Number.MAX_SAFE_INTEGER,
     ),
     dataDir: isAbsolute(dataDir) ? resolve(dataDir) : resolve(workspace, dataDir),
+    allowWrite: merged.allowWrite ?? false,
   };
 };
 
@@ -108,6 +112,7 @@ const readSettingsFile = async (path: string): Promise<Settings> => {
   validateOptionalString(value.model, "model", path);
   validateOptionalString(value.tetoModel, "tetoModel", path);
   validateOptionalString(value.dataDir, "dataDir", path);
+  validateOptionalBoolean(value.allowWrite, "allowWrite", path);
   validateOptionalBoolean(value.tetoEnabled, "tetoEnabled", path);
   validateOptionalInteger(value.maxSteps, "maxSteps", path);
   validateOptionalInteger(value.maxModelTokens, "maxModelTokens", path);

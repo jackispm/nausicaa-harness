@@ -13,14 +13,17 @@ import {
   revalidateWorkspaceParent,
   revalidateWorkspaceWritePath,
   syncDirectory,
+  type WorkspacePathPolicy,
 } from "./workspace-path.js";
 
 const HARD_MAX_BYTES = 1024 * 1024;
 
-export const writeFileTool: AgentTool = {
+export function createWriteFileTool(policy: WorkspacePathPolicy = {}): AgentTool {
+  const pathPolicy = snapshotPolicy(policy);
+  return {
   definition: {
     name: "write_file",
-    description: "Atomically write one UTF-8 file inside the workspace.",
+    description: "Atomically write one UTF-8 file inside an existing workspace directory.",
     parameters: {
       type: "object",
       properties: {
@@ -45,7 +48,11 @@ export const writeFileTool: AgentTool = {
         throw new RangeError(`content exceeds the ${HARD_MAX_BYTES}-byte write limit`);
       }
 
-      resolved = await resolveWorkspaceWritePath(context.workspace, requestedPath);
+      resolved = await resolveWorkspaceWritePath(
+        context.workspace,
+        requestedPath,
+        pathPolicy,
+      );
       temporaryPath = path.join(path.dirname(resolved.absolute), `.nausicaa-${randomUUID()}.tmp`);
       await revalidateWorkspaceParent(resolved);
       const handle = await openNoFollow(
@@ -100,7 +107,14 @@ export const writeFileTool: AgentTool = {
       }
     }
   },
-};
+  };
+}
+
+export const writeFileTool: AgentTool = createWriteFileTool();
+
+function snapshotPolicy(policy: WorkspacePathPolicy): WorkspacePathPolicy {
+  return { protectedPaths: [...(policy.protectedPaths ?? [])] };
+}
 
 async function safeUnlinkTemporary(
   resolved: ResolvedWorkspacePath,

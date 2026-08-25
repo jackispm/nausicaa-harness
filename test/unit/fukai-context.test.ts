@@ -44,7 +44,18 @@ describe("FukaiContextProvider", () => {
         { ref: artifactB, reason: "B", priority: 1 },
         { ref: artifactA, reason: "A", priority: 1 },
       ],
-      tools: [],
+      tools: [
+        {
+          name: "read_file",
+          description: "Read a file",
+          parameters: { type: "object" as const, additionalProperties: false },
+        },
+        {
+          name: "list_files",
+          description: "List files",
+          parameters: { type: "object" as const, additionalProperties: false },
+        },
+      ],
       upperWatermark: 7,
       policyVersion: "v1",
       budget: {
@@ -63,11 +74,18 @@ describe("FukaiContextProvider", () => {
     });
 
     expect(left.cacheKey).toBe(right.cacheKey);
+    expect(left.prefixHash).toBe(right.prefixHash);
     expect(left.messages[0]?.content).toBe("build the feature");
     expect(left.messages[1]?.content).toBe("I will inspect it");
     expect(left.messages.at(-1)?.content).toContain("alpha");
     expect(left.messages.at(-1)?.content).toContain("beta");
     expect(left.truncated).toBe(false);
+
+    const reorderedTools = await provider.build({
+      ...base,
+      tools: [...base.tools].reverse(),
+    });
+    expect(reorderedTools.prefixHash).not.toBe(left.prefixHash);
   });
 
   it("makes omissions and byte truncation explicit", async () => {

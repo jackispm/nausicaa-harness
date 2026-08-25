@@ -1,13 +1,26 @@
-export { listFilesTool } from "./list-files.js";
-export { readFileTool } from "./read-file.js";
-export { WorkspacePathError } from "./workspace-path.js";
-export { writeFileTool } from "./write-file.js";
+export { createListFilesTool, listFilesTool } from "./list-files.js";
+export { createReadFileTool, readFileTool } from "./read-file.js";
+export {
+  type WorkspacePathPolicy,
+  WorkspacePathError,
+} from "./workspace-path.js";
+export { createWriteFileTool, writeFileTool } from "./write-file.js";
 
 import type { AgentTool } from "../domain/ports.js";
-import { listFilesTool } from "./list-files.js";
-import { readFileTool } from "./read-file.js";
-import { writeFileTool } from "./write-file.js";
+import { createListFilesTool } from "./list-files.js";
+import { createReadFileTool } from "./read-file.js";
+import type { WorkspacePathPolicy } from "./workspace-path.js";
+import { createWriteFileTool } from "./write-file.js";
 
-export function createWorkspaceTools(): AgentTool[] {
-  return [readFileTool, listFilesTool, writeFileTool];
+export interface WorkspaceToolOptions extends WorkspacePathPolicy {
+  allowWrite?: boolean;
+}
+
+export function createWorkspaceTools(options: WorkspaceToolOptions = {}): AgentTool[] {
+  const policy = { protectedPaths: [...(options.protectedPaths ?? [])] };
+  const tools = [createReadFileTool(policy), createListFilesTool(policy)];
+  if (options.allowWrite === true) {
+    tools.push(createWriteFileTool(policy));
+  }
+  return tools;
 }

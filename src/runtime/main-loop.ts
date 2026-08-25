@@ -14,6 +14,7 @@ import type {
 import { systemClock } from "../domain/ports.js";
 import type {
   ArtifactRef,
+  CacheOutcome,
   ConversationMessage,
   Goal,
   LaneId,
@@ -95,6 +96,8 @@ export interface MainLoopDeps {
   eventSink: MainEventSink;
   tools: readonly AgentTool[];
   clock?: Clock;
+  /** Monotonic milliseconds used for provider/context latency metrics. */
+  monotonicNow?: () => number;
   beforeStep?: (
     context: MainBeforeStepContext,
   ) => Promise<readonly MainBoundaryMessage[]>;
@@ -144,6 +147,7 @@ export class MainLoop {
   private readonly tools: readonly AgentTool[];
   private readonly toolsByName: ReadonlyMap<string, AgentTool>;
   private readonly clock: Clock;
+  private readonly monotonicNow: () => number;
   private readonly beforeStep: MainLoopDeps["beforeStep"];
   private readonly navigationHook: MainLoopDeps["navigationHook"];
   private readonly afterStep: MainLoopDeps["afterStep"];
@@ -156,6 +160,7 @@ export class MainLoop {
     this.tools = [...deps.tools];
     this.toolsByName = indexTools(this.tools);
     this.clock = deps.clock ?? systemClock;
+    this.monotonicNow = deps.monotonicNow ?? defaultMonotonicNow;
     this.beforeStep = deps.beforeStep;
     this.navigationHook = deps.navigationHook;
     this.afterStep = deps.afterStep;
@@ -243,6 +248,7 @@ export class MainLoop {
           });
         }
 
+        const contextStartedAt = this.monotonicNow();
         const view = await this.contextProvider.build({
           runId: input.runId,
           laneId,
@@ -257,6 +263,7 @@ export class MainLoop {
           budget: contextBudget,
           ...(input.signal === undefined ? {} : { signal: input.signal }),
         });
+        const contextBuildMs = elapsedMilliseconds(contextStartedAt, this.monotonicNow());
 
         const remainingTokens = Math.max(
           1,
@@ -278,11 +285,15 @@ export class MainLoop {
             model: input.model,
             requestHash,
             contextWatermark: view.upperWatermark,
+            prefixHash: view.prefixHash,
+            dependencyRefs: [...view.dependencyRefs],
+            contextBuildMs,
           },
           idempotencyKey: `${laneId}:step:${step}:model:requested`,
         });
 
         let response;
+        const modelStartedAt = this.monotonicNow();
         try {
           response = await this.model.complete({
             runId: input.runId,
@@ -303,6 +314,7 @@ export class MainLoop {
           });
           throw error;
         }
+        const modelLatencyMs = elapsedMilliseconds(modelStartedAt, this.monotonicNow());
 
         usage = addUsage(usage, response.usage);
         finalText = response.content;
@@ -329,6 +341,8 @@ export class MainLoop {
             responseRef: assistantRef,
             stopReason: response.stopReason,
             usage: response.usage,
+            modelLatencyMs,
+            cacheOutcome: cacheOutcome(response.usage),
           },
           idempotencyKey: `${laneId}:step:${step}:model:completed`,
         });
@@ -729,6 +743,31 @@ function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
 
 function chargedTokens(usage: TokenUsage): number {
   return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+function defaultMonotonicNow(): number {
+  return globalThis.performance?.now() ?? Date.now();
+}
+
+function elapsedMilliseconds(start: number, end: number): number {
+  if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    return 0;
+  }
+  return Math.max(0, end - start);
+}
+
+function cacheOutcome(usage: TokenUsage): CacheOutcome {
+  if (usage.cacheRead > 0 && usage.cacheWrite > 0) {
+    return "hit-write";
+  }
+  if (usage.cacheRead > 0) {
+    return "hit";
+  }
+  if (usage.cacheWrite > 0) {
+    return "write";
+  }
+  // Providers that do not expose cache counters must not be called misses.
+  return "unknown";
 }
 
 function boundToolResult(result: ToolResult): ToolResult {

@@ -6,12 +6,15 @@ import {
   openNoFollow,
   resolveExistingWorkspacePath,
   revalidateExistingWorkspacePath,
+  type WorkspacePathPolicy,
 } from "./workspace-path.js";
 
 const DEFAULT_MAX_BYTES = 64 * 1024;
 const HARD_MAX_BYTES = 256 * 1024;
 
-export const readFileTool: AgentTool = {
+export function createReadFileTool(policy: WorkspacePathPolicy = {}): AgentTool {
+  const pathPolicy = snapshotPolicy(policy);
+  return {
   definition: {
     name: "read_file",
     description: "Read a UTF-8 file inside the workspace with an explicit size bound.",
@@ -31,7 +34,11 @@ export const readFileTool: AgentTool = {
       throwIfAborted(context.signal);
       const requestedPath = stringArgument(arguments_.path, "path");
       const maxBytes = boundedInteger(arguments_.maxBytes, "maxBytes", DEFAULT_MAX_BYTES, HARD_MAX_BYTES);
-      const resolved = await resolveExistingWorkspacePath(context.workspace, requestedPath);
+      const resolved = await resolveExistingWorkspacePath(
+        context.workspace,
+        requestedPath,
+        pathPolicy,
+      );
       await revalidateExistingWorkspacePath(resolved);
       const handle = await openNoFollow(resolved.absolute, constants.O_RDONLY);
       try {
@@ -58,7 +65,14 @@ export const readFileTool: AgentTool = {
       return failure(safeMessage(error));
     }
   },
-};
+  };
+}
+
+export const readFileTool: AgentTool = createReadFileTool();
+
+function snapshotPolicy(policy: WorkspacePathPolicy): WorkspacePathPolicy {
+  return { protectedPaths: [...(policy.protectedPaths ?? [])] };
+}
 
 function stringArgument(value: unknown, name: string): string {
   if (typeof value !== "string" || value.length === 0) {

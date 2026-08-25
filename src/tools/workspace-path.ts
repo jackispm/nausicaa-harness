@@ -1,7 +1,7 @@
-import { constants } from "node:fs";
+import { constants, realpathSync } from "node:fs";
 import type { Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
-import { lstat, mkdir, open, realpath } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 
 export class WorkspacePathError extends Error {
@@ -18,31 +18,77 @@ export interface ResolvedWorkspacePath {
   absolute: string;
   relative: string;
   parentIdentity: FileIdentity;
+  policy: WorkspacePathPolicy;
+}
+
+export interface WorkspacePathPolicy {
+  protectedPaths?: readonly string[];
 }
 
 const noFollow = constants.O_NOFOLLOW ?? 0;
+const protectedDirectories = new Set([
+  ".aws",
+  ".azure",
+  ".git",
+  ".gnupg",
+  ".kube",
+  ".nausicaa",
+  ".ssh",
+]);
+const protectedFileNames = new Set([
+  ".git-credentials",
+  ".netrc",
+  ".npmrc",
+  ".pypirc",
+  "_netrc",
+  "application_default_credentials.json",
+  "credentials",
+  "credentials.json",
+  "id_dsa",
+  "id_ecdsa",
+  "id_ed25519",
+  "id_rsa",
+  "secrets.json",
+  "service-account.json",
+  "service_account.json",
+]);
+const protectedExtensions = new Set([
+  ".jks",
+  ".key",
+  ".keystore",
+  ".p12",
+  ".pem",
+  ".pfx",
+]);
 
 export async function resolveExistingWorkspacePath(
   workspace: string,
   requestedPath: string,
+  policy: WorkspacePathPolicy = {},
 ): Promise<ResolvedWorkspacePath> {
   const root = await canonicalWorkspace(workspace);
   const lexical = lexicalPath(root, requestedPath);
+  const normalizedPolicy = normalizePolicy(root, policy);
+  assertPathAllowed(root, lexical, normalizedPolicy);
   const target = await inspectExistingPath(root, lexical);
   return {
     workspace: root,
     absolute: target.absolute,
     relative: relativePath(root, target.absolute),
     parentIdentity: target.parentIdentity,
+    policy: normalizedPolicy,
   };
 }
 
 export async function resolveWorkspaceWritePath(
   workspace: string,
   requestedPath: string,
+  policy: WorkspacePathPolicy = {},
 ): Promise<ResolvedWorkspacePath> {
   const root = await canonicalWorkspace(workspace);
   const lexical = lexicalPath(root, requestedPath);
+  const normalizedPolicy = normalizePolicy(root, policy);
+  assertPathAllowed(root, lexical, normalizedPolicy);
   if (lexical === root) {
     throw new WorkspacePathError("A file path is required");
   }
@@ -62,10 +108,7 @@ export async function resolveWorkspaceWritePath(
       info = await lstat(candidate);
     } catch (error: unknown) {
       if (!isNotFound(error)) throw error;
-      await revalidateDirectory(root, parent);
-      await mkdir(candidate, { mode: 0o700 });
-      await syncDirectory(parent);
-      info = await lstat(candidate);
+      throw new WorkspacePathError(`Parent directory does not exist: ${part}`);
     }
 
     if (info.isSymbolicLink()) {
@@ -87,6 +130,7 @@ export async function resolveWorkspaceWritePath(
     absolute,
     relative: relativePath(root, absolute),
     parentIdentity: identity(await lstat(parent)),
+    policy: normalizedPolicy,
   };
 }
 
@@ -97,6 +141,7 @@ export async function revalidateExistingWorkspacePath(
   if (root !== resolved.workspace) {
     throw new WorkspacePathError("Workspace identity changed");
   }
+  assertPathAllowed(root, resolved.absolute, resolved.policy);
   const current = await inspectExistingPath(root, resolved.absolute);
   assertSameIdentity(resolved.parentIdentity, current.parentIdentity, "Parent directory changed");
   return current.info;
@@ -117,6 +162,7 @@ export async function revalidateWorkspaceParent(
     throw new WorkspacePathError("Workspace identity changed");
   }
   const parent = path.dirname(resolved.absolute);
+  assertPathAllowed(root, resolved.absolute, resolved.policy);
   const info = await revalidateDirectory(root, parent);
   assertSameIdentity(resolved.parentIdentity, identity(info), "Parent directory changed");
 }
@@ -171,6 +217,23 @@ export async function syncDirectory(directory: string): Promise<void> {
 export function relativePath(workspace: string, absolute: string): string {
   const relative = path.relative(workspace, absolute);
   return relative.length === 0 ? "." : relative.split(path.sep).join("/");
+}
+
+export function isWorkspacePathAllowed(
+  workspace: string,
+  candidate: string,
+  policy: WorkspacePathPolicy = {},
+): boolean {
+  try {
+    const normalizedPolicy = normalizePolicy(workspace, policy);
+    assertPathAllowed(workspace, candidate, normalizedPolicy);
+    return true;
+  } catch (error: unknown) {
+    if (error instanceof WorkspacePathError) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 async function canonicalWorkspace(workspace: string): Promise<string> {
@@ -269,6 +332,80 @@ function assertWithin(workspace: string, candidate: string): void {
   if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw new WorkspacePathError("Path escapes the workspace");
   }
+}
+
+function assertPathAllowed(
+  workspace: string,
+  candidate: string,
+  policy: WorkspacePathPolicy,
+): void {
+  assertWithin(workspace, candidate);
+  const parts = path.relative(workspace, candidate).split(path.sep).filter(Boolean);
+  for (const part of parts) {
+    if (isSensitiveName(part)) {
+      throw new WorkspacePathError("Access to a protected workspace path is denied");
+    }
+  }
+
+  for (const protectedPath of policy.protectedPaths ?? []) {
+    if (isWithin(protectedPath, candidate)) {
+      throw new WorkspacePathError("Access to runtime state is denied");
+    }
+  }
+}
+
+function isSensitiveName(value: string): boolean {
+  const name = value.toLowerCase();
+  if (name === ".env.example") {
+    return false;
+  }
+  return name === ".env"
+    || name.startsWith(".env.")
+    || protectedDirectories.has(name)
+    || protectedFileNames.has(name)
+    || protectedExtensions.has(path.extname(name));
+}
+
+function normalizePolicy(
+  workspace: string,
+  policy: WorkspacePathPolicy,
+): WorkspacePathPolicy {
+  const protectedPaths = (policy.protectedPaths ?? []).map((value) => {
+    if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+      throw new WorkspacePathError("protectedPaths must contain non-empty paths without NUL");
+    }
+    return canonicalPolicyPath(workspace, value);
+  });
+  return { protectedPaths };
+}
+
+function canonicalPolicyPath(workspace: string, value: string): string {
+  let current = path.resolve(workspace, value);
+  const suffix: string[] = [];
+  while (true) {
+    try {
+      const canonical = realpathSync(current);
+      return path.join(canonical, ...suffix);
+    } catch (error: unknown) {
+      if (!isNodeError(error) || (error.code !== "ENOENT" && error.code !== "ENOTDIR")) {
+        throw error;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) {
+        return path.resolve(workspace, value);
+      }
+      suffix.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+function isWithin(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return relative.length === 0
+    || (!path.isAbsolute(relative)
+      && relative !== ".."
+      && !relative.startsWith(`..${path.sep}`));
 }
 
 function identity(value: Pick<Stats, "dev" | "ino">): FileIdentity {

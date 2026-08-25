@@ -20,6 +20,7 @@ describe("parseCliArgs", () => {
           "--model",
           "openrouter:openai/gpt-5-mini",
           "--main-only",
+          "--allow-write",
           "--resume",
           "run-7",
           "--max-steps",
@@ -32,8 +33,17 @@ describe("parseCliArgs", () => {
       mode: "json",
       model: "openrouter:openai/gpt-5-mini",
       tetoEnabled: false,
+      allowWrite: true,
       resume: "run-7",
       maxSteps: 8,
+      message: "task",
+    });
+  });
+
+  it("leaves write access unset unless explicitly requested", () => {
+    expect(parseCliArgs(["task"], "/work").allowWrite).toBeUndefined();
+    expect(parseCliArgs(["--allow-write", "task"], "/work")).toMatchObject({
+      allowWrite: true,
       message: "task",
     });
   });
@@ -46,5 +56,18 @@ describe("parseCliArgs", () => {
     expect(() => parseCliArgs(["--max-steps", "0"], "/work")).toThrow(
       CliUsageError,
     );
+    expect(() => parseCliArgs(["--resolve-operation", "op-1"], "/work")).toThrow(
+      /requires --resume/,
+    );
+  });
+
+  it("parses an explicit unknown-operation resolution for resume", () => {
+    expect(parseCliArgs(
+      ["--resume", "run-7", "--resolve-operation", "op-1"],
+      "/work",
+    )).toMatchObject({
+      resume: "run-7",
+      resolveOperation: "op-1",
+    });
   });
 });

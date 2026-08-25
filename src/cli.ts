@@ -15,6 +15,7 @@ import {
   persistedErrorText,
   stringifyRedactedJson,
 } from "./runtime/redaction.js";
+import { UnknownToolOperationError } from "./runtime/recovery.js";
 
 const VERSION = "0.1.0";
 
@@ -44,6 +45,10 @@ const main = async (): Promise<number> => {
   }
 
   const workspace = resolve(options.workspace);
+  let resolvedDataDir = resolve(workspace, options.dataDir ?? ".nausicaa");
+  let resolvedModel: string | undefined;
+  let resolvedAllowWrite = false;
+  let activeRunId = options.resume;
   try {
     const settings = await loadSettings(workspace);
     const overrides: Settings = {
@@ -52,8 +57,12 @@ const main = async (): Promise<number> => {
       ...(options.tetoEnabled === undefined ? {} : { tetoEnabled: options.tetoEnabled }),
       ...(options.maxSteps === undefined ? {} : { maxSteps: options.maxSteps }),
       ...(options.dataDir === undefined ? {} : { dataDir: options.dataDir }),
+      ...(options.allowWrite === undefined ? {} : { allowWrite: options.allowWrite }),
     };
     const resolvedSettings = resolveSettings(workspace, settings, overrides);
+    resolvedDataDir = resolvedSettings.dataDir;
+    resolvedModel = resolvedSettings.model;
+    resolvedAllowWrite = resolvedSettings.allowWrite;
     const controller = new AbortController();
     const abort = (): void => controller.abort(new Error("Interrupted by user"));
     process.once("SIGINT", abort);
@@ -65,6 +74,9 @@ const main = async (): Promise<number> => {
         tetoModel: resolvedSettings.tetoModel,
         ...(options.message === undefined ? {} : { message: options.message }),
         ...(options.resume === undefined ? {} : { resumeRunId: options.resume }),
+        ...(options.resolveOperation === undefined
+          ? {}
+          : { resolveOperationId: options.resolveOperation }),
         policy: {
           maxMainSteps: resolvedSettings.maxSteps,
           maxModelTokens: resolvedSettings.maxModelTokens,
@@ -72,11 +84,13 @@ const main = async (): Promise<number> => {
           tetoMaxOutputTokens: 200,
           tetoTokenRatio: 0.1,
         },
+        allowWrite: resolvedSettings.allowWrite,
         signal: controller.signal,
       }, {
-        ...(options.mode === "json"
-          ? { onEvent: (event: AnyEvent) => writeJson(event) }
-          : {}),
+        onEvent: (event: AnyEvent) => {
+          activeRunId ??= event.runId;
+          if (options.mode === "json") writeJson(event);
+        },
       });
 
       if (options.mode === "json") {
@@ -86,6 +100,7 @@ const main = async (): Promise<number> => {
           completed: result.completed,
           steps: result.steps,
           usage: result.usage,
+          metrics: result.metrics,
           stateDir: result.stateDir,
         });
       } else if (result.finalText.length > 0) {
@@ -100,7 +115,59 @@ const main = async (): Promise<number> => {
       process.removeListener("SIGINT", abort);
     }
   } catch (error: unknown) {
-    process.stderr.write(`${persistedErrorText(error, "Nausicaa failed")}\n`);
+    if (error instanceof UnknownToolOperationError && options.resume !== undefined) {
+      const operationId = error.operationIds[0] ?? "<operation-id>";
+      const resumeCommand = buildResumeCommand({
+        runId: options.resume,
+        workspace,
+        dataDir: resolvedDataDir,
+        ...(resolvedModel === undefined ? {} : { model: resolvedModel }),
+        allowWrite: resolvedAllowWrite,
+        operationId,
+      });
+      if (options.mode === "json") {
+        writeJson({
+          type: "runtime.recovery-required",
+          runId: options.resume,
+          stateDir: resolve(resolvedDataDir, "runs", options.resume),
+          operationIds: error.operationIds,
+          resumeCommand,
+        });
+      } else {
+        process.stderr.write(
+          `${error.message}\nState directory: ${resolve(resolvedDataDir, "runs", options.resume)}\n` +
+          `Resolve and resume with:\n  ${resumeCommand}\n`,
+        );
+      }
+      return 3;
+    }
+    const message = persistedErrorText(error, "Nausicaa failed");
+    if (activeRunId !== undefined) {
+      const stateDir = resolve(resolvedDataDir, "runs", activeRunId);
+      const resumeCommand = buildResumeCommand({
+        runId: activeRunId,
+        workspace,
+        dataDir: resolvedDataDir,
+        ...(resolvedModel === undefined ? {} : { model: resolvedModel }),
+        allowWrite: resolvedAllowWrite,
+      });
+      if (options.mode === "json") {
+        writeJson({
+          type: "runtime.error",
+          error: message,
+          runId: activeRunId,
+          stateDir,
+          resumeCommand,
+        });
+      } else {
+        process.stderr.write(
+          `${message}\nRun: ${activeRunId}\nState directory: ${stateDir}\n` +
+          `Resume with:\n  ${resumeCommand}\n`,
+        );
+      }
+    } else {
+      process.stderr.write(`${message}\n`);
+    }
     return error instanceof SettingsError ? 2 : 1;
   }
 };
@@ -108,5 +175,31 @@ const main = async (): Promise<number> => {
 const writeJson = (value: unknown): void => {
   process.stdout.write(`${stringifyRedactedJson(value)}\n`);
 };
+
+const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+
+interface ResumeCommandOptions {
+  runId: string;
+  workspace: string;
+  dataDir: string;
+  model?: string;
+  allowWrite: boolean;
+  operationId?: string;
+}
+
+const buildResumeCommand = (options: ResumeCommandOptions): string => [
+  "nausicaa",
+  "--workspace",
+  shellQuote(options.workspace),
+  "--data-dir",
+  shellQuote(options.dataDir),
+  ...(options.model === undefined ? [] : ["--model", shellQuote(options.model)]),
+  ...(options.allowWrite ? ["--allow-write"] : []),
+  "--resume",
+  shellQuote(options.runId),
+  ...(options.operationId === undefined
+    ? []
+    : ["--resolve-operation", shellQuote(options.operationId)]),
+].join(" ");
 
 process.exitCode = await main();

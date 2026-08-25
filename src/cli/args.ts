@@ -7,10 +7,12 @@ export interface CliOptions {
   model?: string;
   tetoModel?: string;
   resume?: string;
+  resolveOperation?: string;
   tetoEnabled?: boolean;
   workspace: string;
   dataDir?: string;
   maxSteps?: number;
+  allowWrite?: boolean;
   message?: string;
 }
 
@@ -72,8 +74,15 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
         options.resume = readValue(args, index, argument);
         index += 1;
         break;
+      case "--resolve-operation":
+        options.resolveOperation = readValue(args, index, argument);
+        index += 1;
+        break;
       case "--main-only":
         options.tetoEnabled = false;
+        break;
+      case "--allow-write":
+        options.allowWrite = true;
         break;
       case "--workspace":
         options.workspace = readValue(args, index, argument);
@@ -110,6 +119,9 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   if (message.length > 0) {
     options.message = message;
   }
+  if (options.resolveOperation !== undefined && options.resume === undefined) {
+    throw new CliUsageError("--resolve-operation requires --resume");
+  }
   return options;
 };
 
@@ -124,7 +136,9 @@ Options:
   --model <provider:id>   Main model, for example openrouter:openai/gpt-5-mini
   --teto-model <value>    Optional model override for the Teto lane
   --resume <run-id>       Resume an interrupted Run
+  --resolve-operation <id> Resolve one unknown tool operation as failed (requires --resume)
   --main-only             Disable the Teto lane for this run
+  --allow-write           Allow workspace file writes for this run
   --workspace <path>      Bound tools to this workspace
   --data-dir <path>       Runtime state directory (default: .nausicaa)
   --max-steps <number>    Maximum Main model steps (default: 24)

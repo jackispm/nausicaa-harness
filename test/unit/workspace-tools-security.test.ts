@@ -13,7 +13,15 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { listFilesTool, readFileTool, writeFileTool } from "../../src/tools/index.js";
+import {
+  createListFilesTool,
+  createReadFileTool,
+  createWorkspaceTools,
+  createWriteFileTool,
+  listFilesTool,
+  readFileTool,
+  writeFileTool,
+} from "../../src/tools/index.js";
 import {
   resolveExistingWorkspacePath,
   resolveWorkspaceWritePath,
@@ -31,6 +39,76 @@ afterEach(async () => {
 });
 
 describe("workspace tool path security", () => {
+  it("keeps writes disabled by default and enables them explicitly", () => {
+    expect(createWorkspaceTools().map((tool) => tool.definition.name)).toEqual([
+      "read_file",
+      "list_files",
+    ]);
+    expect(createWorkspaceTools({ allowWrite: true }).map((tool) => tool.definition.name))
+      .toEqual(["read_file", "list_files", "write_file"]);
+  });
+
+  it("denies sensitive files and hides protected entries from root listings", async () => {
+    const workspace = await temporaryDirectory("nausicaa-workspace-protected-");
+    await mkdir(path.join(workspace, ".ssh"));
+    await mkdir(path.join(workspace, ".nausicaa"));
+    await writeFile(path.join(workspace, ".env"), "SECRET=one");
+    await writeFile(path.join(workspace, ".env.local"), "SECRET=two");
+    await writeFile(path.join(workspace, ".env.example"), "PUBLIC_SETTING=example");
+    await writeFile(path.join(workspace, ".ssh", "id_rsa"), "private key");
+    await writeFile(path.join(workspace, ".nausicaa", "events.jsonl"), "runtime state");
+    await writeFile(path.join(workspace, "visible.txt"), "safe");
+    const context = { runId: "run-1", workspace, operationId: "operation-1" };
+
+    for (const protectedPath of [".env", ".env.local", ".ssh/id_rsa", ".nausicaa/events.jsonl"]) {
+      await expect(readFileTool.execute({ path: protectedPath }, context))
+        .resolves.toMatchObject({ isError: true });
+      await expect(writeFileTool.execute({ path: protectedPath, content: "must not write" }, context))
+        .resolves.toMatchObject({ isError: true });
+    }
+
+    const listing = await listFilesTool.execute({ path: ".", recursive: true }, context);
+    expect(listing.isError).toBe(false);
+    const entries = JSON.parse(listing.content).entries as Array<{ path: string; type: string }>;
+    expect(entries).toContainEqual({ path: "visible.txt", type: "file" });
+    expect(entries).toContainEqual({ path: ".env.example", type: "file" });
+    expect(entries.some(({ path: entryPath }) =>
+      entryPath === ".env"
+      || entryPath === ".env.local"
+      || entryPath === ".ssh"
+      || entryPath.startsWith(".ssh/")
+      || entryPath === ".nausicaa"
+      || entryPath.startsWith(".nausicaa/"),
+    )).toBe(false);
+    await expect(readFileTool.execute({ path: ".env.example" }, context))
+      .resolves.toMatchObject({ isError: false });
+  });
+
+  it("blocks a custom runtime state directory through protectedPaths", async () => {
+    const workspace = await temporaryDirectory("nausicaa-workspace-state-");
+    const stateDir = path.join(workspace, "runtime-state");
+    await mkdir(stateDir);
+    await writeFile(path.join(stateDir, "session.json"), "private state");
+    await writeFile(path.join(workspace, "visible.txt"), "safe");
+    const context = { runId: "run-1", workspace, operationId: "operation-1" };
+    const read = createReadFileTool({ protectedPaths: [stateDir] });
+    const write = createWriteFileTool({ protectedPaths: [stateDir] });
+    const list = createListFilesTool({ protectedPaths: [stateDir] });
+
+    await expect(read.execute({ path: "runtime-state/session.json" }, context))
+      .resolves.toMatchObject({ isError: true });
+    await expect(write.execute({ path: "runtime-state/new.json", content: "must not write" }, context))
+      .resolves.toMatchObject({ isError: true });
+
+    const listing = await list.execute({ path: ".", recursive: true }, context);
+    expect(listing.isError).toBe(false);
+    const entries = JSON.parse(listing.content).entries as Array<{ path: string; type: string }>;
+    expect(entries).toContainEqual({ path: "visible.txt", type: "file" });
+    expect(entries.some(({ path: entryPath }) =>
+      entryPath === "runtime-state" || entryPath.startsWith("runtime-state/"),
+    )).toBe(false);
+  });
+
   it("refuses internal directory and file symlinks without traversing them", async () => {
     const workspace = await temporaryDirectory("nausicaa-workspace-secure-");
     const realDirectory = path.join(workspace, "real");

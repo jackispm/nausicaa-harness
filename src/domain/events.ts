@@ -10,6 +10,7 @@ import type {
   NavigationDelta,
   RunId,
   RunPolicy,
+  CacheOutcome,
   TokenUsage,
   Visibility,
 } from "./types.js";
@@ -32,12 +33,21 @@ export interface EventPayloadMap {
     model: string;
     requestHash: string;
     contextWatermark: number;
+    /** Stable prompt/tool prefix hash. Optional for schema-v1 legacy events. */
+    prefixHash?: string;
+    /** Artifact/content dependencies selected by Fukai. */
+    dependencyRefs?: string[];
+    /** Time spent building the model context, in milliseconds. */
+    contextBuildMs?: number;
   };
   "model.completed": {
     model: string;
     responseRef: ArtifactRef;
     stopReason: string;
     usage: TokenUsage;
+    /** Time spent waiting for the provider response, in milliseconds. */
+    modelLatencyMs?: number;
+    cacheOutcome?: CacheOutcome;
   };
   "model.failed": { model: string; error: string };
   "tool.requested": {
