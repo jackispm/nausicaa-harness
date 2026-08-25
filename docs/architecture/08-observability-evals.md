@@ -2,6 +2,8 @@
 
 状态：Proposal。多 lane 系统如果不能解释“谁看到了什么、为什么被唤醒、建议是否有效”，就无法调优或证明收益。
 
+测试分层、OpenRouter 安全边界和 release gate 见 [`../testing-and-acceptance.md`](../testing-and-acceptance.md)。本文只定义运行时观测与评测指标。
+
 ## 可观测对象
 
 每个 Run、lane、Step、query、message、Advice、tool operation 和 checkpoint 都需要关联：

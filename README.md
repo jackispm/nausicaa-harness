@@ -34,6 +34,7 @@ UI 是未来独立的产品层，当前不进入 harness 内核。
 - [`docs/principles.md`](docs/principles.md)：KISS、DIY 和工程约束。
 - [`docs/product-requirements.md`](docs/product-requirements.md)：产品目标、核心体验和非目标。
 - [`docs/architecture.md`](docs/architecture.md)：运行时分层、Ledger、context contracts、lane 和 A2A 设计。
+- [`docs/testing-and-acceptance.md`](docs/testing-and-acceptance.md)：离线门禁、OpenRouter 真实测试和能力 A/B 验收。
 - [`docs/references.md`](docs/references.md)：参考项目、借鉴边界和待验证差异。
 
 ## 当前下一步

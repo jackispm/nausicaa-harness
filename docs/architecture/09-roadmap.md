@@ -4,7 +4,7 @@
 
 ## Phase 0: vocabulary and invariants
 
-确定 Run、Lane、Step、Event、Artifact、Message、Advice、Checkpoint、Capability 的语义和事件因果关系。准备固定事件样例，验证 projection、cursor 单调性、goal revision、权限过滤和 recorded replay。
+确定 Run、Lane、Step、Event、Artifact、Message、Advice、Checkpoint、Capability 的语义和事件因果关系。按 [`../testing-and-acceptance.md`](../testing-and-acceptance.md) 准备 scripted model、固定事件样例和故障矩阵，验证 projection、cursor 单调性、goal revision、权限过滤和 recorded replay。
 
 **退出条件**：能够用文档解释一次成功、失败、暂停、恢复、Advice 采纳和重复副作用。
 
