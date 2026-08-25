@@ -11,13 +11,20 @@ coverage/
 .nausicaa/
 *.log
 
-# Local-only agent instructions and working material
+# Local-only agent instructions, design, and working material
 AGENTS.md
+docs/
+*.md
+!README.md
+!CHANGELOG.md
+!CONTRIBUTING.md
+!SECURITY.md
+!CODE_OF_CONDUCT.md
+!LICENSE.md
 .private/
 .local/
 notes/
 research/
-docs/internal/
 .codex/
 .agents/
 
