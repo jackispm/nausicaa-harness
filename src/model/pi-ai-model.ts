@@ -15,6 +15,7 @@ import type {
   ModelPort,
   ModelRequest,
   ModelResponse,
+  ModelStreamEvent,
 } from "../domain/ports.js";
 import type { ConversationMessage, TokenUsage } from "../domain/types.js";
 
@@ -49,11 +50,7 @@ export class PiAiModelPort implements ModelPort {
       throw new Error(`Unknown model: ${selector.provider}:${selector.model}`);
     }
 
-    const context: Context = {
-      systemPrompt: request.systemPrompt,
-      messages: request.messages.map((message) => toPiMessage(message, model)),
-      tools: request.tools.map(toPiTool),
-    };
+    const context = toPiContext(request, model);
 
     let result: AssistantMessage;
     try {
@@ -75,6 +72,75 @@ export class PiAiModelPort implements ModelPort {
     }
 
     return fromPiMessage(result);
+  }
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    if (request.signal?.aborted) {
+      yield { type: "error", error: abortError(request.signal) };
+      return;
+    }
+
+    let model: Model<Api>;
+    let context: Context;
+    try {
+      const selector = parseModelSelector(request.model, this.defaultProvider);
+      const selectedModel = this.models.getModel(selector.provider, selector.model);
+      if (selectedModel === undefined) {
+        throw new Error(`Unknown model: ${selector.provider}:${selector.model}`);
+      }
+      model = selectedModel;
+      context = toPiContext(request, model);
+    } catch (error: unknown) {
+      // Selector and catalog failures are local configuration errors, not
+      // provider payloads, so they are safe and useful to return verbatim.
+      yield { type: "error", error: asError(error) };
+      return;
+    }
+
+    try {
+      const stream = this.models.stream(model, context, {
+        maxTokens: request.maxOutputTokens,
+        sessionId: request.sessionId,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+      });
+      let textBlockCount = 0;
+      for await (const event of stream) {
+        switch (event.type) {
+          case "start":
+            yield { type: "start" };
+            break;
+          case "text_start":
+            // complete() historically joins separate pi-ai text blocks with a
+            // newline. Mirror that boundary so streamed text equals done.content.
+            if (textBlockCount > 0) {
+              yield { type: "text-delta", delta: "\n" };
+            }
+            textBlockCount += 1;
+            break;
+          case "text_delta":
+            yield { type: "text-delta", delta: event.delta };
+            break;
+          case "done":
+            yield { type: "done", response: fromPiMessage(event.message) };
+            return;
+          case "error":
+            yield {
+              type: "error",
+              error: streamError(request.signal, event.reason),
+            };
+            return;
+        }
+      }
+
+      yield { type: "error", error: new Error("Model request failed") };
+    } catch {
+      yield {
+        type: "error",
+        error: request.signal?.aborted
+          ? abortError(request.signal)
+          : new Error("Model request failed"),
+      };
+    }
   }
 }
 
@@ -160,6 +226,14 @@ function toPiTool(tool: ModelRequest["tools"][number]): PiTool {
   };
 }
 
+function toPiContext(request: ModelRequest, model: Model<Api>): Context {
+  return {
+    systemPrompt: request.systemPrompt,
+    messages: request.messages.map((message) => toPiMessage(message, model)),
+    tools: request.tools.map(toPiTool),
+  };
+}
+
 function fromPiMessage(message: AssistantMessage): ModelResponse {
   return {
     content: message.content
@@ -208,7 +282,27 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   if (!signal?.aborted) {
     return;
   }
-  throw signal.reason instanceof Error
+  throw abortError(signal);
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
     ? signal.reason
     : new DOMException("The operation was aborted", "AbortError");
+}
+
+function streamError(
+  signal: AbortSignal | undefined,
+  reason: "aborted" | "error",
+): Error {
+  if (signal?.aborted) {
+    return abortError(signal);
+  }
+  return reason === "aborted"
+    ? new DOMException("The model request was aborted", "AbortError")
+    : new Error("Model request failed");
+}
+
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
 }

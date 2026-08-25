@@ -38,8 +38,15 @@ export interface ModelResponse {
   usage: TokenUsage;
 }
 
+export type ModelStreamEvent =
+  | { type: "start" }
+  | { type: "text-delta"; delta: string }
+  | { type: "done"; response: ModelResponse }
+  | { type: "error"; error: Error };
+
 export interface ModelPort {
   complete(request: ModelRequest): Promise<ModelResponse>;
+  stream?(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
 }
 
 export interface ToolExecutionContext {

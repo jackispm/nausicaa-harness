@@ -3,6 +3,7 @@
 import { resolve } from "node:path";
 
 import { CliUsageError, parseCliArgs, usage } from "./cli/args.js";
+import { runInteractive } from "./cli/interactive.js";
 import {
   loadSettings,
   resolveSettings,
@@ -10,7 +11,11 @@ import {
   type Settings,
 } from "./config/index.js";
 import type { AnyEvent } from "./domain/events.js";
-import { executeRun } from "./runtime/index.js";
+import {
+  executeRun,
+  findLatestRunId,
+  SessionController,
+} from "./runtime/index.js";
 import {
   persistedErrorText,
   stringifyRedactedJson,
@@ -39,8 +44,13 @@ const main = async (): Promise<number> => {
     process.stdout.write(`${VERSION}\n`);
     return 0;
   }
-  if (options.message === undefined && options.resume === undefined) {
-    process.stderr.write(`A task or --resume is required.\n\n${usage}`);
+  if (
+    !options.modeExplicit
+    && (!process.stdin.isTTY || !process.stdout.isTTY)
+  ) {
+    process.stderr.write(
+      `Interactive mode requires a TTY. Use -p/--print or --json for non-TTY output.\n\n${usage}`,
+    );
     return 2;
   }
 
@@ -63,6 +73,39 @@ const main = async (): Promise<number> => {
     resolvedDataDir = resolvedSettings.dataDir;
     resolvedModel = resolvedSettings.model;
     resolvedAllowWrite = resolvedSettings.allowWrite;
+    if (options.mode === "interactive") {
+      const selectedRunId = options.continue
+        ? await findLatestRunId(resolvedSettings.dataDir, workspace)
+        : options.resume;
+      const session = await SessionController.open({
+        workspace,
+        dataDir: resolvedSettings.dataDir,
+        model: resolvedSettings.model,
+        tetoModel: resolvedSettings.tetoModel,
+        policy: {
+          maxMainStepsPerActivation: resolvedSettings.maxSteps,
+          maxModelTokens: resolvedSettings.maxModelTokens,
+          tetoEnabled: resolvedSettings.tetoEnabled,
+          tetoMaxOutputTokens: 200,
+          tetoTokenRatio: 0.1,
+        },
+        allowWrite: resolvedSettings.allowWrite,
+        ...(selectedRunId === undefined ? {} : { runId: selectedRunId }),
+      });
+      if (options.resolveOperation !== undefined) {
+        await session.resolveOperation(options.resolveOperation);
+      }
+      return await runInteractive({
+        session,
+        ...(options.message === undefined ? {} : { initialMessage: options.message }),
+        ...(
+          options.message === undefined
+          && (options.resume !== undefined || (options.continue && selectedRunId !== undefined))
+            ? { resumeOnStart: true }
+            : {}
+        ),
+      });
+    }
     const controller = new AbortController();
     const abort = (): void => controller.abort(new Error("Interrupted by user"));
     process.once("SIGINT", abort);
@@ -89,19 +132,21 @@ const main = async (): Promise<number> => {
       }, {
         onEvent: (event: AnyEvent) => {
           activeRunId ??= event.runId;
-          if (options.mode === "json") writeJson(event);
+          if (options.mode === "json") writeJson({ kind: "event", event });
         },
       });
 
       if (options.mode === "json") {
         writeJson({
-          type: "runtime.result",
-          runId: result.runId,
-          completed: result.completed,
-          steps: result.steps,
-          usage: result.usage,
-          metrics: result.metrics,
-          stateDir: result.stateDir,
+          kind: "result",
+          result: {
+            runId: result.runId,
+            completed: result.completed,
+            steps: result.steps,
+            usage: result.usage,
+            metrics: result.metrics,
+            stateDir: result.stateDir,
+          },
         });
       } else if (result.finalText.length > 0) {
         process.stdout.write(`${result.finalText}\n`);
@@ -127,11 +172,14 @@ const main = async (): Promise<number> => {
       });
       if (options.mode === "json") {
         writeJson({
-          type: "runtime.recovery-required",
-          runId: options.resume,
-          stateDir: resolve(resolvedDataDir, "runs", options.resume),
-          operationIds: error.operationIds,
-          resumeCommand,
+          kind: "error",
+          error: {
+            type: "runtime.recovery-required",
+            runId: options.resume,
+            stateDir: resolve(resolvedDataDir, "runs", options.resume),
+            operationIds: error.operationIds,
+            resumeCommand,
+          },
         });
       } else {
         process.stderr.write(
@@ -153,11 +201,14 @@ const main = async (): Promise<number> => {
       });
       if (options.mode === "json") {
         writeJson({
-          type: "runtime.error",
-          error: message,
-          runId: activeRunId,
-          stateDir,
-          resumeCommand,
+          kind: "error",
+          error: {
+            type: "runtime.error",
+            message,
+            runId: activeRunId,
+            stateDir,
+            resumeCommand,
+          },
         });
       } else {
         process.stderr.write(

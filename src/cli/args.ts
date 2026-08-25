@@ -1,9 +1,11 @@
-export type OutputMode = "print" | "json";
+export type OutputMode = "interactive" | "print" | "json";
 
 export interface CliOptions {
   help: boolean;
   version: boolean;
   mode: OutputMode;
+  modeExplicit: boolean;
+  continue: boolean;
   model?: string;
   tetoModel?: string;
   resume?: string;
@@ -30,7 +32,9 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   const options: CliOptions = {
     help: false,
     version: false,
-    mode: "print",
+    mode: "interactive",
+    modeExplicit: false,
+    continue: false,
     workspace: cwd,
   };
   const messageParts: string[] = [];
@@ -49,16 +53,19 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
       case "-p":
       case "--print":
         options.mode = "print";
+        options.modeExplicit = true;
         break;
       case "--json":
         options.mode = "json";
+        options.modeExplicit = true;
         break;
       case "--mode": {
         const mode = readValue(args, index, argument);
-        if (mode !== "print" && mode !== "json") {
+        if (mode !== "interactive" && mode !== "print" && mode !== "json") {
           throw new CliUsageError(`unsupported mode: ${mode}`);
         }
         options.mode = mode;
+        options.modeExplicit = true;
         index += 1;
         break;
       }
@@ -73,6 +80,9 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
       case "--resume":
         options.resume = readValue(args, index, argument);
         index += 1;
+        break;
+      case "--continue":
+        options.continue = true;
         break;
       case "--resolve-operation":
         options.resolveOperation = readValue(args, index, argument);
@@ -122,20 +132,26 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   if (options.resolveOperation !== undefined && options.resume === undefined) {
     throw new CliUsageError("--resolve-operation requires --resume");
   }
+  if (options.resume !== undefined && options.continue) {
+    throw new CliUsageError("--resume and --continue are mutually exclusive");
+  }
   return options;
 };
 
 export const usage = `Nausicaa 0.1
 
 Usage:
-  nausicaa [options] <task>
+  nausicaa [options] [message]
 
 Options:
   -p, --print             Run once and print the final answer
-  --mode <print|json>     Select human or NDJSON output
+  --json                  Emit NDJSON events and results
+  --mode <interactive|print|json>
+                          Select the output mode
   --model <provider:id>   Main model, for example openrouter:openai/gpt-5-mini
   --teto-model <value>    Optional model override for the Teto lane
   --resume <run-id>       Resume an interrupted Run
+  --continue              Resume the latest Run for this workspace
   --resolve-operation <id> Resolve one unknown tool operation as failed (requires --resume)
   --main-only             Disable the Teto lane for this run
   --allow-write           Allow workspace file writes for this run

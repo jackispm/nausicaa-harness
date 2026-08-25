@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 
+import type { ModelStreamEvent } from "../../src/domain/index.js";
 import {
   PiAiModelPort,
   ScriptedModel,
@@ -49,6 +50,69 @@ describe("ScriptedModel", () => {
     controller.abort(new Error("cancelled"));
 
     await expect(pending).rejects.toThrow("cancelled");
+  });
+
+  it("streams a deterministic start, text delta, and complete response", async () => {
+    const model = new ScriptedModel([{
+      content: "done",
+      toolCalls: [{ id: "call-1", name: "read_file", arguments: { path: "x" } }],
+      stopReason: "toolUse",
+      usage,
+    }]);
+
+    const events = await collect(model.stream(request()));
+
+    expect(events.map((event) => event.type)).toEqual([
+      "start",
+      "text-delta",
+      "done",
+    ]);
+    expect(events[1]).toEqual({ type: "text-delta", delta: "done" });
+    expect(events[2]).toEqual({
+      type: "done",
+      response: {
+        content: "done",
+        toolCalls: [{ id: "call-1", name: "read_file", arguments: { path: "x" } }],
+        stopReason: "toolUse",
+        usage,
+      },
+    });
+    expect(model.callCount).toBe(1);
+  });
+
+  it("ends a pre-aborted stream with only the caller's error", async () => {
+    const model = new ScriptedModel([{
+      content: "unused",
+      toolCalls: [],
+      stopReason: "stop",
+      usage,
+    }]);
+    const controller = new AbortController();
+    controller.abort(new Error("cancel before start"));
+
+    const events = await collect(model.stream({
+      ...request(),
+      signal: controller.signal,
+    }));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.type).toBe("error");
+    if (events[0]?.type !== "error") throw new Error("Missing error event");
+    expect(events[0].error.message).toBe("cancel before start");
+    expect(model.callCount).toBe(0);
+  });
+
+  it("emits one error terminal after a scripted failure", async () => {
+    const model = new ScriptedModel([new Error("script failed")]);
+
+    const events = await collect(model.stream(request()));
+
+    expect(events.map((event) => event.type)).toEqual(["start", "error"]);
+    const terminal = events.at(-1);
+    expect(terminal?.type).toBe("error");
+    if (terminal?.type !== "error") throw new Error("Missing error event");
+    expect(terminal.error.message).toBe("script failed");
+    expect(model.callCount).toBe(1);
   });
 });
 
@@ -156,6 +220,106 @@ describe("PiAiModelPort", () => {
     });
   });
 
+  it("streams text in order and returns complete tool calls in done", async () => {
+    const faux = fauxProvider({
+      provider: "openrouter",
+      models: [{ id: "demo" }],
+      tokenSize: { min: 1, max: 1 },
+    });
+    const piResponse = fauxAssistantMessage([
+      fauxText("inspect"),
+      fauxText("README"),
+      fauxToolCall("read_file", { path: "README.md" }, { id: "call-1" }),
+    ], { stopReason: "toolUse" });
+    faux.setResponses([piResponse]);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+
+    const events = await collect(adapter.stream({
+      ...request(),
+      model: "openrouter:demo",
+    }));
+
+    expect(events[0]).toEqual({ type: "start" });
+    expect(events.at(-1)?.type).toBe("done");
+    expect(events
+      .filter((event) => event.type === "text-delta")
+      .map((event) => event.delta)
+      .join(""))
+      .toBe("inspect\nREADME");
+    expect(events.filter((event) => (
+      event.type === "done" || event.type === "error"
+    ))).toHaveLength(1);
+    const done = events.at(-1);
+    expect(done?.type).toBe("done");
+    if (done?.type !== "done") throw new Error("Missing done event");
+    expect(done.response).toEqual({
+      content: "inspect\nREADME",
+      stopReason: "toolUse",
+      toolCalls: [
+        { id: "call-1", name: "read_file", arguments: { path: "README.md" } },
+      ],
+      usage: {
+        input: 4,
+        output: 12,
+        cacheRead: 0,
+        cacheWrite: 4,
+        costUsd: 0,
+      },
+    });
+  });
+
+  it("terminates a stream with the AbortSignal reason", async () => {
+    const faux = fauxProvider({
+      provider: "openrouter",
+      models: [{ id: "demo" }],
+      tokenSize: { min: 1, max: 1 },
+      tokensPerSecond: 1_000,
+    });
+    faux.setResponses([fauxAssistantMessage("a response that arrives in chunks")]);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+    const controller = new AbortController();
+    const iterator = adapter.stream({
+      ...request(),
+      model: "openrouter:demo",
+      signal: controller.signal,
+    })[Symbol.asyncIterator]();
+
+    expect((await iterator.next()).value).toEqual({ type: "start" });
+    controller.abort(new Error("cancelled by caller"));
+    const terminal = await iterator.next();
+
+    expect(terminal.value?.type).toBe("error");
+    if (terminal.value?.type !== "error") throw new Error("Missing error event");
+    expect(terminal.value.error.message).toBe("cancelled by caller");
+    expect((await iterator.next()).done).toBe(true);
+  });
+
+  it("redacts provider error details from stream events", async () => {
+    const secret = "Bearer sk-provider-secret";
+    const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
+    faux.setResponses([async () => {
+      throw new Error(secret);
+    }]);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+
+    const events = await collect(adapter.stream({
+      ...request(),
+      model: "openrouter:demo",
+    }));
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.type).toBe("error");
+    if (events[0]?.type !== "error") throw new Error("Missing error event");
+    expect(events[0].error.message).toBe("Model request failed");
+    expect(events[0].error.message).not.toContain(secret);
+  });
+
   it("parses explicit and default provider selectors", () => {
     expect(parseModelSelector("openrouter:anthropic/claude", "other")).toEqual({
       provider: "openrouter",
@@ -179,4 +343,12 @@ function request() {
     tools: [],
     maxOutputTokens: 100,
   };
+}
+
+async function collect(
+  stream: AsyncIterable<ModelStreamEvent>,
+): Promise<ModelStreamEvent[]> {
+  const events: ModelStreamEvent[] = [];
+  for await (const event of stream) events.push(event);
+  return events;
 }

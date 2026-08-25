@@ -2,6 +2,7 @@ import type {
   ModelPort,
   ModelRequest,
   ModelResponse,
+  ModelStreamEvent,
 } from "../domain/ports.js";
 
 export type ScriptedModelStep =
@@ -50,6 +51,27 @@ export class ScriptedModel implements ModelPort {
       typeof step === "function" ? Promise.resolve(step(request, callIndex)) : Promise.resolve(step);
     const response = await withAbort(pending, request.signal);
     return structuredClone(response);
+  }
+
+  async *stream(request: ModelRequest): AsyncIterable<ModelStreamEvent> {
+    if (request.signal?.aborted) {
+      yield { type: "error", error: abortError(request.signal) };
+      return;
+    }
+
+    yield { type: "start" };
+    try {
+      const response = await this.complete(request);
+      if (response.content.length > 0) {
+        yield { type: "text-delta", delta: response.content };
+      }
+      yield { type: "done", response };
+    } catch (error: unknown) {
+      yield {
+        type: "error",
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
   }
 }
 

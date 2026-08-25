@@ -109,7 +109,23 @@ function goal(value: unknown, path: string): asserts value is Goal {
 
 function runPolicy(value: unknown, path: string): asserts value is RunPolicy {
   const item = record(value, path);
-  integer(item.maxMainSteps, `${path}.maxMainSteps`, 1);
+  const hasActivationAllowance = Object.hasOwn(item, "maxMainStepsPerActivation");
+  const hasLegacyLimit = Object.hasOwn(item, "maxMainSteps");
+  if (hasActivationAllowance === hasLegacyLimit) {
+    invalid(
+      path,
+      "an object with exactly one of maxMainStepsPerActivation or legacy maxMainSteps",
+    );
+  }
+  if (hasActivationAllowance) {
+    integer(
+      item.maxMainStepsPerActivation,
+      `${path}.maxMainStepsPerActivation`,
+      1,
+    );
+  } else {
+    integer(item.maxMainSteps, `${path}.maxMainSteps`, 1);
+  }
   integer(item.maxModelTokens, `${path}.maxModelTokens`, 1);
   boolean(item.tetoEnabled, `${path}.tetoEnabled`);
   integer(item.tetoMaxOutputTokens, `${path}.tetoMaxOutputTokens`);
@@ -254,6 +270,9 @@ const payloadValidators = {
   "run.resumed": (value, path) => {
     const item = payloadObject(value, path, ["fromOffset"]);
     integer(item.fromOffset, `${path}.fromOffset`);
+    if (item.reason !== undefined) {
+      oneOf(item.reason, `${path}.reason`, ["new-turn"] as const);
+    }
   },
   "run.completed": (value, path) => {
     const item = record(value, path);
@@ -298,9 +317,93 @@ const payloadValidators = {
     integer(item.step, `${path}.step`, 1);
     string(item.error, `${path}.error`);
   },
+  "input.admitted": (value, path) => {
+    const item = payloadObject(value, path, [
+      "inputId",
+      "messageRef",
+      "delivery",
+      "sequence",
+    ]);
+    string(item.inputId, `${path}.inputId`, false);
+    artifactRef(item.messageRef, `${path}.messageRef`);
+    oneOf(item.delivery, `${path}.delivery`, [
+      "new-turn",
+      "steering",
+      "follow-up",
+    ] as const);
+    optionalString(item.targetTurnId, `${path}.targetTurnId`);
+    integer(item.sequence, `${path}.sequence`, 1);
+  },
+  "input.delivered": (value, path) => {
+    const item = payloadObject(value, path, ["inputId", "turnId", "boundary"]);
+    string(item.inputId, `${path}.inputId`, false);
+    string(item.turnId, `${path}.turnId`, false);
+    string(item.boundary, `${path}.boundary`, false);
+  },
+  "turn.started": (value, path) => {
+    const item = payloadObject(value, path, ["turnId", "inputId", "ordinal"]);
+    string(item.turnId, `${path}.turnId`, false);
+    string(item.inputId, `${path}.inputId`, false);
+    integer(item.ordinal, `${path}.ordinal`, 1);
+  },
+  "turn.completed": (value, path) => {
+    const item = payloadObject(value, path, ["turnId"]);
+    string(item.turnId, `${path}.turnId`, false);
+    if (item.answerRef !== undefined) artifactRef(item.answerRef, `${path}.answerRef`);
+  },
+  "turn.failed": (value, path) => {
+    const item = payloadObject(value, path, ["turnId", "error"]);
+    string(item.turnId, `${path}.turnId`, false);
+    string(item.error, `${path}.error`);
+  },
+  "turn.cancelled": (value, path) => {
+    const item = payloadObject(value, path, ["turnId", "reason", "lastCommittedStep"]);
+    string(item.turnId, `${path}.turnId`, false);
+    string(item.reason, `${path}.reason`, false);
+    integer(item.lastCommittedStep, `${path}.lastCommittedStep`);
+  },
+  "turn.waiting": (value, path) => {
+    const item = payloadObject(value, path, [
+      "turnId",
+      "reason",
+      "lastCommittedStep",
+      "resumeRequires",
+    ]);
+    string(item.turnId, `${path}.turnId`, false);
+    string(item.reason, `${path}.reason`, false);
+    integer(item.lastCommittedStep, `${path}.lastCommittedStep`);
+    string(item.resumeRequires, `${path}.resumeRequires`, false);
+  },
+  "turn.interrupted": (value, path) => {
+    const item = payloadObject(value, path, [
+      "turnId",
+      "reason",
+      "retryable",
+      "lastCommittedStep",
+    ]);
+    string(item.turnId, `${path}.turnId`, false);
+    string(item.reason, `${path}.reason`, false);
+    boolean(item.retryable, `${path}.retryable`);
+    integer(item.lastCommittedStep, `${path}.lastCommittedStep`);
+  },
+  "turn.resumed": (value, path) => {
+    const item = payloadObject(value, path, ["turnId", "fromStep", "stepAllowance"]);
+    string(item.turnId, `${path}.turnId`, false);
+    integer(item.fromStep, `${path}.fromStep`);
+    integer(item.stepAllowance, `${path}.stepAllowance`, 1);
+  },
   "user.message": (value, path) => {
     const item = payloadObject(value, path, ["messageRef"]);
     artifactRef(item.messageRef, `${path}.messageRef`);
+    const hasInputId = Object.hasOwn(item, "inputId");
+    const hasKind = Object.hasOwn(item, "kind");
+    if (hasInputId !== hasKind) {
+      invalid(path, "a legacy message or a message with both inputId and kind");
+    }
+    if (hasInputId) {
+      string(item.inputId, `${path}.inputId`, false);
+      oneOf(item.kind, `${path}.kind`, ["initial", "steering"] as const);
+    }
   },
   "assistant.message": (value, path) => {
     const item = payloadObject(value, path, ["messageRef"]);
@@ -355,6 +458,11 @@ const payloadValidators = {
     string(item.model, `${path}.model`, false);
     string(item.error, `${path}.error`);
   },
+  "model.cancelled": (value, path) => {
+    const item = payloadObject(value, path, ["requestId", "reason"]);
+    string(item.requestId, `${path}.requestId`, false);
+    string(item.reason, `${path}.reason`, false);
+  },
   "tool.requested": (value, path) => {
     const item = payloadObject(value, path, [
       "operationId",
@@ -392,6 +500,21 @@ const payloadValidators = {
     string(item.name, `${path}.name`, false);
     string(item.error, `${path}.error`);
     artifactRef(item.resultRef, `${path}.resultRef`);
+    if (item.resolution !== undefined) {
+      oneOf(item.resolution, `${path}.resolution`, ["operator"] as const);
+    }
+  },
+  "tool.unknown": (value, path) => {
+    const item = payloadObject(value, path, [
+      "operationId",
+      "toolCallId",
+      "name",
+      "reason",
+    ]);
+    string(item.operationId, `${path}.operationId`, false);
+    string(item.toolCallId, `${path}.toolCallId`, false);
+    string(item.name, `${path}.name`, false);
+    string(item.reason, `${path}.reason`, false);
   },
   "message.sent": (value, path) => {
     const item = payloadObject(value, path, ["message"]);

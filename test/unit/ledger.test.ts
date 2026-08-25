@@ -27,10 +27,14 @@ afterEach(async () => {
 function input<K extends EventType>(
   type: K,
   payload: AppendEvent<K>["payload"],
-  options: Partial<Pick<AppendEvent<K>, "runId" | "laneId" | "idempotencyKey">> = {},
+  options: Partial<Pick<
+    AppendEvent<K>,
+    "runId" | "turnId" | "laneId" | "idempotencyKey"
+  >> = {},
 ): AppendEvent<K> {
   return {
     runId: options.runId ?? "run-1",
+    ...(options.turnId === undefined ? {} : { turnId: options.turnId }),
     laneId: options.laneId ?? "main",
     type,
     payload,
@@ -123,6 +127,73 @@ describe("Ledger conformance", () => {
     }
   });
 
+  it("preserves Turn identity and includes it in idempotency fingerprints", async () => {
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        const first = input(
+          "lane.status",
+          { status: "ready" },
+          { turnId: "turn-1", idempotencyKey: "start-turn" },
+        );
+        const appended = await ledger.append(first);
+        expect(appended.turnId).toBe("turn-1");
+        await expect(ledger.append(first)).resolves.toEqual(appended);
+
+        await expect(ledger.append(input(
+          "lane.status",
+          { status: "ready" },
+          { turnId: "turn-2", idempotencyKey: "start-turn" },
+        ))).rejects.toBeInstanceOf(IdempotencyConflictError);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
+  it("deduplicates admission retries by inputId and rejects conflicting reuse", async () => {
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        const messageRef = {
+          id: "message-1",
+          contentHash: `sha256:${"a".repeat(64)}`,
+          mediaType: "text/plain",
+          byteLength: 5,
+        };
+        const admitted = await ledger.append(input("input.admitted", {
+          inputId: "input-1",
+          messageRef,
+          delivery: "new-turn",
+          sequence: 1,
+        }, { idempotencyKey: "admit-input-1" }));
+        const retried = await ledger.append(input("input.admitted", {
+          inputId: "input-1",
+          messageRef: { ...messageRef, id: "equivalent-content" },
+          delivery: "new-turn",
+          sequence: 2,
+        }, { idempotencyKey: "retry-after-lost-ack" }));
+
+        expect(retried).toEqual(admitted);
+        expect(await ledger.watermark()).toBe(1);
+        await expect(ledger.append(input("input.admitted", {
+          inputId: "input-1",
+          messageRef,
+          delivery: "follow-up",
+          sequence: 2,
+        }, { idempotencyKey: "conflicting-input-1" })))
+          .rejects.toBeInstanceOf(IdempotencyConflictError);
+
+        await expect(ledger.append(input("input.admitted", {
+          inputId: "input-2",
+          messageRef,
+          delivery: "follow-up",
+          sequence: 1,
+        }, { idempotencyKey: "non-monotonic-input-2" }))).rejects.toThrow(/not monotonic/);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
   it("filters reads without exposing mutable internal events", async () => {
     for (const { ledger } of await ledgerImplementations()) {
       try {
@@ -194,6 +265,23 @@ describe("Ledger conformance", () => {
           { kind: "main" },
           { runId: "run\0other" },
         ))).rejects.toThrow(/runId/);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
+  it("rejects invalid optional Turn and causation identifiers", async () => {
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        await expect(ledger.append({
+          ...input("lane.status", { status: "ready" }),
+          turnId: "",
+        })).rejects.toThrow(/turnId/);
+        await expect(ledger.append({
+          ...input("lane.status", { status: "ready" }),
+          causationId: "cause\0other",
+        })).rejects.toThrow(/causationId/);
       } finally {
         await ledger.close();
       }

@@ -18,7 +18,7 @@ describe("built CLI", () => {
 
     expect(stderr).toBe("");
     expect(stdout).toContain("Usage:");
-    expect(stdout).toContain("nausicaa [options] <task>");
+    expect(stdout).toContain("nausicaa [options] [message]");
   });
 
   it("reports a stable version", async () => {
@@ -69,6 +69,7 @@ describe("built CLI", () => {
     try {
       const failure = await execFileAsync(process.execPath, [
         "dist/cli.js",
+        "-p",
         "--main-only",
         "--model",
         "missing:model",

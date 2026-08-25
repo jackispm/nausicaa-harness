@@ -8,7 +8,7 @@ import type {
 } from "../domain/events.js";
 import type { Clock } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
-import type { EventId } from "../domain/types.js";
+import type { EventId, RunId } from "../domain/types.js";
 import { cloneJson, sha256, stableJson } from "./hash.js";
 import {
   eventTypes,
@@ -71,6 +71,7 @@ export function computeEventContentHash(
 function commandFingerprint(event: AppendEvent | AnyEvent): string {
   return sha256(stableJson({
     runId: event.runId,
+    turnId: event.turnId,
     laneId: event.laneId,
     type: event.type,
     payload: event.payload,
@@ -78,6 +79,16 @@ function commandFingerprint(event: AppendEvent | AnyEvent): string {
     correlationId: event.correlationId,
     idempotencyKey: event.idempotencyKey,
     visibility: event.visibility ?? "run",
+  }));
+}
+
+function inputAdmissionFingerprint(
+  event: AppendEvent<"input.admitted"> | EventEnvelope<"input.admitted">,
+): string {
+  return sha256(stableJson({
+    contentHash: event.payload.messageRef.contentHash,
+    delivery: event.payload.delivery,
+    targetTurnId: event.payload.targetTurnId,
   }));
 }
 
@@ -101,6 +112,9 @@ export function validateEvent(event: unknown): asserts event is AnyEvent {
   const candidate = event as Partial<AnyEvent>;
   assertNonEmptyString(candidate.eventId, "eventId");
   assertNonEmptyString(candidate.runId, "runId");
+  if (candidate.turnId !== undefined) {
+    assertNonEmptyString(candidate.turnId, "turnId");
+  }
   assertNonEmptyString(candidate.laneId, "laneId");
   assertPositiveInteger(candidate.globalOffset, "globalOffset");
   assertPositiveInteger(candidate.laneSeq, "laneSeq");
@@ -135,6 +149,33 @@ export function validateEvent(event: unknown): asserts event is AnyEvent {
 
   try {
     validateEventPayload(candidate.type, candidate.payload);
+    const payloadTurnId = "turnId" in candidate.payload
+      ? candidate.payload.turnId
+      : undefined;
+    if (
+      (candidate.type === "input.delivered"
+        || candidate.type.startsWith("turn.")
+        || candidate.type === "model.cancelled"
+        || candidate.type === "tool.unknown"
+        || (candidate.type === "user.message" && "inputId" in candidate.payload))
+      && candidate.turnId === undefined
+    ) {
+      throw new TypeError(`${candidate.type} requires an event turnId`);
+    }
+    if (payloadTurnId !== undefined && payloadTurnId !== candidate.turnId) {
+      throw new TypeError("payload turnId must equal the event turnId");
+    }
+    if (
+      candidate.type === "input.admitted"
+      && (
+        (candidate.payload.targetTurnId === undefined && candidate.turnId !== undefined)
+        || candidate.payload.targetTurnId !== candidate.turnId
+      )
+    ) {
+      throw new TypeError(
+        "input.admitted targetTurnId and event turnId must either both be absent or equal",
+      );
+    }
     if (candidate.type === "message.sent") {
       validateMessageRun(candidate.payload.message, candidate.runId);
     }
@@ -162,6 +203,8 @@ export class LedgerState {
   readonly #idempotency = new Map<string, AnyEvent>();
   readonly #eventIds = new Set<string>();
   readonly #laneSequences = new Map<string, number>();
+  readonly #inputAdmissions = new Map<string, EventEnvelope<"input.admitted">>();
+  readonly #inputSequences = new Map<RunId, number>();
   readonly #clock: Clock;
   readonly #createEventId: () => EventId;
 
@@ -182,6 +225,25 @@ export class LedgerState {
 
   prepare<K extends EventType>(input: AppendEvent<K>): PreparedAppend<K> {
     this.#validateAppend(input);
+    if (input.type === "input.admitted") {
+      const admission = input as AppendEvent<"input.admitted">;
+      const inputScope = `${input.runId}\u0000${admission.payload.inputId}`;
+      const existingAdmission = this.#inputAdmissions.get(inputScope);
+      if (existingAdmission !== undefined) {
+        if (
+          inputAdmissionFingerprint(existingAdmission)
+          !== inputAdmissionFingerprint(admission)
+        ) {
+          throw new IdempotencyConflictError(
+            `Input ID ${admission.payload.inputId} was reused with different content`,
+          );
+        }
+        return {
+          event: cloneJson(existingAdmission) as EventEnvelope<K>,
+          duplicate: true,
+        };
+      }
+    }
     const idempotencyScope = `${input.runId}\u0000${input.idempotencyKey}`;
     const existing = this.#idempotency.get(idempotencyScope);
     if (existing !== undefined) {
@@ -206,6 +268,7 @@ export class LedgerState {
     const content = cloneJson({
       eventId: this.#createEventId(),
       runId: input.runId,
+      turnId: input.turnId,
       laneId: input.laneId,
       globalOffset: this.watermark + 1,
       laneSeq,
@@ -258,6 +321,11 @@ export class LedgerState {
     this.#eventIds.add(stored.eventId);
     this.#laneSequences.set(laneScope, stored.laneSeq);
     this.#idempotency.set(idempotencyScope, stored);
+    if (stored.type === "input.admitted") {
+      const inputScope = `${stored.runId}\u0000${stored.payload.inputId}`;
+      this.#inputAdmissions.set(inputScope, stored);
+      this.#inputSequences.set(stored.runId, stored.payload.sequence);
+    }
   }
 
   #validateCandidate(event: AnyEvent): void {
@@ -288,6 +356,19 @@ export class LedgerState {
       );
     }
 
+    if (event.type === "input.admitted") {
+      const inputScope = `${event.runId}\u0000${event.payload.inputId}`;
+      if (this.#inputAdmissions.has(inputScope)) {
+        throw new LedgerCorruptionError(`Duplicate inputId ${event.payload.inputId}`);
+      }
+      const previousSequence = this.#inputSequences.get(event.runId) ?? 0;
+      if (event.payload.sequence <= previousSequence) {
+        throw new LedgerCorruptionError(
+          `Input sequence ${event.payload.sequence} is not monotonic for ${event.runId}`,
+        );
+      }
+    }
+
   }
 
   #validateAppend(input: AppendEvent): void {
@@ -301,6 +382,17 @@ export class LedgerState {
       ["idempotencyKey", input.idempotencyKey],
     ] as const) {
       if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+        throw new LedgerError(`${field} must be a non-empty string without NUL`);
+      }
+    }
+    for (const [field, value] of [
+      ["turnId", input.turnId],
+      ["causationId", input.causationId],
+    ] as const) {
+      if (
+        value !== undefined
+        && (typeof value !== "string" || value.length === 0 || value.includes("\0"))
+      ) {
         throw new LedgerError(`${field} must be a non-empty string without NUL`);
       }
     }

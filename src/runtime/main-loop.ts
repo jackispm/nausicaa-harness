@@ -9,6 +9,9 @@ import type {
   AgentTool,
   Clock,
   ModelPort,
+  ModelRequest,
+  ModelResponse,
+  ModelStreamEvent,
   ToolResult,
 } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
@@ -24,6 +27,7 @@ import type {
   TokenUsage,
   ToolCall,
 } from "../domain/types.js";
+import { mainStepAllowance } from "../domain/types.js";
 import type {
   FukaiArtifactSelection,
   FukaiBudget,
@@ -45,7 +49,7 @@ const MAX_TOOL_RESULT_BYTES = 256 * 1024;
 export interface MainEventSink {
   append<K extends EventType>(
     event: AppendEvent<K>,
-  ): Promise<{ globalOffset: number }>;
+  ): Promise<{ eventId: string; globalOffset: number }>;
 }
 
 export interface MainConversationStore {
@@ -55,7 +59,8 @@ export interface MainConversationStore {
 export type MainBoundaryMessageKind =
   | "advice"
   | "question-answer"
-  | "runtime-notice";
+  | "runtime-notice"
+  | "steering";
 
 export interface MainBoundaryMessage {
   kind: MainBoundaryMessageKind;
@@ -106,10 +111,39 @@ export interface MainLoopDeps {
   ) => void | NavigationDelta;
   /** Synchronously enqueue auxiliary work; never execute a model in this hook. */
   afterStep?: (context: MainAfterStepContext) => void;
+  onStreamEvent?: (event: MainStreamEvent) => void;
 }
+
+export type MainStreamEvent = {
+  runId: RunId;
+  turnId?: string;
+  laneId: LaneId;
+  requestId: string;
+  sequence: number;
+} & (
+  | { type: "stream.start" }
+  | { type: "stream.delta"; delta: string }
+  | { type: "stream.end" }
+  | { type: "stream.cancelled"; reason: string }
+  | { type: "stream.failed"; error: string }
+);
+
+type PendingMainStreamEvent = {
+  input: MainLoopInput;
+  laneId: LaneId;
+  requestId: string;
+} & (
+  | { type: "stream.start" }
+  | { type: "stream.delta"; delta: string }
+  | { type: "stream.end" }
+  | { type: "stream.cancelled"; reason: string }
+  | { type: "stream.failed"; error: string }
+);
 
 export interface MainLoopInput {
   runId: RunId;
+  /** Present for interactive Runs; omitted only for schema-v1 one-shot compatibility. */
+  turnId?: string;
   goal: Goal;
   model: string;
   workspace: string;
@@ -126,6 +160,8 @@ export interface MainLoopInput {
   conversationRefs?: readonly FukaiConversationRef[];
   artifactSelections?: readonly FukaiArtifactSelection[];
   correlationId?: string;
+  /** Legacy one-shot completes the Run; interactive execution completes only its Turn. */
+  completeRun?: boolean;
   signal?: AbortSignal;
 }
 
@@ -151,6 +187,8 @@ export class MainLoop {
   private readonly beforeStep: MainLoopDeps["beforeStep"];
   private readonly navigationHook: MainLoopDeps["navigationHook"];
   private readonly afterStep: MainLoopDeps["afterStep"];
+  private readonly onStreamEvent: MainLoopDeps["onStreamEvent"];
+  private readonly streamSequences = new Map<string, number>();
 
   constructor(deps: MainLoopDeps) {
     this.model = deps.model;
@@ -164,6 +202,7 @@ export class MainLoop {
     this.beforeStep = deps.beforeStep;
     this.navigationHook = deps.navigationHook;
     this.afterStep = deps.afterStep;
+    this.onStreamEvent = deps.onStreamEvent;
   }
 
   async run(input: MainLoopInput): Promise<MainLoopResult> {
@@ -172,12 +211,20 @@ export class MainLoop {
 
     const laneId = input.laneId ?? "main";
     const sessionId = input.sessionId ?? `${input.runId}:${laneId}`;
+    const eventPrefix = input.turnId === undefined
+      ? laneId
+      : `${input.runId}:turn:${input.turnId}`;
     const correlationId = input.correlationId ?? `corr:${hashStable({
       runId: input.runId,
+      turnId: input.turnId,
       laneId,
       loop: "main",
     })}`;
     const startStep = input.startStep ?? 1;
+    const allowance = mainStepAllowance(input.policy);
+    const finalStep = "maxMainStepsPerActivation" in input.policy
+      ? startStep + allowance - 1
+      : allowance;
     const eventState = { watermark: input.upperWatermark ?? 0 };
     const contextBudget = resolveContextBudget(input);
     const conversationRefs = [...(input.conversationRefs ?? [])]
@@ -206,16 +253,18 @@ export class MainLoop {
       conversationRefs.push({
         ref: initialRef,
         sequence,
-        groupId: `${input.runId}:input:${startStep}`,
+        groupId: input.turnId === undefined
+          ? `${input.runId}:input:${startStep}`
+          : `${input.runId}:turn:${input.turnId}:input`,
       });
       await this.emit(input, laneId, correlationId, eventState, {
         type: "user.message",
         payload: { messageRef: initialRef },
-        idempotencyKey: `${laneId}:input:${startStep}`,
+        idempotencyKey: `${eventPrefix}:input:${startStep}`,
       });
     }
 
-    for (let step = startStep; step <= input.policy.maxMainSteps; step += 1) {
+    for (let step = startStep; step <= finalStep; step += 1) {
       throwIfAborted(input.signal);
       if (chargedTokens(usage) >= input.policy.maxModelTokens) {
         break;
@@ -225,7 +274,7 @@ export class MainLoop {
       const stepWatermark = await this.emit(input, laneId, correlationId, eventState, {
         type: "step.started",
         payload: { step },
-        idempotencyKey: `${laneId}:step:${step}:started`,
+        idempotencyKey: `${eventPrefix}:step:${step}:started`,
       });
 
       try {
@@ -258,7 +307,7 @@ export class MainLoop {
           conversationRefs,
           artifactSelections,
           tools: this.tools.map((tool) => tool.definition),
-          upperWatermark: stepWatermark,
+          upperWatermark: stepWatermark.globalOffset,
           policyVersion: input.policyVersion ?? "1",
           budget: contextBudget,
           ...(input.signal === undefined ? {} : { signal: input.signal }),
@@ -279,7 +328,7 @@ export class MainLoop {
           maxOutputTokens,
           sessionId,
         });
-        await this.emit(input, laneId, correlationId, eventState, {
+        const requestEvent = await this.emit(input, laneId, correlationId, eventState, {
           type: "model.requested",
           payload: {
             model: input.model,
@@ -289,13 +338,13 @@ export class MainLoop {
             dependencyRefs: [...view.dependencyRefs],
             contextBuildMs,
           },
-          idempotencyKey: `${laneId}:step:${step}:model:requested`,
+          idempotencyKey: `${eventPrefix}:step:${step}:model:requested`,
         });
 
-        let response;
+        let response: ModelResponse;
         const modelStartedAt = this.monotonicNow();
         try {
-          response = await this.model.complete({
+          const modelRequest: ModelRequest = {
             runId: input.runId,
             laneId,
             sessionId,
@@ -305,13 +354,46 @@ export class MainLoop {
             tools: this.tools.map((tool) => tool.definition),
             maxOutputTokens,
             ...(input.signal === undefined ? {} : { signal: input.signal }),
-          });
+          };
+          response = await this.requestModel(
+            modelRequest,
+            input,
+            laneId,
+            requestEvent.eventId,
+          );
         } catch (error: unknown) {
-          await this.emit(input, laneId, correlationId, eventState, {
-            type: "model.failed",
-            payload: { model: input.model, error: persistedErrorText(error) },
-            idempotencyKey: `${laneId}:step:${step}:model:failed`,
-          });
+          const cancelled = input.signal?.aborted === true;
+          if (cancelled) {
+            const reason = persistedErrorText(input.signal?.reason, "Cancelled");
+            await this.emit(input, laneId, correlationId, eventState, {
+              type: "model.cancelled",
+              payload: { requestId: requestEvent.eventId, reason },
+              idempotencyKey: `${eventPrefix}:step:${step}:model:cancelled`,
+              causationId: requestEvent.eventId,
+            });
+            this.publishStream({
+              type: "stream.cancelled",
+              input,
+              laneId,
+              requestId: requestEvent.eventId,
+              reason,
+            });
+          } else {
+            const message = persistedErrorText(error);
+            await this.emit(input, laneId, correlationId, eventState, {
+              type: "model.failed",
+              payload: { model: input.model, error: message },
+              idempotencyKey: `${eventPrefix}:step:${step}:model:failed`,
+              causationId: requestEvent.eventId,
+            });
+            this.publishStream({
+              type: "stream.failed",
+              input,
+              laneId,
+              requestId: requestEvent.eventId,
+              error: message,
+            });
+          }
           throw error;
         }
         const modelLatencyMs = elapsedMilliseconds(modelStartedAt, this.monotonicNow());
@@ -330,7 +412,9 @@ export class MainLoop {
         conversationRefs.push({
           ref: assistantRef,
           sequence,
-          groupId: `${input.runId}:step:${step}`,
+          groupId: input.turnId === undefined
+            ? `${input.runId}:step:${step}`
+            : `${input.runId}:turn:${input.turnId}:step:${step}`,
         });
 
         validateToolCalls(response.toolCalls);
@@ -344,30 +428,48 @@ export class MainLoop {
             modelLatencyMs,
             cacheOutcome: cacheOutcome(response.usage),
           },
-          idempotencyKey: `${laneId}:step:${step}:model:completed`,
+          idempotencyKey: `${eventPrefix}:step:${step}:model:completed`,
+          causationId: requestEvent.eventId,
         });
         await this.emit(input, laneId, correlationId, eventState, {
           type: "assistant.message",
           payload: { messageRef: assistantRef },
-          idempotencyKey: `${laneId}:step:${step}:assistant`,
+          idempotencyKey: `${eventPrefix}:step:${step}:assistant`,
+          causationId: requestEvent.eventId,
+        });
+        this.publishStream({
+          type: "stream.end",
+          input,
+          laneId,
+          requestId: requestEvent.eventId,
         });
         await this.emit(input, laneId, correlationId, eventState, {
           type: "budget.charged",
           payload: { laneId, usage: response.usage },
-          idempotencyKey: `${laneId}:step:${step}:budget`,
+          idempotencyKey: `${eventPrefix}:step:${step}:budget`,
         });
 
         const toolMessages = response.toolCalls.length === 0
           ? []
           : await settleToolExecutions(response.toolCalls.map((call) =>
-              this.executeTool(input, laneId, correlationId, eventState, step, call),
+              this.executeTool(
+                input,
+                laneId,
+                correlationId,
+                eventState,
+                eventPrefix,
+                step,
+                call,
+              ),
             ));
         for (const toolMessage of toolMessages) {
           sequence += 1;
           conversationRefs.push({
             ref: toolMessage.ref,
             sequence,
-            groupId: `${input.runId}:step:${step}`,
+            groupId: input.turnId === undefined
+              ? `${input.runId}:step:${step}`
+              : `${input.runId}:turn:${input.turnId}:step:${step}`,
           });
         }
 
@@ -398,12 +500,12 @@ export class MainLoop {
         await this.emit(input, laneId, correlationId, eventState, {
           type: "navigation.updated",
           payload: { delta },
-          idempotencyKey: `${laneId}:step:${step}:navigation`,
+          idempotencyKey: `${eventPrefix}:step:${step}:navigation`,
         });
         await this.emit(input, laneId, correlationId, eventState, {
           type: "step.completed",
           payload: { step, hasToolCalls: response.toolCalls.length > 0 },
-          idempotencyKey: `${laneId}:step:${step}:completed`,
+          idempotencyKey: `${eventPrefix}:step:${step}:completed`,
         });
 
         this.dispatchAfterStep({
@@ -420,11 +522,20 @@ export class MainLoop {
         });
 
         if (response.toolCalls.length === 0 && response.stopReason === "stop") {
-          await this.emit(input, laneId, correlationId, eventState, {
-            type: "run.completed",
-            payload: { answerRef: assistantRef },
-            idempotencyKey: `${laneId}:run:completed`,
-          });
+          if (input.turnId !== undefined && input.completeRun !== true) {
+            await this.emit(input, laneId, correlationId, eventState, {
+              type: "turn.completed",
+              payload: { turnId: input.turnId, answerRef: assistantRef },
+              idempotencyKey: `${eventPrefix}:completed`,
+              causationId: requestEvent.eventId,
+            });
+          } else {
+            await this.emit(input, laneId, correlationId, eventState, {
+              type: "run.completed",
+              payload: { answerRef: assistantRef },
+              idempotencyKey: `${eventPrefix}:run:completed`,
+            });
+          }
           return {
             finalText,
             steps,
@@ -447,11 +558,13 @@ export class MainLoop {
           };
         }
       } catch (error: unknown) {
-        await this.emit(input, laneId, correlationId, eventState, {
-          type: "step.failed",
-          payload: { step, error: persistedErrorText(error) },
-          idempotencyKey: `${laneId}:step:${step}:failed`,
-        });
+        if (input.signal?.aborted !== true) {
+          await this.emit(input, laneId, correlationId, eventState, {
+            type: "step.failed",
+            payload: { step, error: persistedErrorText(error) },
+            idempotencyKey: `${eventPrefix}:step:${step}:failed`,
+          });
+        }
         throw error;
       }
     }
@@ -489,12 +602,14 @@ export class MainLoop {
     laneId: LaneId,
     correlationId: string,
     eventState: { watermark: number },
+    eventPrefix: string,
     step: number,
     call: ToolCall,
   ): Promise<{ message: ConversationMessage; ref: ArtifactRef }> {
     throwIfAborted(input.signal);
     const operationId = `op:${hashStable({
       runId: input.runId,
+      turnId: input.turnId,
       laneId,
       step,
       toolCallId: call.id,
@@ -512,7 +627,7 @@ export class MainLoop {
         name: call.name,
         argumentsRef,
       },
-      idempotencyKey: `${laneId}:step:${step}:tool:${call.id}:requested`,
+      idempotencyKey: `${eventPrefix}:step:${step}:tool:${call.id}:requested`,
     });
 
     const tool = this.toolsByName.get(call.name);
@@ -557,7 +672,7 @@ export class MainLoop {
           error: boundedRedactedText(result.content, 1_024),
           resultRef,
         },
-        idempotencyKey: `${laneId}:step:${step}:tool:${call.id}:failed`,
+        idempotencyKey: `${eventPrefix}:step:${step}:tool:${call.id}:failed`,
       });
     } else {
       await this.emit(input, laneId, correlationId, eventState, {
@@ -568,7 +683,7 @@ export class MainLoop {
           name: call.name,
           resultRef,
         },
-        idempotencyKey: `${laneId}:step:${step}:tool:${call.id}:succeeded`,
+        idempotencyKey: `${eventPrefix}:step:${step}:tool:${call.id}:succeeded`,
       });
     }
     return { message, ref: resultRef };
@@ -587,13 +702,16 @@ export class MainLoop {
       type: K;
       payload: EventPayloadMap[K];
       idempotencyKey: string;
+      causationId?: string;
     },
-  ): Promise<number> {
+  ): Promise<{ eventId: string; globalOffset: number }> {
     const receipt = await this.eventSink.append({
       runId: input.runId,
+      ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
       laneId,
       type: event.type,
       payload: event.payload,
+      ...(event.causationId === undefined ? {} : { causationId: event.causationId }),
       correlationId,
       idempotencyKey: event.idempotencyKey,
       visibility: "run",
@@ -603,7 +721,90 @@ export class MainLoop {
       throw new Error("Event sink returned an invalid globalOffset");
     }
     eventState.watermark = Math.max(eventState.watermark, receipt.globalOffset);
-    return receipt.globalOffset;
+    return receipt;
+  }
+
+  private async requestModel(
+    request: ModelRequest,
+    input: MainLoopInput,
+    laneId: LaneId,
+    requestId: string,
+  ): Promise<ModelResponse> {
+    if (this.onStreamEvent === undefined || this.model.stream === undefined) {
+      return raceAbort(this.model.complete(request), request.signal);
+    }
+
+    this.publishStream({ type: "stream.start", input, laneId, requestId });
+    const iterator = this.model.stream(request)[Symbol.asyncIterator]();
+    while (true) {
+      const next = await raceAbort(iterator.next(), request.signal);
+      if (next.done) {
+        throw new Error("Model stream ended without a final response");
+      }
+      const event: ModelStreamEvent = next.value;
+      switch (event.type) {
+        case "start":
+          break;
+        case "text-delta":
+          if (event.delta.length > 0) {
+            this.publishStream({
+              type: "stream.delta",
+              input,
+              laneId,
+              requestId,
+              delta: event.delta,
+            });
+          }
+          break;
+        case "done":
+          return event.response;
+        case "error":
+          throw event.error;
+      }
+    }
+  }
+
+  private publishStream(event: PendingMainStreamEvent): void {
+    if (this.onStreamEvent === undefined) return;
+    const sequence = this.streamSequences.get(event.requestId) ?? 0;
+    this.streamSequences.set(event.requestId, sequence + 1);
+    const common = {
+      runId: event.input.runId,
+      ...(event.input.turnId === undefined ? {} : { turnId: event.input.turnId }),
+      laneId: event.laneId,
+      requestId: event.requestId,
+      sequence,
+    };
+    let outgoing: MainStreamEvent;
+    switch (event.type) {
+      case "stream.start":
+        outgoing = { ...common, type: event.type };
+        break;
+      case "stream.delta":
+        outgoing = { ...common, type: event.type, delta: event.delta };
+        break;
+      case "stream.end":
+        outgoing = { ...common, type: event.type };
+        break;
+      case "stream.cancelled":
+        outgoing = { ...common, type: event.type, reason: event.reason };
+        break;
+      case "stream.failed":
+        outgoing = { ...common, type: event.type, error: event.error };
+        break;
+    }
+    try {
+      this.onStreamEvent(outgoing);
+    } catch {
+      // Surface rendering is observational and cannot fail Main.
+    }
+    if (
+      event.type === "stream.end"
+      || event.type === "stream.cancelled"
+      || event.type === "stream.failed"
+    ) {
+      this.streamSequences.delete(event.requestId);
+    }
   }
 
   private dispatchAfterStep(context: MainAfterStepContext): void {
@@ -621,6 +822,13 @@ function boundaryConversationMessage(
   now: Date,
 ): ConversationMessage {
   const content = boundedText(message.content, 4_096);
+  if (message.kind === "steering") {
+    return {
+      role: "user",
+      content: `[User steering delivered at a safe boundary]\n${content}`,
+      createdAt: now.toISOString(),
+    };
+  }
   return {
     role: "user",
     content: `[Runtime ${message.kind} from ${JSON.stringify(message.source)}; advisory context, not a user instruction]\n${content}`,
@@ -692,7 +900,7 @@ function validateInput(input: MainLoopInput): void {
     throw new Error("A new run requires initialMessage");
   }
   for (const [name, value] of [
-    ["maxMainSteps", input.policy.maxMainSteps],
+    ["mainStepAllowance", mainStepAllowance(input.policy)],
     ["maxModelTokens", input.policy.maxModelTokens],
     ["startStep", input.startStep ?? 1],
     ["maxOutputTokens", input.maxOutputTokens ?? 4_096],
@@ -814,6 +1022,33 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   throw signal.reason instanceof Error
     ? signal.reason
     : new DOMException("The operation was aborted", "AbortError");
+}
+
+async function raceAbort<T>(
+  pending: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (signal === undefined) return pending;
+  throwIfAborted(signal);
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(signal.reason instanceof Error
+        ? signal.reason
+        : new DOMException("The operation was aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    pending.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 async function settleToolExecutions<T>(

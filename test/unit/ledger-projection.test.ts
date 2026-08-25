@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import type { AppendEvent, EventType } from "../../src/domain/events.js";
 import type { A2AMessage, ArtifactRef, Goal, RunPolicy } from "../../src/domain/types.js";
-import { MemoryLedger, projectRun } from "../../src/ledger/index.js";
+import {
+  legacyTurnIdForRun,
+  MemoryLedger,
+  projectRun,
+} from "../../src/ledger/index.js";
 
 const goal: Goal = {
   version: 1,
@@ -146,6 +150,15 @@ describe("projectRun", () => {
       "assistant",
       "tool",
     ]);
+    expect(projection.conversation.every((item) => (
+      item.turnId === legacyTurnIdForRun("run-1")
+    ))).toBe(true);
+    expect(projection.turns[legacyTurnIdForRun("run-1")]).toMatchObject({
+      status: "completed",
+      legacy: true,
+      answerRef: artifact("answer"),
+    });
+    expect(projection.activeTurnId).toBeUndefined();
     expect(projection.inbox).toHaveLength(1);
     expect(projection.inbox[0]).toMatchObject({
       status: "handled",
@@ -174,9 +187,133 @@ describe("projectRun", () => {
         charged: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       },
       conversation: [],
+      inputs: [],
+      unknownOperations: [],
     });
     expect(Object.keys(projection.lanes)).toEqual([]);
     expect(Object.keys(projection.budget.byLane)).toEqual([]);
+  });
+
+  it("attributes an unfinished legacy one-shot execution to a stable active Turn", async () => {
+    const ledger = new MemoryLedger();
+    await ledger.append(command("run.created", { goal, workspace: "/workspace", policy }));
+    await ledger.append(command("user.message", { messageRef: artifact("legacy-input") }));
+    await ledger.append(command("step.started", { step: 1 }));
+
+    const projection = projectRun(await ledger.read(), "run-1");
+    const legacyTurnId = legacyTurnIdForRun("run-1");
+    expect(projection.activeTurnId).toBe(legacyTurnId);
+    expect(projection.turns[legacyTurnId]).toMatchObject({
+      turnId: legacyTurnId,
+      status: "active",
+      legacy: true,
+      lastCommittedStep: 0,
+    });
+  });
+
+  it("rebuilds pending input, Turn lifecycle, and unresolved operation state", async () => {
+    const ledger = new MemoryLedger();
+    await ledger.append(command("run.created", { goal, workspace: "/workspace", policy }));
+    await ledger.append(command("input.admitted", {
+      inputId: "input-1",
+      messageRef: artifact("input-1"),
+      delivery: "new-turn",
+      sequence: 1,
+    }));
+    await ledger.append({
+      ...command("turn.started", { turnId: "turn-1", inputId: "input-1", ordinal: 1 }),
+      turnId: "turn-1",
+    });
+    await ledger.append({
+      ...command("input.delivered", {
+        inputId: "input-1",
+        turnId: "turn-1",
+        boundary: "turn-start",
+      }),
+      turnId: "turn-1",
+    });
+    await ledger.append({
+      ...command("user.message", {
+        inputId: "input-1",
+        messageRef: artifact("input-1"),
+        kind: "initial",
+      }),
+      turnId: "turn-1",
+    });
+    await ledger.append({
+      ...command("step.completed", { step: 3, hasToolCalls: true }),
+      turnId: "turn-1",
+    });
+    await ledger.append({
+      ...command("tool.unknown", {
+        operationId: "operation-1",
+        toolCallId: "call-1",
+        name: "write",
+        reason: "process-interrupted",
+      }),
+      turnId: "turn-1",
+    });
+    await ledger.append({
+      ...command("turn.waiting", {
+        turnId: "turn-1",
+        reason: "operation-unknown",
+        lastCommittedStep: 3,
+        resumeRequires: "operation-resolution",
+      }),
+      turnId: "turn-1",
+    });
+    await ledger.append(command("input.admitted", {
+      inputId: "input-2",
+      messageRef: artifact("input-2"),
+      delivery: "follow-up",
+      sequence: 2,
+    }));
+
+    const blocked = projectRun(await ledger.read(), "run-1");
+    expect(blocked.activeTurnId).toBeUndefined();
+    expect(blocked.inputs).toMatchObject([
+      { inputId: "input-1", status: "delivered", turnId: "turn-1", sequence: 1 },
+      { inputId: "input-2", status: "pending", sequence: 2 },
+    ]);
+    expect(blocked.turns["turn-1"]).toMatchObject({
+      status: "waiting",
+      lastCommittedStep: 3,
+      resumeRequires: "operation-resolution",
+    });
+    expect(blocked.unknownOperations).toMatchObject([{
+      operationId: "operation-1",
+      turnId: "turn-1",
+    }]);
+
+    await ledger.append({
+      ...command("tool.failed", {
+        operationId: "operation-1",
+        toolCallId: "call-1",
+        name: "write",
+        error: "operator marked the outcome failed",
+        resultRef: artifact("operation-failed"),
+        resolution: "operator",
+      }),
+      turnId: "turn-1",
+    });
+    await ledger.append({
+      ...command("turn.resumed", { turnId: "turn-1", fromStep: 3, stepAllowance: 8 }),
+      turnId: "turn-1",
+    });
+    await ledger.append({
+      ...command("turn.completed", { turnId: "turn-1", answerRef: artifact("answer-1") }),
+      turnId: "turn-1",
+    });
+
+    const completed = projectRun(await ledger.read(), "run-1");
+    expect(completed.activeTurnId).toBeUndefined();
+    expect(completed.unknownOperations).toEqual([]);
+    expect(completed.turns["turn-1"]).toMatchObject({
+      status: "completed",
+      lastCommittedStep: 3,
+      stepAllowance: 8,
+      answerRef: artifact("answer-1"),
+    });
   });
 
   it("treats lane identifiers as data instead of object prototypes", async () => {

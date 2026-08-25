@@ -20,6 +20,7 @@ import type {
   RunPolicy,
   TokenUsage,
 } from "../domain/types.js";
+import { mainStepAllowance } from "../domain/types.js";
 import {
   ContentStoreFukaiSource,
   FukaiContextProvider,
@@ -81,7 +82,7 @@ export interface RunExecutionResult {
 }
 
 const DEFAULT_POLICY: RunPolicy = {
-  maxMainSteps: 24,
+  maxMainStepsPerActivation: 24,
   maxModelTokens: 200_000,
   tetoEnabled: true,
   tetoMaxOutputTokens: 200,
@@ -134,7 +135,9 @@ export const executeRun = async (
     const policy = setup.policy;
     const priorTokens = totalTokens(setup.priorUsage);
     const remainingModelTokens = Math.max(0, policy.maxModelTokens - priorTokens);
-    if (remainingModelTokens === 0 || setup.startStep > policy.maxMainSteps) {
+    const legacyStepLimitExhausted = "maxMainSteps" in policy
+      && setup.startStep > mainStepAllowance(policy);
+    if (remainingModelTokens === 0 || legacyStepLimitExhausted) {
       await appendLaneStatus(
         sink,
         runId,
@@ -440,9 +443,18 @@ const appendLaneStatus = async (
 };
 
 const resolvePolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
-  const policy = { ...DEFAULT_POLICY, ...input };
-  if (!Number.isSafeInteger(policy.maxMainSteps) || policy.maxMainSteps < 1) {
-    throw new RangeError("maxMainSteps must be a positive integer");
+  const allowance = input.maxMainStepsPerActivation
+    ?? input.maxMainSteps
+    ?? mainStepAllowance(DEFAULT_POLICY);
+  const policy: RunPolicy = {
+    maxMainStepsPerActivation: allowance,
+    maxModelTokens: input.maxModelTokens ?? DEFAULT_POLICY.maxModelTokens,
+    tetoEnabled: input.tetoEnabled ?? DEFAULT_POLICY.tetoEnabled,
+    tetoMaxOutputTokens: input.tetoMaxOutputTokens ?? DEFAULT_POLICY.tetoMaxOutputTokens,
+    tetoTokenRatio: input.tetoTokenRatio ?? DEFAULT_POLICY.tetoTokenRatio,
+  };
+  if (!Number.isSafeInteger(allowance) || allowance < 1) {
+    throw new RangeError("maxMainStepsPerActivation must be a positive integer");
   }
   if (!Number.isSafeInteger(policy.maxModelTokens) || policy.maxModelTokens < 1) {
     throw new RangeError("maxModelTokens must be a positive integer");

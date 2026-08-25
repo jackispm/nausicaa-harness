@@ -35,7 +35,8 @@
     "check": "npm run typecheck && npm test && npm run eval && npm run test:smoke"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.84.3"
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-tui": "^0.84.3"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",

@@ -8,16 +8,21 @@ import type {
   LaneKind,
   LaneStatus,
   NavigationDelta,
+  InputId,
   RunId,
   RunPolicy,
   CacheOutcome,
   TokenUsage,
+  TurnId,
   Visibility,
 } from "./types.js";
 
+export type InputDelivery = "new-turn" | "steering" | "follow-up";
+export type UserMessageKind = "initial" | "steering";
+
 export interface EventPayloadMap {
   "run.created": { goal: Goal; workspace: string; policy: RunPolicy };
-  "run.resumed": { fromOffset: number };
+  "run.resumed": { fromOffset: number; reason?: "new-turn" };
   "run.completed": { answerRef?: ArtifactRef };
   "run.failed": { error: string };
   "goal.revised": { goal: Goal };
@@ -26,7 +31,34 @@ export interface EventPayloadMap {
   "step.started": { step: number };
   "step.completed": { step: number; hasToolCalls: boolean };
   "step.failed": { step: number; error: string };
-  "user.message": { messageRef: ArtifactRef };
+  "input.admitted": {
+    inputId: InputId;
+    messageRef: ArtifactRef;
+    delivery: InputDelivery;
+    targetTurnId?: TurnId;
+    sequence: number;
+  };
+  "input.delivered": { inputId: InputId; turnId: TurnId; boundary: string };
+  "turn.started": { turnId: TurnId; inputId: InputId; ordinal: number };
+  "turn.completed": { turnId: TurnId; answerRef?: ArtifactRef };
+  "turn.failed": { turnId: TurnId; error: string };
+  "turn.cancelled": { turnId: TurnId; reason: string; lastCommittedStep: number };
+  "turn.waiting": {
+    turnId: TurnId;
+    reason: string;
+    lastCommittedStep: number;
+    resumeRequires: string;
+  };
+  "turn.interrupted": {
+    turnId: TurnId;
+    reason: string;
+    retryable: boolean;
+    lastCommittedStep: number;
+  };
+  "turn.resumed": { turnId: TurnId; fromStep: number; stepAllowance: number };
+  "user.message":
+    | { messageRef: ArtifactRef; inputId?: never; kind?: never }
+    | { inputId: InputId; messageRef: ArtifactRef; kind: UserMessageKind };
   "assistant.message": { messageRef: ArtifactRef };
   "navigation.updated": { delta: NavigationDelta };
   "model.requested": {
@@ -50,6 +82,7 @@ export interface EventPayloadMap {
     cacheOutcome?: CacheOutcome;
   };
   "model.failed": { model: string; error: string };
+  "model.cancelled": { requestId: EventId; reason: string };
   "tool.requested": {
     operationId: string;
     toolCallId: string;
@@ -68,6 +101,13 @@ export interface EventPayloadMap {
     name: string;
     error: string;
     resultRef: ArtifactRef;
+    resolution?: "operator";
+  };
+  "tool.unknown": {
+    operationId: string;
+    toolCallId: string;
+    name: string;
+    reason: string;
   };
   "message.sent": { message: A2AMessage };
   "message.claimed": { messageId: string; claimedBy: LaneId };
@@ -92,6 +132,8 @@ export type EventType = keyof EventPayloadMap;
 export interface EventEnvelope<K extends EventType = EventType> {
   eventId: EventId;
   runId: RunId;
+  /** Absent only for run-scoped facts and schema-v1 legacy events. */
+  turnId?: TurnId;
   laneId: LaneId;
   globalOffset: number;
   laneSeq: number;
@@ -112,6 +154,7 @@ export type AnyEvent = {
 
 export interface AppendEvent<K extends EventType = EventType> {
   runId: RunId;
+  turnId?: TurnId;
   laneId: LaneId;
   type: K;
   payload: EventPayloadMap[K];

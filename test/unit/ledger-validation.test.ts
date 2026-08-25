@@ -105,7 +105,7 @@ const message: A2AMessage = {
 
 const validPayloads = {
   "run.created": { goal, workspace: "/workspace", policy },
-  "run.resumed": { fromOffset: 4 },
+  "run.resumed": { fromOffset: 4, reason: "new-turn" },
   "run.completed": { answerRef: artifact },
   "run.failed": { error: "model failed" },
   "goal.revised": { goal: { ...goal, version: 2 } },
@@ -114,7 +114,32 @@ const validPayloads = {
   "step.started": { step: 1 },
   "step.completed": { step: 1, hasToolCalls: false },
   "step.failed": { step: 1, error: "interrupted" },
-  "user.message": { messageRef: artifact },
+  "input.admitted": {
+    inputId: "input-1",
+    messageRef: artifact,
+    delivery: "steering",
+    targetTurnId: "turn-1",
+    sequence: 1,
+  },
+  "input.delivered": { inputId: "input-1", turnId: "turn-1", boundary: "safe-step" },
+  "turn.started": { turnId: "turn-1", inputId: "input-1", ordinal: 1 },
+  "turn.completed": { turnId: "turn-1", answerRef: artifact },
+  "turn.failed": { turnId: "turn-1", error: "provider failed" },
+  "turn.cancelled": { turnId: "turn-1", reason: "user", lastCommittedStep: 1 },
+  "turn.waiting": {
+    turnId: "turn-1",
+    reason: "step-allowance-exhausted",
+    lastCommittedStep: 1,
+    resumeRequires: "explicit-resume",
+  },
+  "turn.interrupted": {
+    turnId: "turn-1",
+    reason: "process-interrupted",
+    retryable: true,
+    lastCommittedStep: 1,
+  },
+  "turn.resumed": { turnId: "turn-1", fromStep: 1, stepAllowance: 20 },
+  "user.message": { inputId: "input-1", messageRef: artifact, kind: "initial" },
   "assistant.message": { messageRef: artifact },
   "navigation.updated": { delta },
   "model.requested": {
@@ -134,6 +159,7 @@ const validPayloads = {
     cacheOutcome: "hit-write",
   },
   "model.failed": { model: "model-1", error: "provider failed" },
+  "model.cancelled": { requestId: "event-model-requested", reason: "user" },
   "tool.requested": {
     operationId: "operation-1",
     toolCallId: "call-1",
@@ -152,6 +178,13 @@ const validPayloads = {
     name: "read",
     error: "not found",
     resultRef: artifact,
+    resolution: "operator",
+  },
+  "tool.unknown": {
+    operationId: "operation-1",
+    toolCallId: "call-1",
+    name: "write",
+    reason: "process-interrupted",
   },
   "message.sent": { message },
   "message.claimed": { messageId: "message-1", claimedBy: "main" },
@@ -182,7 +215,30 @@ const invalidPayloads = {
   "step.started": { step: 0 },
   "step.completed": { step: 1, hasToolCalls: "no" },
   "step.failed": { step: 1 },
-  "user.message": { messageRef: { ...artifact, byteLength: -1 } },
+  "input.admitted": {
+    inputId: "input-1",
+    messageRef: artifact,
+    delivery: "urgent",
+    sequence: 1,
+  },
+  "input.delivered": { inputId: "input-1", turnId: "turn-1", boundary: "" },
+  "turn.started": { turnId: "turn-1", inputId: "input-1", ordinal: 0 },
+  "turn.completed": { turnId: "", answerRef: artifact },
+  "turn.failed": { turnId: "turn-1" },
+  "turn.cancelled": { turnId: "turn-1", reason: "user", lastCommittedStep: -1 },
+  "turn.waiting": {
+    turnId: "turn-1",
+    reason: "waiting",
+    lastCommittedStep: 0,
+  },
+  "turn.interrupted": {
+    turnId: "turn-1",
+    reason: "interrupted",
+    retryable: "yes",
+    lastCommittedStep: 0,
+  },
+  "turn.resumed": { turnId: "turn-1", fromStep: 0, stepAllowance: 0 },
+  "user.message": { inputId: "input-1", messageRef: artifact },
   "assistant.message": { messageRef: null },
   "navigation.updated": { delta: { ...delta, triggerKind: "wander" } },
   "model.requested": { model: "model-1", requestHash: "hash", contextWatermark: -1 },
@@ -193,6 +249,7 @@ const invalidPayloads = {
     usage: { ...tokenUsage, output: -1 },
   },
   "model.failed": { model: "", error: "failed" },
+  "model.cancelled": { requestId: "", reason: "user" },
   "tool.requested": { operationId: "op", toolCallId: "call", name: "read" },
   "tool.succeeded": {
     operationId: "",
@@ -206,6 +263,12 @@ const invalidPayloads = {
     name: "read",
     error: "failed",
     resultRef: null,
+  },
+  "tool.unknown": {
+    operationId: "op",
+    toolCallId: "call",
+    name: "",
+    reason: "unknown",
   },
   "message.sent": { message: { ...message, priority: -1 } },
   "message.claimed": { messageId: "", claimedBy: "main" },
@@ -269,6 +332,29 @@ describe("event payload validation", () => {
     })).toThrow(/cacheOutcome/);
   });
 
+  it("accepts exactly one current or legacy Main step policy field", () => {
+    const { maxMainSteps: _maxMainSteps, ...withoutStepLimit } = policy;
+    expect(() => validateEventPayload("run.created", {
+      goal,
+      workspace: "/workspace",
+      policy: { ...withoutStepLimit, maxMainStepsPerActivation: 8 },
+    })).not.toThrow();
+    expect(() => validateEventPayload("run.created", {
+      goal,
+      workspace: "/workspace",
+      policy: { ...policy, maxMainStepsPerActivation: 8 },
+    })).toThrow(/exactly one/);
+    expect(() => validateEventPayload("run.created", {
+      goal,
+      workspace: "/workspace",
+      policy: withoutStepLimit,
+    })).toThrow(/exactly one/);
+  });
+
+  it("accepts legacy user messages without Turn metadata", () => {
+    expect(() => validateEventPayload("user.message", { messageRef: artifact })).not.toThrow();
+  });
+
   it("rejects a malformed payload with a valid content hash during replay", async () => {
     const memory = new MemoryLedger({ createEventId: () => "event-1" });
     await memory.append({
@@ -306,5 +392,26 @@ describe("event payload validation", () => {
       correlationId: "correlation-1",
       idempotencyKey: "wrong-run-message",
     })).rejects.toThrow(/equal to the event runId/);
+  });
+
+  it("requires matching envelope and payload Turn identifiers", async () => {
+    const ledger = new MemoryLedger();
+    await expect(ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "turn.started",
+      payload: { turnId: "turn-1", inputId: "input-1", ordinal: 1 },
+      correlationId: "correlation-1",
+      idempotencyKey: "turn-started",
+    })).rejects.toThrow(/requires an event turnId/);
+    await expect(ledger.append({
+      runId: "run-1",
+      turnId: "turn-2",
+      laneId: "main",
+      type: "turn.started",
+      payload: { turnId: "turn-1", inputId: "input-1", ordinal: 1 },
+      correlationId: "correlation-1",
+      idempotencyKey: "turn-started-mismatch",
+    })).rejects.toThrow(/must equal the event turnId/);
   });
 });

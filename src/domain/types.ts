@@ -1,4 +1,6 @@
 export type RunId = string;
+export type TurnId = string;
+export type InputId = string;
 export type LaneId = string;
 export type EventId = string;
 export type ArtifactId = string;
@@ -153,10 +155,19 @@ export interface A2AMessage {
   payload: A2APayload;
 }
 
-export interface RunPolicy {
-  maxMainSteps: number;
+interface RunPolicyBase {
   maxModelTokens: number;
   tetoEnabled: boolean;
   tetoMaxOutputTokens: number;
   tetoTokenRatio: number;
+}
+
+/** New runs use an activation allowance; maxMainSteps is replay-only legacy data. */
+export type RunPolicy = RunPolicyBase & (
+  | { maxMainStepsPerActivation: number; maxMainSteps?: never }
+  | { maxMainSteps: number; maxMainStepsPerActivation?: never }
+);
+
+export function mainStepAllowance(policy: RunPolicy): number {
+  return policy.maxMainStepsPerActivation ?? policy.maxMainSteps;
 }
