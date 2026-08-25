@@ -4,10 +4,10 @@
 
 | 项目 | 主要借鉴 | Nausicaa 的边界 |
 | --- | --- | --- |
-| Pi / `pi-ai` | provider、模型、流式调用、极简扩展边界 | 先复用 `pi-ai`；不默认继承 coding-agent 的产品入口或 loop 语义 |
+| Pi / `pi-ai` / `pi-tui` | provider、模型、流式调用、极简 loop 和 TUI 组件 | 复用 `pi-ai` 与 `pi-tui`；不默认继承 coding-agent 的产品入口或 loop 语义 |
 | DeepSeek Harness | Ledger/event log、Inbox、插件化、可重建请求 | 采用事实源与投影思路，扩展到多 lane 和 Advice 协议 |
-| Prime Agent | RLM、持久 runtime、子 Agent 通信、长程调度 | 借鉴按需查询和持久状态，不预设 Python REPL 是核心 |
-| OpenAI Codex | 上下文纪律、执行边界、审批和可恢复协议 | 研究其安全与上下文取舍，按 Nausicaa 的小内核重组 |
+| Prime Agent | 轻量入口、TUI、RLM 思想、持久状态、子 Agent 通信、长程调度 | 采用 Prime/Pi 风格 surface；Fukai 借鉴按需查询，不预设 Python REPL 是核心 |
+| OpenAI Codex | 上下文纪律、执行边界、审批和可恢复协议 | 只研究内核边界和安全经验；不采用其入口或 TOML 配置风格 |
 | Multica | 多 Agent 管理、团队协作和人机管理体验 | 未来 UI 参考；当前先做 UI 无关的 Agent runtime |
 | Letta / OpenClaw / Claude Code | 后台 reflection、sleep/dream、background subagents | 不把 Dream/Reflection 本身称为原创，重点验证实时 Ledger 观察和 soft advice 的组合 |
 | LangGraph 等 | fan-out/fan-in、后台运行和可恢复图 | 只吸收可验证的调度经验，避免先建立通用 graph 平台 |

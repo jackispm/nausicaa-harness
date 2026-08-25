@@ -7,9 +7,9 @@
 | 类型 | 目标 | 默认权限 | 节奏 |
 | --- | --- | --- | --- |
 | Main | 直接推进用户目标 | 读写已授权能力 | foreground，优先 |
-| Teto / IntentNavigator | 发现任务脱离、意图缺口和更好方法 | 读 Ledger/Store，发 Advice | 稀疏、事件触发 |
-| Explorer | 低频地产生替代路径、类比和新假设 | 只读证据，发 Advice | 随机、稀疏、有界 |
-| Critic | 检查一个明确决策或产物的质量/风险 | 读相关证据，发审查结果 | 一次性或阶段性 |
+| Teto / IntentNavigator | 发现任务脱离、意图缺口和更好方法 | 经 Fukai 取证，发 Advice | 稀疏、事件触发 |
+| Explorer | 低频地产生替代路径、类比和新假设 | 经 Fukai 取证，发 Advice | 随机、稀疏、有界 |
+| Critic | 检查一个明确决策或产物的质量/风险 | 经 Fukai 读取挂接证据 | 一次性或阶段性 |
 | Worker | 完成被委派的局部任务 | 任务范围内的工具 | 有界并行 |
 | Coordinator | 汇总任务状态和交接 | 读 lane 状态，发任务消息 | 只在需要时运行 |
 
@@ -45,13 +45,15 @@ Teto 偏向任务航向和意图完整性，Explorer 偏向受限发散，Critic
 
 ## Teto lane: IntentNavigator
 
-Teto 线是 Nausicaa 的第一条标准辅助线。它订阅 Main 的目标、约束、计划变化、决策、未决问题和产物引用，重点回答三件事：
+Teto 线是 Nausicaa 的第一条标准辅助线。非模型 selector 只根据事件类型和边关系决定是否唤醒它；Teto 本身不订阅或扫描 Main 的完整事件流。它重点回答三件事：
 
 1. 当前行动是否仍然服务于原始任务意图？
 2. 用户目标或成功条件是否缺失、含糊或互相冲突？
 3. 当前路径之外是否有更简单、更稳妥或更有价值的方法？
 
-它不读取完整工具日志，不主动修改文件，不执行代码，不承担 bug 检查，也不直接暂停 Main。它只发 `orientation`、`intent-gap` 或 `method-alternative` Advice，并附证据引用、置信度、建议时机和过期时间。
+Teto 每次启动只收到 `goalRef`、成功条件、触发事件引用、cursor 和本轮预算。它拥有完整的 Fukai Core 操作集，可以多次查询并沿 evidence refs 逐步取证；限制来自 visibility 和预算，而不是阉割查询能力。它不会预先获得 transcript、文件列表、工具日志或“最近所有变化”的索引。只有在判断需要证据时，才请求 Fukai 返回与当前问题相关的局部事件或 Artifact 片段。
+
+它不主动修改文件，不执行代码，不承担 bug 检查，也不直接暂停 Main。它只发 `orientation`、`intent-gap` 或 `method-alternative` Advice，并附证据引用、置信度、建议时机和过期时间。
 
 ## 生命周期
 
@@ -85,7 +87,7 @@ scheduled -> admitted -> context-built -> model-running
 
 - 用户输入、恢复、主线继续：立即唤醒 Main。
 - 关键决策、目标变化、失败、重复尝试、矛盾或不确定性升高：唤醒 Teto、Explorer 或 Critic。
-- 多个普通事件：合并为一个增量 capsule，再唤醒一次。
+- 多个普通事件：调度器内部合并为一个 opaque wake signal，再唤醒一次；事件摘要、changedRefs 和索引不进入 Teto capsule。
 - Main 等待工具、消息或用户时：允许辅助线使用较多预算。
 - 低频 heartbeat：用于长期航向检查，不用于每 token 轮询。
 
@@ -111,4 +113,4 @@ Teto、Explorer 或其他辅助线超时、预算耗尽或模型失败只影响�
 
 ## 并行安全
 
-lane 不共享可变 Prompt、工具实例状态或临时变量。跨 lane 的事实通过 Ledger，交互通过 A2A，长内容通过 Store。需要竞争同一产物时使用版本、锁或主线决策门，而不是隐式的最后写入获胜。
+lane 不共享可变 Prompt、工具实例状态或临时变量。跨 lane 的事实通过 Ledger，交互通过 A2A，长内容通过 Store；模型访问这些内容必须经过 Fukai。需要竞争同一产物时使用版本、锁或主线决策门，而不是隐式的最后写入获胜。

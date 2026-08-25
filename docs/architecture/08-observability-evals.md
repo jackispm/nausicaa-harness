@@ -35,6 +35,7 @@ latency and outcome
 - provider cache read/write 比例。
 - P50/P95 首次响应和完成延迟。
 - 查询重复率、Store 读取量和事件扫描量。
+- Teto 每次唤醒的初始上下文、查询次数、读取字节和有效证据比例。
 
 ### 可靠性
 
@@ -50,11 +51,24 @@ latency and outcome
 1. 单 loop、无辅助线。
 2. 单 loop、每轮固定摘要的 Reflection。
 3. 并行 lane、共享完整 transcript。
-4. Nausicaa 的增量 capsule、按需 Evidence 和 Soft Advice。
+4. Nausicaa 的最小 opaque wake capsule、按需 Evidence 和 Soft Advice。
 
 对于 Explorer，额外比较固定随机种子与不同种子，区分“产生更多内容”和“发现更多有效方向”。随机性带来的 token 增长必须和可采纳的替代方案数量一起报告。
 
 任务集合需要覆盖编码、研究、规划、文件修改、长等待和失败恢复。结果必须同时报告质量、成本和延迟，不能只展示最好的成功样例。
+
+同一任务集至少使用两个能力等级的模型。分别测量 Main-only 和 Main+Teto 的绝对质量，以及 Teto 带来的边际收益。我们希望 lane 能随模型增强而产生更好的查询和 Advice；如果边际收益持续归零，就不能把“模型单调性”当作已验证结论。
+
+评测前固定任务集、模型版本、工具版本、预算、随机种子、样本量和权重。对模型 `m` 定义：
+
+```text
+utility(m) = quality + correctionValue + acceptedAdviceValue
+             - costWeight * cost - latencyWeight * p95
+             - noiseWeight * invalidAdviceRate
+uplift(m) = utility(Main+Teto, m) - utility(Main-only, m)
+```
+
+分别报告 `uplift` 及其置信区间；较强模型应至少不降低 lane 的净收益，并应在更难任务上提高有效 Evidence/Advice 比例。若连续两批预注册任务的 `uplift` 低于零或与零无显著区别，相关机制回到实验 flag，不进入默认内核。
 
 ## 事件审计
 

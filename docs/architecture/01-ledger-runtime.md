@@ -69,6 +69,8 @@ command received
 
 Projection 不能直接修改 Ledger；模型不能绕过 runtime 写事实；UI 不能直接修改 Projection。
 
+Fukai 是模型读取 Projection、Ledger 查询结果和 Store 内容的唯一入口。内部 selector 可以读取事件元数据进行唤醒和调度，但不能把全量索引直接注入 lane Prompt。唤醒只携带不透明的触发引用和固定 watermark；模型若需要事实，必须通过 Fukai 查询。
+
 ## Projection
 
 从 Ledger 可重建的主要视图包括：

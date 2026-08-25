@@ -10,19 +10,19 @@
 
 ## Phase 1: protocol slice
 
-单进程、单 writer、文件 Ledger、内容寻址 Store、一个 Main 和一个 Teto。配合 mock model 验证 `observes`/`advises` sidecar、RLM-lite 的增量 capsule、受限查询、Advice ack 和 recorded replay；不做 Worker、Explorer、通用 graph DSL 或持久代码 runtime。
+单进程、单 writer、文件 Ledger、内容寻址 Store、一个 Main 和一个 Teto。配合 mock model 验证 `observes`/`advises` sidecar、最小 opaque wake capsule、Fukai Core 的受限查询、Advice ack 和 recorded replay；不做 Worker、Explorer、通用 graph DSL 或持久代码 runtime。
 
-**退出条件**：崩溃可恢复，Teto 不读完整 transcript，不阻塞 Main，重复 Advice 可恢复，预算和去重有效；query/read/checkpoint 三类 RLM-lite 能力在恢复后保持 cursor 一致。
+**退出条件**：崩溃可恢复，Teto 不读完整 transcript，不阻塞 Main，重复 Advice 可恢复，预算和去重有效；query/read/checkpoint 三类 Fukai Core 能力在恢复后保持 cursor 一致。
 
 ## Phase 2: real model adapter
 
 接入 `pi-ai`，保留 runtime 对 provider 的隔离。加入稳定前缀、cache outcome、工具 operationId 和最小能力 policy。
 
-**退出条件**：完成 Main-only 与 Main+Teto 的 A/B，对 token、缓存、延迟、纠偏、意图缺失发现和 Advice 噪声设定最低收益门槛；未证明净收益前不增加更多 lane。
+**退出条件**：按评测文档预先冻结任务集、模型层级、预算和收益公式，完成 Main-only 与 Main+Teto 的 A/B，并报告 token、缓存、延迟、纠偏、意图缺失发现和 Advice 噪声；若净收益在预设样本和区间内归零或为负，不增加更多 lane，先简化机制。
 
 ## Phase 3: worker and A2A
 
-加入有界 Worker lane、`delegates/joins` 边、任务交接、Inbox 的 next-step/next-turn 语义、幂等投递和产物引用。只有此阶段才评估 RLM continuation 的有限 spawn/await。
+加入有界 Worker lane、`delegates/joins` 边、任务交接、Inbox 的 next-step/next-turn 语义、幂等投递和产物引用。只有此阶段才评估 Fukai continuation 的有限 spawn/await。
 
 **退出条件**：并行任务不会破坏主线事实；并发上限、背压、公平性、死锁、重复消息和子任务失败可恢复。
 
@@ -40,4 +40,4 @@
 
 ## 明确延后
 
-通用 graph DSL、RLM execution（持久 Python/JS、任意代码和环境恢复）、自动规划市场、向量记忆、无界自我复制、插件 marketplace、模型自动安装插件和 UI-first 的内核设计都延后到有证据证明其必要性。
+通用 graph DSL、Fukai Execution（持久 Python/JS、任意代码和环境恢复）、自动规划市场、向量记忆、无界自我复制、插件 marketplace、模型自动安装插件和 UI-first 的内核设计都延后到有证据证明其必要性。

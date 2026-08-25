@@ -8,7 +8,7 @@ Nausicaa 的核心不是再开一个“反思 Agent”，而是验证一种异�
 
 ## Decision
 
-将第一条辅助线命名为 **Teto 线（Teto Lane）**，技术角色名为 `IntentNavigator`。名称借用《风之谷》中 Teto 作为伴随和感知的意象。Teto 通过 `observes` + `advises` 边订阅目标、计划、决策和未决问题，按需查询局部 Evidence，输出 `orientation`、`intent-gap` 或 `method-alternative` Advice。
+将第一条辅助线命名为 **Teto 线（Teto Lane）**，技术角色名为 `IntentNavigator`。名称借用《风之谷》中 Teto 作为伴随和感知的意象。Teto 通过 `observes` + `advises` 边挂接 Main，只接收最小唤醒信息，再通过 Fukai 按需查询局部 Evidence，输出 `orientation`、`intent-gap` 或 `method-alternative` Advice。
 
 Advice 进入 Inbox，在 Main 的自然决策边界处理为 `accept`、`defer` 或 `reject`。Teto 默认只读，无工具写权限，不执行 bug 检查，也不直接改变 Main 状态。
 
