@@ -1,0 +1,202 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import type { AppendEvent, EventType } from "../../src/domain/events.js";
+import type { Clock } from "../../src/domain/ports.js";
+import {
+  IdempotencyConflictError,
+  JsonlLedger,
+  type Ledger,
+  MemoryLedger,
+} from "../../src/ledger/index.js";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories.splice(0).map((path) => rm(path, {
+      recursive: true,
+      force: true,
+    })),
+  );
+});
+
+function input<K extends EventType>(
+  type: K,
+  payload: AppendEvent<K>["payload"],
+  options: Partial<Pick<AppendEvent<K>, "runId" | "laneId" | "idempotencyKey">> = {},
+): AppendEvent<K> {
+  return {
+    runId: options.runId ?? "run-1",
+    laneId: options.laneId ?? "main",
+    type,
+    payload,
+    correlationId: "correlation-1",
+    idempotencyKey: options.idempotencyKey ?? `${type}-1`,
+  };
+}
+
+function deterministicOptions() {
+  let id = 0;
+  let tick = 0;
+  const clock: Clock = {
+    now: () => new Date(Date.UTC(2026, 0, 1, 0, 0, tick++)),
+  };
+  return {
+    clock,
+    createEventId: () => `event-${++id}`,
+  };
+}
+
+async function ledgerImplementations(): Promise<Array<{
+  name: string;
+  ledger: Ledger;
+}>> {
+  const directory = await mkdtemp(join(tmpdir(), "nausicaa-ledger-unit-"));
+  temporaryDirectories.push(directory);
+  return [
+    { name: "memory", ledger: new MemoryLedger(deterministicOptions()) },
+    {
+      name: "jsonl",
+      ledger: await JsonlLedger.open(
+        join(directory, "events.jsonl"),
+        deterministicOptions(),
+      ),
+    },
+  ];
+}
+
+describe("Ledger conformance", () => {
+  it("assigns global offsets and run-local lane sequences", async () => {
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        const first = await ledger.append(input("lane.registered", { kind: "main" }));
+        const second = await ledger.append(input(
+          "lane.registered",
+          { kind: "intent-navigator" },
+          { laneId: "teto", idempotencyKey: "register-teto" },
+        ));
+        const third = await ledger.append(input(
+          "lane.status",
+          { status: "running" },
+          { idempotencyKey: "main-running" },
+        ));
+
+        expect([first.globalOffset, second.globalOffset, third.globalOffset]).toEqual([1, 2, 3]);
+        expect([first.laneSeq, second.laneSeq, third.laneSeq]).toEqual([1, 1, 2]);
+        expect(await ledger.watermark()).toBe(3);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
+  it("returns the original event for an idempotent retry", async () => {
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        const command = input("lane.registered", { kind: "main" });
+        const first = await ledger.append(command);
+        const retried = await ledger.append(command);
+
+        expect(retried).toEqual(first);
+        expect(await ledger.watermark()).toBe(1);
+        expect(await ledger.read()).toEqual([first]);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
+  it("rejects an idempotency key reused for a different fact", async () => {
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        await ledger.append(input("lane.status", { status: "ready" }));
+        await expect(ledger.append(input("lane.status", { status: "failed" })))
+          .rejects.toBeInstanceOf(IdempotencyConflictError);
+        expect(await ledger.watermark()).toBe(1);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
+  it("filters reads without exposing mutable internal events", async () => {
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        await ledger.append(input("lane.registered", { kind: "main" }));
+        await ledger.append(input(
+          "lane.registered",
+          { kind: "main" },
+          { runId: "run-2", idempotencyKey: "run-2-lane" },
+        ));
+        const third = await ledger.append(input(
+          "lane.status",
+          { status: "running" },
+          { idempotencyKey: "main-running" },
+        ));
+
+        const filtered = await ledger.read({ runId: "run-1", afterOffset: 1 });
+        expect(filtered).toEqual([third]);
+        filtered[0]!.payload = { status: "failed" };
+        expect((await ledger.read({ afterOffset: 2 }))[0]).toEqual(third);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
+  it("serializes concurrent appends in call order", async () => {
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        const events = await Promise.all(
+          Array.from({ length: 20 }, (_, index) => ledger.append(input(
+            "step.started",
+            { step: index + 1 },
+            { idempotencyKey: `step-${index + 1}` },
+          ))),
+        );
+        expect(events.map((event) => event.globalOffset)).toEqual(
+          Array.from({ length: 20 }, (_, index) => index + 1),
+        );
+        expect(events.map((event) => event.laneSeq)).toEqual(
+          Array.from({ length: 20 }, (_, index) => index + 1),
+        );
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
+  it("drains an accepted JSONL append before close", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "nausicaa-ledger-close-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "events.jsonl");
+    const ledger = await JsonlLedger.open(path, deterministicOptions());
+
+    const append = ledger.append(input("lane.registered", { kind: "main" }));
+    const close = ledger.close();
+    await expect(append).resolves.toMatchObject({ globalOffset: 1, laneSeq: 1 });
+    await expect(close).resolves.toBeUndefined();
+
+    const reopened = await JsonlLedger.open(path);
+    expect(await reopened.watermark()).toBe(1);
+    await reopened.close();
+  });
+
+  it("rejects NUL-delimited identifier ambiguity", async () => {
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        await expect(ledger.append(input(
+          "lane.registered",
+          { kind: "main" },
+          { runId: "run\0other" },
+        ))).rejects.toThrow(/runId/);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+});

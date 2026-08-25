@@ -1,0 +1,47 @@
+{
+  "name": "nausicaa",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A lightweight, ledger-driven multi-lane agent harness.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "nausicaa": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run --exclude 'test/live/**' --exclude 'test/eval/**' --exclude 'test/smoke/**'",
+    "test:unit": "vitest run test/unit",
+    "test:protocol": "vitest run test/protocol",
+    "test:recovery": "vitest run test/recovery",
+    "test:smoke": "npm run build && vitest run test/smoke",
+    "test:live": "vitest run test/live --passWithNoTests",
+    "eval": "vitest run test/eval --passWithNoTests",
+    "check": "npm run typecheck && npm test && npm run test:smoke"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.84.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "fast-check": "^4.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
