@@ -1,10 +1,15 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { AgentTool, ModelPort, ModelResponse } from "../../src/domain/index.js";
+import type {
+  AgentTool,
+  ModelPort,
+  ModelResponse,
+  UserImage,
+} from "../../src/domain/index.js";
 import { JsonlLedger } from "../../src/ledger/index.js";
 import { ScriptedModel, type ScriptedModelStep } from "../../src/model/index.js";
 import { executeRun } from "../../src/runtime/index.js";
@@ -28,6 +33,7 @@ describe("executeRun", () => {
       dataDir: join(root, "state"),
       model: "scripted",
       message: "Inspect the workspace",
+      maxOutputTokens: 8_192,
       policy: { maxMainSteps: 3, tetoEnabled: false },
     }, {
       mainModel: model,
@@ -43,9 +49,33 @@ describe("executeRun", () => {
     });
     expect(events).toContain("run.created");
     expect(events).toContain("run.completed");
+    expect(model.requests[0]?.maxOutputTokens).toBe(8_192);
     const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
     expect((await ledger.read()).at(-1)?.type).toBe("checkpoint.committed");
     await ledger.close();
+  });
+
+  it("rejects an unsafe per-call output limit", async () => {
+    const root = await temporaryRoot();
+    await expect(executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect the workspace",
+      maxOutputTokens: 1_000_001,
+    }, {
+      mainModel: new ScriptedModel([response("unused")]),
+    })).rejects.toThrow(/maxOutputTokens.*1.*1000000/i);
+
+    await expect(executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect the workspace",
+      policy: { tetoMaxOutputTokens: 0 },
+    }, {
+      mainModel: new ScriptedModel([response("unused")]),
+    })).rejects.toThrow("tetoMaxOutputTokens must be a positive integer");
   });
 
   it("runs Teto sparsely beside Main and records a silent pass", async () => {
@@ -98,7 +128,6 @@ describe("executeRun", () => {
       await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
       return response('{"action":"silent"}', 20, 5);
     }]);
-    const startedAt = Date.now();
     const result = await executeRun({
       workspace: root,
       dataDir: join(root, "state"),
@@ -114,7 +143,6 @@ describe("executeRun", () => {
     });
 
     expect(result).toMatchObject({ completed: true, finalText: "Done" });
-    expect(Date.now() - startedAt).toBeLessThan(700);
     const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
     const events = await ledger.read({ runId: result.runId });
     expect(events.some((event) => event.type === "teto.observed")).toBe(false);
@@ -243,21 +271,181 @@ describe("executeRun", () => {
     await ledger.close();
   });
 
+  it("records shadow Advice without exposing or delivering it to Main", async () => {
+    const root = await temporaryRoot();
+    const mainResponses: ScriptedModelStep[] = Array.from({ length: 5 }, (_, index) => ({
+      ...response(`Step ${index + 1}`, 1_800, 200),
+      stopReason: "toolUse",
+      toolCalls: [{ id: `shadow-call-${index + 1}`, name: "noop", arguments: {} }],
+    }));
+    mainResponses.push(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 40));
+      return {
+        ...response("Wait for shadow observation", 1_800, 200),
+        stopReason: "toolUse",
+        toolCalls: [{ id: "shadow-call-6", name: "noop", arguments: {} }],
+      };
+    });
+    mainResponses.push((request) => {
+      expect(request.messages.some((message) =>
+        message.role === "user" && message.content.includes("adviceId:"),
+      )).toBe(false);
+      return response("Done without visible Advice", 1_800, 200);
+    });
+    const tetoAdvice = JSON.stringify({
+      kind: "orientation",
+      claim: "The current method may drift from the requested scope.",
+      evidenceRefs: [],
+      confidence: 0.85,
+      risk: "medium",
+      suggestedAction: "Reconfirm the requested scope before continuing.",
+      urgency: "next-step",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      dedupeKey: "shadow-scope-check",
+    });
+
+    const shadowMain = new ScriptedModel(mainResponses);
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "main-scripted",
+      tetoModel: "teto-scripted",
+      adviceDelivery: "shadow",
+      message: "Inspect only the requested installation scope",
+      policy: { maxMainSteps: 7, maxModelTokens: 50_000 },
+    }, {
+      mainModel: shadowMain,
+      tetoModel: new ScriptedModel([response(tetoAdvice, 150, 20)]),
+      tools: [noopTool],
+      createRunId: () => "run-shadow-advice",
+    });
+
+    expect(result.finalText).toBe("Done without visible Advice");
+    const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
+    const events = await ledger.read({ runId: result.runId });
+    expect(events.filter((event) => event.type === "teto.advice.generated"))
+      .toHaveLength(1);
+    expect(events.find((event) => event.type === "teto.advice.generated")?.payload)
+      .toMatchObject({ delivery: "shadow" });
+    expect(events.some((event) => event.type === "message.sent")).toBe(false);
+    expect(events.some((event) => event.type === "message.claimed")).toBe(false);
+    expect(events.some((event) => event.type === "advice.acknowledged")).toBe(false);
+    expect(shadowMain.requests.every((request) =>
+      request.tools.every((tool) => tool.name !== "respond_to_advice"),
+    )).toBe(true);
+    await ledger.close();
+  });
+
+  it("runs an equal-budget private reflection arm without Teto context or Advice", async () => {
+    const root = await temporaryRoot();
+    const mainResponses: ScriptedModelStep[] = Array.from({ length: 5 }, (_, index) => ({
+      ...response(`Step ${index + 1}`, 1_800, 200),
+      stopReason: "toolUse",
+      toolCalls: [{ id: `reflection-call-${index + 1}`, name: "noop", arguments: {} }],
+    }));
+    mainResponses.push(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 40));
+      return {
+        ...response("Wait for self-reflection", 1_800, 200),
+        stopReason: "toolUse",
+        toolCalls: [{ id: "reflection-call-6", name: "noop", arguments: {} }],
+      };
+    });
+    mainResponses.push((request) => {
+      const reflection = request.messages.find((message) =>
+        message.role === "user"
+        && message.content.includes("Runtime reflection")
+        && message.content.includes("broader than the requested scope"),
+      );
+      if (reflection === undefined) throw new Error("Self-reflection was not returned to Main");
+      return response("Done after bounded self-reflection", 1_800, 200);
+    });
+    const mainModel = new ScriptedModel(mainResponses);
+    const reflectionModel = new ScriptedModel([response(JSON.stringify({
+      action: "revise",
+      note: "The current method may be broader than the requested scope.",
+    }), 150, 20)]);
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "main-scripted",
+      reflectionModel: "reflection-scripted",
+      auxiliaryMode: "reflection",
+      message: "Inspect installation prerequisites",
+      policy: {
+        maxMainSteps: 7,
+        maxModelTokens: 50_000,
+        tetoMaxOutputTokens: 200,
+        tetoTokenRatio: 0.1,
+      },
+    }, {
+      mainModel,
+      reflectionModel,
+      tools: [noopTool],
+      createRunId: () => "run-equal-budget-reflection",
+    });
+
+    expect(result.finalText).toBe("Done after bounded self-reflection");
+    expect(mainModel.callCount).toBe(7);
+    expect(reflectionModel.callCount).toBe(1);
+    expect(reflectionModel.requests[0]).toMatchObject({
+      laneId: "reflection",
+      model: "reflection-scripted",
+      tools: [],
+      maxOutputTokens: 200,
+    });
+    const reflectionInput = reflectionModel.requests[0]?.messages[0]?.content ?? "";
+    expect(reflectionInput).toContain('"latestDecision"');
+    expect(reflectionInput).not.toContain('"budget"');
+    expect(reflectionInput).not.toContain('"previousAdviceOutcome"');
+    expect(mainModel.requests.every((request) =>
+      request.tools.every((tool) => tool.name !== "respond_to_advice"),
+    )).toBe(true);
+    expect(mainModel.requests.some((request) =>
+      request.messages.some((message) => message.content.includes("broader than the requested scope")),
+    )).toBe(true);
+
+    const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
+    const events = await ledger.read({ runId: result.runId });
+    expect(events.some((event) =>
+      event.type === "lane.registered"
+      && event.laneId === "reflection"
+      && event.payload.kind === "reflection",
+    )).toBe(true);
+    expect(events.filter((event) => event.type === "reflection.observed"))
+      .toHaveLength(1);
+    expect(events.find((event) => event.type === "reflection.observed")?.payload)
+      .toMatchObject({ action: "revise", usage: { input: 150, output: 20 } });
+    expect(events.filter((event) => event.type === "reflection.delivered"))
+      .toHaveLength(1);
+    expect(events.some((event) => event.type === "teto.observed")).toBe(false);
+    expect(events.some((event) => event.type === "message.sent")).toBe(false);
+    expect(events.some((event) =>
+      event.type === "budget.charged" && event.laneId === "reflection",
+    )).toBe(true);
+    await ledger.close();
+  });
+
   it("does not let a slow observer delay Main failure handling", async () => {
     const root = await temporaryRoot();
+    let markTetoStarted: (() => void) | undefined;
+    const tetoStarted = new Promise<void>((resolve) => { markTetoStarted = resolve; });
     const mainScript: ScriptedModelStep[] = Array.from({ length: 5 }, (_, index) => ({
       ...response(`Step ${index + 1}`, 1_000, 200),
       stopReason: "toolUse",
       toolCalls: [{ id: `failure-call-${index + 1}`, name: "noop", arguments: {} }],
     }));
-    mainScript.push(new Error("Main provider failed"));
+    mainScript.push(async () => {
+      await tetoStarted;
+      throw new Error("Main provider failed");
+    });
     const slowTeto = new ScriptedModel([async () => {
-      await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
-      return response('{"action":"silent"}', 20, 5);
+      markTetoStarted?.();
+      return new Promise<ModelResponse>(() => undefined);
     }]);
-    const startedAt = Date.now();
 
-    await expect(executeRun({
+    const execution = executeRun({
       workspace: root,
       dataDir: join(root, "state"),
       model: "main-scripted",
@@ -269,9 +457,10 @@ describe("executeRun", () => {
       tetoModel: slowTeto,
       tools: [noopTool],
       createRunId: () => "run-main-failure-slow-teto",
-    })).rejects.toThrow("Main provider failed");
+    });
 
-    expect(Date.now() - startedAt).toBeLessThan(700);
+    await tetoStarted;
+    await expect(execution).rejects.toThrow("Main provider failed");
     const ledger = await JsonlLedger.open(join(
       root,
       "state",
@@ -301,6 +490,7 @@ describe("executeRun", () => {
       createRunId: () => "resumable-run",
     });
     expect(first.completed).toBe(false);
+    expect(first.blocker).toBe("model-output-limit");
 
     const resumedModel = new ScriptedModel([response("Complete answer")]);
     const resumed = await executeRun({
@@ -308,18 +498,66 @@ describe("executeRun", () => {
       dataDir,
       model: "scripted",
       resumeRunId: first.runId,
+      maxOutputTokens: 6_144,
     }, { mainModel: resumedModel });
 
     expect(resumed).toMatchObject({ completed: true, finalText: "Complete answer" });
+    expect(resumedModel.requests[0]?.maxOutputTokens).toBe(6_144);
     expect(resumedModel.requests[0]?.messages.map((message) => message.content)).toEqual([
       "Produce a complete answer",
       "Partial answer",
+      expect.stringContaining("Continue exactly where it stopped"),
     ]);
     const ledger = await JsonlLedger.open(join(resumed.stateDir, "ledger.jsonl"));
     const events = await ledger.read({ runId: resumed.runId });
     expect(events.filter((event) => event.type === "run.resumed")).toHaveLength(1);
     expect(events.filter((event) => event.type === "user.message")).toHaveLength(1);
     await ledger.close();
+  });
+
+  it("preserves one-shot images across recovery without writing them to the Ledger", async () => {
+    const root = await temporaryRoot();
+    const dataDir = join(root, "state");
+    const attachedImage = image("one-shot-recovery-image");
+    const firstModel = new ScriptedModel([{
+      ...response("Partial image analysis"),
+      stopReason: "length",
+    }]);
+    const first = await executeRun({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      message: "Analyze the attached image",
+      images: [attachedImage],
+      policy: { maxMainSteps: 2, tetoEnabled: false },
+    }, {
+      mainModel: firstModel,
+      createRunId: () => "image-recovery-run",
+    });
+
+    expect(first).toMatchObject({ completed: false, blocker: "model-output-limit" });
+    expect(firstModel.requests[0]?.messages.find((message) => message.role === "user"))
+      .toMatchObject({
+        content: "Analyze the attached image",
+        images: [attachedImage],
+      });
+    expect(await readFile(join(first.stateDir, "ledger.jsonl"), "utf8"))
+      .not.toContain(attachedImage.data);
+
+    const resumedModel = new ScriptedModel([response("Complete image analysis")]);
+    const resumed = await executeRun({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      resumeRunId: first.runId,
+    }, { mainModel: resumedModel });
+
+    expect(resumed).toMatchObject({ completed: true, finalText: "Complete image analysis" });
+    expect(resumedModel.requests[0]?.messages.find((message) =>
+      message.role === "user" && message.content === "Analyze the attached image",
+    )).toMatchObject({ images: [attachedImage] });
+    expect(await readFile(join(resumed.stateDir, "ledger.jsonl"), "utf8"))
+      .not.toContain(attachedImage.data);
   });
 
   it("does not let an observer failure undo a committed event", async () => {
@@ -387,6 +625,15 @@ const response = (content: string, input = 20, output = 5): ModelResponse => ({
   toolCalls: [],
   stopReason: "stop",
   usage: { input, output, cacheRead: 0, cacheWrite: 0 },
+});
+
+const image = (
+  payload: string,
+  mimeType: UserImage["mimeType"] = "image/png",
+): UserImage => ({
+  type: "image",
+  data: Buffer.from(payload).toString("base64"),
+  mimeType,
 });
 
 const temporaryRoot = async (): Promise<string> => {

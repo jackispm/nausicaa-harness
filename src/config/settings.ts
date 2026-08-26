@@ -2,13 +2,20 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
+import {
+  DEFAULT_MAIN_OUTPUT_TOKENS,
+  MAX_MAIN_OUTPUT_TOKENS,
+} from "../domain/types.js";
+
 export interface Settings {
   model?: string;
   tetoModel?: string;
   tetoEnabled?: boolean;
   maxSteps?: number;
   maxModelTokens?: number;
+  maxOutputTokens?: number;
   dataDir?: string;
+  allowShell?: boolean;
   allowWrite?: boolean;
 }
 
@@ -18,7 +25,9 @@ export interface ResolvedSettings {
   tetoEnabled: boolean;
   maxSteps: number;
   maxModelTokens: number;
+  maxOutputTokens: number;
   dataDir: string;
+  allowShell: boolean;
   allowWrite: boolean;
 }
 
@@ -35,7 +44,9 @@ const allowedKeys = new Set<keyof Settings>([
   "tetoEnabled",
   "maxSteps",
   "maxModelTokens",
+  "maxOutputTokens",
   "dataDir",
+  "allowShell",
   "allowWrite",
 ]);
 
@@ -78,7 +89,14 @@ export const resolveSettings = (
       1,
       Number.MAX_SAFE_INTEGER,
     ),
+    maxOutputTokens: boundedInteger(
+      merged.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS,
+      "maxOutputTokens",
+      1,
+      MAX_MAIN_OUTPUT_TOKENS,
+    ),
     dataDir: isAbsolute(dataDir) ? resolve(dataDir) : resolve(workspace, dataDir),
+    allowShell: merged.allowShell ?? false,
     allowWrite: merged.allowWrite ?? false,
   };
 };
@@ -112,10 +130,12 @@ const readSettingsFile = async (path: string): Promise<Settings> => {
   validateOptionalString(value.model, "model", path);
   validateOptionalString(value.tetoModel, "tetoModel", path);
   validateOptionalString(value.dataDir, "dataDir", path);
+  validateOptionalBoolean(value.allowShell, "allowShell", path);
   validateOptionalBoolean(value.allowWrite, "allowWrite", path);
   validateOptionalBoolean(value.tetoEnabled, "tetoEnabled", path);
   validateOptionalInteger(value.maxSteps, "maxSteps", path);
   validateOptionalInteger(value.maxModelTokens, "maxModelTokens", path);
+  validateOptionalInteger(value.maxOutputTokens, "maxOutputTokens", path);
   return value as Settings;
 };
 

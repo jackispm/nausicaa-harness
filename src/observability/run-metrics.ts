@@ -21,6 +21,14 @@ export interface CacheMetrics {
   known: number;
   hitRate: number;
   writeRate: number;
+  /** Number of model requests that carried a stable prompt/tool prefix hash. */
+  prefixSamples: number;
+  /** Distinct prefix hashes observed by this lane. */
+  uniquePrefixes: number;
+  /** Adjacent prefix changes; high churn can reduce provider cache reuse. */
+  prefixChanges: number;
+  /** Fraction of adjacent samples that kept the same stable prefix. */
+  stablePrefixRate: number;
 }
 
 export interface AdviceMetrics {
@@ -72,9 +80,16 @@ interface MutableLaneMetrics {
   contextBuildMs: number[];
   modelLatencyMs: number[];
   cacheOutcomes: CacheOutcome[];
+  prefixObservations: PrefixObservation[];
   tetoPasses: number;
   advice: AdviceMetrics;
   budgetEvents: number;
+}
+
+interface PrefixObservation {
+  hash: string;
+  laneId: LaneId;
+  globalOffset: number;
 }
 
 const emptyUsage = (): TokenUsage => ({
@@ -101,6 +116,10 @@ const emptyCache = (): CacheMetrics => ({
   known: 0,
   hitRate: 0,
   writeRate: 0,
+  prefixSamples: 0,
+  uniquePrefixes: 0,
+  prefixChanges: 0,
+  stablePrefixRate: 0,
 });
 
 const emptyLatency = (): LatencyStats => ({
@@ -143,6 +162,7 @@ export function projectRunMetrics(
       contextBuildMs: [],
       modelLatencyMs: [],
       cacheOutcomes: [],
+      prefixObservations: [],
       tetoPasses: 0,
       advice: emptyAdvice(),
       budgetEvents: 0,
@@ -166,6 +186,13 @@ export function projectRunMetrics(
     switch (event.type) {
       case "model.requested":
         current.modelRequests += 1;
+        if (event.payload.prefixHash !== undefined) {
+          current.prefixObservations.push({
+            hash: event.payload.prefixHash,
+            laneId: event.laneId,
+            globalOffset: event.globalOffset,
+          });
+        }
         if (event.payload.contextBuildMs !== undefined) {
           current.contextBuildMs.push(event.payload.contextBuildMs);
         }
@@ -255,7 +282,7 @@ export function projectRunMetrics(
 }
 
 function finalizeLane(item: MutableLaneMetrics): LaneRunMetrics {
-  const cache = cacheMetrics(item.cacheOutcomes);
+  const cache = cacheMetrics(item.cacheOutcomes, item.prefixObservations);
   const chargedUsage = item.chargedUsage;
   const usage = item.modelCompletions + item.tetoPasses > 0
     ? item.modelUsage
@@ -296,6 +323,9 @@ function mergeMutableLanes(
     contextBuildMs: values.flatMap((item) => item.contextBuildMs),
     modelLatencyMs: values.flatMap((item) => item.modelLatencyMs),
     cacheOutcomes: values.flatMap((item) => item.cacheOutcomes),
+    prefixObservations: values
+      .flatMap((item) => item.prefixObservations)
+      .sort((left, right) => left.globalOffset - right.globalOffset),
     tetoPasses: values.reduce((sum, item) => sum + item.tetoPasses, 0),
     advice: values.reduce((sum, item) => mergeAdvice(sum, item.advice), emptyAdvice()),
     budgetEvents: values.reduce((sum, item) => sum + item.budgetEvents, 0),
@@ -312,7 +342,10 @@ function mergeAdvice(left: AdviceMetrics, right: AdviceMetrics): AdviceMetrics {
   };
 }
 
-function cacheMetrics(outcomes: readonly CacheOutcome[]): CacheMetrics {
+function cacheMetrics(
+  outcomes: readonly CacheOutcome[],
+  prefixObservations: readonly PrefixObservation[],
+): CacheMetrics {
   const result = emptyCache();
   for (const outcome of outcomes) {
     result.total += 1;
@@ -321,6 +354,26 @@ function cacheMetrics(outcomes: readonly CacheOutcome[]): CacheMetrics {
   result.known = result.total - result.unknown;
   result.hitRate = result.known === 0 ? 0 : (result.hit + result.hitWrite) / result.known;
   result.writeRate = result.known === 0 ? 0 : (result.write + result.hitWrite) / result.known;
+  const ordered = prefixObservations
+    .slice()
+    .sort((left, right) => left.globalOffset - right.globalOffset);
+  const previousByLane = new Map<LaneId, string>();
+  let comparable = 0;
+  for (const observation of ordered) {
+    const previous = previousByLane.get(observation.laneId);
+    if (previous !== undefined) {
+      comparable += 1;
+      if (previous !== observation.hash) result.prefixChanges += 1;
+    }
+    previousByLane.set(observation.laneId, observation.hash);
+  }
+  result.prefixSamples = ordered.length;
+  result.uniquePrefixes = new Set(ordered.map((observation) => observation.hash)).size;
+  result.stablePrefixRate = ordered.length === 0
+    ? 0
+    : comparable === 0
+      ? 1
+      : 1 - result.prefixChanges / comparable;
   return result;
 }
 

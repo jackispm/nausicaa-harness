@@ -1,5 +1,6 @@
 import type {
   A2AMessage,
+  Advice,
   AdviceDisposition,
   ArtifactRef,
   EventId,
@@ -19,6 +20,22 @@ import type {
 
 export type InputDelivery = "new-turn" | "steering" | "follow-up";
 export type UserMessageKind = "initial" | "steering";
+
+export type ContextTruncationKind =
+  | "input-token-budget"
+  | "conversation-message-limit"
+  | "artifact-count-limit"
+  | "artifact-byte-limit"
+  | "query-limit"
+  | "missing-conversation"
+  | "missing-artifact"
+  | "conversation-shape";
+
+export interface ContextTruncation {
+  kind: ContextTruncationKind;
+  ref?: string;
+  detail: string;
+}
 
 export interface EventPayloadMap {
   "run.created": { goal: Goal; workspace: string; policy: RunPolicy };
@@ -65,10 +82,14 @@ export interface EventPayloadMap {
     model: string;
     requestHash: string;
     contextWatermark: number;
+    /** Provider cache affinity. Optional for schema-v1 legacy events. */
+    sessionId?: string;
     /** Stable prompt/tool prefix hash. Optional for schema-v1 legacy events. */
     prefixHash?: string;
     /** Artifact/content dependencies selected by Fukai. */
     dependencyRefs?: string[];
+    /** Explicit context omissions/bounds. Optional for schema-v1 legacy events. */
+    truncations?: ContextTruncation[];
     /** Time spent building the model context, in milliseconds. */
     contextBuildMs?: number;
   };
@@ -112,6 +133,18 @@ export interface EventPayloadMap {
   "message.sent": { message: A2AMessage };
   "message.claimed": { messageId: string; claimedBy: LaneId };
   "message.handled": { messageId: string };
+  "teto.advice.generated": {
+    advice: Advice;
+    delivery: "live" | "shadow";
+  };
+  "reflection.observed": {
+    mainCallIndex: number;
+    trigger: string;
+    action: "silent" | "revise";
+    reflectionRef: ArtifactRef;
+    usage: TokenUsage;
+  };
+  "reflection.delivered": { mainCallIndex: number; messageId: string };
   "advice.acknowledged": {
     adviceId: string;
     disposition: AdviceDisposition;
@@ -125,6 +158,35 @@ export interface EventPayloadMap {
   };
   "budget.charged": { laneId: LaneId; usage: TokenUsage };
   "checkpoint.committed": { watermark: number; checksum: string };
+  "fukai.query.audit": {
+    queryId: string;
+    operation: "events" | "artifact";
+    reason: string;
+    filterHash: string;
+    cursor: string;
+    nextCursor: string;
+    upperWatermark: number;
+    status: "ok" | "truncated" | "denied" | "not-found" | "stale";
+    budget: {
+      maxEvents: number;
+      maxBytes: number;
+      maxTokens: number;
+      maxWallClockMs: number;
+    };
+    usage: { events: number; bytes: number; tokens: number };
+    returnedCount: number;
+    deniedCount: number;
+    evidenceRefs: string[];
+    resultHash: string;
+  };
+  "fukai.checkpoint.committed": {
+    cursor: string;
+    upperWatermark: number;
+    goalVersion: number;
+    stateRefs: ArtifactRef[];
+    stateHash: string;
+    policyVersion: string;
+  };
 }
 
 export type EventType = keyof EventPayloadMap;

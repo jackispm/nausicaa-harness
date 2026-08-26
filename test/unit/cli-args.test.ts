@@ -23,6 +23,22 @@ describe("parseCliArgs", () => {
     expect(parseCliArgs([], "/work")).not.toHaveProperty("message");
   });
 
+  it("separates Prime-style @image operands from the task", () => {
+    expect(parseCliArgs([
+      "@screens/first.png",
+      "inspect",
+      "@screens/second.webp",
+    ], "/work")).toMatchObject({
+      fileArgs: ["screens/first.png", "screens/second.webp"],
+      message: "inspect",
+    });
+    expect(parseCliArgs(["--", "@literal"], "/work")).toMatchObject({
+      fileArgs: [],
+      message: "@literal",
+    });
+    expect(() => parseCliArgs(["@"], "/work")).toThrow(/image path/i);
+  });
+
   it("tracks explicitly selected output modes", () => {
     expect(parseCliArgs(["-p", "task"], "/work")).toMatchObject({
       mode: "print",
@@ -50,10 +66,13 @@ describe("parseCliArgs", () => {
           "openrouter:openai/gpt-5-mini",
           "--main-only",
           "--allow-write",
+          "--allow-shell",
           "--resume",
           "run-7",
           "--max-steps",
           "8",
+          "--max-output-tokens",
+          "8192",
           "task",
         ],
         "/work",
@@ -64,8 +83,10 @@ describe("parseCliArgs", () => {
       model: "openrouter:openai/gpt-5-mini",
       tetoEnabled: false,
       allowWrite: true,
+      allowShell: true,
       resume: "run-7",
       maxSteps: 8,
+      maxOutputTokens: 8192,
       message: "task",
     });
   });
@@ -78,12 +99,32 @@ describe("parseCliArgs", () => {
     });
   });
 
+  it("leaves shell access unset unless explicitly requested", () => {
+    expect(parseCliArgs(["--allow-write", "task"], "/work").allowShell)
+      .toBeUndefined();
+    const options = parseCliArgs(["--allow-shell", "task"], "/work");
+    expect(options).toMatchObject({
+      allowShell: true,
+      message: "task",
+    });
+    expect(options.allowWrite).toBeUndefined();
+  });
+
   it("rejects malformed or unknown options", () => {
     expect(() => parseCliArgs(["--mode", "rpc"], "/work")).toThrow(
       CliUsageError,
     );
     expect(() => parseCliArgs(["--wat"], "/work")).toThrow(CliUsageError);
     expect(() => parseCliArgs(["--max-steps", "0"], "/work")).toThrow(
+      CliUsageError,
+    );
+    expect(() => parseCliArgs(["--max-output-tokens", "0"], "/work")).toThrow(
+      CliUsageError,
+    );
+    expect(() => parseCliArgs(["--max-output-tokens", "1000001"], "/work")).toThrow(
+      CliUsageError,
+    );
+    expect(() => parseCliArgs(["--max-output-tokens", "1.5"], "/work")).toThrow(
       CliUsageError,
     );
     expect(() => parseCliArgs(["--resolve-operation", "op-1"], "/work")).toThrow(
@@ -121,5 +162,7 @@ describe("parseCliArgs", () => {
   it("documents interactive and latest-Run options", () => {
     expect(usage).toContain("--mode <interactive|print|json>");
     expect(usage).toContain("--continue");
+    expect(usage).toContain("--max-output-tokens");
+    expect(usage).toMatch(/--allow-shell.*high privilege.*read\/write outside the workspace/i);
   });
 });

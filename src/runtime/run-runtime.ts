@@ -19,8 +19,14 @@ import type {
   Goal,
   RunPolicy,
   TokenUsage,
+  AuxiliaryMode,
 } from "../domain/types.js";
-import { mainStepAllowance } from "../domain/types.js";
+import { type UserImage, validateUserImages } from "../domain/images.js";
+import {
+  DEFAULT_MAIN_OUTPUT_TOKENS,
+  MAX_MAIN_OUTPUT_TOKENS,
+  mainStepAllowance,
+} from "../domain/types.js";
 import {
   ContentStoreFukaiSource,
   FukaiContextProvider,
@@ -46,25 +52,36 @@ import {
   resolvePendingToolOperation,
   type RunRecoveryState,
 } from "./recovery.js";
+import { resolveRunPolicy } from "./run-policy.js";
 import { TetoScheduler } from "./teto-scheduler.js";
+import type { TetoAdviceDelivery } from "./teto-scheduler.js";
+import { ReflectionScheduler } from "./reflection-scheduler.js";
 
 export interface RunExecutionRequest {
   workspace: string;
   dataDir: string;
   model: string;
   tetoModel?: string;
+  reflectionModel?: string;
+  /** Evaluation-only auxiliary topology. Defaults to Teto when enabled by policy. */
+  auxiliaryMode?: AuxiliaryMode;
+  adviceDelivery?: TetoAdviceDelivery;
   message?: string;
+  images?: UserImage[];
   goal?: Goal;
   resumeRunId?: string;
   resolveOperationId?: string;
   policy?: Partial<RunPolicy>;
+  maxOutputTokens?: number;
   allowWrite?: boolean;
+  allowShell?: boolean;
   signal?: AbortSignal;
 }
 
 export interface RunExecutionDeps {
   mainModel?: ModelPort;
   tetoModel?: ModelPort;
+  reflectionModel?: ModelPort;
   tools?: readonly AgentTool[];
   clock?: Clock;
   createRunId?: () => string;
@@ -79,15 +96,8 @@ export interface RunExecutionResult {
   usage: TokenUsage;
   metrics: RunMetrics;
   stateDir: string;
+  blocker?: "model-output-limit" | "run-budget-or-step-limit" | "resumable-boundary";
 }
-
-const DEFAULT_POLICY: RunPolicy = {
-  maxMainStepsPerActivation: 24,
-  maxModelTokens: 200_000,
-  tetoEnabled: true,
-  tetoMaxOutputTokens: 200,
-  tetoTokenRatio: 0.1,
-};
 
 export const executeRun = async (
   request: RunExecutionRequest,
@@ -100,7 +110,7 @@ export const executeRun = async (
   validateRunId(runId);
   const stateDir = resolve(request.dataDir, "runs", runId);
   const ledger = await JsonlLedger.open(resolve(stateDir, "ledger.jsonl"));
-  let scheduler: TetoScheduler | undefined;
+  let scheduler: TetoScheduler | ReflectionScheduler | undefined;
 
   try {
     const sink = new ObservableEventSink(ledger, deps.onEvent);
@@ -129,10 +139,34 @@ export const executeRun = async (
       };
     }
 
+    const requestedAuxiliaryMode = request.auxiliaryMode
+      ?? (request.policy?.tetoEnabled === false ? "none" : "teto");
     const setup = recovered === undefined
-      ? await createNewRun(sink, request, runId, workspace, clock)
+      ? await createNewRun(sink, request, runId, workspace, clock, requestedAuxiliaryMode)
       : await resumeExistingRun(sink, recovered, clock);
     const policy = setup.policy;
+    const auxiliaryMode = request.auxiliaryMode
+      ?? policy.auxiliaryMode
+      ?? (policy.tetoEnabled ? "teto" : "none");
+    const adviceDelivery = request.adviceDelivery
+      ?? policy.tetoAdviceDelivery
+      ?? "live";
+    if (
+      recovered !== undefined
+      && request.auxiliaryMode !== undefined
+      && policy.auxiliaryMode !== undefined
+      && request.auxiliaryMode !== policy.auxiliaryMode
+    ) {
+      throw new Error("Cannot change auxiliaryMode while resuming a Run");
+    }
+    if (
+      recovered !== undefined
+      && request.adviceDelivery !== undefined
+      && policy.tetoAdviceDelivery !== undefined
+      && request.adviceDelivery !== policy.tetoAdviceDelivery
+    ) {
+      throw new Error("Cannot change adviceDelivery while resuming a Run");
+    }
     const priorTokens = totalTokens(setup.priorUsage);
     const remainingModelTokens = Math.max(0, policy.maxModelTokens - priorTokens);
     const legacyStepLimitExhausted = "maxMainSteps" in policy
@@ -157,6 +191,7 @@ export const executeRun = async (
         usage: emptyUsage(),
         metrics,
         stateDir,
+        blocker: "run-budget-or-step-limit",
       };
     }
 
@@ -168,10 +203,11 @@ export const executeRun = async (
     });
     const tools = [...(deps.tools ?? createWorkspaceTools({
       allowWrite: request.allowWrite === true,
+      allowShell: request.allowShell === true,
       protectedPaths: [resolve(request.dataDir)],
     }))];
-    if (policy.tetoEnabled) {
-      tools.push(createAdviceResponseTool(inbox));
+    if (auxiliaryMode === "teto") {
+      if (adviceDelivery === "live") tools.push(createAdviceResponseTool(inbox));
       const tetoModel = deps.tetoModel ?? mainModel;
       scheduler = new TetoScheduler({
         eventSink: sink,
@@ -188,12 +224,35 @@ export const executeRun = async (
         runId,
         goal: setup.goal,
         model: request.tetoModel ?? request.model,
+        policy: { ...policy, tetoEnabled: true },
+        events: setup.events,
+        clock,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+        adviceDelivery,
+      });
+    } else if (auxiliaryMode === "reflection") {
+      scheduler = new ReflectionScheduler({
+        eventSink: sink,
+        modelPort: deps.reflectionModel ?? deps.tetoModel ?? mainModel,
+        store,
+        runId,
+        goal: setup.goal,
+        model: request.reflectionModel ?? request.tetoModel ?? request.model,
         policy,
         events: setup.events,
         clock,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
     }
+
+    const lastModelCompletion = [...setup.events].reverse().find((event): event is Extract<
+      AnyEvent,
+      { type: "model.completed" }
+    > => event.type === "model.completed");
+    let outputContinuationMessageId = request.resumeRunId !== undefined
+      && lastModelCompletion?.payload.stopReason === "length"
+      ? `output-limit-continuation:${lastModelCompletion.eventId}`
+      : undefined;
 
     const loop = new MainLoop({
       model: mainModel,
@@ -202,11 +261,31 @@ export const executeRun = async (
       eventSink: sink,
       tools,
       clock,
-      ...(scheduler === undefined
+      ...(outputContinuationMessageId === undefined && scheduler === undefined
         ? {}
         : {
-            beforeStep: () => scheduler!.beforeMainStep(),
-            afterStep: (context) => scheduler!.enqueue(context),
+            beforeStep: async () => {
+              const continuation = outputContinuationMessageId === undefined
+                ? []
+                : [{
+                    kind: "runtime-notice" as const,
+                    source: "run-runtime",
+                    content: "The previous assistant response reached the model output limit. Continue exactly where it stopped without repeating completed material.",
+                    messageId: outputContinuationMessageId,
+                  }];
+              outputContinuationMessageId = undefined;
+              return [
+                ...continuation,
+                ...await (
+                  scheduler !== undefined && "beforeMainStep" in scheduler
+                    ? scheduler.beforeMainStep()
+                    : Promise.resolve([])
+                ),
+              ];
+            },
+            ...(scheduler === undefined
+              ? {}
+              : { afterStep: (context) => scheduler!.enqueue(context) }),
           }),
     });
 
@@ -217,22 +296,37 @@ export const executeRun = async (
         model: request.model,
         workspace: setup.workspace,
         policy: { ...policy, maxModelTokens: remainingModelTokens },
-        ...(request.message === undefined ? {} : { initialMessage: request.message }),
+        ...(request.message === undefined && (request.images?.length ?? 0) === 0
+          ? {}
+          : { initialMessage: request.message ?? "" }),
+        ...(request.images === undefined
+          ? {}
+          : { initialImages: structuredClone(request.images) }),
         startStep: setup.startStep,
         upperWatermark: setup.upperWatermark,
         conversationRefs: setup.conversationRefs,
+        maxOutputTokens: request.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
 
       if (scheduler !== undefined) {
         await settlesWithin(scheduler.drain(), 25);
       }
+      const blocker: RunExecutionResult["blocker"] = result.completed
+        ? undefined
+        : result.stopReason === "length"
+          ? "model-output-limit"
+          : "resumable-boundary";
       await appendLaneStatus(
         sink,
         runId,
         "main",
         result.completed ? "completed" : "waiting",
-        result.completed ? undefined : "Main stopped at a resumable boundary",
+        result.completed
+          ? undefined
+          : blocker === "model-output-limit"
+            ? "Model output limit reached"
+            : "Main stopped at a resumable boundary",
         `main:status:${result.completed ? "completed" : "waiting"}:${setup.startStep}`,
         clock,
       );
@@ -247,6 +341,7 @@ export const executeRun = async (
         usage: result.usage,
         metrics,
         stateDir,
+        ...(blocker === undefined ? {} : { blocker }),
       };
     } catch (error: unknown) {
       await scheduler?.stop();
@@ -296,17 +391,32 @@ const createNewRun = async (
   runId: string,
   workspace: string,
   clock: Clock,
+  auxiliaryMode: AuxiliaryMode,
 ): Promise<RunSetup> => {
-  if (request.message === undefined) {
-    throw new Error("A new Run requires a task message");
+  if (request.message === undefined && (request.images?.length ?? 0) === 0) {
+    throw new Error("A new Run requires a task message or image");
   }
+  const task = request.message ?? "Analyze the attached image(s)";
   const goal = request.goal ?? {
     version: 1,
-    statement: request.message,
+    statement: task,
     successCriteria: ["Produce a grounded result for the requested task"],
     hardConstraints: [],
   };
-  const policy = resolvePolicy(request.policy);
+  const policy = resolveRunPolicy({
+    ...request.policy,
+    ...(request.auxiliaryMode === undefined
+      ? {}
+      : { auxiliaryMode: request.auxiliaryMode }),
+    ...(request.adviceDelivery === undefined
+      ? {}
+      : { tetoAdviceDelivery: request.adviceDelivery }),
+    ...(auxiliaryMode === "teto"
+      ? { tetoEnabled: true }
+      : auxiliaryMode === "reflection" || auxiliaryMode === "none"
+        ? { tetoEnabled: false }
+        : {}),
+  });
   await sink.append({
     runId,
     laneId: "main",
@@ -326,7 +436,7 @@ const createNewRun = async (
     idempotencyKey: "lane:main:registered",
     visibility: "run",
   });
-  if (policy.tetoEnabled) {
+  if (auxiliaryMode === "teto") {
     await sink.append({
       runId,
       laneId: "teto",
@@ -334,6 +444,17 @@ const createNewRun = async (
       payload: { kind: "intent-navigator" },
       correlationId: `run:${runId}`,
       idempotencyKey: "lane:teto:registered",
+      visibility: "run",
+    });
+  }
+  if (auxiliaryMode === "reflection") {
+    await sink.append({
+      runId,
+      laneId: "reflection",
+      type: "lane.registered",
+      payload: { kind: "reflection" },
+      correlationId: `run:${runId}`,
+      idempotencyKey: "lane:reflection:registered",
       visibility: "run",
     });
   }
@@ -442,35 +563,6 @@ const appendLaneStatus = async (
   });
 };
 
-const resolvePolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
-  const allowance = input.maxMainStepsPerActivation
-    ?? input.maxMainSteps
-    ?? mainStepAllowance(DEFAULT_POLICY);
-  const policy: RunPolicy = {
-    maxMainStepsPerActivation: allowance,
-    maxModelTokens: input.maxModelTokens ?? DEFAULT_POLICY.maxModelTokens,
-    tetoEnabled: input.tetoEnabled ?? DEFAULT_POLICY.tetoEnabled,
-    tetoMaxOutputTokens: input.tetoMaxOutputTokens ?? DEFAULT_POLICY.tetoMaxOutputTokens,
-    tetoTokenRatio: input.tetoTokenRatio ?? DEFAULT_POLICY.tetoTokenRatio,
-  };
-  if (!Number.isSafeInteger(allowance) || allowance < 1) {
-    throw new RangeError("maxMainStepsPerActivation must be a positive integer");
-  }
-  if (!Number.isSafeInteger(policy.maxModelTokens) || policy.maxModelTokens < 1) {
-    throw new RangeError("maxModelTokens must be a positive integer");
-  }
-  if (
-    !Number.isSafeInteger(policy.tetoMaxOutputTokens)
-    || policy.tetoMaxOutputTokens < 1
-  ) {
-    throw new RangeError("tetoMaxOutputTokens must be a positive integer");
-  }
-  if (policy.tetoTokenRatio <= 0 || policy.tetoTokenRatio >= 1) {
-    throw new RangeError("tetoTokenRatio must be between zero and one");
-  }
-  return policy;
-};
-
 const readAssistantText = async (
   store: ContentAddressedStore,
   ref: Parameters<ContentAddressedStore["get"]>[0],
@@ -494,14 +586,46 @@ const validateRequest = (request: RunExecutionRequest): void => {
   if (request.model.length === 0) {
     throw new Error("model is required");
   }
-  if (request.resumeRunId === undefined && request.message === undefined) {
-    throw new Error("A new Run requires a task message");
+  if (
+    request.auxiliaryMode !== undefined
+    && request.auxiliaryMode !== "none"
+    && request.auxiliaryMode !== "teto"
+    && request.auxiliaryMode !== "reflection"
+  ) {
+    throw new Error("auxiliaryMode must be none, teto, or reflection");
+  }
+  try {
+    validateUserImages(request.images);
+  } catch (error: unknown) {
+    throw new Error("Run images are invalid", { cause: error });
+  }
+  if (
+    request.resumeRunId === undefined
+    && request.message === undefined
+    && (request.images?.length ?? 0) === 0
+  ) {
+    throw new Error("A new Run requires a task message or image");
+  }
+  if (request.images !== undefined && request.message === undefined && request.resumeRunId !== undefined) {
+    throw new Error("Images submitted while resuming require a task message");
   }
   if (request.resolveOperationId !== undefined && request.resumeRunId === undefined) {
     throw new Error("resolveOperationId requires resumeRunId");
   }
   if (request.resolveOperationId !== undefined && request.resolveOperationId.length === 0) {
     throw new Error("resolveOperationId must not be empty");
+  }
+  if (
+    request.maxOutputTokens !== undefined
+    && (
+      !Number.isSafeInteger(request.maxOutputTokens)
+      || request.maxOutputTokens < 1
+      || request.maxOutputTokens > MAX_MAIN_OUTPUT_TOKENS
+    )
+  ) {
+    throw new RangeError(
+      `maxOutputTokens must be an integer from 1 to ${MAX_MAIN_OUTPUT_TOKENS}`,
+    );
   }
 };
 

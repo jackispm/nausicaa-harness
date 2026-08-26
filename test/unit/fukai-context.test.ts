@@ -129,6 +129,48 @@ describe("FukaiContextProvider", () => {
     expect(view.messages.some((message) => message.content.includes("�"))).toBe(false);
   });
 
+  it("pins the active Turn objective outside the stable cached prefix", async () => {
+    const store = new MemoryContentAddressedStore();
+    const old = await putMessage(store, {
+      role: "user",
+      content: "history that may be omitted",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    const provider = new FukaiContextProvider(new ContentStoreFukaiSource(store));
+    const request = {
+      runId: "run-objective",
+      laneId: "main",
+      laneKind: "main" as const,
+      goal: { version: 1, statement: "Assist in this workspace", successCriteria: [], hardConstraints: [] },
+      activeObjective: "Explain the installation steps",
+      systemPrompt: "Main",
+      conversationRefs: [{ ref: old, sequence: 1 }],
+      artifactSelections: [],
+      tools: [],
+      upperWatermark: 1,
+      policyVersion: "1",
+      budget: {
+        maxInputTokens: 500,
+        maxConversationMessages: 0,
+        maxArtifacts: 0,
+        maxArtifactBytes: 0,
+        maxQueries: 0,
+      },
+    };
+
+    const first = await provider.build(request);
+    const second = await provider.build({
+      ...request,
+      activeObjective: "Review the test failures",
+    });
+
+    expect(first.messages).toHaveLength(1);
+    expect(first.messages[0]?.content).toContain("Explain the installation steps");
+    expect(first.truncations.map((item) => item.kind)).toContain("conversation-message-limit");
+    expect(second.prefixHash).toBe(first.prefixHash);
+    expect(second.cacheKey).not.toBe(first.cacheKey);
+  });
+
   it("fails when the stable prefix alone exceeds the budget", async () => {
     const store = new MemoryContentAddressedStore();
     const provider = new FukaiContextProvider(new ContentStoreFukaiSource(store));

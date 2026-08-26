@@ -123,13 +123,20 @@ describe("Run recovery", () => {
     )).rejects.toThrow(/not pending/);
     expect(await ledger.read()).toHaveLength(beforeResolution);
 
-    await resolvePendingToolOperation(
+    const resolution = await resolvePendingToolOperation(
       ledger,
       store,
       "run-1",
       "operation-unknown",
       { clock: { now: () => new Date("2026-01-01T00:00:01.000Z") } },
     );
+    expect(resolution).toMatchObject({
+      type: "tool.failed",
+      payload: {
+        operationId: "operation-unknown",
+        resolution: "operator",
+      },
+    });
 
     const events = await ledger.read();
     const failed = events.find((event) => event.type === "tool.failed");
@@ -202,6 +209,17 @@ describe("Run recovery", () => {
       step: 2,
       hasToolCalls: false,
     }, "step-2-completed");
+    await ledger.append({
+      runId: "run-1",
+      laneId: "teto",
+      type: "budget.charged",
+      payload: {
+        laneId: "teto",
+        usage: { input: 9_000, output: 1_000, cacheRead: 0, cacheWrite: 0 },
+      },
+      correlationId: "correlation-1",
+      idempotencyKey: "teto-budget",
+    });
 
     const recovered = await recoverRun(ledger, "run-1");
 
@@ -246,5 +264,35 @@ describe("Run recovery", () => {
     await expect(recoverRun(corrupt, "run-1")).rejects.toBeInstanceOf(
       RunRecoveryError,
     );
+  });
+
+  it("preserves preregistered auxiliary policy arms across recovery", async () => {
+    const arms: RunPolicy[] = [{
+      ...policy,
+      tetoEnabled: false,
+      auxiliaryMode: "reflection",
+    }, {
+      ...policy,
+      auxiliaryMode: "teto",
+      tetoAdviceDelivery: "shadow",
+    }];
+
+    for (const [index, evaluationPolicy] of arms.entries()) {
+      const ledger = new MemoryLedger();
+      await append(ledger, "run.created", {
+        goal: {
+          version: 1,
+          statement: `Evaluate auxiliary arm ${index + 1}`,
+          successCriteria: [],
+          hardConstraints: [],
+        },
+        workspace: "/workspace",
+        policy: evaluationPolicy,
+      }, `created-evaluation-${index + 1}`);
+
+      const recovered = await recoverRun(ledger, "run-1");
+
+      expect(recovered.policy).toEqual(evaluationPolicy);
+    }
   });
 });

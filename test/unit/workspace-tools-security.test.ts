@@ -39,13 +39,28 @@ afterEach(async () => {
 });
 
 describe("workspace tool path security", () => {
-  it("keeps writes disabled by default and enables them explicitly", () => {
+  it("keeps writes and shell disabled by default and enables them independently", () => {
     expect(createWorkspaceTools().map((tool) => tool.definition.name)).toEqual([
       "read_file",
       "list_files",
+      "grep",
+      "find",
     ]);
     expect(createWorkspaceTools({ allowWrite: true }).map((tool) => tool.definition.name))
-      .toEqual(["read_file", "list_files", "write_file"]);
+      .toEqual(["read_file", "list_files", "grep", "find", "write_file", "edit"]);
+    expect(createWorkspaceTools({ allowShell: true }).map((tool) => tool.definition.name))
+      .toEqual(["read_file", "list_files", "grep", "find", "bash"]);
+    expect(createWorkspaceTools({ allowShell: true, allowWrite: true })
+      .map((tool) => tool.definition.name))
+      .toEqual([
+        "read_file",
+        "list_files",
+        "grep",
+        "find",
+        "write_file",
+        "edit",
+        "bash",
+      ]);
   });
 
   it("denies sensitive files and hides protected entries from root listings", async () => {

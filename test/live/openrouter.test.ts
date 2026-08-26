@@ -15,8 +15,11 @@ import { projectRunMetrics } from "../../src/observability/index.js";
 import { executeRun } from "../../src/runtime/index.js";
 
 const apiKey = process.env.OPENROUTER_API_KEY;
-const configuredModel = process.env.NAUSICAA_EVAL_MODEL;
+const configuredModel = process.env.NAUSICAA_LIVE_MODEL
+  ?? process.env.NAUSICAA_EVAL_MODEL;
 const budgetUsd = Number(process.env.NAUSICAA_EVAL_BUDGET_USD);
+const configuredVisionModel = process.env.NAUSICAA_VISION_MODEL;
+const visionBudgetUsd = Number(process.env.NAUSICAA_VISION_BUDGET_USD);
 const liveEnabled = process.env.NAUSICAA_LIVE_TESTS === "1"
   && apiKey !== undefined
   && apiKey.trim().length > 0
@@ -24,16 +27,29 @@ const liveEnabled = process.env.NAUSICAA_LIVE_TESTS === "1"
   && configuredModel.trim().length > 0
   && Number.isFinite(budgetUsd)
   && budgetUsd > 0;
+const visionLiveEnabled = process.env.NAUSICAA_LIVE_TESTS === "1"
+  && apiKey !== undefined
+  && apiKey.trim().length > 0
+  && configuredVisionModel !== undefined
+  && configuredVisionModel.trim().length > 0
+  && Number.isFinite(visionBudgetUsd)
+  && visionBudgetUsd > 0;
 
 const modelSelector = configuredModel ?? "disabled";
 const model = modelSelector.startsWith("openrouter:")
   ? modelSelector
   : `openrouter:${modelSelector}`;
+const visionModelSelector = configuredVisionModel ?? "disabled";
+const visionModel = visionModelSelector.startsWith("openrouter:")
+  ? visionModelSelector
+  : `openrouter:${visionModelSelector}`;
 const MAX_REQUESTS = 5;
 const MAIN_OUTPUT_TOKENS = 128;
 const TETO_OUTPUT_TOKENS = 16;
 const RUN_TIMEOUT_MS = 45_000;
 const TETO_SETTLE_TIMEOUT_MS = 25_000;
+const RED_PIXEL_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGUlEQVR4nGP4z8DwnxLMMGrAqAGjBgwXAwAwxP4QHCfkAAAAAABJRU5ErkJggg==";
 
 describe.skipIf(!liveEnabled)("OpenRouter live harness acceptance", () => {
   it("runs a grounded tool loop and bounds the Main-only versus Teto comparison", async () => {
@@ -156,6 +172,35 @@ describe.skipIf(!liveEnabled)("OpenRouter live harness acceptance", () => {
       await rm(root, { recursive: true, force: true });
     }
   }, 100_000);
+});
+
+describe.skipIf(!visionLiveEnabled)("OpenRouter live vision acceptance", () => {
+  it("sends one bounded pi-ai image request to an explicitly selected vision model", async () => {
+    const budget = new LiveBudget(visionBudgetUsd, 1);
+    const liveModel = new CappedLiveModel(createOpenRouterModelPort(), budget);
+
+    const response = await liveModel.complete({
+      runId: "live-vision",
+      laneId: "main",
+      sessionId: "live-vision:main",
+      model: visionModel,
+      systemPrompt: "Answer the image question directly and briefly.",
+      messages: [{
+        role: "user",
+        content: "What is the dominant color of this image? Reply with the color name.",
+        images: [{ type: "image", mimeType: "image/png", data: RED_PIXEL_PNG }],
+        createdAt: new Date(0).toISOString(),
+      }],
+      tools: [],
+      maxOutputTokens: 32,
+      signal: AbortSignal.timeout(20_000),
+    });
+
+    expect(response.content).toMatch(/red/i);
+    expect(liveModel.requests).toHaveLength(1);
+    expect(budget.requests).toBe(1);
+    expect(budget.spentUsd).toBeLessThanOrEqual(visionBudgetUsd);
+  }, 30_000);
 });
 
 class LiveBudget {

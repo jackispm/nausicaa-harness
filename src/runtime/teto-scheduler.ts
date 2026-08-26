@@ -51,7 +51,12 @@ export interface TetoSchedulerOptions {
   tetoLaneId?: LaneId;
   createId?: () => string;
   signal?: AbortSignal;
+  /** Shadow preserves the observation and generated Advice facts without
+   * claiming or delivering Advice to Main. */
+  adviceDelivery?: TetoAdviceDelivery;
 }
+
+export type TetoAdviceDelivery = "live" | "shadow";
 
 export interface TetoSchedulerRecoveryOptions {
   runId: RunId;
@@ -95,6 +100,7 @@ export class TetoScheduler {
   private readonly cadence: TetoCadence;
   private tokenGate: TokenRatioGate;
   private readonly signal: AbortSignal | undefined;
+  private readonly adviceDelivery: TetoAdviceDelivery;
   private readonly stopController = new AbortController();
   private accepting = true;
   private goal: Goal;
@@ -116,6 +122,7 @@ export class TetoScheduler {
     this.tetoLaneId = options.tetoLaneId ?? DEFAULT_TETO_LANE;
     this.createId = options.createId ?? randomUUID;
     this.signal = options.signal;
+    this.adviceDelivery = options.adviceDelivery ?? "live";
     this.goal = structuredClone(options.goal);
 
     const recovered = recoverTetoSchedulerState(options.events ?? [], {
@@ -318,23 +325,39 @@ export class TetoScheduler {
       reservationSettled = true;
 
       if (result.advice !== undefined) {
-        await this.inbox.send({
-          messageId: this.createId(),
+        await this.eventSink.append({
           runId: this.runId,
-          conversationId: this.runId,
-          threadId: `${this.runId}:${this.mainLaneId}`,
-          from: this.tetoLaneId,
-          to: this.mainLaneId,
-          createdAt: this.clock.now().toISOString(),
-          expiresAt: result.advice.expiresAt,
+          laneId: this.tetoLaneId,
+          type: "teto.advice.generated",
+          payload: {
+            advice: result.advice,
+            delivery: this.adviceDelivery,
+          },
           causationId: context.delta.boundaryId,
           correlationId: this.runId,
-          idempotencyKey: `teto:${decision.mainCallIndex}:${result.advice.dedupeKey}`,
+          idempotencyKey: `teto:${decision.mainCallIndex}:${result.advice.dedupeKey}:generated`,
           visibility: "run",
-          priority: advicePriority(result.advice.risk),
-          delivery: result.advice.urgency,
-          payload: { type: "advice.propose", advice: result.advice },
+          occurredAt: this.clock.now().toISOString(),
         });
+        if (this.adviceDelivery === "live") {
+          await this.inbox.send({
+            messageId: this.createId(),
+            runId: this.runId,
+            conversationId: this.runId,
+            threadId: `${this.runId}:${this.mainLaneId}`,
+            from: this.tetoLaneId,
+            to: this.mainLaneId,
+            createdAt: this.clock.now().toISOString(),
+            expiresAt: result.advice.expiresAt,
+            causationId: context.delta.boundaryId,
+            correlationId: this.runId,
+            idempotencyKey: `teto:${decision.mainCallIndex}:${result.advice.dedupeKey}`,
+            visibility: "run",
+            priority: advicePriority(result.advice.risk),
+            delivery: result.advice.urgency,
+            payload: { type: "advice.propose", advice: result.advice },
+          });
+        }
       }
 
       await this.recordLaneStatus(decision.mainCallIndex, "dormant");
@@ -687,6 +710,11 @@ function validateOptions(options: TetoSchedulerOptions): void {
   if (!Number.isSafeInteger(options.policy.tetoMaxOutputTokens)
     || options.policy.tetoMaxOutputTokens <= 0) {
     throw new Error("tetoMaxOutputTokens must be a positive integer");
+  }
+  if (options.adviceDelivery !== undefined
+    && options.adviceDelivery !== "live"
+    && options.adviceDelivery !== "shadow") {
+    throw new Error("adviceDelivery must be live or shadow");
   }
 }
 

@@ -3,6 +3,7 @@
 import { resolve } from "node:path";
 
 import { CliUsageError, parseCliArgs, usage } from "./cli/args.js";
+import { processImageInputs } from "./cli/image-input.js";
 import { runInteractive } from "./cli/interactive.js";
 import {
   loadSettings,
@@ -11,6 +12,7 @@ import {
   type Settings,
 } from "./config/index.js";
 import type { AnyEvent } from "./domain/events.js";
+import { DEFAULT_MAIN_OUTPUT_TOKENS } from "./domain/types.js";
 import {
   executeRun,
   findLatestRunId,
@@ -57,7 +59,9 @@ const main = async (): Promise<number> => {
   const workspace = resolve(options.workspace);
   let resolvedDataDir = resolve(workspace, options.dataDir ?? ".nausicaa");
   let resolvedModel: string | undefined;
+  let resolvedMaxOutputTokens = DEFAULT_MAIN_OUTPUT_TOKENS;
   let resolvedAllowWrite = false;
+  let resolvedAllowShell = false;
   let activeRunId = options.resume;
   try {
     const settings = await loadSettings(workspace);
@@ -66,13 +70,24 @@ const main = async (): Promise<number> => {
       ...(options.tetoModel === undefined ? {} : { tetoModel: options.tetoModel }),
       ...(options.tetoEnabled === undefined ? {} : { tetoEnabled: options.tetoEnabled }),
       ...(options.maxSteps === undefined ? {} : { maxSteps: options.maxSteps }),
+      ...(options.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: options.maxOutputTokens }),
       ...(options.dataDir === undefined ? {} : { dataDir: options.dataDir }),
       ...(options.allowWrite === undefined ? {} : { allowWrite: options.allowWrite }),
+      ...(options.allowShell === undefined ? {} : { allowShell: options.allowShell }),
     };
     const resolvedSettings = resolveSettings(workspace, settings, overrides);
     resolvedDataDir = resolvedSettings.dataDir;
     resolvedModel = resolvedSettings.model;
+    resolvedMaxOutputTokens = resolvedSettings.maxOutputTokens;
     resolvedAllowWrite = resolvedSettings.allowWrite;
+    resolvedAllowShell = resolvedSettings.allowShell;
+    const processedImages = await processImageInputs(options.fileArgs, {
+      workspace,
+      protectedPaths: [resolvedSettings.dataDir],
+    });
+    const initialMessage = combineInitialMessage(processedImages.text, options.message);
     if (options.mode === "interactive") {
       const selectedRunId = options.continue
         ? await findLatestRunId(resolvedSettings.dataDir, workspace)
@@ -82,6 +97,7 @@ const main = async (): Promise<number> => {
         dataDir: resolvedSettings.dataDir,
         model: resolvedSettings.model,
         tetoModel: resolvedSettings.tetoModel,
+        maxOutputTokens: resolvedSettings.maxOutputTokens,
         policy: {
           maxMainStepsPerActivation: resolvedSettings.maxSteps,
           maxModelTokens: resolvedSettings.maxModelTokens,
@@ -90,6 +106,7 @@ const main = async (): Promise<number> => {
           tetoTokenRatio: 0.1,
         },
         allowWrite: resolvedSettings.allowWrite,
+        allowShell: resolvedSettings.allowShell,
         ...(selectedRunId === undefined ? {} : { runId: selectedRunId }),
       });
       if (options.resolveOperation !== undefined) {
@@ -97,9 +114,12 @@ const main = async (): Promise<number> => {
       }
       return await runInteractive({
         session,
-        ...(options.message === undefined ? {} : { initialMessage: options.message }),
+        ...(initialMessage === undefined ? {} : { initialMessage }),
+        ...(processedImages.images.length === 0
+          ? {}
+          : { initialImages: processedImages.images }),
         ...(
-          options.message === undefined
+          initialMessage === undefined
           && (options.resume !== undefined || (options.continue && selectedRunId !== undefined))
             ? { resumeOnStart: true }
             : {}
@@ -115,7 +135,11 @@ const main = async (): Promise<number> => {
         dataDir: resolvedSettings.dataDir,
         model: resolvedSettings.model,
         tetoModel: resolvedSettings.tetoModel,
-        ...(options.message === undefined ? {} : { message: options.message }),
+        maxOutputTokens: resolvedSettings.maxOutputTokens,
+        ...(initialMessage === undefined ? {} : { message: initialMessage }),
+        ...(processedImages.images.length === 0
+          ? {}
+          : { images: processedImages.images }),
         ...(options.resume === undefined ? {} : { resumeRunId: options.resume }),
         ...(options.resolveOperation === undefined
           ? {}
@@ -128,6 +152,7 @@ const main = async (): Promise<number> => {
           tetoTokenRatio: 0.1,
         },
         allowWrite: resolvedSettings.allowWrite,
+        allowShell: resolvedSettings.allowShell,
         signal: controller.signal,
       }, {
         onEvent: (event: AnyEvent) => {
@@ -146,14 +171,18 @@ const main = async (): Promise<number> => {
             usage: result.usage,
             metrics: result.metrics,
             stateDir: result.stateDir,
+            ...(result.blocker === undefined ? {} : { blocker: result.blocker }),
           },
         });
-      } else if (result.finalText.length > 0) {
-        process.stdout.write(`${result.finalText}\n`);
       } else {
-        process.stderr.write(
-          `Run ${result.runId} stopped at a resumable boundary (${result.stateDir}).\n`,
-        );
+        if (result.finalText.length > 0) {
+          process.stdout.write(`${result.finalText}\n`);
+        }
+        if (!result.completed) {
+          process.stderr.write(result.blocker === "model-output-limit"
+            ? `Run ${result.runId} reached the model output limit; the partial answer is preserved. Resume with --resume ${shellQuote(result.runId)}.\n`
+            : `Run ${result.runId} stopped at a resumable boundary (${result.stateDir}).\n`);
+        }
       }
       return result.completed ? 0 : 3;
     } finally {
@@ -167,7 +196,9 @@ const main = async (): Promise<number> => {
         workspace,
         dataDir: resolvedDataDir,
         ...(resolvedModel === undefined ? {} : { model: resolvedModel }),
+        maxOutputTokens: resolvedMaxOutputTokens,
         allowWrite: resolvedAllowWrite,
+        allowShell: resolvedAllowShell,
         operationId,
       });
       if (options.mode === "json") {
@@ -197,7 +228,9 @@ const main = async (): Promise<number> => {
         workspace,
         dataDir: resolvedDataDir,
         ...(resolvedModel === undefined ? {} : { model: resolvedModel }),
+        maxOutputTokens: resolvedMaxOutputTokens,
         allowWrite: resolvedAllowWrite,
+        allowShell: resolvedAllowShell,
       });
       if (options.mode === "json") {
         writeJson({
@@ -229,12 +262,22 @@ const writeJson = (value: unknown): void => {
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 
+const combineInitialMessage = (
+  fileText: string,
+  message: string | undefined,
+): string | undefined => {
+  const parts = [fileText, message?.trim() ?? ""].filter((part) => part.length > 0);
+  return parts.length === 0 ? undefined : parts.join("\n");
+};
+
 interface ResumeCommandOptions {
   runId: string;
   workspace: string;
   dataDir: string;
   model?: string;
+  maxOutputTokens: number;
   allowWrite: boolean;
+  allowShell: boolean;
   operationId?: string;
 }
 
@@ -245,7 +288,10 @@ const buildResumeCommand = (options: ResumeCommandOptions): string => [
   "--data-dir",
   shellQuote(options.dataDir),
   ...(options.model === undefined ? [] : ["--model", shellQuote(options.model)]),
+  "--max-output-tokens",
+  String(options.maxOutputTokens),
   ...(options.allowWrite ? ["--allow-write"] : []),
+  ...(options.allowShell ? ["--allow-shell"] : []),
   "--resume",
   shellQuote(options.runId),
   ...(options.operationId === undefined

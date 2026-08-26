@@ -12,6 +12,7 @@ import {
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 
 import type {
+  ModelCapabilities,
   ModelPort,
   ModelRequest,
   ModelResponse,
@@ -39,6 +40,15 @@ export class PiAiModelPort implements ModelPort {
   constructor(options: PiAiModelPortOptions) {
     this.models = options.models;
     this.defaultProvider = options.defaultProvider ?? "openrouter";
+  }
+
+  capabilities(modelSelector: string): ModelCapabilities {
+    const selector = parseModelSelector(modelSelector, this.defaultProvider);
+    const model = this.models.getModel(selector.provider, selector.model);
+    if (model === undefined) {
+      throw new Error(`Unknown model: ${selector.provider}:${selector.model}`);
+    }
+    return { imageInput: model.input.includes("image") };
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
@@ -108,6 +118,15 @@ export class PiAiModelPort implements ModelPort {
         switch (event.type) {
           case "start":
             yield { type: "start" };
+            break;
+          case "thinking_start":
+            yield { type: "thinking-start" };
+            break;
+          case "thinking_delta":
+            yield { type: "thinking-delta", delta: event.delta };
+            break;
+          case "thinking_end":
+            yield { type: "thinking-end" };
             break;
           case "text_start":
             // complete() historically joins separate pi-ai text blocks with a
@@ -180,7 +199,22 @@ function toPiMessage(
 ): Message {
   const timestamp = timestampOf(message.createdAt);
   if (message.role === "user") {
-    return { role: "user", content: message.content, timestamp };
+    if ((message.images?.length ?? 0) === 0) {
+      return { role: "user", content: message.content, timestamp };
+    }
+    if (!model.input.includes("image")) {
+      throw new Error("Selected model does not support image input");
+    }
+    return {
+      role: "user",
+      content: [
+        ...(message.content.length === 0
+          ? []
+          : [{ type: "text" as const, text: message.content }]),
+        ...message.images!.map((image) => structuredClone(image)),
+      ],
+      timestamp,
+    };
   }
   if (message.role === "tool") {
     return {

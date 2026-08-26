@@ -1,3 +1,5 @@
+import { MAX_MAIN_OUTPUT_TOKENS } from "../domain/types.js";
+
 export type OutputMode = "interactive" | "print" | "json";
 
 export interface CliOptions {
@@ -14,7 +16,10 @@ export interface CliOptions {
   workspace: string;
   dataDir?: string;
   maxSteps?: number;
+  maxOutputTokens?: number;
+  allowShell?: boolean;
   allowWrite?: boolean;
+  fileArgs: string[];
   message?: string;
 }
 
@@ -36,6 +41,7 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
     modeExplicit: false,
     continue: false,
     workspace: cwd,
+    fileArgs: [],
   };
   const messageParts: string[] = [];
 
@@ -94,6 +100,9 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
       case "--allow-write":
         options.allowWrite = true;
         break;
+      case "--allow-shell":
+        options.allowShell = true;
+        break;
       case "--workspace":
         options.workspace = readValue(args, index, argument);
         index += 1;
@@ -111,6 +120,17 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
         index += 1;
         break;
       }
+      case "--max-output-tokens": {
+        const value = Number(readValue(args, index, argument));
+        if (!Number.isSafeInteger(value) || value < 1 || value > MAX_MAIN_OUTPUT_TOKENS) {
+          throw new CliUsageError(
+            `--max-output-tokens must be an integer from 1 to ${MAX_MAIN_OUTPUT_TOKENS}`,
+          );
+        }
+        options.maxOutputTokens = value;
+        index += 1;
+        break;
+      }
       case "--":
         messageParts.push(...args.slice(index + 1));
         index = args.length;
@@ -118,6 +138,13 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
       default:
         if (argument?.startsWith("-")) {
           throw new CliUsageError(`unknown option: ${argument}`);
+        }
+        if (argument?.startsWith("@")) {
+          if (argument.length === 1) {
+            throw new CliUsageError("@ requires a workspace-relative image path");
+          }
+          options.fileArgs.push(argument.slice(1));
+          break;
         }
         if (argument !== undefined) {
           messageParts.push(argument);
@@ -141,7 +168,7 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
 export const usage = `Nausicaa 0.1
 
 Usage:
-  nausicaa [options] [message]
+  nausicaa [options] [@image ...] [message]
 
 Options:
   -p, --print             Run once and print the final answer
@@ -155,9 +182,12 @@ Options:
   --resolve-operation <id> Resolve one unknown tool operation as failed (requires --resume)
   --main-only             Disable the Teto lane for this run
   --allow-write           Allow workspace file writes for this run
+  --allow-shell           Explicit high privilege: shell may read/write outside the workspace
   --workspace <path>      Bound tools to this workspace
   --data-dir <path>       Runtime state directory (default: .nausicaa)
   --max-steps <number>    Maximum Main model steps (default: 24)
+  --max-output-tokens <number>
+                          Maximum output tokens per Main call (default: 4096)
   -h, --help              Show help
   -v, --version           Show version
 `;

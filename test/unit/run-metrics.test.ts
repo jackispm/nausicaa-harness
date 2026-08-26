@@ -46,6 +46,12 @@ describe("projectRunMetrics", () => {
       dependencyRefs: ["artifact-1"],
       contextBuildMs: 7,
     }, "main", "2026-01-01T00:00:00.100Z");
+    await append(ledger, "model.requested", {
+      model: "scripted",
+      requestHash: "request-2",
+      contextWatermark: 2,
+      prefixHash: "prefix-1",
+    }, "main", "2026-01-01T00:00:00.150Z");
     await append(ledger, "model.completed", {
       model: "scripted",
       responseRef: ref("answer"),
@@ -101,7 +107,7 @@ describe("projectRunMetrics", () => {
     const metrics = projectRunMetrics(await ledger.read(), "run-1");
 
     expect(metrics).toMatchObject({
-      eventCount: 12,
+      eventCount: 13,
       durationMs: 1_000,
       toolCalls: 2,
       toolFailures: 0,
@@ -130,11 +136,20 @@ describe("projectRunMetrics", () => {
       p95Ms: 13,
     });
     expect(metrics.lanes.main).toMatchObject({
-      modelRequests: 1,
+      modelRequests: 2,
       modelCompletions: 1,
       modelFailures: 0,
       contextBuild: { count: 1, totalMs: 7 },
-      cache: { total: 1, hitWrite: 1, hitRate: 1, writeRate: 1 },
+      cache: {
+        total: 1,
+        hitWrite: 1,
+        hitRate: 1,
+        writeRate: 1,
+        prefixSamples: 2,
+        uniquePrefixes: 1,
+        prefixChanges: 0,
+        stablePrefixRate: 1,
+      },
     });
     expect(metrics.lanes.teto).toMatchObject({ tetoPasses: 1, usage: tetoUsage });
   });
@@ -149,6 +164,65 @@ describe("projectRunMetrics", () => {
     const other = { ...events[0]!, eventId: "other", runId: "run-2", globalOffset: 2 };
 
     expect(projectRunMetrics([other, ...events].reverse(), "run-1").total.usage).toEqual(mainUsage);
+  });
+
+  it("reports prefix churn separately from provider cache outcomes", async () => {
+    const ledger = new MemoryLedger();
+    await append(ledger, "model.requested", {
+      model: "scripted",
+      requestHash: "request-1",
+      contextWatermark: 1,
+      prefixHash: "prefix-a",
+    }, "main", "2026-01-01T00:00:00.000Z");
+    await append(ledger, "model.requested", {
+      model: "scripted",
+      requestHash: "request-2",
+      contextWatermark: 2,
+      prefixHash: "prefix-b",
+    }, "main", "2026-01-01T00:00:00.100Z");
+    await append(ledger, "model.requested", {
+      model: "scripted",
+      requestHash: "request-3",
+      contextWatermark: 3,
+      prefixHash: "prefix-b",
+    }, "main", "2026-01-01T00:00:00.200Z");
+
+    expect(projectRunMetrics(await ledger.read(), "run-1").lanes.main?.cache).toMatchObject({
+      total: 0,
+      prefixSamples: 3,
+      uniquePrefixes: 2,
+      prefixChanges: 1,
+      stablePrefixRate: 0.5,
+    });
+  });
+
+  it("does not count normal Main and Teto prefix differences as churn", async () => {
+    const ledger = new MemoryLedger();
+    await append(ledger, "model.requested", {
+      model: "main-model",
+      requestHash: "main-1",
+      contextWatermark: 1,
+      prefixHash: "main-prefix",
+    }, "main", "2026-01-01T00:00:00.000Z");
+    await append(ledger, "model.requested", {
+      model: "teto-model",
+      requestHash: "teto-1",
+      contextWatermark: 2,
+      prefixHash: "teto-prefix",
+    }, "teto", "2026-01-01T00:00:00.100Z");
+    await append(ledger, "model.requested", {
+      model: "main-model",
+      requestHash: "main-2",
+      contextWatermark: 3,
+      prefixHash: "main-prefix",
+    }, "main", "2026-01-01T00:00:00.200Z");
+
+    expect(projectRunMetrics(await ledger.read(), "run-1").total.cache).toMatchObject({
+      prefixSamples: 3,
+      uniquePrefixes: 2,
+      prefixChanges: 0,
+      stablePrefixRate: 1,
+    });
   });
 });
 

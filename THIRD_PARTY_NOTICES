@@ -1,0 +1,51 @@
+Nausicaa directly depends on @earendil-works/pi-ai and @earendil-works/pi-tui
+(MIT, https://github.com/earendil-works/pi). Model discovery, provider request
+conversion, streaming, multimodal content types, and the terminal primitives
+remain upstream responsibilities and are not reimplemented here.
+
+Portions of src/tools/edit-diff.ts, src/tools/file-mutation-queue.ts,
+src/tools/shell-output.ts, and src/tools/shell-process.ts are adapted from Pi
+and Prime Agent. The @image operand, image MIME-detection flow, clipboard image
+reader, and [image #N] marker logic are minimally adapted from Prime Agent's
+coding-agent package as audited at commit
+7787f07415d843b9a800f6a4720e0c739bd608e5. The semantic tool presentation
+registry in src/cli/tool-renderers.ts minimally adapts that commit's
+ToolExecutionComponent, Bash preview, and rich diff presentation behavior.
+The thinkingRecap helper in src/cli/tui-components.ts minimally adapts
+packages/coding-agent/src/modes/interactive/components/assistant-message.ts
+from the same Prime Agent commit
+7787f07415d843b9a800f6a4720e0c739bd608e5.
+Native clipboard access is provided by the optional
+@mariozechner/clipboard 0.3.9 dependency (MIT). Nausicaa does not copy Prime's
+daemon, RPC, inline-session serialization, IPython, or image resizing stack;
+workspace policy, limits, persistence, and pi-ai integration are local glue.
+
+Pi and Prime Agent:
+Copyright (c) 2025 Mario Zechner
+Copyright (c) 2026 Prime Intellect
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Image signatures are detected with file-type 21.3.4 (MIT):
+Copyright (c) Sindre Sorhus <sindresorhus@gmail.com>
+
+The project also depends on @vscode/ripgrep (MIT) and diff (BSD-3-Clause).
+Complete dependency license texts are distributed with those packages.

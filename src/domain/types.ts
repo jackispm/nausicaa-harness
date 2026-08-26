@@ -1,3 +1,5 @@
+import type { UserImage } from "./images.js";
+
 export type RunId = string;
 export type TurnId = string;
 export type InputId = string;
@@ -7,7 +9,7 @@ export type ArtifactId = string;
 export type MessageId = string;
 export type OperationId = string;
 
-export type LaneKind = "main" | "intent-navigator";
+export type LaneKind = "main" | "intent-navigator" | "reflection";
 export type LaneStatus =
   | "dormant"
   | "ready"
@@ -54,6 +56,7 @@ export type ConversationMessage =
   | {
       role: "user";
       content: string;
+      images?: UserImage[];
       createdAt: string;
     }
   | {
@@ -113,6 +116,9 @@ export interface ObservationFrame {
 export type AdviceKind = "orientation" | "intent-gap" | "method-alternative";
 export type AdviceDisposition = "accept" | "defer" | "reject";
 
+export const DEFAULT_MAIN_OUTPUT_TOKENS = 4_096;
+export const MAX_MAIN_OUTPUT_TOKENS = 1_000_000;
+
 export interface Advice {
   adviceId: string;
   kind: AdviceKind;
@@ -128,6 +134,7 @@ export interface Advice {
 }
 
 export type DeliveryMode = "next-step" | "next-turn" | "deferred" | "urgent";
+export type AuxiliaryMode = "none" | "teto" | "reflection";
 
 export type A2APayload =
   | { type: "advice.propose"; advice: Advice }
@@ -160,6 +167,10 @@ interface RunPolicyBase {
   tetoEnabled: boolean;
   tetoMaxOutputTokens: number;
   tetoTokenRatio: number;
+  /** Present only for preregistered evaluation arms. */
+  auxiliaryMode?: AuxiliaryMode;
+  /** Shadow records generated Advice without publishing it to Main's Inbox. */
+  tetoAdviceDelivery?: "live" | "shadow";
 }
 
 /** New runs use an activation allowance; maxMainSteps is replay-only legacy data. */

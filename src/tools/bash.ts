@@ -1,0 +1,161 @@
+import { stat } from "node:fs/promises";
+
+import type { AgentTool, ToolResult } from "../domain/ports.js";
+import { executeShellCommand, type ShellExecutionResult } from "./shell-process.js";
+
+const MAX_TIMEOUT_SECONDS = 2_147_483_647 / 1_000;
+
+export function createBashTool(): AgentTool {
+  return {
+    definition: {
+      name: "bash",
+      description: [
+        "Execute a Bash command with the working directory fixed to the current workspace.",
+        "The command is interpreted by Bash, including variables, pipes, redirects, and command substitution.",
+        "This privileged tool must be enabled behind an explicit execution permission.",
+        "Stdout and stderr retain only their bounded tails.",
+        "Background jobs are unsupported; where OS-level process containment is unavailable, cleanup is best-effort.",
+      ].join(" "),
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Bash source to execute" },
+          timeout: {
+            type: "number",
+            exclusiveMinimum: 0,
+            maximum: MAX_TIMEOUT_SECONDS,
+            description: "Optional timeout in seconds; there is no default timeout",
+          },
+        },
+        required: ["command"],
+        additionalProperties: false,
+      },
+    },
+
+    async execute(arguments_, context): Promise<ToolResult> {
+      try {
+        const command = requiredCommand(arguments_.command);
+        const timeout = optionalTimeout(arguments_.timeout);
+        if (context.signal?.aborted) {
+          return failure({
+            error: "Command aborted",
+            exitCode: null,
+            aborted: true,
+            timedOut: false,
+            ...emptyOutput(),
+          });
+        }
+        const workspaceStat = await stat(context.workspace);
+        if (!workspaceStat.isDirectory()) {
+          return failure({ error: "Workspace is not a directory" });
+        }
+
+        const execution = await executeShellCommand({
+          command,
+          cwd: context.workspace,
+          ...(timeout === undefined ? {} : { timeoutMs: timeout * 1_000 }),
+          ...(context.signal === undefined ? {} : { signal: context.signal }),
+        });
+        return formatResult(execution, timeout);
+      } catch (error: unknown) {
+        return failure({ error: safeMessage(error) });
+      }
+    },
+  };
+}
+
+export const bashTool: AgentTool = createBashTool();
+
+function formatResult(execution: ShellExecutionResult, timeout: number | undefined): ToolResult {
+  const output = {
+    stdout: execution.stdout.content,
+    stderr: execution.stderr.content,
+    exitCode: execution.exitCode,
+    aborted: execution.aborted,
+    timedOut: execution.timedOut,
+    truncated: execution.stdout.truncated || execution.stderr.truncated,
+    truncation: {
+      stdout: truncationMetadata(execution.stdout),
+      stderr: truncationMetadata(execution.stderr),
+    },
+  };
+
+  if (execution.spawnError !== undefined) {
+    return failure({ ...output, error: execution.spawnError.message });
+  }
+  if (execution.aborted) {
+    return failure({ ...output, error: "Command aborted" });
+  }
+  if (execution.timedOut) {
+    return failure({ ...output, error: `Command timed out after ${timeout} seconds` });
+  }
+  if (execution.exitCode !== 0) {
+    return failure({ ...output, error: `Command exited with code ${execution.exitCode}` });
+  }
+  return success(output);
+}
+
+function truncationMetadata(snapshot: ShellExecutionResult["stdout"]): {
+  truncated: boolean;
+  truncatedBy: "bytes" | "lines" | null;
+  totalBytes: number;
+  totalLines: number;
+  outputBytes: number;
+  outputLines: number;
+} {
+  return {
+    truncated: snapshot.truncated,
+    truncatedBy: snapshot.truncatedBy,
+    totalBytes: snapshot.totalBytes,
+    totalLines: snapshot.totalLines,
+    outputBytes: snapshot.outputBytes,
+    outputLines: snapshot.outputLines,
+  };
+}
+
+function emptyOutput(): object {
+  const stream = {
+    truncated: false,
+    truncatedBy: null,
+    totalBytes: 0,
+    totalLines: 0,
+    outputBytes: 0,
+    outputLines: 0,
+  };
+  return {
+    stdout: "",
+    stderr: "",
+    truncated: false,
+    truncation: { stdout: stream, stderr: stream },
+  };
+}
+
+function requiredCommand(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError("command must be a non-empty string");
+  }
+  return value;
+}
+
+function optionalTimeout(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new TypeError("timeout must be a finite number greater than zero");
+  }
+  if (value > MAX_TIMEOUT_SECONDS) {
+    throw new TypeError(`timeout must not exceed ${MAX_TIMEOUT_SECONDS} seconds`);
+  }
+  return value;
+}
+
+function success(value: unknown): ToolResult {
+  return { content: JSON.stringify(value), isError: false };
+}
+
+function failure(value: unknown): ToolResult {
+  return { content: JSON.stringify(value), isError: true };
+}
+
+function safeMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Command execution failed";
+}

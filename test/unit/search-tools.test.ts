@@ -1,0 +1,172 @@
+import { access, link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { createFindTool, createGrepTool } from "../../src/tools/index.js";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, {
+    recursive: true,
+    force: true,
+  })));
+});
+
+describe("workspace search tools", () => {
+  it("finds globbed files in stable order and reports limits as JSON", async () => {
+    const workspace = await temporaryDirectory("nausicaa-find-");
+    await mkdir(path.join(workspace, "src", "nested"), { recursive: true });
+    await writeFile(path.join(workspace, "src", "z.ts"), "z");
+    await writeFile(path.join(workspace, "src", "a.ts"), "a");
+    await writeFile(path.join(workspace, "src", "nested", "b.ts"), "b");
+    await writeFile(path.join(workspace, "src", "ignored.js"), "js");
+
+    const result = await createFindTool().execute({
+      pattern: "**/*.ts",
+      path: "src",
+      limit: 2,
+    }, context(workspace));
+
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content)).toEqual({
+      path: "src",
+      pattern: "**/*.ts",
+      files: ["src/a.ts", "src/nested/b.ts"],
+      count: 2,
+      truncated: true,
+    });
+  });
+
+  it("supports literal, case-insensitive, globbed grep with context", async () => {
+    const workspace = await temporaryDirectory("nausicaa-grep-");
+    await mkdir(path.join(workspace, "src"));
+    await writeFile(path.join(workspace, "src", "match.ts"), [
+      "before",
+      "Needle.ONE",
+      "after",
+    ].join("\n"));
+    await writeFile(path.join(workspace, "src", "regex-only.ts"), "needleXone");
+    await writeFile(path.join(workspace, "src", "excluded.md"), "needle.one");
+
+    const result = await createGrepTool().execute({
+      pattern: "needle.one",
+      path: ".",
+      glob: "**/*.ts",
+      ignoreCase: true,
+      literal: true,
+      context: 1,
+    }, context(workspace));
+
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content)).toEqual({
+      path: ".",
+      pattern: "needle.one",
+      matches: [
+        {
+          path: "src/match.ts",
+          line: 2,
+          column: 1,
+          text: "Needle.ONE",
+          before: [{ line: 1, text: "before" }],
+          after: [{ line: 3, text: "after" }],
+        },
+      ],
+      matchCount: 1,
+      filesMatched: 1,
+      truncated: false,
+    });
+  });
+
+  it("returns globally stable grep results and enforces the match limit", async () => {
+    const workspace = await temporaryDirectory("nausicaa-grep-limit-");
+    await writeFile(path.join(workspace, "z.txt"), "hit z");
+    await writeFile(path.join(workspace, "a.txt"), "hit a\nhit again");
+
+    const result = await createGrepTool().execute({
+      pattern: "hit",
+      limit: 2,
+    }, context(workspace));
+    const output = JSON.parse(result.content) as {
+      matches: Array<{ path: string; line: number; column: number; text: string }>;
+      matchCount: number;
+      filesMatched: number;
+      truncated: boolean;
+    };
+
+    expect(result.isError).toBe(false);
+    expect(output.matches).toEqual([
+      { path: "a.txt", line: 1, column: 1, text: "hit a" },
+      { path: "a.txt", line: 2, column: 1, text: "hit again" },
+    ]);
+    expect(output.matchCount).toBe(2);
+    expect(output.filesMatched).toBe(1);
+    expect(output.truncated).toBe(true);
+  });
+
+  it("does not expose protected paths, symbolic links, or hard links", async () => {
+    const workspace = await temporaryDirectory("nausicaa-search-secure-");
+    const outside = await temporaryDirectory("nausicaa-search-outside-");
+    await writeFile(path.join(workspace, ".env"), "TOKEN=secret");
+    await writeFile(path.join(workspace, "private.txt"), "custom secret");
+    await writeFile(path.join(workspace, "visible.txt"), "public");
+    await writeFile(path.join(outside, "secret.txt"), "outside secret");
+    await symlink(outside, path.join(workspace, "escape"), "dir");
+    await link(path.join(outside, "secret.txt"), path.join(workspace, "hardlink-secret.txt"));
+    const policy = { protectedPaths: ["private.txt"] };
+    const tools = [createFindTool(policy), createGrepTool(policy)];
+
+    for (const tool of tools) {
+      for (const protectedPath of [".env", "private.txt", "hardlink-secret.txt"]) {
+        const protectedResult = await tool.execute({
+          ...(tool.definition.name === "find" ? { pattern: "*" } : { pattern: "secret" }),
+          path: protectedPath,
+        }, context(workspace));
+        expect(protectedResult.isError).toBe(true);
+      }
+      const linkedResult = await tool.execute({
+        ...(tool.definition.name === "find" ? { pattern: "*" } : { pattern: "secret" }),
+        path: "escape",
+      }, context(workspace));
+
+      expect(linkedResult.isError).toBe(true);
+    }
+
+    const found = await createFindTool(policy).execute({ pattern: "*", path: "." }, context(workspace));
+    expect(JSON.parse(found.content).files).toEqual(["visible.txt"]);
+    const searched = await createGrepTool(policy).execute({ pattern: "secret", path: "." }, context(workspace));
+    expect(JSON.parse(searched.content)).toMatchObject({ matches: [], matchCount: 0 });
+  });
+
+  it("passes hostile search text as data without invoking a shell", async () => {
+    const workspace = await temporaryDirectory("nausicaa-search-injection-");
+    const marker = path.join(workspace, "shell-was-run");
+    const payload = `$(touch ${marker})`;
+    await writeFile(path.join(workspace, "input.txt"), payload);
+
+    const grep = await createGrepTool().execute({
+      pattern: payload,
+      literal: true,
+    }, context(workspace));
+    const find = await createFindTool().execute({
+      pattern: `*; touch ${marker}`,
+    }, context(workspace));
+
+    expect(grep.isError).toBe(false);
+    expect(JSON.parse(grep.content).matchCount).toBe(1);
+    expect(find.isError).toBe(true);
+    await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+function context(workspace: string) {
+  return { runId: "run-1", workspace, operationId: "operation-1" };
+}
+
+async function temporaryDirectory(prefix: string): Promise<string> {
+  const directory = await mkdtemp(path.join(tmpdir(), prefix));
+  temporaryDirectories.push(directory);
+  return directory;
+}

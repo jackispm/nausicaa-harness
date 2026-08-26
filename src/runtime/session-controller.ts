@@ -12,18 +12,26 @@ import type {
 } from "../domain/events.js";
 import type { AgentTool, Clock, ModelPort } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
+import {
+  type UserImage,
+  validateUserImages,
+} from "../domain/images.js";
 import type {
   ArtifactRef,
   ConversationMessage,
   Goal,
+  LaneStatus,
   RunPolicy,
   TokenUsage,
 } from "../domain/types.js";
-import { mainStepAllowance } from "../domain/types.js";
+import {
+  DEFAULT_MAIN_OUTPUT_TOKENS,
+  MAX_MAIN_OUTPUT_TOKENS,
+  mainStepAllowance,
+} from "../domain/types.js";
 import {
   ContentStoreFukaiSource,
   FukaiContextProvider,
-  type FukaiConversationRef,
 } from "../fukai/index.js";
 import {
   JsonlLedger,
@@ -44,11 +52,36 @@ import {
   type MainBoundaryMessage,
   type MainStreamEvent,
 } from "./main-loop.js";
-import { commitRunCheckpoint, resolvePendingToolOperation } from "./recovery.js";
+import {
+  commitRunCheckpoint,
+  projectMainExecutionRecovery,
+  resolvePendingToolOperation,
+} from "./recovery.js";
 import { persistedErrorText } from "./redaction.js";
+import { resolveRunPolicy } from "./run-policy.js";
 import { TetoScheduler } from "./teto-scheduler.js";
+import {
+  MESSAGE_MEDIA_TYPE,
+  projectPendingAdmissions,
+  projectPendingInputs,
+  projectSessionTranscript,
+  readConversationArtifact,
+  readToolArgumentsFromStore,
+  readUserMessage,
+  readUserText,
+  type SessionPendingInput,
+  type SessionTranscriptEntry,
+} from "./session-artifacts.js";
+import { SessionProtocolError } from "./session-protocol-error.js";
 
-const MESSAGE_MEDIA_TYPE = "application/vnd.nausicaa.conversation-message+json";
+export {
+  SessionProtocolError,
+} from "./session-protocol-error.js";
+export type {
+  SessionPendingInput,
+  SessionTranscriptEntry,
+} from "./session-artifacts.js";
+const DEFAULT_INTERACTIVE_GOAL = "Assist the user with tasks in the current workspace";
 const MAX_PENDING_INPUTS = 8;
 const CLOSE_GRACE_MS = 2_000;
 
@@ -64,29 +97,30 @@ export type SessionRuntimeEvent =
   | { kind: "stream"; event: MainStreamEvent }
   | { kind: "state"; snapshot: SessionSnapshot };
 
+export interface SessionModelCapabilities {
+  imageInput: "supported" | "unsupported" | "unknown";
+}
+
 export interface SessionSnapshot {
   workspace: string;
   runId?: string;
   turnId?: string;
+  goal?: Goal;
   status: SessionControllerStatus;
   model: string;
   tetoEnabled: boolean;
   allowWrite: boolean;
+  allowShell: boolean;
   pendingInputs: number;
   lastCommittedStep: number;
   usage: TokenUsage;
   blocker?: string;
 }
 
-export interface SessionTranscriptEntry {
-  role: "user" | "assistant" | "tool";
-  content: string;
-  turnId: string;
-}
-
 export interface SessionSubmitRequest {
   inputId: string;
   text: string;
+  images?: UserImage[];
   delivery?: InputDelivery;
 }
 
@@ -103,7 +137,9 @@ export interface SessionControllerOptions {
   model: string;
   tetoModel?: string;
   policy?: Partial<RunPolicy>;
+  maxOutputTokens?: number;
   allowWrite?: boolean;
+  allowShell?: boolean;
   runId?: string;
 }
 
@@ -134,16 +170,14 @@ interface ActiveTurn {
   controller: AbortController;
 }
 
-export class SessionProtocolError extends Error {
-  override readonly name = "SessionProtocolError";
-}
-
 export class SessionController {
   readonly workspace: string;
   readonly dataDir: string;
   readonly model: string;
   readonly tetoModel: string;
+  readonly maxOutputTokens: number;
   readonly allowWrite: boolean;
+  readonly allowShell: boolean;
 
   private readonly deps: SessionControllerDeps;
   private readonly clock: Clock;
@@ -167,10 +201,12 @@ export class SessionController {
     this.dataDir = dataDir;
     this.model = options.model;
     this.tetoModel = options.tetoModel ?? options.model;
+    this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS;
     this.allowWrite = options.allowWrite === true;
+    this.allowShell = options.allowShell === true;
     this.deps = deps;
     this.clock = deps.clock ?? systemClock;
-    this.policy = resolveSessionPolicy(options.policy);
+    this.policy = resolveRunPolicy(options.policy);
   }
 
   static async open(
@@ -193,19 +229,38 @@ export class SessionController {
     return () => this.listeners.delete(listener);
   }
 
+  modelCapabilities(): SessionModelCapabilities {
+    this.assertOpen();
+    try {
+      const capabilities = (
+        this.deps.mainModel ?? createOpenRouterModelPort()
+      ).capabilities?.(this.model);
+      if (capabilities === undefined) return { imageInput: "unknown" };
+      return {
+        imageInput: capabilities.imageInput ? "supported" : "unsupported",
+      };
+    } catch {
+      // Capability discovery is advisory. The model boundary still reports
+      // selector and provider errors when a request is actually attempted.
+      return { imageInput: "unknown" };
+    }
+  }
+
   snapshot(): SessionSnapshot {
     const events = this.attached?.sink.cachedEvents ?? [];
     const usage = usageFromEvents(events);
-    const pending = pendingAdmissions(events);
+    const pending = projectPendingAdmissions(events);
     const blocker = blockingReason(events);
     return {
       workspace: this.workspace,
       ...(this.attached === undefined ? {} : { runId: this.attached.runId }),
       ...(this.active === undefined ? {} : { turnId: this.active.turnId }),
+      ...(this.attached === undefined ? {} : { goal: structuredClone(this.attached.goal) }),
       status: this.status,
       model: this.model,
       tetoEnabled: this.attached?.policy.tetoEnabled ?? this.policy.tetoEnabled,
       allowWrite: this.allowWrite,
+      allowShell: this.allowShell,
       pendingInputs: pending.length,
       lastCommittedStep: this.active === undefined
         ? 0
@@ -219,25 +274,83 @@ export class SessionController {
     this.assertOpen();
     const attached = this.requireAttached();
     const events = await attached.ledger.read({ runId: attached.runId });
-    const transcript: SessionTranscriptEntry[] = [];
-    for (const event of events) {
-      if (
-        event.type !== "user.message"
-        && event.type !== "assistant.message"
-        && event.type !== "tool.succeeded"
-        && event.type !== "tool.failed"
-      ) continue;
-      const ref = event.type === "tool.succeeded" || event.type === "tool.failed"
-        ? event.payload.resultRef
-        : event.payload.messageRef;
-      const message = await readConversationArtifact(attached.store, ref);
-      transcript.push({
-        role: message.role,
-        content: message.content,
-        turnId: event.turnId ?? legacyTurnIdForTranscript(attached.runId),
-      });
+    return projectSessionTranscript(attached.store, events, attached.runId);
+  }
+
+  /** Return admitted inputs which have not reached a Main boundary yet. */
+  async pendingInputs(): Promise<SessionPendingInput[]> {
+    this.assertOpen();
+    if (this.attached === undefined) {
+      return [];
     }
-    return transcript;
+    const attached = this.attached;
+    const events = await attached.ledger.read({ runId: attached.runId });
+    attached.sink.replaceCache(events);
+    return projectPendingInputs(attached.store, events);
+  }
+
+  /** Read and strictly validate a tool arguments artifact. */
+  async readToolArguments(ref: ArtifactRef): Promise<Record<string, unknown>> {
+    this.assertOpen();
+    return readToolArgumentsFromStore(this.requireAttached().store, ref);
+  }
+
+  /** Read one durable conversation artifact for a presentation adapter. */
+  async readConversationMessage(ref: ArtifactRef): Promise<ConversationMessage> {
+    this.assertOpen();
+    return readConversationArtifact(this.requireAttached().store, ref);
+  }
+
+  /** Explicitly replace the durable Run mission; ordinary Turn input never calls this. */
+  async reviseGoal(statement: string): Promise<Goal> {
+    return this.runAdmission(async () => {
+      this.assertOpen();
+      const normalized = statement.trim();
+      if (normalized.length === 0) {
+        throw new SessionProtocolError("Goal statement must not be empty");
+      }
+      if (this.active !== undefined || this.execution !== undefined) {
+        throw new SessionProtocolError("Wait for or cancel the active Turn before revising Goal");
+      }
+      if (this.attached === undefined) {
+        await this.createRun(normalized);
+        this.publishState();
+        return structuredClone(this.requireAttached().goal);
+      }
+
+      const attached = this.attached;
+      const events = await attached.ledger.read({ runId: attached.runId });
+      attached.sink.replaceCache(events);
+      const current = projectRun(events, attached.runId).goal;
+      if (current === undefined) {
+        throw new SessionProtocolError(`Run ${attached.runId} is missing its Goal`);
+      }
+      attached.goal = current;
+      if (current.statement === normalized) {
+        return structuredClone(current);
+      }
+      if (current.version >= Number.MAX_SAFE_INTEGER) {
+        throw new SessionProtocolError("Goal version is exhausted");
+      }
+      const goal: Goal = {
+        ...structuredClone(current),
+        version: current.version + 1,
+        statement: normalized,
+      };
+      await attached.sink.append({
+        runId: attached.runId,
+        laneId: "main",
+        type: "goal.revised",
+        payload: { goal },
+        correlationId: `run:${attached.runId}`,
+        idempotencyKey: `${attached.runId}:goal:${goal.version}`,
+        visibility: "run",
+        occurredAt: this.clock.now().toISOString(),
+      });
+      attached.goal = goal;
+      this.publishState();
+      return structuredClone(goal);
+    });
   }
 
   async submit(request: SessionSubmitRequest): Promise<SessionSubmitResult> {
@@ -245,7 +358,7 @@ export class SessionController {
       this.assertOpen();
       validateSubmit(request);
       if (this.attached === undefined) {
-        await this.createRun(request.text);
+        await this.createRun();
       }
       const attached = this.requireAttached();
       let events = await attached.ledger.read({ runId: attached.runId });
@@ -265,7 +378,7 @@ export class SessionController {
         };
       }
 
-      if (pendingAdmissions(events).length >= MAX_PENDING_INPUTS) {
+      if (projectPendingAdmissions(events).length >= MAX_PENDING_INPUTS) {
         throw new SessionProtocolError(
           `Pending input limit reached (${MAX_PENDING_INPUTS})`,
         );
@@ -308,6 +421,9 @@ export class SessionController {
       const messageRef = await attached.store.put(stableJson({
         role: "user",
         content: request.text,
+        ...(request.images === undefined
+          ? {}
+          : { images: structuredClone(request.images) }),
         createdAt: this.clock.now().toISOString(),
       } satisfies ConversationMessage), MESSAGE_MEDIA_TYPE);
       const admitted = await attached.sink.append({
@@ -397,7 +513,7 @@ export class SessionController {
       }
       const waiting = latestResumableTurn(events);
       if (waiting === undefined) {
-        const pending = pendingAdmissions(events)[0];
+        const pending = projectPendingAdmissions(events)[0];
         if (pending !== undefined) {
           const promoted = await this.promote({ event: pending }, "resume-pending");
           this.startExecution(promoted);
@@ -443,15 +559,49 @@ export class SessionController {
         throw new SessionProtocolError("Cancel the active Turn before resolving an operation");
       }
       const attached = this.requireAttached();
-      await resolvePendingToolOperation(
+      const resolution = await resolvePendingToolOperation(
         attached.ledger,
         attached.store,
         attached.runId,
         operationId,
         { clock: this.clock },
       );
-      attached.sink.replaceCache(await attached.ledger.read({ runId: attached.runId }));
+      const events = await attached.ledger.read({ runId: attached.runId });
+      attached.sink.replaceCache(events);
+      if (resolution !== undefined) {
+        this.publish({ kind: "event", event: resolution });
+      }
+      if (projectRun(events, attached.runId).unknownOperations.length > 0) {
+        this.publishState();
+        return;
+      }
+      const waiting = latestResumableTurn(events);
+      if (
+        waiting?.status === "waiting"
+        && waiting.reason === "operation-unknown"
+        && waiting.resumeRequires === "operation-resolution"
+      ) {
+        const fromStep = highestTurnStep(events, waiting.turnId) + 1;
+        await attached.sink.append({
+          runId: attached.runId,
+          turnId: waiting.turnId,
+          laneId: "main",
+          type: "turn.resumed",
+          payload: {
+            turnId: waiting.turnId,
+            fromStep,
+            stepAllowance: mainStepAllowance(attached.policy),
+          },
+          correlationId: `turn:${waiting.turnId}`,
+          idempotencyKey: `${attached.runId}:turn:${waiting.turnId}:resume:${fromStep}`,
+          visibility: "run",
+          occurredAt: this.clock.now().toISOString(),
+        });
+        this.startExecution({ turnId: waiting.turnId, inputId: waiting.inputId });
+        return;
+      }
       this.publishState();
+      await this.promoteNextPending();
     });
   }
 
@@ -533,7 +683,7 @@ export class SessionController {
     await closePromise;
   }
 
-  private async createRun(firstMessage: string): Promise<void> {
+  private async createRun(goalStatement = DEFAULT_INTERACTIVE_GOAL): Promise<void> {
     const runId = (this.deps.createRunId ?? randomUUID)();
     validateRunId(runId);
     const stateDir = resolve(this.dataDir, "runs", runId);
@@ -543,8 +693,8 @@ export class SessionController {
       const sink = new SessionEventSink(ledger, [], (event) => this.publish(event));
       const goal: Goal = {
         version: 1,
-        statement: firstMessage,
-        successCriteria: ["Produce a grounded result for the requested task"],
+        statement: goalStatement,
+        successCriteria: ["Address each explicit user request with a grounded result"],
         hardConstraints: [],
       };
       await sink.append({
@@ -725,7 +875,26 @@ export class SessionController {
     let scheduler: TetoScheduler | undefined;
     try {
       const events = await attached.ledger.read({ runId: attached.runId });
-      const used = totalTokens(usageFromEvents(events));
+      const projection = projectRun(events, attached.runId);
+      if (projection.goal === undefined) {
+        throw new SessionProtocolError(`Run ${attached.runId} is missing its Goal`);
+      }
+      // Goal is the durable Run mission. The Turn's admitted input is its
+      // recoverable active objective; steering must not silently replace it.
+      attached.goal = projection.goal;
+      const activeObjective = await readTurnObjective(attached.store, events, turn);
+      let outputContinuationMessageId = outputLimitContinuationMessageId(
+        events,
+        turn.turnId,
+      );
+      const startStep = highestTurnStep(events, turn.turnId) + 1;
+      await this.appendMainLaneStatus(
+        "running",
+        undefined,
+        `turn:${turn.turnId}:running:${startStep}`,
+        turn.turnId,
+      );
+      const used = totalTokens(projectMainExecutionRecovery(events).usage);
       const remaining = Math.max(0, attached.policy.maxModelTokens - used);
       if (remaining === 0) {
         await this.failRunBudget(turn.turnId);
@@ -735,6 +904,7 @@ export class SessionController {
       const inbox = new A2AInbox({ sink: attached.sink, events, clock: this.clock });
       const tools = [...(this.deps.tools ?? createWorkspaceTools({
         allowWrite: this.allowWrite,
+        allowShell: this.allowShell,
         protectedPaths: [this.dataDir],
       }))];
       if (attached.policy.tetoEnabled) {
@@ -767,32 +937,50 @@ export class SessionController {
         eventSink: attached.sink,
         tools,
         clock: this.clock,
-        beforeStep: async ({ step }) => [
-          ...await this.deliverSteering(turn.turnId, step),
-          ...await (scheduler?.beforeMainStep() ?? Promise.resolve([])),
-        ],
+        beforeStep: async ({ step }) => {
+          const continuation = outputContinuationMessageId === undefined
+            ? []
+            : [{
+                kind: "runtime-notice" as const,
+                source: "session-controller",
+                content: "The previous assistant response reached the model output limit. Continue exactly where it stopped without repeating completed material.",
+                messageId: outputContinuationMessageId,
+              }];
+          outputContinuationMessageId = undefined;
+          return [
+            ...continuation,
+            ...await this.deliverSteering(turn.turnId, step),
+            ...await (scheduler?.beforeMainStep() ?? Promise.resolve([])),
+          ];
+        },
         ...(scheduler === undefined
           ? {}
           : { afterStep: (context) => scheduler!.enqueue(context) }),
         onStreamEvent: (event) => this.publish({ kind: "stream", event }),
       });
       const latestEvents = await attached.ledger.read({ runId: attached.runId });
+      const recoveredMain = projectMainExecutionRecovery(latestEvents);
       const result = await loop.run({
         runId: attached.runId,
         turnId: turn.turnId,
+        activeObjective,
         goal: attached.goal,
         model: this.model,
         workspace: this.workspace,
         policy: { ...attached.policy, maxModelTokens: remaining },
-        conversationRefs: conversationRefs(latestEvents),
+        conversationRefs: recoveredMain.conversationRefs,
         upperWatermark: latestEvents.at(-1)?.globalOffset ?? 0,
         startStep: highestTurnStep(latestEvents, turn.turnId) + 1,
+        maxOutputTokens: this.maxOutputTokens,
         completeRun: false,
         signal: turn.controller.signal,
       });
       await settlesWithin(scheduler?.drain() ?? Promise.resolve(), 25);
       await scheduler?.stop();
       if (!result.completed) {
+        const waitingReason = result.stopReason === "length"
+          ? "model-output-limit"
+          : "step-allowance-exhausted";
         await attached.sink.append({
           runId: attached.runId,
           turnId: turn.turnId,
@@ -800,7 +988,7 @@ export class SessionController {
           type: "turn.waiting",
           payload: {
             turnId: turn.turnId,
-            reason: "step-allowance-exhausted",
+            reason: waitingReason,
             lastCommittedStep: highestTurnStep(attached.sink.cachedEvents, turn.turnId),
             resumeRequires: "explicit-resume",
           },
@@ -809,6 +997,21 @@ export class SessionController {
           visibility: "run",
           occurredAt: this.clock.now().toISOString(),
         });
+        await this.appendMainLaneStatus(
+          "waiting",
+          waitingReason,
+          `turn:${turn.turnId}:waiting:${highestTurnStep(attached.sink.cachedEvents, turn.turnId)}`,
+          turn.turnId,
+        );
+      } else {
+        // A completed Turn leaves the long-lived interactive Main lane ready
+        // for another Turn; only one-shot Runs use the terminal completed state.
+        await this.appendMainLaneStatus(
+          "ready",
+          undefined,
+          `turn:${turn.turnId}:ready`,
+          turn.turnId,
+        );
       }
     } catch (error: unknown) {
       await scheduler?.stop().catch(() => undefined);
@@ -818,17 +1021,24 @@ export class SessionController {
           "Cancelled by user",
         ));
       } else {
+        const message = persistedErrorText(error);
         await attached.sink.append({
           runId: attached.runId,
           turnId: turn.turnId,
           laneId: "main",
           type: "turn.failed",
-          payload: { turnId: turn.turnId, error: persistedErrorText(error) },
+          payload: { turnId: turn.turnId, error: message },
           correlationId: `turn:${turn.turnId}`,
           idempotencyKey: `${attached.runId}:turn:${turn.turnId}:failed`,
           visibility: "run",
           occurredAt: this.clock.now().toISOString(),
         });
+        await this.appendMainLaneStatus(
+          "failed",
+          message,
+          `turn:${turn.turnId}:failed`,
+          turn.turnId,
+        );
       }
     } finally {
       await scheduler?.stop().catch(() => undefined);
@@ -895,10 +1105,17 @@ export class SessionController {
         visibility: "user",
         occurredAt: this.clock.now().toISOString(),
       });
+      const userMessage = await readUserMessage(
+        attached.store,
+        admission.payload.messageRef,
+      );
       messages.push({
         kind: "steering",
         source: "user",
-        content: await readUserText(attached.store, admission.payload.messageRef),
+        content: userMessage.content,
+        ...(userMessage.images === undefined
+          ? {}
+          : { images: structuredClone(userMessage.images) }),
         messageId: admission.payload.inputId,
       });
     }
@@ -913,7 +1130,7 @@ export class SessionController {
     const projection = projectRun(events, this.attached.runId);
     if (projection.run.error === "run-budget-exhausted") return;
     if (blockingReason(events) !== undefined) return;
-    const pending = pendingAdmissions(events)[0];
+    const pending = projectPendingAdmissions(events)[0];
     if (pending === undefined) return;
     const promoted = await this.promote({ event: pending },
       pending.payload.delivery === "steering"
@@ -943,6 +1160,12 @@ export class SessionController {
       idempotencyKey: `${attached.runId}:budget-failed`,
       visibility: "run",
     });
+    await this.appendMainLaneStatus(
+      "failed",
+      "Run token budget exhausted",
+      `turn:${turnId}:budget-failed`,
+      turnId,
+    );
   }
 
   private async appendTurnCancelled(turnId: string, reason: string): Promise<void> {
@@ -959,6 +1182,33 @@ export class SessionController {
       },
       correlationId: `turn:${turnId}`,
       idempotencyKey: `${attached.runId}:turn:${turnId}:cancelled`,
+      visibility: "run",
+      occurredAt: this.clock.now().toISOString(),
+    });
+    await this.appendMainLaneStatus(
+      "cancelled",
+      reason,
+      `turn:${turnId}:cancelled`,
+      turnId,
+    );
+  }
+
+  private async appendMainLaneStatus(
+    status: LaneStatus,
+    reason: string | undefined,
+    scope: string,
+    turnId?: string,
+    target?: AttachedRun,
+  ): Promise<void> {
+    const attached = target ?? this.requireAttached();
+    await attached.sink.append({
+      runId: attached.runId,
+      ...(turnId === undefined ? {} : { turnId }),
+      laneId: "main",
+      type: "lane.status",
+      payload: { status, ...(reason === undefined ? {} : { reason }) },
+      correlationId: turnId === undefined ? `run:${attached.runId}` : `turn:${turnId}`,
+      idempotencyKey: `${attached.runId}:main:${scope}`,
       visibility: "run",
       occurredAt: this.clock.now().toISOString(),
     });
@@ -1006,6 +1256,12 @@ export class SessionController {
         idempotencyKey: `${attached.runId}:turn:${turn.turnId}:operation-unknown`,
         visibility: "run",
       });
+      await this.appendMainLaneStatus(
+        "waiting",
+        "operation-unknown",
+        `turn:${turn.turnId}:waiting:operation-unknown`,
+        turn.turnId,
+      );
     }
   }
 
@@ -1060,6 +1316,13 @@ export class SessionController {
       visibility: "run",
       occurredAt: this.clock.now().toISOString(),
     });
+    await this.appendMainLaneStatus(
+      "waiting",
+      "process-interrupted",
+      `turn:${turnId}:waiting:process-interrupted`,
+      turnId,
+      attached,
+    );
   }
 
   private async detach(): Promise<void> {
@@ -1242,39 +1505,6 @@ function parseCommittedEvents(contents: Buffer, path: string): AnyEvent[] {
   });
 }
 
-function resolveSessionPolicy(input: Partial<RunPolicy> = {}): RunPolicy {
-  const policy: RunPolicy = {
-    maxMainStepsPerActivation: input.maxMainStepsPerActivation ?? input.maxMainSteps ?? 24,
-    maxModelTokens: input.maxModelTokens ?? 200_000,
-    tetoEnabled: input.tetoEnabled ?? true,
-    tetoMaxOutputTokens: input.tetoMaxOutputTokens ?? 200,
-    tetoTokenRatio: input.tetoTokenRatio ?? 0.1,
-  };
-  if (!Number.isSafeInteger(mainStepAllowance(policy)) || mainStepAllowance(policy) < 1) {
-    throw new SessionProtocolError("Main step allowance must be a positive integer");
-  }
-  if (!Number.isSafeInteger(policy.maxModelTokens) || policy.maxModelTokens < 1) {
-    throw new SessionProtocolError("Run token budget must be a positive integer");
-  }
-  if (policy.tetoTokenRatio <= 0 || policy.tetoTokenRatio >= 1) {
-    throw new SessionProtocolError("Teto token ratio must be between zero and one");
-  }
-  return policy;
-}
-
-function pendingAdmissions(
-  events: readonly AnyEvent[],
-): Array<Extract<AnyEvent, { type: "input.admitted" }>> {
-  const delivered = new Set(events
-    .filter((event) => event.type === "input.delivered")
-    .map((event) => event.payload.inputId));
-  return events
-    .filter((event): event is Extract<AnyEvent, { type: "input.admitted" }> => (
-      event.type === "input.admitted" && !delivered.has(event.payload.inputId)
-    ))
-    .sort((left, right) => left.payload.sequence - right.payload.sequence);
-}
-
 function nextInputSequence(events: readonly AnyEvent[]): number {
   return events.reduce((highest, event) =>
     event.type === "input.admitted"
@@ -1322,6 +1552,7 @@ function latestResumableTurn(
   turnId: string;
   inputId: string;
   status: "waiting" | "interrupted";
+  reason?: string;
   retryable?: boolean;
   resumeRequires?: string;
 } | undefined {
@@ -1344,29 +1575,10 @@ function latestResumableTurn(
     turnId: turn.turnId,
     inputId: turn.inputId,
     status: turn.status,
+    ...(turn.reason === undefined ? {} : { reason: turn.reason }),
     ...(turn.retryable === undefined ? {} : { retryable: turn.retryable }),
     ...(turn.resumeRequires === undefined ? {} : { resumeRequires: turn.resumeRequires }),
   };
-}
-
-function conversationRefs(events: readonly AnyEvent[]): FukaiConversationRef[] {
-  const refs: FukaiConversationRef[] = [];
-  for (const event of events) {
-    if (event.type === "user.message" || event.type === "assistant.message") {
-      refs.push({
-        ref: event.payload.messageRef,
-        sequence: event.globalOffset,
-        groupId: `event:${event.eventId}`,
-      });
-    } else if (event.type === "tool.succeeded" || event.type === "tool.failed") {
-      refs.push({
-        ref: event.payload.resultRef,
-        sequence: event.globalOffset,
-        groupId: `operation:${event.payload.operationId}`,
-      });
-    }
-  }
-  return refs.sort((left, right) => left.sequence - right.sequence);
 }
 
 function usageFromEvents(events: readonly AnyEvent[]): TokenUsage {
@@ -1412,41 +1624,57 @@ async function assertSameAdmission(
   event: Extract<AnyEvent, { type: "input.admitted" }>,
   request: SessionSubmitRequest,
 ): Promise<void> {
-  const text = await readUserText(store, event.payload.messageRef);
+  const message = await readUserMessage(store, event.payload.messageRef);
   const requestedDelivery = request.delivery ?? event.payload.delivery;
-  if (text !== request.text || requestedDelivery !== event.payload.delivery) {
+  if (
+    stableJson({ text: message.content, images: message.images ?? [] })
+      !== stableJson({ text: request.text, images: request.images ?? [] })
+    || requestedDelivery !== event.payload.delivery
+  ) {
     throw new SessionProtocolError(
       `Input id ${request.inputId} was reused with different content or delivery`,
     );
   }
 }
 
-async function readUserText(store: ContentAddressedStore, ref: ArtifactRef): Promise<string> {
-  const value = await readConversationArtifact(store, ref);
-  if (value.role !== "user") {
-    throw new SessionProtocolError("Input artifact is not a user message");
-  }
-  return value.content;
+function outputLimitContinuationMessageId(
+  events: readonly AnyEvent[],
+  turnId: string,
+): string | undefined {
+  const waiting = [...events].reverse().find((event): event is Extract<AnyEvent, {
+    type: "turn.waiting";
+  }> => (
+    event.type === "turn.waiting"
+    && event.payload.turnId === turnId
+    && event.payload.reason === "model-output-limit"
+  ));
+  if (waiting === undefined) return undefined;
+  const resumed = [...events].reverse().find((event): event is Extract<AnyEvent, {
+    type: "turn.resumed";
+  }> => event.type === "turn.resumed" && event.payload.turnId === turnId);
+  return resumed !== undefined && resumed.globalOffset > waiting.globalOffset
+    ? `output-limit-continuation:${resumed.eventId}`
+    : undefined;
 }
 
-async function readConversationArtifact(
+async function readTurnObjective(
   store: ContentAddressedStore,
-  ref: ArtifactRef,
-): Promise<ConversationMessage> {
-  const value: unknown = JSON.parse(new TextDecoder().decode(await store.get(ref)));
-  if (
-    value === null
-    || typeof value !== "object"
-    || !["user", "assistant", "tool"].includes((value as Partial<ConversationMessage>).role ?? "")
-    || typeof (value as Partial<ConversationMessage>).content !== "string"
-  ) {
-    throw new SessionProtocolError("Conversation artifact is invalid");
+  events: readonly AnyEvent[],
+  turn: Pick<ActiveTurn, "turnId" | "inputId">,
+): Promise<string> {
+  const admission = events.find((event): event is Extract<AnyEvent, {
+    type: "input.admitted";
+  }> => (
+    event.type === "input.admitted"
+    && event.payload.inputId === turn.inputId
+  ));
+  if (admission === undefined) {
+    throw new SessionProtocolError(
+      `Turn ${turn.turnId} is missing its admitted input ${turn.inputId}`,
+    );
   }
-  return value as ConversationMessage;
-}
-
-function legacyTurnIdForTranscript(runId: string): string {
-  return `legacy:${runId}:0`;
+  const text = await readUserText(store, admission.payload.messageRef);
+  return text.trim().length === 0 ? "Analyze the attached image(s)" : text;
 }
 
 function validateOptions(options: SessionControllerOptions): void {
@@ -1454,14 +1682,31 @@ function validateOptions(options: SessionControllerOptions): void {
     throw new SessionProtocolError("workspace, dataDir, and model are required");
   }
   if (options.runId !== undefined) validateRunId(options.runId);
+  if (
+    options.maxOutputTokens !== undefined
+    && (
+      !Number.isSafeInteger(options.maxOutputTokens)
+      || options.maxOutputTokens < 1
+      || options.maxOutputTokens > MAX_MAIN_OUTPUT_TOKENS
+    )
+  ) {
+    throw new SessionProtocolError(
+      `maxOutputTokens must be an integer from 1 to ${MAX_MAIN_OUTPUT_TOKENS}`,
+    );
+  }
 }
 
 function validateSubmit(request: SessionSubmitRequest): void {
   if (request.inputId.length === 0 || request.inputId.includes("\0")) {
     throw new SessionProtocolError("inputId must be a non-empty string without NUL");
   }
-  if (request.text.trim().length === 0) {
-    throw new SessionProtocolError("Input text must not be empty");
+  try {
+    validateUserImages(request.images);
+  } catch (error: unknown) {
+    throw new SessionProtocolError("Input images are invalid", { cause: error });
+  }
+  if (request.text.trim().length === 0 && (request.images?.length ?? 0) === 0) {
+    throw new SessionProtocolError("Input text or images are required");
   }
 }
 

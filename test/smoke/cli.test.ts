@@ -7,22 +7,23 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
 const execFileAsync = promisify(execFile);
+const builtCli = join(process.cwd(), "dist", "cli.js");
 
 describe("built CLI", () => {
-  it("starts under plain Node and prints help without model credentials", async () => {
+  it("starts through its executable bin and prints help without model credentials", async () => {
     const { stdout, stderr } = await execFileAsync(
-      process.execPath,
-      ["dist/cli.js", "--help"],
-      { env: {} },
+      builtCli,
+      ["--help"],
+      { env: { PATH: process.env.PATH } },
     );
 
     expect(stderr).toBe("");
     expect(stdout).toContain("Usage:");
-    expect(stdout).toContain("nausicaa [options] [message]");
+    expect(stdout).toContain("nausicaa [options] [@image ...] [message]");
   });
 
   it("reports a stable version", async () => {
-    const { stdout } = await execFileAsync(process.execPath, ["dist/cli.js", "--version"]);
+    const { stdout } = await execFileAsync(builtCli, ["--version"]);
     expect(stdout.trim()).toBe("0.1.0");
   });
 
@@ -67,8 +68,7 @@ describe("built CLI", () => {
   it("prints actionable recovery metadata after a built CLI Run fails", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-cli-failure-"));
     try {
-      const failure = await execFileAsync(process.execPath, [
-        "dist/cli.js",
+      const failure = await execFileAsync(builtCli, [
         "-p",
         "--main-only",
         "--model",

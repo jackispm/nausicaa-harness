@@ -4,14 +4,21 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { AgentTool } from "../../src/domain/ports.js";
+import type {
+  AgentTool,
+  ModelPort,
+  ModelResponse,
+} from "../../src/domain/ports.js";
 import {
   ContentStoreFukaiSource,
   FukaiContextProvider,
 } from "../../src/fukai/index.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
-import { MainLoop } from "../../src/runtime/main-loop.js";
+import {
+  MainLoop,
+  type MainStreamEvent,
+} from "../../src/runtime/main-loop.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -23,6 +30,97 @@ afterEach(async () => {
 });
 
 describe("MainLoop", () => {
+  it("reconciles partial deltas with the committed assistant message", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const response: ModelResponse = {
+      content: "partial response completed from durable state",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(4, 6),
+    };
+    const model: ModelPort = {
+      async complete() { return response; },
+      async *stream() {
+        yield { type: "start" as const };
+        yield { type: "text-delta" as const, delta: "partial response" };
+        yield { type: "done" as const, response };
+      },
+    };
+    const streamed: MainStreamEvent[] = [];
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+      onStreamEvent: (event) => streamed.push(event),
+    });
+
+    await loop.run({
+      runId: "stream-reconcile-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    });
+
+    expect(streamed.find((event) => event.type === "stream.delta")).toMatchObject({
+      delta: "partial response",
+    });
+    const ended = streamed.find((event) => event.type === "stream.end");
+    expect(ended?.type).toBe("stream.end");
+    if (ended?.type !== "stream.end") throw new Error("Missing stream.end");
+    const committed = JSON.parse(new TextDecoder().decode(await store.get(ended.messageRef)));
+    expect(committed.content).toBe(response.content);
+  });
+
+  it("accepts an image-only initial message and preserves it for the model", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const model = new ScriptedModel([{
+      content: "image inspected",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(4, 3),
+    }]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+    });
+    const image = { type: "image" as const, data: "AQID", mimeType: "image/png" };
+
+    const result = await loop.run({
+      runId: "image-only-run",
+      goal: {
+        version: 1,
+        statement: "Analyze the attached image",
+        successCriteria: [],
+        hardConstraints: [],
+      },
+      model: "vision-demo",
+      workspace,
+      policy: policy(1),
+      initialImages: [image],
+    });
+
+    expect(result.finalText).toBe("image inspected");
+    expect(model.requests[0]?.messages.find((message) =>
+      message.role === "user" && message.images !== undefined
+    )).toMatchObject({ content: "", images: [image] });
+    const userEvent = (await ledger.read({ runId: "image-only-run" }))
+      .find((event) => event.type === "user.message");
+    if (userEvent?.type !== "user.message") throw new Error("Missing user message");
+    const persisted = JSON.parse(new TextDecoder().decode(await store.get(userEvent.payload.messageRef)));
+    expect(persisted).toMatchObject({ role: "user", content: "", images: [image] });
+  });
+
   it("executes same-response tools concurrently and records natural boundaries", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
@@ -80,6 +178,7 @@ describe("MainLoop", () => {
 
     const result = await loop.run({
       runId: "run-main",
+      activeObjective: "Handle the current Turn",
       goal: {
         version: 1,
         statement: "Complete the task",
@@ -96,6 +195,7 @@ describe("MainLoop", () => {
     expect(started).toBe(2);
     expect(result).toMatchObject({ finalText: "all done", steps: 2, completed: true });
     expect(result.usage).toEqual(tokenUsage(45, 10));
+    expect(model.requests[0]?.messages.at(-1)?.content).toContain("Handle the current Turn");
     expect(model.requests[0]?.messages.some((message) =>
       message.content.includes("Runtime advice")
       && message.content.includes("Check the simpler route"),
@@ -106,6 +206,10 @@ describe("MainLoop", () => {
     expect(events.filter((event) => event.type === "tool.requested")).toHaveLength(2);
     expect(events.filter((event) => event.type === "tool.succeeded")).toHaveLength(2);
     expect(events.filter((event) => event.type === "navigation.updated")).toHaveLength(2);
+    expect(result.navigationDeltas.map((delta) => delta.activeObjective)).toEqual([
+      "Handle the current Turn",
+      "Handle the current Turn",
+    ]);
     expect(events.at(-1)?.type).toBe("run.completed");
     expect(new Set(events.map((event) => event.correlationId)).size).toBe(1);
     expect(events.every((event) => event.idempotencyKey.length > 0)).toBe(true);
@@ -217,6 +321,7 @@ describe("MainLoop", () => {
     });
 
     expect(result.completed).toBe(false);
+    expect(result.stopReason).toBe("length");
     expect(result.navigationDeltas[0]?.status).toBe("uncertain");
     expect(afterSteps).toEqual([{
       usage: tokenUsage(3, 4),
@@ -227,6 +332,60 @@ describe("MainLoop", () => {
     const requested = events.find((event) => event.type === "model.requested");
     expect(requested?.payload.contextWatermark).toBeGreaterThan(0);
     expect(requested?.payload.contextWatermark).toBeLessThan(requested?.globalOffset ?? 0);
+  });
+
+  it("never executes tool calls from a length-truncated model response", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    let executions = 0;
+    const model = new ScriptedModel([
+      {
+        content: "partial tool call",
+        toolCalls: [{ id: "truncated-call", name: "mutate", arguments: { path: "a" } }],
+        stopReason: "length",
+        usage: tokenUsage(3, 4),
+      },
+      {
+        content: "recovered",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(4, 2),
+      },
+    ]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [{
+        definition: {
+          name: "mutate",
+          description: "must not run with truncated arguments",
+          parameters: { type: "object", additionalProperties: true },
+        },
+        async execute() {
+          executions += 1;
+          return { content: "mutated", isError: false };
+        },
+      }],
+    });
+
+    const result = await loop.run({
+      runId: "truncated-tool-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      initialMessage: "Go",
+    });
+
+    expect(executions).toBe(0);
+    expect(result).toMatchObject({ completed: true, finalText: "recovered" });
+    const events = await ledger.read({ runId: "truncated-tool-run" });
+    expect(events.filter((event) => event.type === "tool.failed")).toHaveLength(1);
+    const retryContext = model.requests[1]?.messages.find((message) => message.role === "tool");
+    expect(retryContext?.content).toContain("may be truncated");
   });
 
   it("records monotonic context and provider latency without wall-clock inference", async () => {
@@ -260,12 +419,146 @@ describe("MainLoop", () => {
     const events = await ledger.read({ runId: "telemetry-run" });
     const requested = events.find((event) => event.type === "model.requested");
     const completed = events.find((event) => event.type === "model.completed");
-    expect(requested?.payload).toMatchObject({ contextBuildMs: 4 });
+    expect(requested?.payload).toMatchObject({
+      contextBuildMs: 4,
+      sessionId: "telemetry-run:main",
+      truncations: [],
+    });
     expect(requested?.payload.prefixHash).toMatch(/^[a-f0-9]{64}$/);
     expect(completed?.payload).toMatchObject({
       modelLatencyMs: 25,
       cacheOutcome: "hit-write",
     });
+  });
+
+  it("keeps prefix and session affinity stable across images, steering, recovery, and turns", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const image = { type: "image" as const, data: "AQID", mimeType: "image/png" };
+    const model = new ScriptedModel([
+      {
+        content: "inspect once",
+        toolCalls: [{ id: "inspect", name: "noop", arguments: {} }],
+        stopReason: "toolUse",
+        usage: tokenUsage(5, 2),
+      },
+      {
+        content: "first turn complete",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(6, 2),
+      },
+      {
+        content: "second turn complete",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(7, 2),
+      },
+    ]);
+    let boundaryOrdinal = 0;
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [{
+        definition: {
+          name: "noop",
+          description: "Return a deterministic observation",
+          parameters: { type: "object", additionalProperties: false },
+        },
+        async execute() {
+          return { content: "observed", isError: false };
+        },
+      }],
+      beforeStep: async () => {
+        boundaryOrdinal += 1;
+        return [{
+          kind: "steering",
+          source: "user",
+          content: `steering-${boundaryOrdinal}`,
+          messageId: `steering-${boundaryOrdinal}`,
+        }];
+      },
+    });
+    const goal = {
+      version: 1,
+      statement: "Keep cache evidence explainable",
+      successCriteria: [],
+      hardConstraints: [],
+    };
+    const contextBudget = {
+      maxInputTokens: 4_000,
+      maxConversationMessages: 3,
+    };
+
+    const interrupted = await loop.run({
+      runId: "cache-evidence-run",
+      turnId: "turn-1",
+      activeObjective: "Inspect the image",
+      goal,
+      model: "vision-demo",
+      workspace,
+      policy: policy(1),
+      initialImages: [image],
+      contextBudget,
+    });
+    expect(interrupted.completed).toBe(false);
+
+    const resumed = await loop.run({
+      runId: "cache-evidence-run",
+      turnId: "turn-1",
+      activeObjective: "Finish the inspection",
+      goal,
+      model: "vision-demo",
+      workspace,
+      policy: policy(2),
+      startStep: 2,
+      upperWatermark: await ledger.watermark(),
+      conversationRefs: interrupted.conversationRefs,
+      contextBudget,
+    });
+    expect(resumed.completed).toBe(true);
+
+    await loop.run({
+      runId: "cache-evidence-run",
+      turnId: "turn-2",
+      activeObjective: "Answer the follow-up",
+      goal,
+      model: "vision-demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "What changed?",
+      upperWatermark: await ledger.watermark(),
+      conversationRefs: resumed.conversationRefs,
+      contextBudget,
+    });
+
+    expect(model.requests.map((request) => request.sessionId)).toEqual([
+      "cache-evidence-run:main",
+      "cache-evidence-run:main",
+      "cache-evidence-run:main",
+    ]);
+    expect(model.requests[0]?.messages.some((message) =>
+      message.role === "user" && message.images?.length === 1
+    )).toBe(true);
+    expect(model.requests[1]?.messages.some((message) =>
+      message.content.includes("steering-2")
+    )).toBe(true);
+
+    const requested = (await ledger.read({ runId: "cache-evidence-run" }))
+      .filter((event) => event.type === "model.requested");
+    expect(requested).toHaveLength(3);
+    expect(new Set(requested.map((event) => event.payload.sessionId))).toEqual(
+      new Set(["cache-evidence-run:main"]),
+    );
+    expect(new Set(requested.map((event) => event.payload.prefixHash)).size).toBe(1);
+    expect(new Set(requested.map((event) => event.payload.requestHash)).size).toBe(3);
+    expect(requested[0]?.payload.truncations).toEqual([]);
+    expect(requested.slice(1).every((event) =>
+      event.payload.truncations?.some((item) => item.kind === "conversation-message-limit")
+    )).toBe(true);
   });
 
   it("redacts persisted model and Step failure text", async () => {

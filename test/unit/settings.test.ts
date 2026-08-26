@@ -92,7 +92,7 @@ describe("settings", () => {
       resolveSettings(
         "/work",
         { model: "openrouter:base", maxSteps: 3 },
-        { model: "openrouter:override" },
+        { model: "openrouter:override", maxOutputTokens: 8_192 },
         {},
       ),
     ).toMatchObject({
@@ -100,9 +100,26 @@ describe("settings", () => {
       tetoModel: "openrouter:override",
       tetoEnabled: true,
       maxSteps: 3,
+      maxOutputTokens: 8_192,
       dataDir: "/work/.nausicaa",
+      allowShell: false,
       allowWrite: false,
     });
+  });
+
+  it("defaults and bounds the per-call Main output limit", () => {
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base" },
+      {},
+      {},
+    ).maxOutputTokens).toBe(4_096);
+    expect(() => resolveSettings(
+      "/work",
+      { model: "openrouter:base", maxOutputTokens: 1_000_001 },
+      {},
+      {},
+    )).toThrow(/maxOutputTokens.*1.*1000000/i);
   });
 
   it("keeps writes disabled by default and supports explicit overrides", () => {
@@ -120,6 +137,21 @@ describe("settings", () => {
     ).allowWrite).toBe(true);
   });
 
+  it("keeps shell access disabled by default and independent from writes", () => {
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base", allowWrite: true },
+      {},
+      {},
+    )).toMatchObject({ allowShell: false, allowWrite: true });
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base", allowWrite: true },
+      { allowShell: true, allowWrite: false },
+      {},
+    )).toMatchObject({ allowShell: true, allowWrite: false });
+  });
+
   it("validates allowWrite in settings files", async () => {
     const root = await makeRoot();
     const home = join(root, "home");
@@ -131,5 +163,18 @@ describe("settings", () => {
 
     await expect(loadSettings(join(root, "workspace"), { userHome: home }))
       .rejects.toThrow(/allowWrite.*boolean/i);
+  });
+
+  it("validates allowShell in settings files", async () => {
+    const root = await makeRoot();
+    const home = join(root, "home");
+    await mkdir(join(home, ".nausicaa"), { recursive: true });
+    await writeFile(
+      join(home, ".nausicaa", "settings.json"),
+      JSON.stringify({ model: "openrouter:base", allowShell: "yes" }),
+    );
+
+    await expect(loadSettings(join(root, "workspace"), { userHome: home }))
+      .rejects.toThrow(/allowShell.*boolean/i);
   });
 });

@@ -1,4 +1,4 @@
-import type { AnyEvent } from "../domain/events.js";
+import type { AnyEvent, EventEnvelope } from "../domain/events.js";
 import type { Clock } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
 import type {
@@ -29,6 +29,11 @@ export interface RunRecoveryState {
   priorUsage: TokenUsage;
   completedAnswerRef?: ArtifactRef;
   events: AnyEvent[];
+}
+
+export interface MainExecutionRecoveryProjection {
+  conversationRefs: FukaiConversationRef[];
+  usage: TokenUsage;
 }
 
 export class RunRecoveryError extends Error {}
@@ -97,6 +102,7 @@ export const recoverRun = async (
   const completedAnswerRef = projection.run.status === "completed"
     ? projection.run.answerRef
     : undefined;
+  const main = projectMainExecutionRecovery(events);
   return {
     runId,
     goal: projection.goal,
@@ -104,11 +110,8 @@ export const recoverRun = async (
     workspace: projection.run.workspace,
     startStep: highestStep(events) + 1,
     upperWatermark: projection.run.lastOffset,
-    conversationRefs: conversationRefs(events),
-    priorUsage: recoverMainUsage(
-      events,
-      projection.budget.byLane.main ?? emptyUsage(),
-    ),
+    conversationRefs: main.conversationRefs,
+    priorUsage: main.usage,
     ...(completedAnswerRef === undefined ? {} : { completedAnswerRef }),
     events,
   };
@@ -126,7 +129,7 @@ export const resolvePendingToolOperation = async (
   runId: RunId,
   operationId: string,
   options: { clock?: Clock } = {},
-): Promise<void> => {
+): Promise<EventEnvelope<"tool.failed"> | undefined> => {
   if (operationId.length === 0 || operationId.includes("\0")) {
     throw new RunRecoveryError("Operation id must be a non-empty string without NUL");
   }
@@ -136,7 +139,7 @@ export const resolvePendingToolOperation = async (
   }
   await verifyLatestCheckpoint(events, runId);
   if (hasOperatorResolution(events, operationId)) {
-    return;
+    return undefined;
   }
   const pending = findPendingToolOperation(events, operationId);
   if (pending === undefined) {
@@ -162,8 +165,9 @@ export const resolvePendingToolOperation = async (
     stableJson(message),
     CONVERSATION_MESSAGE_MEDIA_TYPE,
   );
-  await ledger.append({
+  return ledger.append({
     runId,
+    ...(pending.turnId === undefined ? {} : { turnId: pending.turnId }),
     laneId: pending.laneId,
     type: "tool.failed",
     payload: {
@@ -172,6 +176,7 @@ export const resolvePendingToolOperation = async (
       name: pending.name,
       error: OPERATOR_RESOLUTION_ERROR,
       resultRef,
+      resolution: "operator",
     },
     causationId: pending.eventId,
     correlationId: pending.correlationId,
@@ -269,6 +274,7 @@ interface PendingToolOperation {
   toolCallId: string;
   name: string;
   laneId: string;
+  turnId?: string;
   eventId: string;
   correlationId: string;
 }
@@ -284,6 +290,7 @@ const findPendingToolOperations = (
         toolCallId: event.payload.toolCallId,
         name: event.payload.name,
         laneId: event.laneId,
+        ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
         eventId: event.eventId,
         correlationId: event.correlationId,
       });
@@ -305,11 +312,16 @@ const hasOperatorResolution = (
 ): boolean => events.some((event) =>
   event.type === "tool.failed"
   && event.payload.operationId === operationId
-  && event.payload.error === OPERATOR_RESOLUTION_ERROR
-  && event.idempotencyKey.endsWith(":operator-resolved"),
+  && (
+    event.payload.resolution === "operator"
+    || (
+      event.payload.error === OPERATOR_RESOLUTION_ERROR
+      && event.idempotencyKey.endsWith(":operator-resolved")
+    )
+  ),
 );
 
-const conversationRefs = (events: readonly AnyEvent[]): FukaiConversationRef[] => {
+const recoverConversationRefs = (events: readonly AnyEvent[]): FukaiConversationRef[] => {
   const refs: FukaiConversationRef[] = [];
   const pendingModelMessages: Array<{
     ref: ArtifactRef;
@@ -358,6 +370,25 @@ const conversationRefs = (events: readonly AnyEvent[]): FukaiConversationRef[] =
     }
   }
   return refs.sort((left, right) => left.sequence - right.sequence);
+};
+
+/**
+ * Rebuild Main's committed context and token usage from durable facts. A
+ * completed response is already billable and usable even when the process
+ * stopped before its assistant.message or budget.charged events were appended.
+ */
+export const projectMainExecutionRecovery = (
+  events: readonly AnyEvent[],
+): MainExecutionRecoveryProjection => {
+  const chargedUsage = events.reduce<TokenUsage>((usage, event) => (
+    event.type === "budget.charged" && event.payload.laneId === "main"
+      ? addUsage(usage, event.payload.usage)
+      : usage
+  ), emptyUsage());
+  return {
+    conversationRefs: recoverConversationRefs(events),
+    usage: recoverMainUsage(events, chargedUsage),
+  };
 };
 
 const emptyUsage = (): TokenUsage => ({

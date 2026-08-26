@@ -117,6 +117,106 @@ describe("ScriptedModel", () => {
 });
 
 describe("PiAiModelPort", () => {
+  it("preserves pi-ai session cache affinity across repeated requests", async () => {
+    const faux = fauxProvider({
+      provider: "openrouter",
+      models: [{ id: "demo" }],
+    });
+    faux.setResponses([
+      fauxAssistantMessage("cold"),
+      fauxAssistantMessage("warm"),
+      fauxAssistantMessage("other session"),
+    ]);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+    const repeated = {
+      ...request(),
+      model: "openrouter:demo",
+      systemPrompt: "stable system prefix",
+      messages: [{
+        role: "user" as const,
+        content: "same dynamic tail",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }],
+    };
+
+    const cold = await adapter.complete(repeated);
+    const warm = await adapter.complete(repeated);
+    const otherSession = await adapter.complete({
+      ...repeated,
+      sessionId: "session-2",
+    });
+
+    expect(cold.usage.cacheWrite).toBeGreaterThan(0);
+    expect(cold.usage.cacheRead).toBe(0);
+    expect(warm.usage.cacheRead).toBeGreaterThan(0);
+    expect(warm.usage.cacheWrite).toBe(0);
+    expect(otherSession.usage.cacheRead).toBe(0);
+    expect(otherSession.usage.cacheWrite).toBeGreaterThan(0);
+  });
+
+  it("passes pi-ai image blocks through without inventing a provider protocol", async () => {
+    let observedContent: unknown;
+    const faux = fauxProvider({
+      provider: "openrouter",
+      models: [{ id: "vision", input: ["text", "image"] }],
+    });
+    faux.setResponses([(context) => {
+      observedContent = context.messages[0]?.content;
+      return fauxAssistantMessage("seen");
+    }]);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+
+    await adapter.complete({
+      ...request(),
+      model: "openrouter:vision",
+      messages: [{
+        role: "user",
+        content: "inspect",
+        images: [{ type: "image", mimeType: "image/png", data: "AA==" }],
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }],
+    });
+
+    expect(observedContent).toEqual([
+      { type: "text", text: "inspect" },
+      { type: "image", mimeType: "image/png", data: "AA==" },
+    ]);
+  });
+
+  it("rejects image input before calling a text-only model", async () => {
+    const faux = fauxProvider({
+      provider: "openrouter",
+      models: [{ id: "text-only", input: ["text"] }],
+    });
+    faux.setResponses([fauxAssistantMessage("must not run")]);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+    const imageRequest = {
+      ...request(),
+      model: "openrouter:text-only",
+      messages: [{
+        role: "user" as const,
+        content: "inspect",
+        images: [{ type: "image" as const, mimeType: "image/png", data: "AA==" }],
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }],
+    };
+
+    await expect(adapter.complete(imageRequest)).rejects.toThrow(/does not support image/i);
+    const events = await collect(adapter.stream(imageRequest));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "error",
+      error: { message: expect.stringMatching(/does not support image/i) },
+    });
+    expect(faux.state.callCount).toBe(0);
+  });
+
   it("adapts an injected pi-ai collection and maps cache usage", async () => {
     let observedRoles: string[] = [];
     const faux = fauxProvider({

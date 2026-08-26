@@ -1,4 +1,5 @@
 import type { ArtifactRef, ConversationMessage } from "../domain/types.js";
+import { validateUserImages } from "../domain/images.js";
 import type {
   FukaiArtifactRead,
   FukaiReadOptions,
@@ -12,6 +13,16 @@ export interface FukaiContentStore {
 /** Adapts an immutable content store to Fukai's bounded read contract. */
 export class ContentStoreFukaiSource implements FukaiSource {
   constructor(private readonly store: FukaiContentStore) {}
+
+  async hasArtifact(
+    ref: ArtifactRef,
+    options: FukaiReadOptions = {},
+  ): Promise<boolean> {
+    throwIfAborted(options.signal);
+    const bytes = await readOptional(this.store, ref);
+    throwIfAborted(options.signal);
+    return bytes !== undefined;
+  }
 
   async readConversation(
     ref: ArtifactRef,
@@ -89,8 +100,14 @@ function isConversationMessage(value: unknown): value is ConversationMessage {
     return false;
   }
   if (value.role === "user") {
-    return true;
+    try {
+      validateUserImages(value.images);
+      return true;
+    } catch {
+      return false;
+    }
   }
+  if (value.images !== undefined) return false;
   if (value.role === "tool") {
     return typeof value.toolCallId === "string"
       && typeof value.toolName === "string"

@@ -38,13 +38,22 @@ export interface ModelResponse {
   usage: TokenUsage;
 }
 
+export interface ModelCapabilities {
+  imageInput: boolean;
+}
+
 export type ModelStreamEvent =
   | { type: "start" }
+  | { type: "thinking-start" }
+  | { type: "thinking-delta"; delta: string }
+  | { type: "thinking-end" }
   | { type: "text-delta"; delta: string }
   | { type: "done"; response: ModelResponse }
   | { type: "error"; error: Error };
 
 export interface ModelPort {
+  /** Optional because custom model ports may not have a local capability catalog. */
+  capabilities?(model: string): ModelCapabilities;
   complete(request: ModelRequest): Promise<ModelResponse>;
   stream?(request: ModelRequest): AsyncIterable<ModelStreamEvent>;
 }

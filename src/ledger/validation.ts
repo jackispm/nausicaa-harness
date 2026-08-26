@@ -133,6 +133,19 @@ function runPolicy(value: unknown, path: string): asserts value is RunPolicy {
   if ((item.tetoTokenRatio as number) > 1) {
     invalid(`${path}.tetoTokenRatio`, "a finite number between 0 and 1");
   }
+  if (item.auxiliaryMode !== undefined) {
+    oneOf(item.auxiliaryMode, `${path}.auxiliaryMode`, [
+      "none",
+      "teto",
+      "reflection",
+    ] as const);
+  }
+  if (item.tetoAdviceDelivery !== undefined) {
+    oneOf(item.tetoAdviceDelivery, `${path}.tetoAdviceDelivery`, [
+      "live",
+      "shadow",
+    ] as const);
+  }
 }
 
 function navigationDelta(value: unknown, path: string): asserts value is NavigationDelta {
@@ -157,6 +170,24 @@ function navigationDelta(value: unknown, path: string): asserts value is Navigat
   ] as const);
   stringArray(item.uncertainties, `${path}.uncertainties`);
   stringArray(item.openQuestions, `${path}.openQuestions`);
+}
+
+function contextTruncation(value: unknown, path: string): void {
+  const item = payloadObject(value, path, ["kind", "detail"]);
+  oneOf(item.kind, `${path}.kind`, [
+    "input-token-budget",
+    "conversation-message-limit",
+    "artifact-count-limit",
+    "artifact-byte-limit",
+    "query-limit",
+    "missing-conversation",
+    "missing-artifact",
+    "conversation-shape",
+  ] as const);
+  if (item.ref !== undefined) {
+    string(item.ref, `${path}.ref`, false);
+  }
+  string(item.detail, `${path}.detail`, false);
 }
 
 function advice(value: unknown, path: string): asserts value is Advice {
@@ -288,7 +319,7 @@ const payloadValidators = {
   },
   "lane.registered": (value, path) => {
     const item = payloadObject(value, path, ["kind"]);
-    oneOf(item.kind, `${path}.kind`, ["main", "intent-navigator"] as const);
+    oneOf(item.kind, `${path}.kind`, ["main", "intent-navigator", "reflection"] as const);
   },
   "lane.status": (value, path) => {
     const item = payloadObject(value, path, ["status"]);
@@ -422,9 +453,20 @@ const payloadValidators = {
     string(item.model, `${path}.model`, false);
     string(item.requestHash, `${path}.requestHash`, false);
     integer(item.contextWatermark, `${path}.contextWatermark`);
+    if (item.sessionId !== undefined) {
+      string(item.sessionId, `${path}.sessionId`, false);
+    }
     optionalString(item.prefixHash, `${path}.prefixHash`);
     if (item.dependencyRefs !== undefined) {
       stringArray(item.dependencyRefs, `${path}.dependencyRefs`);
+    }
+    if (item.truncations !== undefined) {
+      if (!Array.isArray(item.truncations)) {
+        invalid(`${path}.truncations`, "an array of context truncations");
+      }
+      item.truncations.forEach((truncation, index) => {
+        contextTruncation(truncation, `${path}.truncations[${index}]`);
+      });
     }
     if (item.contextBuildMs !== undefined) {
       finiteNumber(item.contextBuildMs, `${path}.contextBuildMs`);
@@ -529,6 +571,33 @@ const payloadValidators = {
     const item = payloadObject(value, path, ["messageId"]);
     string(item.messageId, `${path}.messageId`, false);
   },
+  "teto.advice.generated": (value, path) => {
+    const item = payloadObject(value, path, ["advice", "delivery"]);
+    advice(item.advice, `${path}.advice`);
+    oneOf(item.delivery, `${path}.delivery`, ["live", "shadow"] as const);
+    if ((item.advice as Advice).sourceLane !== "teto") {
+      invalid(`${path}.advice.sourceLane`, "equal to teto");
+    }
+  },
+  "reflection.observed": (value, path) => {
+    const item = payloadObject(value, path, [
+      "mainCallIndex",
+      "trigger",
+      "action",
+      "reflectionRef",
+      "usage",
+    ]);
+    integer(item.mainCallIndex, `${path}.mainCallIndex`, 1);
+    string(item.trigger, `${path}.trigger`, false);
+    oneOf(item.action, `${path}.action`, ["silent", "revise"] as const);
+    artifactRef(item.reflectionRef, `${path}.reflectionRef`);
+    usage(item.usage, `${path}.usage`);
+  },
+  "reflection.delivered": (value, path) => {
+    const item = payloadObject(value, path, ["mainCallIndex", "messageId"]);
+    integer(item.mainCallIndex, `${path}.mainCallIndex`, 1);
+    string(item.messageId, `${path}.messageId`, false);
+  },
   "advice.acknowledged": (value, path) => {
     const item = payloadObject(value, path, ["adviceId", "disposition"]);
     string(item.adviceId, `${path}.adviceId`, false);
@@ -551,6 +620,70 @@ const payloadValidators = {
     const item = payloadObject(value, path, ["watermark", "checksum"]);
     integer(item.watermark, `${path}.watermark`);
     string(item.checksum, `${path}.checksum`, false);
+  },
+  "fukai.query.audit": (value, path) => {
+    const item = payloadObject(value, path, [
+      "queryId",
+      "operation",
+      "reason",
+      "filterHash",
+      "cursor",
+      "nextCursor",
+      "upperWatermark",
+      "status",
+      "budget",
+      "usage",
+      "returnedCount",
+      "deniedCount",
+      "evidenceRefs",
+      "resultHash",
+    ]);
+    string(item.queryId, `${path}.queryId`, false);
+    oneOf(item.operation, `${path}.operation`, ["events", "artifact"] as const);
+    string(item.reason, `${path}.reason`, false);
+    string(item.filterHash, `${path}.filterHash`, false);
+    string(item.cursor, `${path}.cursor`, false);
+    string(item.nextCursor, `${path}.nextCursor`, false);
+    integer(item.upperWatermark, `${path}.upperWatermark`);
+    oneOf(item.status, `${path}.status`, [
+      "ok",
+      "truncated",
+      "denied",
+      "not-found",
+      "stale",
+    ] as const);
+    const budget = record(item.budget, `${path}.budget`);
+    integer(budget.maxEvents, `${path}.budget.maxEvents`);
+    integer(budget.maxBytes, `${path}.budget.maxBytes`);
+    integer(budget.maxTokens, `${path}.budget.maxTokens`);
+    integer(budget.maxWallClockMs, `${path}.budget.maxWallClockMs`, 1);
+    const usage = record(item.usage, `${path}.usage`);
+    integer(usage.events, `${path}.usage.events`);
+    integer(usage.bytes, `${path}.usage.bytes`);
+    integer(usage.tokens, `${path}.usage.tokens`);
+    integer(item.returnedCount, `${path}.returnedCount`);
+    integer(item.deniedCount, `${path}.deniedCount`);
+    stringArray(item.evidenceRefs, `${path}.evidenceRefs`);
+    string(item.resultHash, `${path}.resultHash`, false);
+  },
+  "fukai.checkpoint.committed": (value, path) => {
+    const item = payloadObject(value, path, [
+      "cursor",
+      "upperWatermark",
+      "goalVersion",
+      "stateRefs",
+      "stateHash",
+      "policyVersion",
+    ]);
+    string(item.cursor, `${path}.cursor`);
+    integer(item.upperWatermark, `${path}.upperWatermark`);
+    integer(item.goalVersion, `${path}.goalVersion`, 1);
+    if (!Array.isArray(item.stateRefs)) {
+      invalid(`${path}.stateRefs`, "an array of artifact refs");
+    }
+    item.stateRefs.forEach((ref, index) => artifactRef(ref, `${path}.stateRefs[${index}]`));
+    string(item.stateHash, `${path}.stateHash`, false);
+    string(item.policyVersion, `${path}.policyVersion`, false);
   },
 } satisfies Record<EventType, PayloadValidator>;
 

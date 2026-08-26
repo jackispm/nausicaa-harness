@@ -38,6 +38,8 @@ export interface FukaiContextRequest {
   laneId: LaneId;
   laneKind: FukaiLaneKind;
   goal: Goal;
+  /** Current Turn intent, pinned as a dynamic user reminder outside the stable prefix. */
+  activeObjective?: string;
   systemPrompt: string;
   conversationRefs: readonly FukaiConversationRef[];
   artifactSelections: readonly FukaiArtifactSelection[];
@@ -93,6 +95,7 @@ export interface FukaiArtifactRead {
 }
 
 export interface FukaiSource {
+  hasArtifact(ref: ArtifactRef, options?: FukaiReadOptions): Promise<boolean>;
   readConversation(
     ref: ArtifactRef,
     options?: FukaiReadOptions,
