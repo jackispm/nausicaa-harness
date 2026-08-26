@@ -74,9 +74,9 @@ describe("preregistered Phase 2.4 contract", () => {
       bootstrapReplicates: 2_000,
     });
     expect(PREREGISTERED_MANIFEST.manifestHash).toBe(hashManifest(PREREGISTERED_MANIFEST));
-    expect(PREREGISTERED_MANIFEST_HASH).toBe("sha256:0d295dcb90e467eff402ed0e9d5846f3d8152bf9e46f0ed47baa45aa5496e58d");
+    expect(PREREGISTERED_MANIFEST_HASH).toBe("sha256:35894c3ee2b91a152674edb675283dcffc6a63d6d941843220191063bcea9e33");
     expect(PREREGISTERED_MANIFEST.provenance).toMatchObject({
-      repositoryCommit: "71805f0a83b390f2a1e5a303e36a12fda4b32f9b",
+      repositoryCommit: "062aca4c3f830d870e89889d5cca128b8a5f1aac",
       runnerVersion: "nausicaa-eval-runner-v2.1",
     });
     expect(PREREGISTERED_MANIFEST.arms.every((arm) => arm.budget.scope === "per-pair")).toBe(true);

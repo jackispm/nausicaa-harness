@@ -299,7 +299,7 @@ export interface ReleaseDecision {
   reasons: readonly string[];
 }
 
-const FROZEN_REPOSITORY_COMMIT = "71805f0a83b390f2a1e5a303e36a12fda4b32f9b";
+const FROZEN_REPOSITORY_COMMIT = "062aca4c3f830d870e89889d5cca128b8a5f1aac";
 const FROZEN_MODEL = {
   main: "openrouter:z-ai/glm-4.7-flash",
   teto: "openrouter:z-ai/glm-4.7-flash",
