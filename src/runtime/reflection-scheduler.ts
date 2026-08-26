@@ -11,7 +11,7 @@ import type {
   RunPolicy,
   TokenUsage,
 } from "../domain/index.js";
-import { systemClock } from "../domain/index.js";
+import { parseSingleJsonObject, systemClock } from "../domain/index.js";
 import { stableJson } from "../ledger/hash.js";
 import type { ContentAddressedStore } from "../store/index.js";
 import { TetoCadence, TokenRatioGate, type TetoCadenceState, type TokenRatioGateState } from "../teto/index.js";
@@ -438,9 +438,9 @@ type ParsedReflection = { action: "silent" } | { action: "revise"; note: string 
 function parseReflectionOutput(content: string): ParsedReflection {
   let value: unknown;
   try {
-    value = JSON.parse(content);
+    value = parseSingleJsonObject(content);
   } catch {
-    throw new Error("Reflection output must be one JSON object");
+    throw new Error("Reflection output must contain one JSON object");
   }
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error("Reflection output must be one JSON object");

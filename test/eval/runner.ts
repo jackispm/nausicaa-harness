@@ -385,7 +385,10 @@ export async function executeEvaluationArm(
           maxMainStepsPerActivation: 8,
           maxModelTokens: arm.budget.maxInputTokens + arm.budget.maxOutputTokens,
           tetoEnabled: config.auxiliaryMode === "teto",
-          tetoMaxOutputTokens: 64,
+          // The live evaluation needs enough room for providers that wrap
+          // structured advice in a short explanation. Production Teto keeps
+          // the tighter 64-token policy default.
+          tetoMaxOutputTokens: 128,
           tetoTokenRatio: 0.1,
           auxiliaryMode: config.auxiliaryMode === "teto"
             ? "teto"
@@ -394,7 +397,9 @@ export async function executeEvaluationArm(
               : "none",
           ...(config.adviceDelivery === undefined ? {} : { tetoAdviceDelivery: config.adviceDelivery }),
         },
-        maxOutputTokens: 128,
+        // Keep the experiment from confounding quality with an artificial
+        // 128-token Main response ceiling.
+        maxOutputTokens: 512,
         allowWrite: fixture.allowWrite,
         allowShell: false,
         signal: controller.signal,

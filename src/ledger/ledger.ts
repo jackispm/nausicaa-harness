@@ -152,10 +152,11 @@ export function validateEvent(event: unknown): asserts event is AnyEvent {
     const payloadTurnId = "turnId" in candidate.payload
       ? candidate.payload.turnId
       : undefined;
+    // Legacy one-shot runs may cancel a model request without a Turn; interactive
+    // callers still include their Turn identity on the event envelope.
     if (
       (candidate.type === "input.delivered"
         || candidate.type.startsWith("turn.")
-        || candidate.type === "model.cancelled"
         || candidate.type === "tool.unknown"
         || (candidate.type === "user.message" && "inputId" in candidate.payload))
       && candidate.turnId === undefined

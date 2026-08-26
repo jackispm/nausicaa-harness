@@ -116,7 +116,7 @@ describe("IntentNavigator", () => {
     expect(result.usage.output).toBe(40);
   });
 
-  it("rejects malformed, fenced, or expanded output without retrying", async () => {
+  it("accepts one fenced object but rejects malformed or expanded output", async () => {
     const model = new ScriptedModel(response(
       '```json\n{"action":"silent"}\n```',
     ));
@@ -125,8 +125,33 @@ describe("IntentNavigator", () => {
       runId: "run-1",
       sessionId: "teto-session",
       frame,
-    })).rejects.toBeInstanceOf(TetoOutputError);
+    })).resolves.satisfy((result: { advice?: unknown }) => result.advice === undefined);
     expect(model.requests).toHaveLength(1);
+
+    const wrapped = new ScriptedModel(response(
+      "I checked the boundary.\n{\"action\":\"silent\"}\nDone.",
+    ));
+    await expect(navigator(wrapped).observe({
+      runId: "run-1",
+      sessionId: "teto-session",
+      frame,
+    })).resolves.satisfy((result: { advice?: unknown }) => result.advice === undefined);
+
+    const malformed = new ScriptedModel(response("not JSON"));
+    await expect(navigator(malformed).observe({
+      runId: "run-1",
+      sessionId: "teto-session",
+      frame,
+    })).rejects.toBeInstanceOf(TetoOutputError);
+
+    const expanded = new ScriptedModel(response(
+      '{"action":"silent"}\n{"action":"silent"}',
+    ));
+    await expect(navigator(expanded).observe({
+      runId: "run-1",
+      sessionId: "teto-session",
+      frame,
+    })).rejects.toBeInstanceOf(TetoOutputError);
   });
 
   it("rejects unknown fields instead of accepting model-owned metadata", async () => {

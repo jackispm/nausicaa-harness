@@ -541,4 +541,31 @@ describe("event payload validation", () => {
       idempotencyKey: "turn-started-mismatch",
     })).rejects.toThrow(/must equal the event turnId/);
   });
+
+  it("allows run-scoped model cancellation and preserves interactive Turn identity", async () => {
+    const ledger = new MemoryLedger();
+
+    const runScoped = await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "model.cancelled",
+      payload: { requestId: "request-1", reason: "timeout" },
+      correlationId: "correlation-1",
+      idempotencyKey: "run-model-cancelled",
+    });
+    expect(runScoped.type).toBe("model.cancelled");
+    expect(runScoped.turnId).toBeUndefined();
+
+    const interactive = await ledger.append({
+      runId: "run-1",
+      turnId: "turn-1",
+      laneId: "main",
+      type: "model.cancelled",
+      payload: { requestId: "request-2", reason: "user" },
+      correlationId: "correlation-1",
+      idempotencyKey: "turn-model-cancelled",
+    });
+    expect(interactive.type).toBe("model.cancelled");
+    expect(interactive.turnId).toBe("turn-1");
+  });
 });

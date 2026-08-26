@@ -8,7 +8,7 @@ import type {
   ObservationFrame,
   RunId,
 } from "../domain/index.js";
-import { systemClock } from "../domain/index.js";
+import { parseSingleJsonObject, systemClock } from "../domain/index.js";
 
 export const TETO_SYSTEM_PROMPT = `Teto navigates intent. From mission and boundary only, flag drift, missing user intent, or a materially simpler method. Never inspect bugs or invent facts. JSON only: {"action":"silent"} or {"action":"advise","kind":"orientation|intent-gap|method-alternative","claim":"brief","suggestedAction":"brief","risk":"low|medium|high"}.`;
 
@@ -130,9 +130,9 @@ export function parseAdviceJson(
 ): Advice | undefined {
   let value: unknown;
   try {
-    value = JSON.parse(text);
+    value = parseSingleJsonObject(text);
   } catch {
-    throw new TetoOutputError("Teto output must be a single JSON object");
+    throw new TetoOutputError("Teto output must contain a single JSON object");
   }
   if (!isRecord(value) || Array.isArray(value)) {
     throw new TetoOutputError("Teto output must be a JSON object");
