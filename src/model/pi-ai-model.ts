@@ -77,8 +77,9 @@ export class PiAiModelPort implements ModelPort {
 
     if (result.stopReason === "error" || result.stopReason === "aborted") {
       // Provider diagnostics can contain request metadata. Keep the public
-      // failure deliberately small; the adapter never logs provider payloads.
-      throw new Error(`Model request ${result.stopReason}`);
+      // failure deliberately bounded and redacted; the adapter never logs
+      // provider payloads or credentials.
+      throw new Error(safeProviderFailure(result));
     }
 
     return fromPiMessage(result);
@@ -335,6 +336,23 @@ function streamError(
   return reason === "aborted"
     ? new DOMException("The model request was aborted", "AbortError")
     : new Error("Model request failed");
+}
+
+function safeProviderFailure(message: AssistantMessage): string {
+  const reason = message.errorMessage === undefined
+    ? ""
+    : `: ${boundedProviderText(message.errorMessage)}`;
+  return `Model request ${message.stopReason}${reason}`;
+}
+
+function boundedProviderText(value: string): string {
+  const redacted = value
+    .replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
+    .replace(/\b(?:sk-or-v1|sk)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]")
+    .replace(/https?:\/\/[^\s"']+/gi, "[URL]");
+  return redacted.length <= 256
+    ? redacted
+    : `${redacted.slice(0, 241)}[TRUNCATED]`;
 }
 
 function asError(error: unknown): Error {

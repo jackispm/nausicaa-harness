@@ -388,6 +388,58 @@ describe("MainLoop", () => {
     expect(retryContext?.content).toContain("may be truncated");
   });
 
+  it("does not promote one expected tool miss to a repeated-failure wake", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const model = new ScriptedModel([
+      {
+        content: "",
+        toolCalls: [{ id: "missing-1", name: "read_file", arguments: { path: "OPTIONAL.md" } }],
+        stopReason: "toolUse",
+        usage: tokenUsage(3, 1),
+      },
+      {
+        content: "done",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(3, 1),
+      },
+    ]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [{
+        definition: {
+          name: "read_file",
+          description: "read a bounded file",
+          parameters: { type: "object", additionalProperties: false },
+        },
+        async execute() {
+          return { content: "File not found", isError: true };
+        },
+      }],
+    });
+
+    const result = await loop.run({
+      runId: "expected-miss-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      initialMessage: "Go",
+    });
+
+    expect(result.completed).toBe(true);
+    expect(result.navigationDeltas[0]).toMatchObject({
+      triggerKind: "normal",
+      actionOrDecision: expect.stringContaining("OPTIONAL.md"),
+      outcome: expect.stringContaining("File not found"),
+    });
+  });
+
   it("records monotonic context and provider latency without wall-clock inference", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();

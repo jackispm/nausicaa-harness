@@ -420,6 +420,20 @@ describe("PiAiModelPort", () => {
     expect(events[0].error.message).not.toContain(secret);
   });
 
+  it("retains bounded, redacted details for a provider error response", async () => {
+    const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
+    const response = fauxAssistantMessage("", { stopReason: "error" });
+    response.errorMessage = "HTTP 429 Bearer sk-provider-secret https://example.test/private";
+    faux.setResponses([response]);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+
+    await expect(adapter.complete(request())).rejects.toThrow(
+      "Model request error: HTTP 429 Bearer [REDACTED] [URL]",
+    );
+  });
+
   it("parses explicit and default provider selectors", () => {
     expect(parseModelSelector("openrouter:anthropic/claude", "other")).toEqual({
       provider: "openrouter",

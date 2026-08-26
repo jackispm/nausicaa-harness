@@ -514,6 +514,7 @@ export class MainLoop {
           response.toolCalls,
           toolMessages.map((result) => result.message),
           response.stopReason,
+          previousDelta,
         );
         // Navigation hooks may only derive/dispatch local state. Auxiliary
         // model work belongs behind afterStep and must not block Main.
@@ -910,24 +911,45 @@ function defaultNavigationDelta(
   toolCalls: readonly ToolCall[],
   toolResults: readonly ConversationMessage[],
   stopReason: string,
+  previousDelta?: NavigationDelta,
 ): NavigationDelta {
-  const failures = toolResults
-    .filter((message) => message.role === "tool" && message.isError)
-    .map((message) => `Tool ${message.role === "tool" ? message.toolName : "unknown"} failed`);
+  const toolSummaries = toolCalls.map((call) => {
+    const result = toolResults.find((message) => (
+      message.role === "tool" && message.toolCallId === call.id
+    ));
+    const descriptor = `${call.name}(${boundedToolArguments(call.arguments)})`;
+    if (result?.role !== "tool") return descriptor;
+    const resultText = boundedRedactedText(result.content, 240);
+    return `${descriptor}${result.isError ? " failed" : " succeeded"}: ${resultText}`;
+  });
+  const failures = toolCalls
+    .map((call) => {
+      const result = toolResults.find((message) => (
+        message.role === "tool" && message.toolCallId === call.id
+      ));
+      return result?.role === "tool" && result.isError
+        ? `${call.name}(${boundedToolArguments(call.arguments)})`
+        : undefined;
+    })
+    .filter((value): value is string => value !== undefined);
+  const repeatedFailure = failures.length > 0 && failures.some((failure) => (
+    previousDelta?.status === "uncertain"
+    && previousDelta.uncertainties.some((uncertainty) => uncertainty.includes(failure))
+  ));
   const hasTools = toolCalls.length > 0;
   const incompleteStop = !hasTools && stopReason !== "stop";
   return {
     boundaryId: `${input.runId}:${laneId}:step:${step}`,
-    triggerKind: failures.length > 0 ? "repeated-failure" : "normal",
+    triggerKind: repeatedFailure ? "repeated-failure" : "normal",
     activeObjective: boundedText(input.activeObjective ?? input.goal.statement, 512),
     actionOrDecision: hasTools
-      ? `Call tools: ${toolCalls.map((call) => call.name).join(", ")}`
+      ? `Call tools: ${toolSummaries.join("; ")}`
       : boundedText(responseText, 512),
     expectedOutcome: hasTools
       ? "Use bounded tool results to advance the active objective"
       : "Return a complete answer that satisfies the mission",
     outcome: failures.length > 0
-      ? failures.join("; ")
+      ? toolSummaries.filter((summary, index) => failures.some((failure) => summary.startsWith(failure)))[0] ?? failures.join("; ")
       : hasTools
         ? `${toolResults.length} tool result(s) recorded`
         : incompleteStop
@@ -943,6 +965,16 @@ function defaultNavigationDelta(
       : failures,
     openQuestions: [],
   };
+}
+
+function boundedToolArguments(arguments_: Record<string, unknown>): string {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(arguments_);
+  } catch {
+    serialized = "[unserializable]";
+  }
+  return boundedRedactedText(serialized, 160);
 }
 
 function resolveContextBudget(input: MainLoopInput): FukaiBudget {
