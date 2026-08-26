@@ -440,6 +440,59 @@ describe("MainLoop", () => {
     });
   });
 
+  it("marks a successful workspace mutation as a decision boundary", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const loop = new MainLoop({
+      model: new ScriptedModel([
+        {
+          content: "",
+          toolCalls: [{
+            id: "edit-1",
+            name: "edit",
+            arguments: { path: "src/value.ts", oldText: "1", newText: "2" },
+          }],
+          stopReason: "toolUse",
+          usage: tokenUsage(3, 1),
+        },
+        {
+          content: "done",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: tokenUsage(3, 1),
+        },
+      ]),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [{
+        definition: {
+          name: "edit",
+          description: "edit one file",
+          parameters: { type: "object", additionalProperties: true },
+        },
+        async execute() {
+          return { content: "Updated src/value.ts", isError: false };
+        },
+      }],
+    });
+
+    const result = await loop.run({
+      runId: "mutation-decision-run",
+      goal: { version: 1, statement: "Change the value", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      initialMessage: "Go",
+    });
+
+    expect(result.navigationDeltas[0]).toMatchObject({
+      triggerKind: "decision",
+      actionOrDecision: expect.stringContaining("src/value.ts"),
+    });
+  });
+
   it("records monotonic context and provider latency without wall-clock inference", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();

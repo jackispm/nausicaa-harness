@@ -936,11 +936,22 @@ function defaultNavigationDelta(
     previousDelta?.status === "uncertain"
     && previousDelta.uncertainties.some((uncertainty) => uncertainty.includes(failure))
   ));
+  const mutationDecision = toolCalls.some((call) => {
+    if (call.name !== "write_file" && call.name !== "edit") return false;
+    const result = toolResults.find((message) => (
+      message.role === "tool" && message.toolCallId === call.id
+    ));
+    return result?.role === "tool" && !result.isError;
+  });
   const hasTools = toolCalls.length > 0;
   const incompleteStop = !hasTools && stopReason !== "stop";
   return {
     boundaryId: `${input.runId}:${laneId}:step:${step}`,
-    triggerKind: repeatedFailure ? "repeated-failure" : "normal",
+    triggerKind: repeatedFailure
+      ? "repeated-failure"
+      : mutationDecision
+        ? "decision"
+        : "normal",
     activeObjective: boundedText(input.activeObjective ?? input.goal.statement, 512),
     actionOrDecision: hasTools
       ? `Call tools: ${toolSummaries.join("; ")}`

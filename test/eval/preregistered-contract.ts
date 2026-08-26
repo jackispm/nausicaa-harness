@@ -5,20 +5,23 @@ import {
   FROZEN_FIXTURE_CATALOG_HASH,
   FROZEN_SCORER_CONTRACT,
 } from "./fixtures.js";
+import type { FixtureCategory, FixtureVariant } from "./fixtures.js";
 import { canonicalJson, hashJson, hashText } from "./fingerprint.js";
 import { FROZEN_TOOL_CONTRACT_HASH } from "./tool-contract.js";
 
 export { hashJson } from "./fingerprint.js";
 
 export const PREREGISTERED_MANIFEST_VERSION = 1 as const;
-export const CONTROL_ARM = "equal-budget-reflection" as const;
+/** Reflection is retained as a descriptive control, but Teto shadow is the
+ * primary placebo for the causal live-vs-shadow comparison. */
+export const CONTROL_ARM = "teto-shadow" as const;
 export const PRIMARY_CONTROL_ARM = CONTROL_ARM;
 export const PRIMARY_TREATMENT_ARM = "teto-live" as const;
 export const SECONDARY_BASELINE_ARM = "main-only" as const;
 export const PREREGISTERED_ARMS = [
   SECONDARY_BASELINE_ARM,
+  "equal-budget-reflection",
   CONTROL_ARM,
-  "teto-shadow",
   "teto-live",
 ] as const;
 export const TETO_ARMS = ["teto-shadow", "teto-live"] as const;
@@ -58,7 +61,9 @@ export interface ArmPlan {
 
 export interface TaskPlan {
   taskId: string;
-  category: "goal-drift" | "intent-gap" | "method-alternative" | "coding" | "recovery";
+  familyId: string;
+  category: FixtureCategory;
+  variant: FixtureVariant;
   fixtureVersion: string;
   oracle: "hidden";
 }
@@ -97,7 +102,12 @@ export interface PreregisteredManifest {
   sampleCount: number;
   taskOrder: "seeded-permutation";
   armOrder: "seeded-balanced-rotation";
-  retryPolicy: { runnerRetries: 0 };
+  retryPolicy: {
+    runnerRetries: 0;
+    providerMaxAttempts: number;
+    providerBaseDelayMs: number;
+    providerMaxDelayMs: number;
+  };
   arms: readonly ArmPlan[];
   experimentBudget: ExperimentBudget;
   tasks: readonly TaskPlan[];
@@ -258,11 +268,16 @@ export interface ReportBuildOptions {
 export interface ReleaseArmCheck {
   armId: TetoArmId;
   passed: boolean;
+  /** The primary comparison is always live versus the shadow placebo. */
+  comparison: "primary-shadow" | "placebo-safety";
   completionRate: number;
   utilityCiLow: number;
   minimumUtilityUplift: number;
   qualityDeltaMean: number;
   qualityDeltaCiLow: number;
+  /** Secondary positive-utility/non-regression check against Main-only. */
+  secondaryUtilityCiLow?: number;
+  secondaryQualityDeltaCiLow?: number;
   maximumQualityRegression: number;
   costMeanUsd: number;
   costMaxUsdObserved: number;
@@ -271,6 +286,7 @@ export interface ReleaseArmCheck {
   qualityPass: boolean;
   budgetPass: boolean;
   completionPass: boolean;
+  harmfulAdvicePass: boolean;
 }
 
 export interface ReleaseDecision {
@@ -285,12 +301,12 @@ export interface ReleaseDecision {
 
 const FROZEN_REPOSITORY_COMMIT = "71805f0a83b390f2a1e5a303e36a12fda4b32f9b";
 const FROZEN_MODEL = {
-  main: "openrouter:qwen/qwen3.7-flash",
-  teto: "openrouter:qwen/qwen3.7-flash",
+  main: "openrouter:z-ai/glm-4.7-flash",
+  teto: "openrouter:z-ai/glm-4.7-flash",
 } as const;
-const FROZEN_TASK_SET_VERSION = "phase-2.4-v1";
+const FROZEN_TASK_SET_VERSION = "phase-2.4-v2";
 const FROZEN_TOOL_VERSION = "workspace-fixture-v2";
-const FROZEN_RUNNER_VERSION = "nausicaa-eval-runner-v2";
+const FROZEN_RUNNER_VERSION = "nausicaa-eval-runner-v2.1";
 const FROZEN_SEED = "nausicaa-phase-2.4-seed-1";
 const FROZEN_SCORER_VERSION = "phase-2.4-scorer-v3";
 const FROZEN_BUDGET: BudgetEnvelope = {
@@ -343,7 +359,7 @@ const manifestDraft: Omit<PreregisteredManifest, "manifestHash"> = {
   sampleCount: FROZEN_TASKS.length * 3,
   taskOrder: "seeded-permutation",
   armOrder: "seeded-balanced-rotation",
-  retryPolicy: { runnerRetries: 0 },
+  retryPolicy: { runnerRetries: 0, providerMaxAttempts: 2, providerBaseDelayMs: 250, providerMaxDelayMs: 4_000 },
   arms: [
     {
       id: SECONDARY_BASELINE_ARM,
@@ -353,7 +369,7 @@ const manifestDraft: Omit<PreregisteredManifest, "manifestHash"> = {
       budget: { ...FROZEN_BUDGET },
     },
     {
-      id: CONTROL_ARM,
+      id: "equal-budget-reflection",
       topology: "main+reflection",
       adviceVisibility: "none",
       maxAuxiliaryRequests: 2,
@@ -501,21 +517,50 @@ export function evaluateReleaseDecision(report: PairedReport): ReleaseDecision {
   validateReport(PREREGISTERED_MANIFEST, report);
   const checks = Object.fromEntries(TETO_ARMS.map((armId) => {
     const aggregate = report.aggregates[armId]!;
-    const uplift = report.uplifts[armId]!;
+    const uplift = armId === CONTROL_ARM ? undefined : report.uplifts[armId]!;
     const budget = PREREGISTERED_MANIFEST.arms.find((arm) => arm.id === armId)!.budget;
-    const utilityPass = uplift.utilityCi95.low > PREREGISTERED_MANIFEST.scoring.minimumUtilityUplift;
-    const qualityPass = uplift.qualityDeltaCi95.low >= -PREREGISTERED_MANIFEST.scoring.maximumQualityRegression;
+    const isLive = armId === PRIMARY_TREATMENT_ARM;
+    const utilityPass = isLive
+      ? uplift!.utilityCi95.low > PREREGISTERED_MANIFEST.scoring.minimumUtilityUplift
+      : true;
+    const qualityPass = isLive
+      ? uplift!.qualityDeltaCi95.low >= -PREREGISTERED_MANIFEST.scoring.maximumQualityRegression
+      : true;
+    const secondaryUtilityCiLow = isLive
+      ? bootstrapMeanCi(
+        report.rows.map((row) => netUtility(row.outcomes[armId]!, PREREGISTERED_MANIFEST.scoring)
+          - netUtility(row.outcomes[SECONDARY_BASELINE_ARM]!, PREREGISTERED_MANIFEST.scoring)),
+        { seed: PREREGISTERED_MANIFEST.seed, replicates: PREREGISTERED_MANIFEST.scoring.bootstrapReplicates, confidenceLevel: PREREGISTERED_MANIFEST.scoring.confidenceLevel },
+        `${armId}:uplift:main-only`,
+      ).low
+      : undefined;
+    const secondaryQualityDeltaCiLow = isLive
+      ? bootstrapScalarCi(
+        report.rows.map((row) => row.outcomes[armId]!.quality - row.outcomes[SECONDARY_BASELINE_ARM]!.quality),
+        { seed: PREREGISTERED_MANIFEST.seed, replicates: PREREGISTERED_MANIFEST.scoring.bootstrapReplicates, confidenceLevel: PREREGISTERED_MANIFEST.scoring.confidenceLevel },
+        `${armId}:quality-uplift:main-only`,
+      ).low
+      : undefined;
+    const secondaryPass = !isLive
+      || (secondaryUtilityCiLow !== undefined
+        && secondaryUtilityCiLow > PREREGISTERED_MANIFEST.scoring.minimumUtilityUplift
+        && secondaryQualityDeltaCiLow !== undefined
+        && secondaryQualityDeltaCiLow >= -PREREGISTERED_MANIFEST.scoring.maximumQualityRegression);
     const budgetPass = aggregate.budgetBreachRate === 0
       && aggregate.costMaxUsd <= budget.maxCostUsd;
     const completionPass = aggregate.completionRate === 1;
+    const harmfulAdvicePass = aggregate.harmfulAdviceRate === 0;
     return [armId, {
       armId,
-      passed: utilityPass && qualityPass && budgetPass && completionPass,
+      comparison: isLive ? "primary-shadow" : "placebo-safety",
+      passed: utilityPass && qualityPass && secondaryPass && budgetPass && completionPass && harmfulAdvicePass,
       completionRate: aggregate.completionRate,
-      utilityCiLow: uplift.utilityCi95.low,
+      utilityCiLow: uplift?.utilityCi95.low ?? 0,
       minimumUtilityUplift: PREREGISTERED_MANIFEST.scoring.minimumUtilityUplift,
-      qualityDeltaMean: uplift.qualityDeltaMean,
-      qualityDeltaCiLow: uplift.qualityDeltaCi95.low,
+      qualityDeltaMean: uplift?.qualityDeltaMean ?? 0,
+      qualityDeltaCiLow: uplift?.qualityDeltaCi95.low ?? 0,
+      ...(secondaryUtilityCiLow === undefined ? {} : { secondaryUtilityCiLow }),
+      ...(secondaryQualityDeltaCiLow === undefined ? {} : { secondaryQualityDeltaCiLow }),
       maximumQualityRegression: PREREGISTERED_MANIFEST.scoring.maximumQualityRegression,
       costMeanUsd: aggregate.costMeanUsd,
       costMaxUsdObserved: aggregate.costMaxUsd,
@@ -524,6 +569,7 @@ export function evaluateReleaseDecision(report: PairedReport): ReleaseDecision {
       qualityPass,
       budgetPass,
       completionPass,
+      harmfulAdvicePass,
     } satisfies ReleaseArmCheck];
   })) as Record<TetoArmId, ReleaseArmCheck>;
   const primaryCheck = checks[PRIMARY_TREATMENT_ARM]!;
@@ -549,7 +595,14 @@ export function validateManifest(manifest: unknown): asserts manifest is Preregi
     throw new Error("Manifest identity is not frozen");
   }
   if (canonicalJson(manifest.model) !== canonicalJson(FROZEN_MODEL)) throw new Error("Manifest model is not frozen");
-  if (manifest.taskOrder !== "seeded-permutation" || manifest.armOrder !== "seeded-balanced-rotation" || canonicalJson(manifest.retryPolicy) !== canonicalJson({ runnerRetries: 0 })) throw new Error("Manifest ordering/retry policy is not frozen");
+  if (manifest.taskOrder !== "seeded-permutation"
+    || manifest.armOrder !== "seeded-balanced-rotation"
+    || canonicalJson(manifest.retryPolicy) !== canonicalJson({
+      runnerRetries: 0,
+      providerMaxAttempts: 2,
+      providerBaseDelayMs: 250,
+      providerMaxDelayMs: 4_000,
+    })) throw new Error("Manifest ordering/retry policy is not frozen");
   if (manifest.repetitions !== 3 || manifest.sampleCount !== FROZEN_TASKS.length * manifest.repetitions) {
     throw new Error("Manifest sample plan is invalid");
   }
@@ -875,8 +928,15 @@ function releaseReason(check: ReleaseArmCheck): string {
   const failed: string[] = [];
   if (!check.utilityPass) failed.push(`utility CI low ${check.utilityCiLow} does not exceed ${check.minimumUtilityUplift}`);
   if (!check.qualityPass) failed.push(`quality delta ${check.qualityDeltaMean} regresses beyond ${check.maximumQualityRegression}`);
+  if (check.secondaryUtilityCiLow !== undefined && check.secondaryUtilityCiLow <= check.minimumUtilityUplift) {
+    failed.push(`Main-only utility CI low ${check.secondaryUtilityCiLow} does not exceed ${check.minimumUtilityUplift}`);
+  }
+  if (check.secondaryQualityDeltaCiLow !== undefined && check.secondaryQualityDeltaCiLow < -check.maximumQualityRegression) {
+    failed.push(`Main-only quality delta CI low ${check.secondaryQualityDeltaCiLow} regresses beyond ${check.maximumQualityRegression}`);
+  }
   if (!check.budgetPass) failed.push(`observed max cost ${check.costMaxUsdObserved} exceeds ${check.maxCostUsd}`);
   if (!check.completionPass) failed.push(`completion rate ${check.completionRate} is below 1`);
+  if (!check.harmfulAdvicePass) failed.push("harmful Advice rate is not zero");
   return `${check.armId}: ${failed.join("; ")}`;
 }
 

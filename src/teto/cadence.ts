@@ -2,6 +2,7 @@ import type { MainTriggerKind, TokenUsage } from "../domain/index.js";
 
 export interface TetoCadenceOptions {
   creditThreshold?: number;
+  firstPassThreshold?: number;
   maxGap?: number;
   minGap?: number;
   rollingWindow?: number;
@@ -28,6 +29,7 @@ export interface TetoCadenceDecision {
 
 const DEFAULT_CADENCE = {
   creditThreshold: 5,
+  firstPassThreshold: 2,
   maxGap: 7,
   minGap: 4,
   rollingWindow: 20,
@@ -77,9 +79,12 @@ export class TetoCadence {
     const callsSincePass = previousPass === undefined
       ? this.mainCallIndex
       : this.mainCallIndex - previousPass;
+    const creditThreshold = previousPass === undefined
+      ? this.options.firstPassThreshold
+      : this.options.creditThreshold;
     const reason = hardTrigger
       ? "hard-trigger"
-      : this.credit >= this.options.creditThreshold
+      : this.credit >= creditThreshold
         ? "credit"
         : callsSincePass >= this.options.maxGap
           ? "max-gap"
@@ -245,6 +250,7 @@ export class TokenRatioGate {
 
 function validateOptions(options: Required<TetoCadenceOptions>): void {
   assertPositiveInteger(options.creditThreshold, "creditThreshold");
+  assertPositiveInteger(options.firstPassThreshold, "firstPassThreshold");
   assertPositiveInteger(options.maxGap, "maxGap");
   assertPositiveInteger(options.minGap, "minGap");
   assertPositiveInteger(options.rollingWindow, "rollingWindow");

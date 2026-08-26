@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   Advice,
   AdviceKind,
@@ -10,11 +10,9 @@ import type {
 } from "../domain/index.js";
 import { systemClock } from "../domain/index.js";
 
-export const TETO_SYSTEM_PROMPT = `You are Teto, a sparse intent navigator beside a primary agent.
-Check only whether the current action serves the mission, whether user intent is missing, or whether a materially simpler method exists. Do not inspect bugs or invent unavailable evidence.
-Usually stay silent. Only propose when there is a real course error, intent gap, or clearly better method. For silence return exactly {"action":"silent"}.
-Otherwise return one JSON object and no markdown with exactly these keys: kind, claim, evidenceRefs, confidence, risk, suggestedAction, urgency, expiresAt, dedupeKey.
-kind is orientation, intent-gap, or method-alternative. confidence is 0..1. risk is low, medium, or high. urgency is next-step, next-turn, or deferred. Keep the result concise.`;
+export const TETO_SYSTEM_PROMPT = `Teto navigates intent. From mission and boundary only, flag drift, missing user intent, or a materially simpler method. Never inspect bugs or invent facts. JSON only: {"action":"silent"} or {"action":"advise","kind":"orientation|intent-gap|method-alternative","claim":"brief","suggestedAction":"brief","risk":"low|medium|high"}.`;
+
+const ADVICE_TTL_MS = 10 * 60 * 1_000;
 
 export interface IntentNavigatorOptions {
   modelPort: ModelPort;
@@ -57,7 +55,7 @@ export class IntentNavigator {
     this.laneId = options.laneId ?? "teto";
     this.clock = options.clock ?? systemClock;
     this.createAdviceId = options.createAdviceId ?? randomUUID;
-    this.maxAdviceOutputTokens = options.maxAdviceOutputTokens ?? 200;
+    this.maxAdviceOutputTokens = options.maxAdviceOutputTokens ?? 64;
     if (!Number.isSafeInteger(this.maxAdviceOutputTokens) || this.maxAdviceOutputTokens <= 0) {
       throw new RangeError("maxAdviceOutputTokens must be a positive integer");
     }
@@ -98,6 +96,7 @@ export class IntentNavigator {
       adviceId: this.createAdviceId(),
       sourceLane: this.laneId,
       now,
+      boundaryId: request.frame.mainDelta.boundaryId,
     });
     return {
       ...(advice === undefined ? {} : { advice }),
@@ -110,18 +109,15 @@ interface ParseAdviceOptions {
   adviceId: string;
   sourceLane: LaneId;
   now: Date;
+  boundaryId: string;
 }
 
 const adviceKeys = [
+  "action",
   "claim",
-  "confidence",
-  "dedupeKey",
-  "evidenceRefs",
-  "expiresAt",
   "kind",
   "risk",
   "suggestedAction",
-  "urgency",
 ] as const;
 
 export class TetoOutputError extends Error {
@@ -154,37 +150,35 @@ export function parseAdviceJson(
   ) {
     throw new TetoOutputError("Teto output has missing or unknown fields");
   }
+  if (value.action !== "advise") {
+    throw new TetoOutputError("Teto action must be silent or advise");
+  }
 
   const kind = enumValue(value.kind, [
     "orientation",
     "intent-gap",
     "method-alternative",
   ] as const, "kind");
-  const claim = nonEmptyString(value.claim, "claim");
-  const evidenceRefs = stringArray(value.evidenceRefs, "evidenceRefs", 8);
-  const confidence = finiteNumber(value.confidence, "confidence");
-  if (confidence < 0 || confidence > 1) {
-    throw new TetoOutputError("confidence must be between 0 and 1");
-  }
+  const claim = boundedString(value.claim, "claim", 280);
   const risk = enumValue(value.risk, ["low", "medium", "high"] as const, "risk");
-  const suggestedAction = nonEmptyString(value.suggestedAction, "suggestedAction");
-  const urgency = enumValue(
-    value.urgency,
-    ["next-step", "next-turn", "deferred"] as const,
-    "urgency",
+  const suggestedAction = boundedString(
+    value.suggestedAction,
+    "suggestedAction",
+    280,
   );
-  const expiresAt = nonEmptyString(value.expiresAt, "expiresAt");
-  const expiry = Date.parse(expiresAt);
-  if (!Number.isFinite(expiry) || expiry <= options.now.getTime()) {
-    throw new TetoOutputError("expiresAt must be a future ISO date");
-  }
-  const dedupeKey = nonEmptyString(value.dedupeKey, "dedupeKey");
+  const confidence = risk === "high" ? 0.9 : risk === "medium" ? 0.8 : 0.7;
+  const urgency = risk === "low" ? "next-turn" : "next-step";
+  const expiresAt = new Date(options.now.getTime() + ADVICE_TTL_MS).toISOString();
+  const dedupeKey = createHash("sha256")
+    .update(JSON.stringify([kind, claim, suggestedAction]))
+    .digest("hex")
+    .slice(0, 24);
 
   return {
     adviceId: options.adviceId,
     kind: kind as AdviceKind,
     claim,
-    evidenceRefs,
+    evidenceRefs: [options.boundaryId],
     confidence,
     risk,
     suggestedAction,
@@ -199,29 +193,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function nonEmptyString(value: unknown, field: string): string {
+function boundedString(value: unknown, field: string, maximum: number): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new TetoOutputError(`${field} must be a non-empty string`);
   }
-  return value;
-}
-
-function stringArray(value: unknown, field: string, maximum: number): string[] {
-  if (
-    !Array.isArray(value)
-    || value.length > maximum
-    || value.some((item) => typeof item !== "string" || item.trim().length === 0)
-  ) {
-    throw new TetoOutputError(`${field} must contain at most ${maximum} strings`);
+  const trimmed = value.trim();
+  if (trimmed.length > maximum) {
+    throw new TetoOutputError(`${field} must not exceed ${maximum} characters`);
   }
-  return [...new Set(value)];
-}
-
-function finiteNumber(value: unknown, field: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new TetoOutputError(`${field} must be a finite number`);
-  }
-  return value;
+  return trimmed;
 }
 
 function enumValue<const T extends readonly string[]>(

@@ -21,19 +21,15 @@ class OneShotModel implements ModelPort {
     this.calls += 1;
     return {
       content: JSON.stringify({
+        action: "advise",
         kind: "intent-gap",
         claim: "The requested install verification is still missing.",
-        evidenceRefs: ["boundary:5"],
-        confidence: 0.9,
         risk: "medium",
         suggestedAction: "Verify the documented command in a clean directory.",
-        urgency: "next-turn",
-        expiresAt: "2026-08-25T12:10:00.000Z",
-        dedupeKey: "verify-install",
       }),
       toolCalls: [],
       stopReason: "stop",
-      usage: { input: 150, output: 80, cacheRead: 80, cacheWrite: 0 },
+      usage: { input: 150, output: 40, cacheRead: 80, cacheWrite: 0 },
     };
   }
 }
@@ -53,7 +49,7 @@ describe("Teto protocol", () => {
     });
 
     let shouldWake = false;
-    for (let call = 1; call <= 5; call += 1) {
+    for (let call = 1; call <= 2; call += 1) {
       shouldWake = cadence.recordMainCall().shouldWake;
     }
     expect(shouldWake).toBe(true);
@@ -78,7 +74,7 @@ describe("Teto protocol", () => {
         openQuestions: ["Has installation actually run?"],
       },
       budget: {
-        maxOutputTokens: 200,
+        maxOutputTokens: 64,
         deadline: "2026-08-25T12:05:00.000Z",
       },
     });

@@ -234,15 +234,11 @@ describe("executeRun", () => {
     });
     mainResponses.push(response("Done with Advice", 1_800, 200));
     const tetoAdvice = JSON.stringify({
+      action: "advise",
       kind: "intent-gap",
       claim: "The installation command still needs a prerequisite check.",
-      evidenceRefs: [],
-      confidence: 0.9,
       risk: "medium",
       suggestedAction: "Check the package engines field before concluding.",
-      urgency: "next-step",
-      expiresAt: "2099-01-01T00:00:00.000Z",
-      dedupeKey: "check-package-engines",
     });
 
     const result = await executeRun({
@@ -293,15 +289,11 @@ describe("executeRun", () => {
       return response("Done without visible Advice", 1_800, 200);
     });
     const tetoAdvice = JSON.stringify({
+      action: "advise",
       kind: "orientation",
       claim: "The current method may drift from the requested scope.",
-      evidenceRefs: [],
-      confidence: 0.85,
       risk: "medium",
       suggestedAction: "Reconfirm the requested scope before continuing.",
-      urgency: "next-step",
-      expiresAt: "2099-01-01T00:00:00.000Z",
-      dedupeKey: "shadow-scope-check",
     });
 
     const shadowMain = new ScriptedModel(mainResponses);

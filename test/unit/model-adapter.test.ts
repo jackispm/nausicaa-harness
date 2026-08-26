@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import type { ModelStreamEvent } from "../../src/domain/index.js";
 import {
   PiAiModelPort,
+  ProviderModelError,
   ScriptedModel,
   parseModelSelector,
 } from "../../src/model/index.js";
@@ -398,7 +399,7 @@ describe("PiAiModelPort", () => {
     expect((await iterator.next()).done).toBe(true);
   });
 
-  it("redacts provider error details from stream events", async () => {
+  it("reduces thrown provider details to a safe structured stream error", async () => {
     const secret = "Bearer sk-provider-secret";
     const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
     faux.setResponses([async () => {
@@ -416,11 +417,15 @@ describe("PiAiModelPort", () => {
     expect(events).toHaveLength(1);
     expect(events[0]?.type).toBe("error");
     if (events[0]?.type !== "error") throw new Error("Missing error event");
-    expect(events[0].error.message).toBe("Model request failed");
+    expect(events[0].error).toBeInstanceOf(ProviderModelError);
+    expect(events[0].error).toMatchObject({
+      category: "provider",
+      retryable: false,
+    });
     expect(events[0].error.message).not.toContain(secret);
   });
 
-  it("retains bounded, redacted details for a provider error response", async () => {
+  it("exposes only structured status and category for a provider response", async () => {
     const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
     const response = fauxAssistantMessage("", { stopReason: "error" });
     response.errorMessage = "HTTP 429 Bearer sk-provider-secret https://example.test/private";
@@ -429,9 +434,164 @@ describe("PiAiModelPort", () => {
     models.setProvider(faux.provider);
     const adapter = new PiAiModelPort({ models });
 
-    await expect(adapter.complete(request())).rejects.toThrow(
-      "Model request error: HTTP 429 Bearer [REDACTED] [URL]",
-    );
+    const error = await adapter.complete(request()).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ProviderModelError);
+    expect(error).toMatchObject({
+      category: "rate-limit",
+      status: 429,
+      retryable: true,
+    });
+    expect((error as Error).message).not.toContain("sk-provider-secret");
+    expect((error as Error).message).not.toContain("example.test");
+  });
+
+  it("disables pi-ai retries and captures only public retry response metadata", async () => {
+    const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
+    const providerResponse = fauxAssistantMessage("", { stopReason: "error" });
+    providerResponse.errorMessage = "private body with Bearer sample-credential https://private.test/path";
+    const observed: Array<{ maxRetries?: number; fetch?: typeof globalThis.fetch }> = [];
+    const models = {
+      getModel: () => faux.getModel(),
+      complete: async (
+        _model: unknown,
+        _context: unknown,
+        options?: { maxRetries?: number; fetch?: typeof globalThis.fetch },
+      ) => {
+        observed.push(options ?? {});
+        await options?.fetch?.("https://request.test");
+        return providerResponse;
+      },
+    } as unknown as Models;
+    const adapter = new PiAiModelPort({
+      models,
+      fetch: async () => new Response("private response", {
+        status: 429,
+        headers: {
+          "retry-after-ms": "2500",
+          "x-should-retry": "true",
+          "x-private-header": "private-header-value",
+        },
+      }),
+    });
+
+    const error = await adapter.complete(request()).catch((caught: unknown) => caught);
+
+    expect(observed).toHaveLength(1);
+    expect(observed[0]?.maxRetries).toBe(0);
+    expect(error).toBeInstanceOf(ProviderModelError);
+    expect(error).toMatchObject({
+      category: "rate-limit",
+      status: 429,
+      retryable: true,
+      retryAfterMs: 2500,
+    });
+    expect(JSON.stringify(error)).not.toMatch(/credential|private|request\.test/i);
+  });
+
+  it("also disables hidden pi-ai retries on the streaming path", async () => {
+    const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
+    const observed: Array<{ maxRetries?: number; fetch?: typeof globalThis.fetch }> = [];
+    const models = {
+      getModel: () => faux.getModel(),
+      stream: (
+        _model: unknown,
+        _context: unknown,
+        options?: { maxRetries?: number; fetch?: typeof globalThis.fetch },
+      ) => {
+        observed.push(options ?? {});
+        return (async function* () {
+          yield { type: "start" as const };
+          yield {
+            type: "done" as const,
+            message: fauxAssistantMessage("done"),
+          };
+        })();
+      },
+    } as unknown as Models;
+    const adapter = new PiAiModelPort({ models });
+
+    const events = await collect(adapter.stream(request()));
+
+    expect(events.at(-1)?.type).toBe("done");
+    expect(observed).toHaveLength(1);
+    expect(observed[0]?.maxRetries).toBe(0);
+    expect(observed[0]?.fetch).toBeTypeOf("function");
+  });
+
+  it.each([
+    ["HTTP 401 invalid API key", "authentication", 401],
+    ["HTTP 403 forbidden", "permission", 403],
+    ["HTTP 429 insufficient credits quota", "quota", 429],
+    ["HTTP 422 invalid request", "invalid-request", 422],
+  ])("never marks a permanent failure retryable: %s", async (message, category, status) => {
+    const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
+    const response = fauxAssistantMessage("", { stopReason: "error" });
+    response.errorMessage = message;
+    faux.setResponses([response]);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+
+    const error = await adapter.complete(request()).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ProviderModelError);
+    expect(error).toMatchObject({ category, status, retryable: false });
+  });
+
+  it.each([
+    ["HTTP 408 request timeout", "timeout", 408],
+    ["HTTP 409 conflict", "transient", 409],
+    ["HTTP 503 unavailable", "server", 503],
+  ])("marks only a transient HTTP failure retryable: %s", async (message, category, status) => {
+    const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
+    const response = fauxAssistantMessage("", { stopReason: "error" });
+    response.errorMessage = message;
+    faux.setResponses([response]);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+
+    const error = await adapter.complete(request()).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ProviderModelError);
+    expect(error).toMatchObject({ category, status, retryable: true });
+  });
+
+  it("honors a provider's public no-retry directive", async () => {
+    const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
+    const response = fauxAssistantMessage("", { stopReason: "error" });
+    response.errorMessage = "opaque failure";
+    const models = fetchCallingModels(faux.getModel(), response);
+    const adapter = new PiAiModelPort({
+      models,
+      fetch: async () => new Response("private", {
+        status: 503,
+        headers: { "x-should-retry": "false" },
+      }),
+    });
+
+    const error = await adapter.complete(request()).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ category: "server", status: 503, retryable: false });
+  });
+
+  it("classifies a transport rejection without exposing its payload", async () => {
+    const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
+    const response = fauxAssistantMessage("", { stopReason: "error" });
+    response.errorMessage = "opaque failure";
+    const secret = "network https://private.test Bearer sample-credential";
+    const models = fetchCallingModels(faux.getModel(), response);
+    const adapter = new PiAiModelPort({
+      models,
+      fetch: async () => { throw new Error(secret); },
+    });
+
+    const error = await adapter.complete(request()).catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ category: "network", retryable: true });
+    expect((error as Error).message).not.toContain(secret);
+    expect(JSON.stringify(error)).not.toMatch(/credential|private/i);
   });
 
   it("parses explicit and default provider selectors", () => {
@@ -465,4 +625,25 @@ async function collect(
   const events: ModelStreamEvent[] = [];
   for await (const event of stream) events.push(event);
   return events;
+}
+
+function fetchCallingModels(
+  model: ReturnType<ReturnType<typeof fauxProvider>["getModel"]>,
+  response: ReturnType<typeof fauxAssistantMessage>,
+): Models {
+  return {
+    getModel: () => model,
+    complete: async (
+      _model: unknown,
+      _context: unknown,
+      options?: { fetch?: typeof globalThis.fetch },
+    ) => {
+      try {
+        await options?.fetch?.("https://request.test");
+      } catch {
+        // pi-ai converts transport throws to an AssistantMessage error.
+      }
+      return response;
+    },
+  } as unknown as Models;
 }

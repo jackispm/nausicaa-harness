@@ -52,7 +52,7 @@ function response(content: string): ModelResponse {
     content,
     toolCalls: [],
     stopReason: "stop",
-    usage: { input: 120, output: 80, cacheRead: 50, cacheWrite: 0 },
+    usage: { input: 120, output: 40, cacheRead: 50, cacheWrite: 0 },
   };
 }
 
@@ -69,15 +69,11 @@ function navigator(model: ScriptedModel): IntentNavigator {
 describe("IntentNavigator", () => {
   it("uses exactly one model pass with no tools and only the ObservationFrame", async () => {
     const model = new ScriptedModel(response(JSON.stringify({
+      action: "advise",
       kind: "method-alternative",
       claim: "The lockfile is a stronger signal than prose.",
-      evidenceRefs: ["boundary:b5"],
-      confidence: 0.9,
       risk: "low",
       suggestedAction: "Use the package manager named by the lockfile.",
-      urgency: "next-step",
-      expiresAt: "2026-08-25T12:04:00.000Z",
-      dedupeKey: "install-lockfile",
     })));
 
     const result = await navigator(model).observe({
@@ -90,7 +86,7 @@ describe("IntentNavigator", () => {
     expect(model.requests[0]).toMatchObject({
       laneId: "teto",
       tools: [],
-      maxOutputTokens: 200,
+      maxOutputTokens: 64,
     });
     expect(model.requests[0]?.messages).toHaveLength(1);
     expect(model.requests[0]?.messages[0]?.content).toBe(JSON.stringify(frame));
@@ -98,6 +94,11 @@ describe("IntentNavigator", () => {
       adviceId: "advice-1",
       sourceLane: "teto",
       kind: "method-alternative",
+      confidence: 0.7,
+      evidenceRefs: ["b5"],
+      urgency: "next-turn",
+      expiresAt: "2026-08-25T12:10:00.000Z",
+      dedupeKey: expect.stringMatching(/^[0-9a-f]{24}$/),
     });
   });
 
@@ -112,7 +113,7 @@ describe("IntentNavigator", () => {
 
     expect(model.requests).toHaveLength(1);
     expect(result.advice).toBeUndefined();
-    expect(result.usage.output).toBe(80);
+    expect(result.usage.output).toBe(40);
   });
 
   it("rejects malformed, fenced, or expanded output without retrying", async () => {
@@ -128,17 +129,13 @@ describe("IntentNavigator", () => {
     expect(model.requests).toHaveLength(1);
   });
 
-  it("rejects unknown fields and non-future Advice", async () => {
+  it("rejects unknown fields instead of accepting model-owned metadata", async () => {
     const model = new ScriptedModel(response(JSON.stringify({
+      action: "advise",
       kind: "orientation",
       claim: "Return to the task",
-      evidenceRefs: [],
-      confidence: 0.7,
       risk: "medium",
       suggestedAction: "Read package.json",
-      urgency: "next-step",
-      expiresAt: "2026-08-25T11:59:00.000Z",
-      dedupeKey: "course",
       explanation: "not allowed",
     })));
 
@@ -151,7 +148,7 @@ describe("IntentNavigator", () => {
 
   it("rejects tool calls and provider output beyond the token gate", async () => {
     const overBudget = response('{"action":"silent"}');
-    overBudget.usage.output = 201;
+    overBudget.usage.output = 65;
     overBudget.toolCalls = [{ id: "call-1", name: "bash", arguments: {} }];
     const model = new ScriptedModel(overBudget);
 

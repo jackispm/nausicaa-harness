@@ -43,7 +43,7 @@ const visionModelSelector = configuredVisionModel ?? "disabled";
 const visionModel = visionModelSelector.startsWith("openrouter:")
   ? visionModelSelector
   : `openrouter:${visionModelSelector}`;
-const MAX_REQUESTS = 5;
+const MAX_REQUESTS = 7;
 const MAIN_OUTPUT_TOKENS = 128;
 const TETO_OUTPUT_TOKENS = 16;
 const RUN_TIMEOUT_MS = 45_000;
@@ -72,9 +72,9 @@ describe.skipIf(!liveEnabled)("OpenRouter live harness acceptance", () => {
     const liveModel = new CappedLiveModel(createOpenRouterModelPort(), budget);
     const task = [
       "Inspect this workspace using tools; do not infer file contents.",
-      "In your first response, issue exactly these three tool calls in parallel and no prose:",
-      "list_files for '.', read_file for README.md, and read_file for OPTIONAL.md.",
-      "OPTIONAL.md is deliberately absent; treat that expected failure only as evidence it is absent.",
+      "In your first response, issue exactly one read_file call for OPTIONAL.md and no prose.",
+      "OPTIONAL.md is deliberately absent; after that expected failure, issue exactly these three tool calls in parallel and no prose:",
+      "list_files for '.', read_file for README.md, and read_file for package.json.",
       "Then answer one short line containing the install command, Node requirement, and test command.",
     ].join(" ");
     const goal = {
@@ -96,7 +96,7 @@ describe.skipIf(!liveEnabled)("OpenRouter live harness acceptance", () => {
         message: task,
         goal,
         policy: {
-          maxMainSteps: 2,
+          maxMainSteps: 3,
           maxModelTokens: 3_000,
           tetoEnabled: false,
         },
@@ -117,7 +117,7 @@ describe.skipIf(!liveEnabled)("OpenRouter live harness acceptance", () => {
         message: task,
         goal,
         policy: {
-          maxMainSteps: 2,
+          maxMainSteps: 3,
           maxModelTokens: 3_000,
           tetoEnabled: true,
           tetoMaxOutputTokens: TETO_OUTPUT_TOKENS,
@@ -248,7 +248,7 @@ class CappedLiveModel implements ModelPort {
     if (request.laneId === "main") {
       const mainCalls = (this.mainCallsByRun.get(request.runId) ?? 0) + 1;
       this.mainCallsByRun.set(request.runId, mainCalls);
-      if (request.runId === "live-with-teto" && mainCalls === 2) {
+      if (request.runId === "live-with-teto" && mainCalls === 3) {
         await withTimeout(
           this.tetoFinished.promise,
           20_000,

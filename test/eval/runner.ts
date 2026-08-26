@@ -10,7 +10,7 @@ import type {
   ModelResponse,
   TokenUsage,
 } from "../../src/domain/index.js";
-import { createOpenRouterModelPort } from "../../src/model/index.js";
+import { createOpenRouterModelPort, RetryingModelPort } from "../../src/model/index.js";
 import { projectCacheEvidence, projectRunMetrics, type CacheEvidenceReport, type RunMetrics } from "../../src/observability/index.js";
 import { executeRun, type RunExecutionResult } from "../../src/runtime/index.js";
 import { JsonlLedger } from "../../src/ledger/index.js";
@@ -343,7 +343,16 @@ export async function executeEvaluationArm(
   }) ?? (live
     ? createOpenRouterModelPort()
     : new ScenarioModel(publicFixtureView(fixture), arm));
-  const wrappedModel = new BudgetedModel(model, meter);
+  const budgetedModel = new BudgetedModel(model, meter);
+  // Keep retries outside the budget decorator so every physical provider
+  // attempt is admitted, metered, and included in the frozen request cap.
+  const wrappedModel = live
+    ? new RetryingModelPort(budgetedModel, {
+      maxAttempts: manifest.retryPolicy.providerMaxAttempts,
+      baseDelayMs: manifest.retryPolicy.providerBaseDelayMs,
+      maxDelayMs: manifest.retryPolicy.providerMaxDelayMs,
+    })
+    : budgetedModel;
   const config = armExecutionConfig(arm);
   const started = performance.now();
   let runResult: RunExecutionResult | undefined;
@@ -376,7 +385,7 @@ export async function executeEvaluationArm(
           maxMainStepsPerActivation: 8,
           maxModelTokens: arm.budget.maxInputTokens + arm.budget.maxOutputTokens,
           tetoEnabled: config.auxiliaryMode === "teto",
-          tetoMaxOutputTokens: 200,
+          tetoMaxOutputTokens: 64,
           tetoTokenRatio: 0.1,
           auxiliaryMode: config.auxiliaryMode === "teto"
             ? "teto"
@@ -410,7 +419,7 @@ export async function executeEvaluationArm(
   const metrics = projectRunMetrics(events, runId);
   const cacheEvidence = projectCacheEvidence(events, runId);
   const snapshot = meter.snapshot();
-  const advice = adviceCounts(events, fixture);
+  const advice = adviceCounts(events, fixture, toolTrace);
   if (error === undefined && snapshot.breached) error = snapshot.breachReason;
   if (error === undefined && runResult?.completed !== true) error = "Run did not complete";
   const treatmentFidelity = evaluateTreatmentFidelity(arm, events);
@@ -586,7 +595,11 @@ interface AdviceCountsWithPending {
   pending: number;
 }
 
-function adviceCounts(events: readonly AnyEvent[], fixture: EvaluationFixture): AdviceCountsWithPending {
+function adviceCounts(
+  events: readonly AnyEvent[],
+  fixture: EvaluationFixture,
+  toolTrace: readonly ToolTraceEntry[],
+): AdviceCountsWithPending {
   const generated = events.filter((event): event is Extract<AnyEvent, { type: "teto.advice.generated" }> => event.type === "teto.advice.generated");
   const acknowledged = new Set<string>();
   let accepted = 0;
@@ -594,7 +607,13 @@ function adviceCounts(events: readonly AnyEvent[], fixture: EvaluationFixture): 
   let rejected = 0;
   let harmful = 0;
   for (const event of generated) {
-    if (fixture.oracle.harmfulAdvice(event.payload.advice.claim, event.payload.advice.suggestedAction)) harmful += 1;
+    const assessment = fixture.oracle.classifyAdvice({
+      kind: event.payload.advice.kind,
+      claim: event.payload.advice.claim,
+      suggestedAction: event.payload.advice.suggestedAction,
+      toolTrace,
+    });
+    if (assessment === "harmful") harmful += 1;
   }
   for (const event of events) {
     if (event.type !== "advice.acknowledged" || acknowledged.has(event.payload.adviceId)) continue;
@@ -977,12 +996,12 @@ export class ScenarioModel implements ModelPort {
         usage: mainUsage(call),
       });
     }
-    const nextStage = ["OPTIONAL-MISSING.md", "STAGE-1.md", "STAGE-2.md", "STAGE-3.md", "STAGE-4.md"]
+    const nextRead = plannedReads(this.fixture.task)
       .find((path) => !hasReadRequest(request.messages, path));
-    if (nextStage !== undefined) {
+    if (nextRead !== undefined) {
       return response({
         content: "",
-        toolCalls: [{ id: `read-${call}`, name: "read_file", arguments: { path: nextStage } }],
+        toolCalls: [{ id: `read-${call}`, name: "read_file", arguments: { path: nextRead } }],
         stopReason: "toolUse",
         usage: mainUsage(call),
       });
@@ -1007,19 +1026,38 @@ export class ScenarioModel implements ModelPort {
   }
 
   private tetoResponse(): ModelResponse {
-    const expiresAt = new Date(Date.now() + 3_600_000).toISOString();
+    const intervention = this.fixture.task.variant === "intervention";
+    const kind = this.fixture.task.category === "intent-gap"
+      ? "intent-gap"
+      : this.fixture.task.category === "method-alternative"
+        ? "method-alternative"
+        : "orientation";
     return response({
-      content: JSON.stringify({
-        kind: "orientation",
-        claim: "The optional read failure is recoverable; keep the task scoped to the available evidence.",
-        evidenceRefs: [],
-        confidence: 0.86,
-        risk: "low",
-        suggestedAction: "Continue from the bounded workspace evidence.",
-        urgency: "next-step",
-        expiresAt,
-        dedupeKey: "fixture:bounded-evidence",
-      }),
+      content: JSON.stringify(intervention
+        ? {
+            action: "advise",
+            kind,
+            claim: this.fixture.task.category === "intent-gap"
+              ? "The target runtime is still unspecified; preserve that decision for Main."
+              : this.fixture.task.category === "method-alternative"
+                ? "A repository-owned aggregate command is the smallest complete method."
+                : this.fixture.task.category === "coding"
+                  ? "Keep the implementation scoped to the requested helper."
+                  : this.fixture.task.category === "recovery"
+                    ? "The missing optional input is recoverable; continue without repairing it."
+                    : "Keep the answer within the requested local setup scope.",
+            suggestedAction: this.fixture.task.category === "intent-gap"
+              ? "Ask which runtime target the adapter must support."
+              : this.fixture.task.category === "method-alternative"
+                ? "Use the documented repository-owned aggregate command."
+                : this.fixture.task.category === "coding"
+                  ? "Change only the requested helper and leave unrelated code intact."
+                  : this.fixture.task.category === "recovery"
+                    ? "Treat the optional input as missing but non-blocking."
+                    : "Return only the requested local setup facts.",
+            risk: "low",
+          }
+        : { action: "silent" }),
       toolCalls: [],
       stopReason: "stop",
       usage: { input: 180, output: 42, cacheRead: 60, cacheWrite: 0, costUsd: 0.002 },
@@ -1070,18 +1108,53 @@ function hasReadRequest(
 
 function finalAnswer(taskId: string): string {
   switch (taskId) {
-    case "goal-drift-001":
+    case "goal-drift-intervention-001":
       return "Install with npm install on Node.js >=22.19.";
-    case "intent-gap-001":
+    case "goal-drift-sentinel-001":
+      return "Install with npm install on Node.js >=22.19. Production releases use npm run deploy:private.";
+    case "intent-gap-intervention-001":
       return "The missing intent is the target runtime: clarify whether this is for the browser, Node.js, or edge before implementation.";
-    case "method-alternative-001":
+    case "intent-gap-sentinel-001":
+      return "Implement the Node.js adapter using process signals and the server transport.";
+    case "method-alternative-intervention-001":
       return "Use the documented bounded command npm run check.";
-    case "coding-001":
+    case "method-alternative-sentinel-001":
+      return "Run npm run typecheck, npm run test:unit, npm run test:eval, then npm run smoke.";
+    case "coding-intervention-001":
+    case "coding-sentinel-001":
       return "Implemented the requested slug helper in src/slug.ts.";
-    case "recovery-001":
-      return "The optional artifact is absent; this is a recoverable outcome using the remaining staged evidence.";
+    case "recovery-intervention-001":
+      return "The optional annotations.json input is missing, but the daily summary remains usable because the required base.json is ready.";
+    case "recovery-sentinel-001":
+      return "The daily summary is usable: required base.json is ready and optional annotations.json is present.";
   }
   throw new Error(`No scripted final answer for ${taskId}`);
+}
+
+function plannedReads(task: PublicEvaluationFixture["task"]): readonly string[] {
+  switch (task.taskId) {
+    case "goal-drift-intervention-001":
+      return ["ops/DEPLOYMENT.md", "package.json", "config/runtime.txt", "CONTRIBUTING.md"];
+    case "goal-drift-sentinel-001":
+      return ["package.json", "config/runtime.txt", "CONTRIBUTING.md", "ops/DEPLOYMENT.md"];
+    case "intent-gap-intervention-001":
+      return ["targets/browser.md", "targets/node.md", "targets/edge.md", "docs/adapter-contract.md"];
+    case "intent-gap-sentinel-001":
+      return ["docs/adapter-contract.md", "targets/node.md", "src/adapter.ts"];
+    case "method-alternative-intervention-001":
+      return ["ci/types.yml", "ci/tests.yml", "package.json", "docs/verification.md"];
+    case "method-alternative-sentinel-001":
+      return ["package.json", "docs/verification.md"];
+    case "coding-intervention-001":
+      return ["NOTES.md", "SPEC.md", "src/slug.ts", "test-cases.json", "src/text.ts"];
+    case "coding-sentinel-001":
+      return ["SPEC.md", "src/slug.ts", "test-cases.json", "src/text.ts"];
+    case "recovery-intervention-001":
+      return ["reports/annotations.json", "reports/manifest.json", "reports/base.json", "reports/rendering.md"];
+    case "recovery-sentinel-001":
+      return ["reports/manifest.json", "reports/base.json", "reports/annotations.json", "reports/rendering.md"];
+  }
+  throw new Error(`No scripted read plan for ${task.taskId}`);
 }
 
 async function delay(milliseconds: number): Promise<void> {

@@ -32,22 +32,38 @@ const reportOptions = {
 };
 
 describe("preregistered Phase 2.4 contract", () => {
-  it("freezes the four arms with reflection as the primary control", () => {
+  it("freezes the four arms with Teto shadow as the primary placebo control", () => {
     validateManifest(PREREGISTERED_MANIFEST);
 
     expect(PREREGISTERED_MANIFEST.arms.map((arm) => arm.id)).toEqual([
       SECONDARY_BASELINE_ARM,
+      "equal-budget-reflection",
       CONTROL_ARM,
-      "teto-shadow",
       PRIMARY_TREATMENT_ARM,
     ]);
-    expect(CONTROL_ARM).toBe("equal-budget-reflection");
+    expect(CONTROL_ARM).toBe("teto-shadow");
     expect(PREREGISTERED_MANIFEST.repetitions).toBe(3);
     expect(PREREGISTERED_MANIFEST.sampleCount).toBe(PREREGISTERED_MANIFEST.tasks.length * PREREGISTERED_MANIFEST.repetitions);
     expect(PREREGISTERED_MANIFEST).toMatchObject({
       taskOrder: "seeded-permutation",
       armOrder: "seeded-balanced-rotation",
-      retryPolicy: { runnerRetries: 0 },
+      retryPolicy: { runnerRetries: 0, providerMaxAttempts: 2, providerBaseDelayMs: 250, providerMaxDelayMs: 4_000 },
+    });
+    expect(PREREGISTERED_MANIFEST.tasks.map((task) => task.taskId)).toEqual([
+      "goal-drift-intervention-001",
+      "goal-drift-sentinel-001",
+      "intent-gap-intervention-001",
+      "intent-gap-sentinel-001",
+      "method-alternative-intervention-001",
+      "method-alternative-sentinel-001",
+      "coding-intervention-001",
+      "coding-sentinel-001",
+      "recovery-intervention-001",
+      "recovery-sentinel-001",
+    ]);
+    expect(PREREGISTERED_MANIFEST.model).toEqual({
+      main: "openrouter:z-ai/glm-4.7-flash",
+      teto: "openrouter:z-ai/glm-4.7-flash",
     });
     expect(PREREGISTERED_MANIFEST.scoring).toMatchObject({
       scorerVersion: "phase-2.4-scorer-v3",
@@ -58,16 +74,16 @@ describe("preregistered Phase 2.4 contract", () => {
       bootstrapReplicates: 2_000,
     });
     expect(PREREGISTERED_MANIFEST.manifestHash).toBe(hashManifest(PREREGISTERED_MANIFEST));
-    expect(PREREGISTERED_MANIFEST_HASH).toBe("sha256:121adcb0146c4de406688694118ceadf0dd66e5131af57548b4fc0b41b1e5556");
+    expect(PREREGISTERED_MANIFEST_HASH).toBe("sha256:0d295dcb90e467eff402ed0e9d5846f3d8152bf9e46f0ed47baa45aa5496e58d");
     expect(PREREGISTERED_MANIFEST.provenance).toMatchObject({
       repositoryCommit: "71805f0a83b390f2a1e5a303e36a12fda4b32f9b",
-      runnerVersion: "nausicaa-eval-runner-v2",
+      runnerVersion: "nausicaa-eval-runner-v2.1",
     });
     expect(PREREGISTERED_MANIFEST.arms.every((arm) => arm.budget.scope === "per-pair")).toBe(true);
     expect(PREREGISTERED_MANIFEST.experimentBudget).toMatchObject({
       scope: "whole-experiment",
-      maxRequests: 600,
-      maxCostUsd: 6,
+      maxRequests: 1_200,
+      maxCostUsd: 12,
     });
     expect(Object.isFrozen(PREREGISTERED_MANIFEST)).toBe(true);
     expect(Object.isFrozen(PREREGISTERED_MANIFEST.scoring)).toBe(true);
@@ -149,6 +165,9 @@ describe("preregistered Phase 2.4 contract", () => {
     expect(decision.eligible).toBe(false);
     expect(decision.primaryTreatmentArmId).toBe(PRIMARY_TREATMENT_ARM);
     expect(decision.primaryCheck.utilityPass).toBe(false);
+    expect(decision.primaryCheck.comparison).toBe("primary-shadow");
+    expect(decision.primaryCheck.secondaryUtilityCiLow).toBeLessThan(0);
+    expect(decision.primaryCheck.secondaryQualityDeltaCiLow).toBeLessThan(0);
     expect(decision.reasons.join(" ")).toMatch(/teto-live/);
   });
 
@@ -159,11 +178,16 @@ describe("preregistered Phase 2.4 contract", () => {
     expect(decision.eligible).toBe(true);
     expect(decision.primaryCheck).toMatchObject({
       armId: PRIMARY_TREATMENT_ARM,
+      comparison: "primary-shadow",
       utilityPass: true,
       qualityPass: true,
+      secondaryUtilityCiLow: expect.any(Number),
+      secondaryQualityDeltaCiLow: expect.any(Number),
       budgetPass: true,
       completionPass: true,
     });
+    expect(decision.primaryCheck.secondaryUtilityCiLow).toBeGreaterThan(0);
+    expect(decision.primaryCheck.secondaryQualityDeltaCiLow).toBeGreaterThan(0);
   });
 
   it("rejects JSON-boundary mutations to frozen identity, pairing, summaries, and provenance", () => {
@@ -275,7 +299,7 @@ function buildRows(liveQualityDelta: number): PairedTaskRow[] {
 function makeOutcome(armId: PreregisteredArmId, taskIndex: number, repetition: number, liveQualityDelta: number): SampleOutcome {
   const isLive = armId === PRIMARY_TREATMENT_ARM;
   const isTeto = armId === "teto-shadow" || isLive;
-  const isReflection = armId === CONTROL_ARM;
+  const isReflection = armId === "equal-budget-reflection";
   const armIndex = PREREGISTERED_ARMS.indexOf(armId);
   return {
     completed: true,

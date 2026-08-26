@@ -3,6 +3,7 @@ import {
   type Api,
   type AssistantMessage,
   type Context,
+  type FetchFunction,
   type Message,
   type Model,
   type Models,
@@ -19,14 +20,23 @@ import type {
   ModelStreamEvent,
 } from "../domain/ports.js";
 import type { ConversationMessage, TokenUsage } from "../domain/types.js";
+import {
+  ProviderModelError,
+  type ProviderFailureCategory,
+} from "./provider-error.js";
+
+const MAX_FAILURE_TEXT_CHARS = 4_096;
+const MAX_RETRY_AFTER_MS = 7 * 24 * 60 * 60 * 1_000;
 
 export interface PiAiModelPortOptions {
   models: Models;
   defaultProvider?: string;
+  fetch?: FetchFunction;
 }
 
 export interface OpenRouterModelPortOptions {
   models?: MutableModels;
+  fetch?: FetchFunction;
 }
 
 /**
@@ -36,10 +46,12 @@ export interface OpenRouterModelPortOptions {
 export class PiAiModelPort implements ModelPort {
   private readonly models: Models;
   private readonly defaultProvider: string;
+  private readonly fetch: FetchFunction;
 
   constructor(options: PiAiModelPortOptions) {
     this.models = options.models;
     this.defaultProvider = options.defaultProvider ?? "openrouter";
+    this.fetch = options.fetch ?? globalThis.fetch;
   }
 
   capabilities(modelSelector: string): ModelCapabilities {
@@ -61,25 +73,24 @@ export class PiAiModelPort implements ModelPort {
     }
 
     const context = toPiContext(request, model);
+    const probe = new ProviderFailureProbe(this.fetch);
 
     let result: AssistantMessage;
     try {
       result = await this.models.complete(model, context, {
         maxTokens: request.maxOutputTokens,
         sessionId: request.sessionId,
+        maxRetries: 0,
+        fetch: probe.fetch,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
-    } catch {
+    } catch (error: unknown) {
       throwIfAborted(request.signal);
-      // Never propagate provider/auth payloads into the Ledger error path.
-      throw new Error("Model request failed");
+      throw providerFailure(error, probe, undefined);
     }
 
     if (result.stopReason === "error" || result.stopReason === "aborted") {
-      // Provider diagnostics can contain request metadata. Keep the public
-      // failure deliberately bounded and redacted; the adapter never logs
-      // provider payloads or credentials.
-      throw new Error(safeProviderFailure(result));
+      throw providerFailure(result, probe, result.stopReason);
     }
 
     return fromPiMessage(result);
@@ -93,6 +104,7 @@ export class PiAiModelPort implements ModelPort {
 
     let model: Model<Api>;
     let context: Context;
+    const probe = new ProviderFailureProbe(this.fetch);
     try {
       const selector = parseModelSelector(request.model, this.defaultProvider);
       const selectedModel = this.models.getModel(selector.provider, selector.model);
@@ -112,6 +124,8 @@ export class PiAiModelPort implements ModelPort {
       const stream = this.models.stream(model, context, {
         maxTokens: request.maxOutputTokens,
         sessionId: request.sessionId,
+        maxRetries: 0,
+        fetch: probe.fetch,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
       let textBlockCount = 0;
@@ -146,19 +160,22 @@ export class PiAiModelPort implements ModelPort {
           case "error":
             yield {
               type: "error",
-              error: streamError(request.signal, event.reason),
+              error: streamError(request.signal, event.reason, event.error, probe),
             };
             return;
         }
       }
 
-      yield { type: "error", error: new Error("Model request failed") };
-    } catch {
+      yield {
+        type: "error",
+        error: providerFailure(new Error("Model request failed"), probe, undefined),
+      };
+    } catch (error: unknown) {
       yield {
         type: "error",
         error: request.signal?.aborted
           ? abortError(request.signal)
-          : new Error("Model request failed"),
+          : providerFailure(error, probe, undefined),
       };
     }
   }
@@ -171,7 +188,11 @@ export function createOpenRouterModelPort(
   if (models.getProvider("openrouter") === undefined) {
     models.setProvider(openrouterProvider());
   }
-  return new PiAiModelPort({ models, defaultProvider: "openrouter" });
+  return new PiAiModelPort({
+    models,
+    defaultProvider: "openrouter",
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+  });
 }
 
 export function parseModelSelector(
@@ -329,30 +350,181 @@ function abortError(signal: AbortSignal): Error {
 function streamError(
   signal: AbortSignal | undefined,
   reason: "aborted" | "error",
+  message: AssistantMessage,
+  probe: ProviderFailureProbe,
 ): Error {
   if (signal?.aborted) {
     return abortError(signal);
   }
   return reason === "aborted"
-    ? new DOMException("The model request was aborted", "AbortError")
-    : new Error("Model request failed");
+    ? new ProviderModelError({ category: "aborted", retryable: false })
+    : providerFailure(message, probe, message.stopReason);
 }
 
-function safeProviderFailure(message: AssistantMessage): string {
-  const reason = message.errorMessage === undefined
-    ? ""
-    : `: ${boundedProviderText(message.errorMessage)}`;
-  return `Model request ${message.stopReason}${reason}`;
+interface ProviderFailureEvidence {
+  status?: number;
+  retryDirective?: boolean;
+  retryAfterMs?: number;
+  transportFailure: boolean;
 }
 
-function boundedProviderText(value: string): string {
-  const redacted = value
-    .replace(/Bearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
-    .replace(/\b(?:sk-or-v1|sk)-[A-Za-z0-9_-]{12,}\b/g, "[REDACTED]")
-    .replace(/https?:\/\/[^\s"']+/gi, "[URL]");
-  return redacted.length <= 256
-    ? redacted
-    : `${redacted.slice(0, 241)}[TRUNCATED]`;
+class ProviderFailureProbe {
+  private readonly evidence: ProviderFailureEvidence = { transportFailure: false };
+  readonly fetch: FetchFunction;
+
+  constructor(baseFetch: FetchFunction) {
+    this.fetch = async (input, init) => {
+      try {
+        const response = await baseFetch(input, init);
+        if (!response.ok) this.captureResponse(response);
+        return response;
+      } catch (error: unknown) {
+        this.evidence.transportFailure = true;
+        throw error;
+      }
+    };
+  }
+
+  snapshot(): ProviderFailureEvidence {
+    return { ...this.evidence };
+  }
+
+  private captureResponse(response: Response): void {
+    this.evidence.status = response.status;
+    const retryDirective = response.headers.get("x-should-retry")?.toLowerCase();
+    if (retryDirective === "true") this.evidence.retryDirective = true;
+    if (retryDirective === "false") this.evidence.retryDirective = false;
+    const retryAfterMs = parseRetryAfter(response.headers);
+    if (retryAfterMs !== undefined) this.evidence.retryAfterMs = retryAfterMs;
+  }
+}
+
+function providerFailure(
+  source: unknown,
+  probe: ProviderFailureProbe,
+  stopReason: AssistantMessage["stopReason"] | undefined,
+): ProviderModelError {
+  if (source instanceof ProviderModelError) return source;
+  const evidence = probe.snapshot();
+  const text = failureText(source);
+  const status = evidence.status ?? statusFromText(text);
+  const category = failureCategory(source, text, status, evidence, stopReason);
+  const retryable = isRetryable(category, status, evidence.retryDirective);
+  return new ProviderModelError({
+    category,
+    retryable,
+    ...(status === undefined ? {} : { status }),
+    ...(evidence.retryAfterMs === undefined ? {} : { retryAfterMs: evidence.retryAfterMs }),
+  });
+}
+
+function failureCategory(
+  source: unknown,
+  text: string,
+  status: number | undefined,
+  evidence: ProviderFailureEvidence,
+  stopReason: AssistantMessage["stopReason"] | undefined,
+): ProviderFailureCategory {
+  if (stopReason === "aborted") return "aborted";
+  const code = errorCode(source);
+  if (code === "auth" || code === "oauth" || status === 401 || looksLikeAuth(text)) {
+    return "authentication";
+  }
+  if (status === 403) return "permission";
+  if (status === 402 || looksLikeQuota(text)) return "quota";
+  if (status === 408) return "timeout";
+  if (status === 409) return "transient";
+  if (status === 429) return "rate-limit";
+  if (status !== undefined && status >= 500) return "server";
+  if (status !== undefined && status >= 400 && status < 500) return "invalid-request";
+  if (looksLikeTimeout(text)) return "timeout";
+  if (evidence.transportFailure || looksLikeNetwork(text)) return "network";
+  if (evidence.retryDirective === true) return "transient";
+  return "provider";
+}
+
+function isRetryable(
+  category: ProviderFailureCategory,
+  status: number | undefined,
+  directive: boolean | undefined,
+): boolean {
+  if (
+    category === "aborted"
+    || category === "authentication"
+    || category === "invalid-request"
+    || category === "permission"
+    || category === "quota"
+    || status === 403
+  ) {
+    return false;
+  }
+  if (directive !== undefined) return directive;
+  return category === "network"
+    || category === "rate-limit"
+    || category === "server"
+    || category === "timeout"
+    || category === "transient";
+}
+
+function failureText(source: unknown): string {
+  let text = "";
+  if (isAssistantMessage(source)) text = source.errorMessage ?? "";
+  else if (source instanceof Error) text = source.message;
+  else if (typeof source === "string") text = source;
+  return text.slice(0, MAX_FAILURE_TEXT_CHARS).toLowerCase();
+}
+
+function isAssistantMessage(value: unknown): value is AssistantMessage {
+  return typeof value === "object"
+    && value !== null
+    && "role" in value
+    && value.role === "assistant"
+    && "stopReason" in value;
+}
+
+function errorCode(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null || !("code" in value)) return undefined;
+  return typeof value.code === "string" ? value.code.toLowerCase() : undefined;
+}
+
+function statusFromText(text: string): number | undefined {
+  const match = /(?:^|\bhttp(?:\s+status)?[\s:<(]*)\b([1-5]\d{2})\b/i.exec(text)
+    ?? /^([1-5]\d{2})\b/.exec(text);
+  if (match?.[1] === undefined) return undefined;
+  return Number(match[1]);
+}
+
+function looksLikeAuth(text: string): boolean {
+  return /\b(?:api[ _-]?key|auth(?:entication|orization)?|oauth|unauthorized|invalid key|not configured)\b/.test(text);
+}
+
+function looksLikeQuota(text: string): boolean {
+  return /\b(?:billing|credit balance|insufficient credits?|payment required|quota|usage limit)\b/.test(text);
+}
+
+function looksLikeTimeout(text: string): boolean {
+  return /\b(?:timed out|timeout)\b/.test(text);
+}
+
+function looksLikeNetwork(text: string): boolean {
+  return /\b(?:connection error|connection reset|fetch failed|network_error|network error)\b/.test(text);
+}
+
+function parseRetryAfter(headers: Headers): number | undefined {
+  const milliseconds = headers.get("retry-after-ms");
+  if (milliseconds !== null) return boundedDelay(Number.parseFloat(milliseconds));
+  const retryAfter = headers.get("retry-after");
+  if (retryAfter === null) return undefined;
+  const seconds = Number.parseFloat(retryAfter);
+  if (Number.isFinite(seconds)) return boundedDelay(seconds * 1_000);
+  const timestamp = Date.parse(retryAfter);
+  if (Number.isNaN(timestamp)) return undefined;
+  return boundedDelay(timestamp - Date.now());
+}
+
+function boundedDelay(value: number): number | undefined {
+  if (!Number.isFinite(value) || value < 0) return undefined;
+  return Math.min(value, MAX_RETRY_AFTER_MS);
 }
 
 function asError(error: unknown): Error {

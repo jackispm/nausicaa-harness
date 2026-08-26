@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { TetoCadence, TokenRatioGate } from "../../src/teto/index.js";
 
 describe("TetoCadence", () => {
-  it("wakes at calls 5, 10, 15, and 20 for ordinary Main work", () => {
+  it("observes short work early, then keeps four sparse passes per 20 calls", () => {
     const cadence = new TetoCadence();
     const passes: number[] = [];
 
@@ -15,7 +15,7 @@ describe("TetoCadence", () => {
       }
     }
 
-    expect(passes).toEqual([5, 10, 15, 20]);
+    expect(passes).toEqual([2, 7, 12, 17]);
   });
 
   it("never lets hard triggers bypass spacing or the rolling limit", () => {
@@ -42,7 +42,11 @@ describe("TetoCadence", () => {
   });
 
   it("uses max-gap as a backstop and preserves uncommitted credit", () => {
-    const cadence = new TetoCadence({ creditThreshold: 100, maxGap: 7 });
+    const cadence = new TetoCadence({
+      creditThreshold: 100,
+      firstPassThreshold: 100,
+      maxGap: 7,
+    });
     for (let call = 1; call < 7; call += 1) {
       expect(cadence.recordMainCall().shouldWake).toBe(false);
     }
@@ -54,7 +58,7 @@ describe("TetoCadence", () => {
 
   it("restores cadence state without changing the next decision", () => {
     const original = new TetoCadence();
-    for (let call = 0; call < 5; call += 1) {
+    for (let call = 0; call < 2; call += 1) {
       const decision = original.recordMainCall();
       if (decision.shouldWake) original.commitPass();
     }
@@ -63,7 +67,7 @@ describe("TetoCadence", () => {
     for (let call = 0; call < 5; call += 1) {
       const decision = restored.recordMainCall();
       if (call === 4) {
-        expect(decision).toMatchObject({ mainCallIndex: 10, shouldWake: true });
+        expect(decision).toMatchObject({ mainCallIndex: 7, shouldWake: true });
       }
     }
   });

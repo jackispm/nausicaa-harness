@@ -53,7 +53,7 @@ describe("TetoScheduler", () => {
     releaseFirst?.(silentResponse());
     await scheduler.drain();
     expect(model.callCount).toBe(2);
-    expect(scheduler.snapshot().cadenceState.passCalls).toEqual([5, 10]);
+    expect(scheduler.snapshot().cadenceState.passCalls).toEqual([2, 7]);
     const tetoInput = model.requests[0]?.messages[0]?.content ?? "";
     expect(tetoInput).not.toContain("private Main response");
     expect(tetoInput).not.toContain("private-tool");
@@ -141,7 +141,7 @@ describe("TetoScheduler", () => {
       && event.payload.reason?.includes("provider unavailable")
     ))).toBe(true);
     expect(events.some((event) => (
-      event.type === "teto.observed" && event.payload.mainCallIndex === 10
+      event.type === "teto.observed" && event.payload.mainCallIndex === 7
     ))).toBe(true);
     expect(events.at(-1)).toMatchObject({
       type: "lane.status",
@@ -241,7 +241,7 @@ describe("TetoScheduler", () => {
     const events = await ledger.read({ runId: "run-1" });
     const recovered = recoverTetoSchedulerState(events, { runId: "run-1" });
     expect(recovered).toMatchObject({
-      cadenceState: { mainCallIndex: 5, credit: 0, passCalls: [5] },
+      cadenceState: { mainCallIndex: 5, credit: 3, passCalls: [2] },
       tokenGateState: { mainTokens: 7_500, tetoTokens: 200 },
     });
 
@@ -260,7 +260,7 @@ describe("TetoScheduler", () => {
     await second.drain();
 
     expect(secondModel.callCount).toBe(1);
-    expect(second.snapshot().cadenceState.passCalls).toEqual([5, 10]);
+    expect(second.snapshot().cadenceState.passCalls).toEqual([2, 7]);
   });
 });
 
@@ -345,7 +345,7 @@ function policy(): RunPolicy {
     maxMainSteps: 20,
     maxModelTokens: 100_000,
     tetoEnabled: true,
-    tetoMaxOutputTokens: 200,
+    tetoMaxOutputTokens: 64,
     tetoTokenRatio: 0.1,
   };
 }
@@ -371,15 +371,11 @@ function silentResponse(): ModelResponse {
 function adviceResponse(): ModelResponse {
   return {
     content: JSON.stringify({
+      action: "advise",
       kind: "intent-gap",
       claim: "Installation has been found but not verified.",
-      evidenceRefs: ["boundary:5"],
-      confidence: 0.9,
       risk: "medium",
       suggestedAction: "Run the command in a clean temporary directory.",
-      urgency: "next-step",
-      expiresAt: "2026-08-26T00:10:00.000Z",
-      dedupeKey: "verify-install",
     }),
     toolCalls: [],
     stopReason: "stop",

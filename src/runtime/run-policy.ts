@@ -5,7 +5,7 @@ export const DEFAULT_RUN_POLICY: RunPolicy = {
   maxMainStepsPerActivation: 24,
   maxModelTokens: 200_000,
   tetoEnabled: true,
-  tetoMaxOutputTokens: 200,
+  tetoMaxOutputTokens: 64,
   tetoTokenRatio: 0.1,
 };
 

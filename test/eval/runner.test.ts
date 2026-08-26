@@ -90,14 +90,24 @@ describe("Phase 2.4 evaluation runner", () => {
       expect(pair.records.every((record) => record.treatmentFidelity.passed)).toBe(true);
       expect(pair.records.every((record) => record.budget.requests <= 10)).toBe(true);
 
+      const intervention = pair.records[0]!.taskId.includes("-intervention-");
       const shadow = pair.records.find((record) => record.armId === "teto-shadow")!;
-      expect(shadow.treatmentFidelity.adviceGenerated).toBeGreaterThan(0);
+      if (intervention) {
+        expect(shadow.treatmentFidelity.adviceGenerated).toBeGreaterThan(0);
+      } else {
+        expect(shadow.treatmentFidelity.adviceGenerated).toBe(0);
+      }
       expect(shadow.treatmentFidelity).toMatchObject({ advicePublished: 0, adviceClaimed: 0 });
       expect(shadow.outcome?.advice.unacknowledged).toBe(shadow.outcome?.advice.proposed);
 
       const live = pair.records.find((record) => record.armId === "teto-live")!;
-      expect(live.treatmentFidelity.adviceGenerated).toBeGreaterThan(0);
-      expect(live.treatmentFidelity.advicePublished).toBeGreaterThan(0);
+      if (intervention) {
+        expect(live.treatmentFidelity.adviceGenerated).toBeGreaterThan(0);
+        expect(live.treatmentFidelity.advicePublished).toBeGreaterThan(0);
+      } else {
+        expect(live.treatmentFidelity.adviceGenerated).toBe(0);
+        expect(live.treatmentFidelity.advicePublished).toBe(0);
+      }
       // A sparse sidecar may finish after the last Main boundary. In that
       // case publication is durable and the Advice remains pending for the
       // next safe boundary instead of being force-acknowledged.
@@ -150,7 +160,7 @@ describe("Phase 2.4 evaluation runner", () => {
 
   it("keeps runtime and treatment failures as auditable outcomes", async () => {
     const root = await temporaryRoot();
-    const failedPair = await runEvaluationPair("goal-drift-001", 0, {
+    const failedPair = await runEvaluationPair("goal-drift-intervention-001", 0, {
       rootDirectory: join(root, "provider-failure"),
       writeArtifacts: false,
       repositoryStateForTests: cleanRepository,
@@ -203,7 +213,7 @@ describe("Phase 2.4 evaluation runner", () => {
     const redacted = await readFile(join(artifactDirectory, "report.json"), "utf8");
     expect(redacted).toContain(evaluation.report!.provenance.evidenceDigest);
     expect(redacted).not.toContain("Install with npm install");
-  }, 30_000);
+  }, 120_000);
 });
 
 function requestFor(model: string, tools: readonly unknown[]): ModelRequest {

@@ -176,7 +176,7 @@ describe("runtime activation parity", () => {
       tetoCalls: 1,
       tetoModels: ["scripted-teto"],
       tetoSessionIds: [`${runId}:teto:scripted-teto`],
-      tetoOutputLimits: [200],
+      tetoOutputLimits: [64],
       tetoRegistered: 1,
       observations: 1,
       tetoCharges: 1,
