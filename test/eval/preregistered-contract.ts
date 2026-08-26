@@ -283,7 +283,7 @@ export interface ReleaseDecision {
   reasons: readonly string[];
 }
 
-const FROZEN_REPOSITORY_COMMIT = "ed5bddc675e872cdd5b99904abb18c8ee544932e";
+const FROZEN_REPOSITORY_COMMIT = "b550a1f08763d423531721b22ca153fa07640db4";
 const FROZEN_MODEL = {
   main: "openrouter:qwen/qwen3.7-flash",
   teto: "openrouter:qwen/qwen3.7-flash",
