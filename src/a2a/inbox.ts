@@ -71,6 +71,7 @@ export interface ClaimOptions {
   claimId?: string;
   limit?: number;
   now?: Date;
+  from?: LaneId;
   types?: readonly A2APayload["type"][];
 }
 
@@ -349,6 +350,7 @@ export class A2AInbox {
     const limit = options.limit ?? 1;
     const claimId = options.claimId ?? randomUUID();
     nonEmpty(claimId, "claimId");
+    if (options.from !== undefined) nonEmpty(options.from, "from");
     if (!Number.isSafeInteger(limit) || limit <= 0) {
       throw new RangeError("claim limit must be a positive integer");
     }
@@ -360,6 +362,7 @@ export class A2AInbox {
       if (repeated.some((record) => (
         record.message.to !== to
         || record.claim?.claimedBy !== claimedBy
+        || (options.from !== undefined && record.message.from !== options.from)
         || (options.types !== undefined
           && !options.types.includes(record.message.payload.type))
       ))) {
@@ -370,6 +373,7 @@ export class A2AInbox {
 
     const eligible = this.projector.list(to)
       .filter((record) => this.isClaimable(record, now))
+      .filter((record) => options.from === undefined || record.message.from === options.from)
       .filter((record) => (
         options.types === undefined
         || options.types.includes(record.message.payload.type)

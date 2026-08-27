@@ -149,6 +149,27 @@ describe("A2AInbox", () => {
     expect(inbox.snapshot().records[0]?.claim?.attempt).toBe(1);
   });
 
+  it("filters claims by message source when requested", async () => {
+    const inbox = new A2AInbox();
+    await inbox.send(taskMessage(
+      { type: "task.accept", taskId: "task-a" },
+      { messageId: "accept-a", idempotencyKey: "accept-a", from: "worker-a", to: "main" },
+    ));
+    await inbox.send(taskMessage(
+      { type: "task.accept", taskId: "task-b" },
+      { messageId: "accept-b", idempotencyKey: "accept-b", from: "worker-b", to: "main" },
+    ));
+
+    const claimed = await inbox.claim("main", "main", {
+      claimId: "worker-b-only",
+      from: "worker-b",
+      types: ["task.accept"],
+    });
+    expect(claimed.map((record) => record.message.messageId)).toEqual(["accept-b"]);
+    expect(inbox.snapshot().records.find((record) => record.message.messageId === "accept-a")?.status)
+      .toBe("pending");
+  });
+
   it("deduplicates Advice until TTL and never delivers expired messages", async () => {
     const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
     const inbox = new A2AInbox({ clock });
