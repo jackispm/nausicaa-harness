@@ -15,6 +15,7 @@ import {
   ToolStatusBlock,
   ThinkingRow,
   UserMessageBlock,
+  WorkerTaskSummaryLine,
   selectLatestToolExpandHint,
   setNausicaaColorScheme,
   terminalSafeText,
@@ -42,6 +43,15 @@ describe("TUI components", () => {
     tool.setStatus("succeeded");
     const components = [
       new SessionTray(() => snapshot),
+      new WorkerTaskSummaryLine(() => ({
+        total: 3,
+        queued: 0,
+        running: 1,
+        ready: 1,
+        done: 1,
+        failed: 0,
+        stale: 0,
+      })),
       new ActivityLine(() => snapshot),
       new UserMessageBlock("Inspect **this repository** and explain it."),
       new AssistantMessageBlock("## Result\n\n- one\n- two\n\n```ts\nconst x = 1;\n```"),
@@ -83,6 +93,43 @@ describe("TUI components", () => {
     const workerSnapshot = { ...snapshot, workerEnabled: true };
     const tray = stripTerminalSequences(new SessionTray(() => workerSnapshot).render(100).join("\n"));
     expect(tray).toContain("main + Teto + Worker/running");
+  });
+
+  it("hides an empty Worker summary and names every durable lifecycle", () => {
+    const summary = {
+      total: 0,
+      queued: 0,
+      running: 0,
+      ready: 0,
+      done: 0,
+      failed: 0,
+      stale: 0,
+    };
+    const line = new WorkerTaskSummaryLine(() => summary);
+    expect(line.render(80)).toEqual([]);
+
+    Object.assign(summary, { total: 1, queued: 1 });
+    expect(stripTerminalSequences(line.render(80).join("\n")))
+      .toBe("1 Worker task · 1 queued");
+
+    Object.assign(summary, {
+      total: 6,
+      queued: 1,
+      running: 1,
+      ready: 1,
+      done: 1,
+      failed: 1,
+      stale: 1,
+    });
+    const rendered = stripTerminalSequences(line.render(120).join("\n"));
+    expect(rendered).toBe(
+      "6 Worker tasks · 1 queued · 1 running · 1 ready · 1 done · 1 failed · 1 stale",
+    );
+    for (const width of [1, 2, 20, 80]) {
+      for (const renderedLine of line.render(width)) {
+        expect(visibleWidth(renderedLine)).toBeLessThanOrEqual(width);
+      }
+    }
   });
 
   it("keeps the Prime-style brand header useful at wide and narrow widths", () => {

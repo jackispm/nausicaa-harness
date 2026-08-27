@@ -14,7 +14,10 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
-import type { SessionSnapshot } from "../runtime/index.js";
+import type {
+  SessionSnapshot,
+  WorkerTaskSummary,
+} from "../runtime/index.js";
 import {
   renderToolPresentation,
   type ToolPresentationLine,
@@ -283,6 +286,35 @@ export class SessionTray implements Component {
     const cachePercent = cacheBase === 0 ? 0 : Math.round((snapshot.usage.cacheRead / cacheBase) * 100);
     const right = `${formatTokens(consumed)} (${cachePercent}%) `;
     return [alignLine(palette.muted(left), palette.dim(right), safeWidth)];
+  }
+
+  invalidate(): void {}
+}
+
+/** A quiet, durable summary of Worker tasks in the attached Run. */
+export class WorkerTaskSummaryLine implements Component {
+  constructor(private readonly readSummary: () => WorkerTaskSummary) {}
+
+  render(width: number): string[] {
+    const summary = this.readSummary();
+    if (summary.total === 0) return [];
+
+    const states: Array<[keyof Omit<WorkerTaskSummary, "total">, number]> = [
+      ["queued", summary.queued],
+      ["running", summary.running],
+      ["ready", summary.ready],
+      ["done", summary.done],
+      ["failed", summary.failed],
+      ["stale", summary.stale],
+    ];
+    const taskLabel = summary.total === 1 ? "task" : "tasks";
+    const text = [
+      `${summary.total} Worker ${taskLabel}`,
+      ...states
+        .filter(([, count]) => count > 0)
+        .map(([state, count]) => `${count} ${state}`),
+    ].join(" · ");
+    return [palette.dim(truncateToWidth(text, Math.max(1, width), "…"))];
   }
 
   invalidate(): void {}

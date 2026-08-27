@@ -61,6 +61,7 @@ import {
   SessionTray,
   ToolStatusBlock,
   UserMessageBlock,
+  WorkerTaskSummaryLine,
   selectLatestToolExpandHint,
   setNausicaaColorScheme,
 } from "./tui-components.js";
@@ -173,6 +174,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   screen.addChild(shortcutGuide, { basis: "auto", minSize: 0, shrink: 1 });
   screen.addChild(queuePreview, { basis: "auto", minSize: 0, shrink: 1 });
   screen.addChild(promptSlot, { minSize: 1, shrink: 0 });
+  screen.addChild(new WorkerTaskSummaryLine(
+    () => options.session.workerTaskSummary(),
+  ), {
+    basis: "auto",
+    minSize: 0,
+    shrink: 1,
+  });
   screen.addChild(new SessionTray(
     () => options.session.snapshot(),
     () => interruptExitUntil > Date.now() ? "Press Ctrl+C again to exit" : undefined,
@@ -548,6 +556,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   ): Promise<void> => {
     if (runtimeEvent.kind === "event") {
       const event = runtimeEvent.event;
+      if (
+        event.type === "message.sent"
+        || event.type === "step.completed"
+        || event.type === "goal.revised"
+        || event.type === "message.handled"
+      ) {
+        tui.requestRender();
+      }
       if (
         event.type === "input.admitted"
         || event.type === "input.delivered"

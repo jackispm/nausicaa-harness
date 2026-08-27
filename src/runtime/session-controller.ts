@@ -37,6 +37,7 @@ import {
   JsonlLedger,
   type Ledger,
   projectRun,
+  projectTaskGraph,
   validateEvent,
 } from "../ledger/index.js";
 import {
@@ -136,6 +137,16 @@ export interface SessionSnapshot {
   blocker?: string;
 }
 
+export interface WorkerTaskSummary {
+  total: number;
+  queued: number;
+  running: number;
+  ready: number;
+  done: number;
+  failed: number;
+  stale: number;
+}
+
 export interface SessionSubmitRequest {
   inputId: string;
   text: string;
@@ -216,6 +227,11 @@ export class SessionController {
   private readonly requestedWorkerEnabled: boolean | undefined;
   private selectedMainModel: string;
   private readonly listeners = new Set<(event: SessionRuntimeEvent) => void>();
+  private workerTaskSummaryCache: {
+    runId: string;
+    lastOffset: number;
+    summary: WorkerTaskSummary;
+  } | undefined;
   private attached: AttachedRun | undefined;
   private active: ActiveTurn | undefined;
   private status: SessionControllerStatus = "detached";
@@ -369,6 +385,47 @@ export class SessionController {
       usage,
       ...(blocker === undefined ? {} : { blocker }),
     };
+  }
+
+  /** Project the durable Worker lifecycle without giving the TUI its own task state. */
+  workerTaskSummary(): WorkerTaskSummary {
+    const attached = this.attached;
+    if (attached === undefined) return emptyWorkerTaskSummary();
+    const lastOffset = attached.sink.cachedLastOffset;
+    if (
+      this.workerTaskSummaryCache?.runId === attached.runId
+      && this.workerTaskSummaryCache.lastOffset === lastOffset
+    ) {
+      return { ...this.workerTaskSummaryCache.summary };
+    }
+
+    const summary = emptyWorkerTaskSummary();
+    const tasks = projectTaskGraph(attached.sink.cachedEvents, attached.runId).tasks;
+    summary.total = tasks.length;
+    for (const task of tasks) {
+      const terminal = task.state.kind === "delegated"
+        ? undefined
+        : task.state.terminal;
+      if (task.state.kind === "stale") {
+        summary.stale += 1;
+      } else if (terminal?.type === "task.failed") {
+        summary.failed += 1;
+      } else if (task.state.kind === "joined") {
+        summary.done += 1;
+      } else if (task.state.kind === "terminal") {
+        summary.ready += 1;
+      } else if (task.accept === undefined) {
+        summary.queued += 1;
+      } else {
+        summary.running += 1;
+      }
+    }
+    this.workerTaskSummaryCache = {
+      runId: attached.runId,
+      lastOffset,
+      summary: { ...summary },
+    };
+    return { ...summary };
   }
 
   async transcript(): Promise<SessionTranscriptEntry[]> {
@@ -1618,9 +1675,22 @@ export class SessionController {
   }
 }
 
+function emptyWorkerTaskSummary(): WorkerTaskSummary {
+  return {
+    total: 0,
+    queued: 0,
+    running: 0,
+    ready: 0,
+    done: 0,
+    failed: 0,
+    stale: 0,
+  };
+}
+
 class SessionEventSink {
   private active = true;
   private events: AnyEvent[];
+  private lastOffset: number;
 
   constructor(
     private readonly ledger: Ledger,
@@ -1628,14 +1698,20 @@ class SessionEventSink {
     private readonly onEvent: (event: SessionRuntimeEvent) => void,
   ) {
     this.events = [...events];
+    this.lastOffset = highestGlobalOffset(events);
   }
 
   get cachedEvents(): AnyEvent[] {
     return this.events.map((event) => structuredClone(event));
   }
 
+  get cachedLastOffset(): number {
+    return this.lastOffset;
+  }
+
   replaceCache(events: readonly AnyEvent[]): void {
     this.events = [...events];
+    this.lastOffset = highestGlobalOffset(events);
   }
 
   deactivate(): void {
@@ -1651,10 +1727,15 @@ class SessionEventSink {
     if (!this.active) return event;
     if (!this.events.some((candidate) => candidate.eventId === event.eventId)) {
       this.events.push(event as AnyEvent);
+      this.lastOffset = Math.max(this.lastOffset, event.globalOffset);
       this.onEvent({ kind: "event", event: event as AnyEvent });
     }
     return event;
   }
+}
+
+function highestGlobalOffset(events: readonly AnyEvent[]): number {
+  return events.reduce((highest, event) => Math.max(highest, event.globalOffset), 0);
 }
 
 export async function findLatestRunId(

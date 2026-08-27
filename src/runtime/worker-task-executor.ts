@@ -29,6 +29,7 @@ Do not request tools in this bounded worker slice.`;
 
 const MESSAGE_MEDIA_TYPE = "application/vnd.nausicaa.conversation-message+json";
 const DEFAULT_MAX_INPUT_BYTES = 256 * 1024;
+const MAX_WORKER_OUTPUT_TOKENS = 512;
 const DEFAULT_DRAIN_LIMIT = 8;
 const MAX_DRAIN_LIMIT = 64;
 
@@ -329,6 +330,19 @@ export class WorkerTaskExecutor {
 
     const attempt = state.nextAttempt;
     const prefix = `${this.runId}:${this.laneId}:task:${task.taskId}:attempt:${attempt}`;
+    const remainingModelTokens = task.budget.maxModelTokens - totalTokens(state.usage);
+    if (remainingModelTokens <= 0) {
+      return {
+        kind: "failed",
+        payload: failed(
+          task.taskId,
+          `Worker model token budget exhausted (${task.budget.maxModelTokens})`,
+          false,
+          evidenceRefs,
+        ),
+      };
+    }
+    const maxOutputTokens = Math.min(MAX_WORKER_OUTPUT_TOKENS, remainingModelTokens);
     const deadline = new TaskDeadline(remainingMs, [
       this.signal,
       this.stopController.signal,
@@ -348,7 +362,7 @@ export class WorkerTaskExecutor {
         systemPrompt: this.systemPrompt,
         messages,
         tools,
-        maxOutputTokens: task.budget.maxModelTokens,
+        maxOutputTokens,
       }));
       const contextWatermark = this.readWatermark === undefined
         ? 0
@@ -382,7 +396,7 @@ export class WorkerTaskExecutor {
           systemPrompt: this.systemPrompt,
           messages,
           tools,
-          maxOutputTokens: task.budget.maxModelTokens,
+          maxOutputTokens,
           signal: deadline.signal,
         }), deadline.signal);
       } catch (error: unknown) {

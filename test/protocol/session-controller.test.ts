@@ -150,6 +150,15 @@ describe("SessionController", () => {
     session.subscribe((event) => events.push(event));
 
     expect(session.snapshot()).toMatchObject({ workerEnabled: true });
+    expect(session.workerTaskSummary()).toEqual({
+      total: 0,
+      queued: 0,
+      running: 0,
+      ready: 0,
+      done: 0,
+      failed: 0,
+      stale: 0,
+    });
     await session.submit({ inputId: "worker-input", text: "Inspect the package metadata" });
     await session.waitForIdle();
 
@@ -175,7 +184,23 @@ describe("SessionController", () => {
       && event.payload.message.payload.type === "task.result"
       && event.payload.message.payload.taskId === "task-1"
     ))).toBe(true);
+    expect(session.workerTaskSummary()).toMatchObject({ total: 1, done: 1 });
     await session.close();
+
+    const reopened = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted/main",
+      runId: "session-worker-run",
+    }, {
+      mainModel: new ScriptedModel([]),
+      workerModel: new ScriptedModel([]),
+    });
+    const restoredSummary = reopened.workerTaskSummary();
+    expect(restoredSummary).toMatchObject({ total: 1, done: 1 });
+    restoredSummary.done = 0;
+    expect(reopened.workerTaskSummary()).toMatchObject({ total: 1, done: 1 });
+    await reopened.close();
   });
 
   it("keeps Worker work alive across completed Turns", async () => {

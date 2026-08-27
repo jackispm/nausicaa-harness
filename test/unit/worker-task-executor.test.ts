@@ -11,6 +11,7 @@ import type {
   ModelResponse,
 } from "../../src/domain/index.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
+import { sha256, stableJson } from "../../src/ledger/hash.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import {
   WorkerTaskExecutor,
@@ -159,6 +160,37 @@ describe("WorkerTaskExecutor", () => {
       taskId: "task-1",
       retryable: false,
     });
+  });
+
+  it("caps one Worker response independently from the cumulative task token budget", async () => {
+    const model = new ScriptedModel([{
+      content: "Bounded result",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: { input: 600, output: 300, cacheRead: 0, cacheWrite: 0 },
+    }]);
+    const { executor, ledger } = await setup(model, "input", {
+      maxModelTokens: 1_000,
+      maxWallClockMs: 5_000,
+    });
+
+    await expect(executor.runOnce()).resolves.toMatchObject({
+      status: "completed",
+      usage: { input: 600, output: 300 },
+    });
+    const request = model.requests[0]!;
+    expect(request.maxOutputTokens).toBe(512);
+    const requested = (await ledger.read({ runId: "run-1" })).find((event) => (
+      event.type === "model.requested"
+    ));
+    expect(requested?.payload.requestHash).toBe(sha256(stableJson({
+      model: request.model,
+      sessionId: request.sessionId,
+      systemPrompt: request.systemPrompt,
+      messages: request.messages,
+      tools: request.tools,
+      maxOutputTokens: 512,
+    })));
   });
 
   it("fails a task when the wall-clock budget expires", async () => {

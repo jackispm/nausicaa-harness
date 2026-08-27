@@ -1269,6 +1269,86 @@ describe("interactive TUI", () => {
     }
   });
 
+  it("updates the durable Worker summary from running through ready and done", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-worker-summary-"));
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    let releaseWorker = (_response: ModelResponse): void => {};
+    let releaseMain = (_response: ModelResponse): void => {};
+    let markWorkerStarted = (): void => {};
+    let markMainWaiting = (): void => {};
+    const workerStarted = new Promise<void>((resolve) => { markWorkerStarted = resolve; });
+    const mainWaiting = new Promise<void>((resolve) => { markMainWaiting = resolve; });
+    try {
+      const workerModel = new ScriptedModel([async () => {
+        markWorkerStarted();
+        return new Promise<ModelResponse>((resolve) => { releaseWorker = resolve; });
+      }]);
+      const mainModel = new ScriptedModel([
+        response("Delegating", [{
+          id: "delegate-summary",
+          name: "delegate_task",
+          arguments: {
+            taskId: "summary-task",
+            statement: "Inspect the package name",
+            successCriteria: ["Return the package name"],
+            maxModelTokens: 200,
+            maxWallClockMs: 5_000,
+          },
+        }], "toolUse"),
+        async () => {
+          markMainWaiting();
+          return new Promise<ModelResponse>((resolve) => { releaseMain = resolve; });
+        },
+        response("WORKER_SUMMARY_DONE"),
+      ]);
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted/main",
+        workerModel: "scripted/worker",
+        workerEnabled: true,
+        policy: {
+          maxMainStepsPerActivation: 4,
+          maxModelTokens: 10_000,
+          tetoEnabled: false,
+        },
+      }, {
+        mainModel,
+        workerModel,
+        tools: [inspectTool],
+        createRunId: () => "interactive-worker-summary-run",
+      });
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("inspect in parallel");
+      terminal.send("\r");
+      await Promise.all([workerStarted, mainWaiting]);
+      await waitForOutput(terminal, "1 Worker task · 1 running");
+
+      releaseWorker(response("package name: nausicaa"));
+      await waitForOutput(terminal, "1 Worker task · 1 ready");
+
+      releaseMain(response("Commit the Worker result", [{
+        id: "worker-boundary",
+        name: "inspect_manifest",
+        arguments: { path: "package.json" },
+      }], "toolUse"));
+      await waitForOutput(terminal, "WORKER_SUMMARY_DONE");
+      await waitForOutput(terminal, "1 Worker task · 1 done");
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      releaseWorker(response("cleanup"));
+      releaseMain(response("cleanup"));
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("shows one durable failure notice and does not persist a streamed fragment", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-failure-"));
     const terminal = new MemoryTerminal(100, 28);
