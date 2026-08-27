@@ -1149,8 +1149,8 @@ export class SessionController {
           return [
             ...continuation,
             ...await this.deliverSteering(turn.turnId, step),
-            ...await (scheduler?.beforeMainStep() ?? Promise.resolve([])),
-            ...await (attached.worker?.scheduler.beforeMainStep() ?? Promise.resolve([])),
+            ...await (scheduler?.beforeMainStep({ step }) ?? Promise.resolve([])),
+            ...await (attached.worker?.scheduler.beforeMainStep({ step }) ?? Promise.resolve([])),
           ];
         },
         ...(scheduler === undefined && attached.worker === undefined

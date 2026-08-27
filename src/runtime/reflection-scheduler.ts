@@ -15,7 +15,11 @@ import { parseSingleJsonObject, systemClock } from "../domain/index.js";
 import { stableJson } from "../ledger/hash.js";
 import type { ContentAddressedStore } from "../store/index.js";
 import { TetoCadence, TokenRatioGate, type TetoCadenceState, type TokenRatioGateState } from "../teto/index.js";
-import type { MainAfterStepContext, MainBoundaryMessage } from "./main-loop.js";
+import type {
+  MainAfterStepContext,
+  MainBeforeStepContext,
+  MainBoundaryMessage,
+} from "./main-loop.js";
 import { persistedErrorText } from "./redaction.js";
 
 const DEFAULT_REFLECTION_LANE = "reflection";
@@ -106,7 +110,9 @@ export class ReflectionScheduler {
   }
 
   /** Return at most one completed self-reflection at a natural Main boundary. */
-  async beforeMainStep(): Promise<readonly MainBoundaryMessage[]> {
+  async beforeMainStep(
+    _context?: Pick<MainBeforeStepContext, "step">,
+  ): Promise<readonly MainBoundaryMessage[]> {
     await this.drain();
     const pending = this.pendingReflections[0];
     if (pending === undefined) return [];

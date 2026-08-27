@@ -121,6 +121,23 @@ describe("TetoScheduler", () => {
     expect(question).toMatchObject({ status: "pending" });
   });
 
+  it("holds low-risk next-turn Advice until a Turn-opening boundary", async () => {
+    const model = new ScriptedModel([adviceResponse("low")]);
+    const { scheduler, inbox } = setup(model);
+    enqueueFive(scheduler);
+    await scheduler.drain();
+
+    expect(await scheduler.beforeMainStep({ step: 2 })).toEqual([]);
+    const pending = inbox.snapshot().records.find((record) => (
+      record.message.payload.type === "advice.propose"
+    ));
+    expect(pending).toMatchObject({
+      status: "pending",
+      message: { delivery: "next-turn" },
+    });
+    expect(await scheduler.beforeMainStep({ step: 1 })).toHaveLength(1);
+  });
+
   it("isolates a failed pass, records failure, and continues later", async () => {
     const model = new ScriptedModel([
       new Error("Teto provider unavailable"),
@@ -368,13 +385,13 @@ function silentResponse(): ModelResponse {
   };
 }
 
-function adviceResponse(): ModelResponse {
+function adviceResponse(risk: "low" | "medium" | "high" = "medium"): ModelResponse {
   return {
     content: JSON.stringify({
       action: "advise",
       kind: "intent-gap",
       claim: "Installation has been found but not verified.",
-      risk: "medium",
+      risk,
       suggestedAction: "Run the command in a clean temporary directory.",
     }),
     toolCalls: [],

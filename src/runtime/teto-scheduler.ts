@@ -6,6 +6,7 @@ import type {
   AdviceDisposition,
   AnyEvent,
   Clock,
+  DeliveryMode,
   Goal,
   LaneId,
   MainTriggerKind,
@@ -27,6 +28,7 @@ import {
 import { persistedErrorText } from "./redaction.js";
 import type {
   MainAfterStepContext,
+  MainBeforeStepContext,
   MainBoundaryMessage,
 } from "./main-loop.js";
 
@@ -35,6 +37,12 @@ const DEFAULT_MAIN_LANE = "main";
 const OBSERVATION_DEADLINE_MS = 30_000;
 const MAX_BOUNDARY_ADVICE = 4;
 const TETO_INPUT_OVERHEAD_TOKENS = 16;
+
+function mainBoundaryDeliveries(step: number): readonly DeliveryMode[] {
+  return step === 1
+    ? ["urgent", "next-step", "next-turn"]
+    : ["urgent", "next-step"];
+}
 
 export interface TetoSchedulerOptions {
   eventSink: EventSink;
@@ -159,7 +167,9 @@ export class TetoScheduler {
   }
 
   /** Claims only Advice that was fully published before this Main boundary. */
-  async beforeMainStep(): Promise<readonly MainBoundaryMessage[]> {
+  async beforeMainStep(
+    context?: Pick<MainBeforeStepContext, "step">,
+  ): Promise<readonly MainBoundaryMessage[]> {
     if (!this.policy.tetoEnabled) {
       return [];
     }
@@ -169,6 +179,9 @@ export class TetoScheduler {
         claimId: this.createId(),
         limit: MAX_BOUNDARY_ADVICE,
         types: ["advice.propose"],
+        ...(context === undefined
+          ? {}
+          : { deliveries: mainBoundaryDeliveries(context.step) }),
       });
       return records
         .filter((record) => (

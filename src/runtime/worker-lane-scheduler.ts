@@ -1,8 +1,12 @@
 import { randomUUID } from "node:crypto";
 
 import type { A2AInbox, InboxRecord } from "../a2a/index.js";
-import type { AnyEvent, LaneId, RunId } from "../domain/index.js";
-import type { MainAfterStepContext, MainBoundaryMessage } from "./main-loop.js";
+import type { AnyEvent, DeliveryMode, LaneId, RunId } from "../domain/index.js";
+import type {
+  MainAfterStepContext,
+  MainBeforeStepContext,
+  MainBoundaryMessage,
+} from "./main-loop.js";
 import type { WorkerTaskExecutor } from "./worker-task-executor.js";
 
 const DEFAULT_MAIN_LANE = "main";
@@ -16,6 +20,12 @@ const MAX_TASKS_PER_ACTIVATION = 64;
 const DEFAULT_STOP_WAIT_MS = 250;
 const MAX_STOP_WAIT_MS = 10_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function mainBoundaryDeliveries(step: number): readonly DeliveryMode[] {
+  return step === 1
+    ? ["urgent", "next-step", "next-turn"]
+    : ["urgent", "next-step"];
+}
 
 export type WorkerTaskRunner = Pick<WorkerTaskExecutor, "runOnce"> & {
   /** Optional hook for executors which own an AbortController. */
@@ -174,7 +184,9 @@ export class WorkerLaneScheduler {
   }
 
   /** Claim completed Worker replies for the next Main natural boundary. */
-  async beforeMainStep(): Promise<readonly MainBoundaryMessage[]> {
+  async beforeMainStep(
+    context?: Pick<MainBeforeStepContext, "step">,
+  ): Promise<readonly MainBoundaryMessage[]> {
     if (!this.accepting || this.stopController.signal.aborted || this.signal?.aborted) {
       return [];
     }
@@ -185,6 +197,9 @@ export class WorkerLaneScheduler {
         limit: this.maxResultsPerBoundary,
         from: this.workerLaneId,
         types: ["task.accept", "task.result", "task.failed"],
+        ...(context === undefined
+          ? {}
+          : { deliveries: mainBoundaryDeliveries(context.step) }),
       });
       const messages: MainBoundaryMessage[] = [];
       for (const record of records) {

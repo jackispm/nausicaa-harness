@@ -327,7 +327,7 @@ export const executeRun = async (
         && workerScheduler === undefined
         ? {}
         : {
-            beforeStep: async () => {
+            beforeStep: async ({ step }) => {
               const continuation = outputContinuationMessageId === undefined
                 ? []
                 : [{
@@ -341,10 +341,10 @@ export const executeRun = async (
                 ...continuation,
                 ...await (
                   scheduler !== undefined && "beforeMainStep" in scheduler
-                    ? scheduler.beforeMainStep()
+                    ? scheduler.beforeMainStep({ step })
                     : Promise.resolve([])
                 ),
-                ...await (workerScheduler?.beforeMainStep() ?? Promise.resolve([])),
+                ...await (workerScheduler?.beforeMainStep({ step }) ?? Promise.resolve([])),
               ];
             },
             ...(scheduler === undefined && workerScheduler === undefined

@@ -134,6 +134,47 @@ describe("WorkerLaneScheduler", () => {
     expect(failed?.status).toBe("claimed");
   });
 
+  it("holds next-turn Worker replies until the first boundary of a later Turn", async () => {
+    const ledger = new MemoryLedger();
+    const store = new MemoryContentAddressedStore();
+    const inbox = new A2AInbox({ sink: ledger });
+    const dispatcher = new TaskDispatcher({ inbox, runId: "run-1", to: "worker" });
+    await dispatcher.dispatch({
+      taskId: "next-turn-task",
+      goal,
+      budget: { maxModelTokens: 500, maxWallClockMs: 5_000 },
+      delivery: "next-turn",
+    });
+    const scheduler = new WorkerLaneScheduler({
+      executor: new WorkerTaskExecutor({
+        inbox,
+        eventSink: ledger,
+        store,
+        model: new ScriptedModel([{
+          content: "future result",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+        }]),
+        modelName: "scripted/worker",
+        runId: "run-1",
+        workerLaneId: "worker",
+      }),
+      inbox,
+      runId: "run-1",
+      workerLaneId: "worker",
+    });
+
+    scheduler.enqueue(mainStep());
+    await scheduler.drain();
+    expect(await scheduler.beforeMainStep({ step: 2 })).toEqual([]);
+    expect(await scheduler.beforeMainStep({ step: 1 })).toEqual([
+      expect.objectContaining({
+        messageId: "run-1:worker:task:next-turn-task:result",
+      }),
+    ]);
+  });
+
   it("does not await an in-flight Worker model from enqueue", async () => {
     let resolveModel: ((response: ModelResponse) => void) | undefined;
     const slowModel: ModelPort = {

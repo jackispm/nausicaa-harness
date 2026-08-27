@@ -562,7 +562,7 @@ export class WorkerTaskExecutor {
       idempotencyKey: messageId,
       visibility: request.visibility,
       priority: request.priority,
-      delivery: "next-step",
+      delivery: request.delivery,
       payload,
     });
     return { messageId: sent.messageId };

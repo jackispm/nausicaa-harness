@@ -196,6 +196,42 @@ describe("A2AInbox", () => {
       .toBe("pending");
   });
 
+  it("claims only delivery modes admitted at the current boundary", async () => {
+    const inbox = new A2AInbox();
+    for (const delivery of ["next-step", "next-turn", "deferred"] as const) {
+      await inbox.send(taskMessage(
+        { type: "task.accept", taskId: delivery },
+        {
+          messageId: delivery,
+          idempotencyKey: delivery,
+          from: "worker-a",
+          to: "main",
+          delivery,
+        },
+      ));
+    }
+
+    const currentTurn = await inbox.claim("main", "main", {
+      claimId: "current-turn",
+      deliveries: ["urgent", "next-step"],
+    });
+    expect(currentTurn.map((record) => record.message.messageId)).toEqual(["next-step"]);
+    expect(inbox.nextClaimableDelayMs("main", {
+      deliveries: ["next-turn"],
+    })).toBe(0);
+
+    const nextTurn = await inbox.claim("main", "main", {
+      claimId: "next-turn-boundary",
+      deliveries: ["urgent", "next-step", "next-turn"],
+    });
+    expect(nextTurn.map((record) => record.message.messageId)).toEqual(["next-turn"]);
+    const deferred = await inbox.claim("main", "main", {
+      claimId: "explicit-deferred",
+      deliveries: ["deferred"],
+    });
+    expect(deferred.map((record) => record.message.messageId)).toEqual(["deferred"]);
+  });
+
   it("ages old low-priority work until it cannot be starved, including after replay", async () => {
     const ledger = new MemoryLedger();
     const inbox = new A2AInbox({ sink: ledger });

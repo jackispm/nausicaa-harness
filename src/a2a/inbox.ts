@@ -9,6 +9,7 @@ import type {
   EventEnvelope,
   EventType,
   ArtifactRef,
+  DeliveryMode,
   Goal,
   LaneId,
   TaskBudget,
@@ -73,11 +74,12 @@ export interface ClaimOptions {
   now?: Date;
   from?: LaneId;
   types?: readonly A2APayload["type"][];
+  deliveries?: readonly DeliveryMode[];
 }
 
 export type ClaimAvailabilityOptions = Pick<
   ClaimOptions,
-  "now" | "from" | "types"
+  "now" | "from" | "types" | "deliveries"
 >;
 
 export interface AdviceAckResult {
@@ -296,6 +298,8 @@ export class A2AInbox {
         || (options.from !== undefined && record.message.from !== options.from)
         || (options.types !== undefined
           && !options.types.includes(record.message.payload.type))
+        || (options.deliveries !== undefined
+          && !options.deliveries.includes(record.message.delivery))
       ) {
         continue;
       }
@@ -405,6 +409,8 @@ export class A2AInbox {
         || (options.from !== undefined && record.message.from !== options.from)
         || (options.types !== undefined
           && !options.types.includes(record.message.payload.type))
+        || (options.deliveries !== undefined
+          && !options.deliveries.includes(record.message.delivery))
       ))) {
         throw new A2AProtocolError(`claimId ${claimId} was reused by another receiver`);
       }
@@ -417,6 +423,10 @@ export class A2AInbox {
       .filter((record) => (
         options.types === undefined
         || options.types.includes(record.message.payload.type)
+      ))
+      .filter((record) => (
+        options.deliveries === undefined
+        || options.deliveries.includes(record.message.delivery)
       ))
       .slice(0, limit);
     const claimed: InboxRecord[] = [];
