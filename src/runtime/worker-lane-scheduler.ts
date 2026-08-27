@@ -2,14 +2,20 @@ import { randomUUID } from "node:crypto";
 
 import type { A2AInbox, InboxRecord } from "../a2a/index.js";
 import type { LaneId, RunId } from "../domain/index.js";
-import type { MainBoundaryMessage } from "./main-loop.js";
+import type { MainAfterStepContext, MainBoundaryMessage } from "./main-loop.js";
 import type { WorkerTaskExecutor } from "./worker-task-executor.js";
 
 const DEFAULT_MAIN_LANE = "main";
 const DEFAULT_WORKER_LANE = "worker";
 const DEFAULT_BOUNDARY_LIMIT = 4;
 const MAX_BOUNDARY_LIMIT = 32;
+const DEFAULT_STOP_WAIT_MS = 250;
+const MAX_STOP_WAIT_MS = 10_000;
 
+export type WorkerTaskRunner = Pick<WorkerTaskExecutor, "runOnce"> & {
+  /** Optional hook for executors which own an AbortController. */
+  stop?: () => void | Promise<void>;
+};
 type TerminalRecord = InboxRecord & {
   message: InboxRecord["message"] & {
     payload: Extract<InboxRecord["message"]["payload"], {
@@ -19,13 +25,15 @@ type TerminalRecord = InboxRecord & {
 };
 
 export interface WorkerLaneSchedulerOptions {
-  executor: WorkerTaskExecutor;
+  executor: WorkerTaskRunner;
   inbox: A2AInbox;
   runId: RunId;
   mainLaneId?: LaneId;
   workerLaneId?: LaneId;
   maxResultsPerBoundary?: number;
   createId?: () => string;
+  signal?: AbortSignal;
+  stopWaitMs?: number;
 }
 
 /**
@@ -33,13 +41,16 @@ export interface WorkerLaneSchedulerOptions {
  * only schedules a serial worker activation; Main never awaits the worker.
  */
 export class WorkerLaneScheduler {
-  private readonly executor: WorkerTaskExecutor;
+  private readonly executor: WorkerTaskRunner;
   private readonly inbox: A2AInbox;
   private readonly runId: RunId;
   private readonly mainLaneId: LaneId;
   private readonly workerLaneId: LaneId;
   private readonly maxResultsPerBoundary: number;
   private readonly createId: () => string;
+  private readonly signal: AbortSignal | undefined;
+  private readonly stopWaitMs: number;
+  private readonly stopController = new AbortController();
   private readonly delivered = new Map<string, InboxRecord>();
   private readonly failures: Error[] = [];
   private tail: Promise<void> = Promise.resolve();
@@ -64,15 +75,47 @@ export class WorkerLaneScheduler {
     this.workerLaneId = options.workerLaneId ?? DEFAULT_WORKER_LANE;
     this.maxResultsPerBoundary = maxResultsPerBoundary;
     this.createId = options.createId ?? randomUUID;
+    this.signal = options.signal;
+    const stopWaitMs = options.stopWaitMs ?? DEFAULT_STOP_WAIT_MS;
+    if (
+      !Number.isSafeInteger(stopWaitMs)
+      || stopWaitMs < 1
+      || stopWaitMs > MAX_STOP_WAIT_MS
+    ) {
+      throw new RangeError(
+        `stopWaitMs must be an integer between 1 and ${MAX_STOP_WAIT_MS}`,
+      );
+    }
+    this.stopWaitMs = stopWaitMs;
     nonEmpty(this.mainLaneId, "mainLaneId");
     nonEmpty(this.workerLaneId, "workerLaneId");
   }
 
+  /** Pass this signal to an executor that supports cancellation. */
+  get abortSignal(): AbortSignal {
+    return this.stopController.signal;
+  }
+
   /** Called from Main's synchronous afterStep hook. */
-  enqueue(): void {
+  enqueue(context?: MainAfterStepContext): void {
     if (!this.accepting) return;
+    const boundary = context === undefined
+      ? undefined
+      : {
+          runId: context.runId,
+          laneId: context.laneId,
+          boundaryMessageIds: [...context.boundaryMessageIds],
+        };
     const operation = this.tail.then(async () => {
-      await this.acknowledgeDelivered();
+      if (boundary !== undefined) {
+        if (boundary.runId !== this.runId || boundary.laneId !== this.mainLaneId) {
+          throw new Error(
+            `Worker lane scheduler for ${this.runId}/${this.mainLaneId} received ${boundary.runId}/${boundary.laneId}`,
+          );
+        }
+        await this.acknowledgeDelivered(boundary.boundaryMessageIds);
+      }
+      if (this.stopController.signal.aborted || this.signal?.aborted) return;
       await this.executor.runOnce();
     });
     this.tail = operation.catch((error: unknown) => {
@@ -82,7 +125,9 @@ export class WorkerLaneScheduler {
 
   /** Claim completed Worker replies for the next Main natural boundary. */
   async beforeMainStep(): Promise<readonly MainBoundaryMessage[]> {
-    if (!this.accepting) return [];
+    if (!this.accepting || this.stopController.signal.aborted || this.signal?.aborted) {
+      return [];
+    }
     try {
       const records = await this.inbox.claim(this.mainLaneId, this.mainLaneId, {
         claimId: `${this.runId}:worker:delivery:${this.createId()}`,
@@ -94,7 +139,12 @@ export class WorkerLaneScheduler {
       for (const record of records) {
         if (record.message.payload.type === "task.accept") {
           // Acceptance is a transport status, not model context.
-          await this.inbox.handle(record.message.messageId, this.mainLaneId);
+          try {
+            await this.inbox.handle(record.message.messageId, this.mainLaneId);
+          } catch (error: unknown) {
+            // Keep a failed receipt leased so the Inbox can redeliver it.
+            this.failures.push(asError(error));
+          }
           continue;
         }
         const terminal = record as TerminalRecord;
@@ -125,11 +175,23 @@ export class WorkerLaneScheduler {
 
   async stop(): Promise<readonly Error[]> {
     this.accepting = false;
-    return this.drain();
+    if (!this.stopController.signal.aborted) {
+      this.stopController.abort(new DOMException(
+        "Worker lane cancelled after Main finished",
+        "AbortError",
+      ));
+    }
+    try {
+      await this.runWithin(this.executor.stop?.(), this.stopWaitMs);
+    } catch (error: unknown) {
+      this.failures.push(asError(error));
+    }
+    return this.drainWithin(this.stopWaitMs);
   }
 
-  private async acknowledgeDelivered(): Promise<void> {
-    for (const [messageId] of this.delivered) {
+  private async acknowledgeDelivered(messageIds: readonly string[]): Promise<void> {
+    for (const messageId of messageIds) {
+      if (!this.delivered.has(messageId)) continue;
       try {
         await this.inbox.handle(messageId, this.mainLaneId);
         this.delivered.delete(messageId);
@@ -137,6 +199,31 @@ export class WorkerLaneScheduler {
         // Keep the record for a later lease-based retry; do not block Main.
         this.failures.push(asError(error));
       }
+    }
+  }
+
+  private async drainWithin(milliseconds: number): Promise<readonly Error[]> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<readonly Error[]>((resolve) => {
+      timer = setTimeout(() => resolve([...this.failures]), milliseconds);
+    });
+    try {
+      return await Promise.race([this.drain(), timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private async runWithin<T>(operation: Promise<T> | void, milliseconds: number): Promise<void> {
+    if (operation === undefined) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Worker stop hook exceeded its wait bound")), milliseconds);
+    });
+    try {
+      await Promise.race([operation.then(() => undefined), timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
 }
