@@ -135,6 +135,32 @@ describe("A2AInbox", () => {
     });
   });
 
+  it("reports the next matching claimable delay without mutating the Inbox", async () => {
+    const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock, claimLeaseMs: 1_000 });
+    await inbox.send(adviceMessage());
+    expect(inbox.nextClaimableDelayMs("main", {
+      from: "teto",
+      types: ["advice.propose"],
+    })).toBe(0);
+    await inbox.claim("main", "worker-a", { claimId: "claim-a" });
+    const claimed = inbox.snapshot();
+
+    expect(inbox.nextClaimableDelayMs("main", {
+      from: "teto",
+      types: ["advice.propose"],
+    })).toBe(1_000);
+    expect(inbox.nextClaimableDelayMs("main", {
+      types: ["task.request"],
+    })).toBeUndefined();
+    expect(inbox.snapshot()).toEqual(claimed);
+
+    clock.advance(400);
+    expect(inbox.nextClaimableDelayMs("main")).toBe(600);
+    clock.advance(600);
+    expect(inbox.nextClaimableDelayMs("main")).toBe(0);
+  });
+
   it("atomically admits only one of two concurrent claims", async () => {
     const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
     const inbox = new A2AInbox({ clock });

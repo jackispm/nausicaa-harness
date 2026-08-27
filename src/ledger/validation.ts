@@ -403,6 +403,17 @@ const payloadValidators = {
     const item = payloadObject(value, path, ["step", "hasToolCalls"]);
     integer(item.step, `${path}.step`, 1);
     boolean(item.hasToolCalls, `${path}.hasToolCalls`);
+    if (item.boundaryMessageIds !== undefined) {
+      stringArray(item.boundaryMessageIds, `${path}.boundaryMessageIds`);
+      const unique = new Set<string>();
+      item.boundaryMessageIds.forEach((messageId, index) => {
+        string(messageId, `${path}.boundaryMessageIds[${index}]`, false);
+        if (unique.has(messageId)) {
+          invalid(`${path}.boundaryMessageIds[${index}]`, "unique within the Step");
+        }
+        unique.add(messageId);
+      });
+    }
   },
   "step.failed": (value, path) => {
     const item = payloadObject(value, path, ["step", "error"]);

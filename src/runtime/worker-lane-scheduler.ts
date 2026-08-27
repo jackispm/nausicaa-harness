@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { A2AInbox, InboxRecord } from "../a2a/index.js";
-import type { LaneId, RunId } from "../domain/index.js";
+import type { AnyEvent, LaneId, RunId } from "../domain/index.js";
 import type { MainAfterStepContext, MainBoundaryMessage } from "./main-loop.js";
 import type { WorkerTaskExecutor } from "./worker-task-executor.js";
 
@@ -15,6 +15,7 @@ const DEFAULT_MAX_TASKS_PER_ACTIVATION = 8;
 const MAX_TASKS_PER_ACTIVATION = 64;
 const DEFAULT_STOP_WAIT_MS = 250;
 const MAX_STOP_WAIT_MS = 10_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export type WorkerTaskRunner = Pick<WorkerTaskExecutor, "runOnce"> & {
   /** Optional hook for executors which own an AbortController. */
@@ -39,6 +40,8 @@ export interface WorkerLaneSchedulerOptions {
   maxPendingActivations?: number;
   /** Maximum tasks consumed by one activation before yielding to Main. */
   maxTasksPerActivation?: number;
+  /** Boundary messages already consumed by committed Main Steps during replay. */
+  committedBoundaryMessageIds?: readonly string[];
   createId?: () => string;
   signal?: AbortSignal;
   stopWaitMs?: number;
@@ -61,10 +64,12 @@ export class WorkerLaneScheduler {
   private readonly signal: AbortSignal | undefined;
   private readonly stopWaitMs: number;
   private readonly stopController = new AbortController();
-  private readonly delivered = new Map<string, InboxRecord>();
+  private readonly committedBoundaryMessageIds = new Set<string>();
   private readonly failures: Error[] = [];
   private tail: Promise<void> = Promise.resolve();
   private receiptTail: Promise<void> = Promise.resolve();
+  private leaseWakeTimer: ReturnType<typeof setTimeout> | undefined;
+  private leaseWakeRequested = false;
   private pendingActivationCount = 0;
   private droppedWakeups = 0;
   private accepting = true;
@@ -125,6 +130,10 @@ export class WorkerLaneScheduler {
     this.stopWaitMs = stopWaitMs;
     nonEmpty(this.mainLaneId, "mainLaneId");
     nonEmpty(this.workerLaneId, "workerLaneId");
+    for (const messageId of options.committedBoundaryMessageIds ?? []) {
+      nonEmpty(messageId, "committedBoundaryMessageIds[]");
+      this.committedBoundaryMessageIds.add(messageId);
+    }
   }
 
   /** Pass this signal to an executor that supports cancellation. */
@@ -152,8 +161,11 @@ export class WorkerLaneScheduler {
         ));
         return;
       }
-      this.scheduleAcknowledgements(context.boundaryMessageIds);
+      for (const messageId of context.boundaryMessageIds) {
+        this.committedBoundaryMessageIds.add(messageId);
+      }
     }
+    this.scheduleAcknowledgements([...this.committedBoundaryMessageIds]);
     if (this.pendingActivationCount >= this.maxPendingActivations) {
       this.droppedWakeups += 1;
       return;
@@ -167,6 +179,7 @@ export class WorkerLaneScheduler {
       return [];
     }
     try {
+      await this.acknowledgeCommitted([...this.committedBoundaryMessageIds]);
       const records = await this.inbox.claim(this.mainLaneId, this.mainLaneId, {
         claimId: `${this.runId}:worker:delivery:${this.createId()}`,
         limit: this.maxResultsPerBoundary,
@@ -186,7 +199,12 @@ export class WorkerLaneScheduler {
           continue;
         }
         const terminal = record as TerminalRecord;
-        this.delivered.set(record.message.messageId, record);
+        if (this.committedBoundaryMessageIds.has(record.message.messageId)) {
+          // The Main Step is already committed. Repair the transport receipt,
+          // but never inject the terminal into a second model request.
+          await this.acknowledgeCommitted([record.message.messageId]);
+          continue;
+        }
         messages.push({
           kind: "runtime-notice",
           source: this.workerLaneId,
@@ -214,6 +232,8 @@ export class WorkerLaneScheduler {
 
   async stop(): Promise<readonly Error[]> {
     this.accepting = false;
+    this.clearLeaseWakeup();
+    this.leaseWakeRequested = false;
     if (!this.stopController.signal.aborted) {
       this.stopController.abort(new DOMException(
         "Worker lane cancelled after Main finished",
@@ -243,26 +263,82 @@ export class WorkerLaneScheduler {
       this.failures.push(asError(error));
     }).finally(() => {
       this.pendingActivationCount -= 1;
+      if (this.leaseWakeRequested) {
+        this.leaseWakeRequested = false;
+        this.scheduleActivation();
+        return;
+      }
+      this.scheduleLeaseWakeup();
     });
+  }
+
+  private scheduleLeaseWakeup(): void {
+    this.clearLeaseWakeup();
+    if (!this.accepting || this.stopController.signal.aborted || this.signal?.aborted) return;
+    const delay = this.inbox.nextClaimableDelayMs(this.workerLaneId, {
+      types: ["task.request"],
+    });
+    // An idle executor and an already-claimable record disagree. Do not spin;
+    // a future Main boundary or Inbox mutation can provide the next wakeup.
+    if (delay === undefined || delay <= 0) return;
+
+    const timer = setTimeout(() => {
+      if (this.leaseWakeTimer !== timer) return;
+      this.leaseWakeTimer = undefined;
+      if (!this.accepting || this.stopController.signal.aborted || this.signal?.aborted) return;
+      if (this.pendingActivationCount >= this.maxPendingActivations) {
+        this.leaseWakeRequested = true;
+        return;
+      }
+      this.scheduleActivation();
+    }, Math.min(delay, MAX_TIMER_DELAY_MS));
+    timer.unref?.();
+    this.leaseWakeTimer = timer;
+  }
+
+  private clearLeaseWakeup(): void {
+    if (this.leaseWakeTimer === undefined) return;
+    clearTimeout(this.leaseWakeTimer);
+    this.leaseWakeTimer = undefined;
   }
 
   private scheduleAcknowledgements(messageIds: readonly string[]): void {
     if (messageIds.length === 0) return;
     const ids = [...new Set(messageIds)];
-    const operation = this.receiptTail.then(() => this.acknowledgeDelivered(ids));
+    const operation = this.receiptTail.then(() => this.acknowledgeCommitted(ids));
     this.receiptTail = operation.catch((error: unknown) => {
       this.failures.push(asError(error));
     });
   }
 
-  private async acknowledgeDelivered(messageIds: readonly string[]): Promise<void> {
+  private async acknowledgeCommitted(messageIds: readonly string[]): Promise<void> {
+    const records = new Map(this.inbox.snapshot().records.map((record) => [
+      record.message.messageId,
+      record,
+    ]));
     for (const messageId of messageIds) {
-      if (!this.delivered.has(messageId)) continue;
+      const record = records.get(messageId);
+      if (record === undefined || !isWorkerTerminalRecord(
+        record,
+        this.runId,
+        this.mainLaneId,
+        this.workerLaneId,
+      )) {
+        this.committedBoundaryMessageIds.delete(messageId);
+        continue;
+      }
+      if (record.status === "handled") {
+        this.committedBoundaryMessageIds.delete(messageId);
+        continue;
+      }
+      if (record.status !== "claimed" || record.claim?.claimedBy !== this.mainLaneId) {
+        continue;
+      }
       try {
         await this.inbox.handle(messageId, this.mainLaneId);
-        this.delivered.delete(messageId);
+        this.committedBoundaryMessageIds.delete(messageId);
       } catch (error: unknown) {
-        // Keep the record for a later lease-based retry; do not block Main.
+        // Keep the committed receipt for replay; do not block or reinject Main.
         this.failures.push(asError(error));
       }
     }
@@ -292,6 +368,44 @@ export class WorkerLaneScheduler {
       if (timer !== undefined) clearTimeout(timer);
     }
   }
+}
+
+export function projectCommittedBoundaryMessageIds(
+  events: readonly AnyEvent[],
+  runId: RunId,
+  mainLaneId: LaneId = DEFAULT_MAIN_LANE,
+): string[] {
+  nonEmpty(runId, "runId");
+  nonEmpty(mainLaneId, "mainLaneId");
+  const committed = new Set<string>();
+  for (const event of events) {
+    if (
+      event.runId !== runId
+      || event.laneId !== mainLaneId
+      || event.type !== "step.completed"
+    ) {
+      continue;
+    }
+    for (const messageId of event.payload.boundaryMessageIds ?? []) {
+      committed.add(messageId);
+    }
+  }
+  return [...committed];
+}
+
+function isWorkerTerminalRecord(
+  record: InboxRecord,
+  runId: RunId,
+  mainLaneId: LaneId,
+  workerLaneId: LaneId,
+): record is TerminalRecord {
+  return record.message.runId === runId
+    && record.message.from === workerLaneId
+    && record.message.to === mainLaneId
+    && (
+      record.message.payload.type === "task.result"
+      || record.message.payload.type === "task.failed"
+    );
 }
 
 function formatTerminal(record: TerminalRecord): string {

@@ -62,7 +62,10 @@ import { resolveRunPolicy } from "./run-policy.js";
 import { TetoScheduler } from "./teto-scheduler.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
 import { TaskDispatcher } from "./task-dispatcher.js";
-import { WorkerLaneScheduler } from "./worker-lane-scheduler.js";
+import {
+  projectCommittedBoundaryMessageIds,
+  WorkerLaneScheduler,
+} from "./worker-lane-scheduler.js";
 import { WorkerTaskExecutor } from "./worker-task-executor.js";
 import {
   MESSAGE_MEDIA_TYPE,
@@ -789,9 +792,10 @@ export class SessionController {
   }
 
   private createWorkerLaneRuntime(attached: AttachedRun): WorkerLaneRuntime {
+    const events = attached.sink.cachedEvents;
     const inbox = new A2AInbox({
       sink: attached.sink,
-      events: attached.sink.cachedEvents,
+      events,
       clock: this.clock,
     });
     const dispatcher = new TaskDispatcher({
@@ -808,11 +812,16 @@ export class SessionController {
       runId: attached.runId,
       clock: this.clock,
       readWatermark: () => attached.ledger.watermark(),
+      readEvents: () => attached.ledger.read({ runId: attached.runId }),
     });
     const scheduler = new WorkerLaneScheduler({
       executor,
       inbox,
       runId: attached.runId,
+      committedBoundaryMessageIds: projectCommittedBoundaryMessageIds(
+        events,
+        attached.runId,
+      ),
     });
     return { inbox, dispatcher, scheduler };
   }

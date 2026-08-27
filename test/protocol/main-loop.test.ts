@@ -329,6 +329,8 @@ describe("MainLoop", () => {
     }]);
     const events = await ledger.read({ runId: "length-run" });
     expect(events.some((event) => event.type === "run.completed")).toBe(false);
+    const completed = events.find((event) => event.type === "step.completed");
+    expect(completed?.payload.boundaryMessageIds).toEqual(["advice-length"]);
     const requested = events.find((event) => event.type === "model.requested");
     expect(requested?.payload.contextWatermark).toBeGreaterThan(0);
     expect(requested?.payload.contextWatermark).toBeLessThan(requested?.globalOffset ?? 0);

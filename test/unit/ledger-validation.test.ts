@@ -406,6 +406,23 @@ describe("event payload validation", () => {
     }
   });
 
+  it("accepts legacy Step receipts and validates committed boundary IDs", () => {
+    expect(() => validateEventPayload("step.completed", {
+      step: 1,
+      hasToolCalls: false,
+    })).not.toThrow();
+    expect(() => validateEventPayload("step.completed", {
+      step: 1,
+      hasToolCalls: false,
+      boundaryMessageIds: ["worker-result-1"],
+    })).not.toThrow();
+    expect(() => validateEventPayload("step.completed", {
+      step: 1,
+      hasToolCalls: false,
+      boundaryMessageIds: ["worker-result-1", "worker-result-1"],
+    })).toThrow(/unique/);
+  });
+
   it("rejects malformed payloads before append", async () => {
     const ledger = new MemoryLedger();
     const command = {

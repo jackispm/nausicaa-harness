@@ -75,6 +75,11 @@ export interface ClaimOptions {
   types?: readonly A2APayload["type"][];
 }
 
+export type ClaimAvailabilityOptions = Pick<
+  ClaimOptions,
+  "now" | "from" | "types"
+>;
+
 export interface AdviceAckResult {
   status: "acknowledged" | "duplicate";
   messageId: string;
@@ -271,6 +276,41 @@ export class A2AInbox {
 
   snapshot(): InboxProjection {
     return this.projector.snapshot();
+  }
+
+  /** Read-only delay until the next matching message can be claimed. */
+  nextClaimableDelayMs(
+    to: LaneId,
+    options: ClaimAvailabilityOptions = {},
+  ): number | undefined {
+    nonEmpty(to, "to");
+    if (options.from !== undefined) nonEmpty(options.from, "from");
+    const now = options.now ?? this.clock.now();
+    const nowMs = now.getTime();
+    let earliestClaimableAt: number | undefined;
+
+    for (const record of this.projector.list(to)) {
+      if (
+        record.status === "handled"
+        || isExpired(record.message, now)
+        || (options.from !== undefined && record.message.from !== options.from)
+        || (options.types !== undefined
+          && !options.types.includes(record.message.payload.type))
+      ) {
+        continue;
+      }
+      const claimableAt = record.status === "pending" || record.claim === undefined
+        ? nowMs
+        : Date.parse(record.claim.claimedAt) + this.claimLeaseMs;
+      if (isExpired(record.message, new Date(claimableAt))) continue;
+      earliestClaimableAt = earliestClaimableAt === undefined
+        ? claimableAt
+        : Math.min(earliestClaimableAt, claimableAt);
+    }
+
+    return earliestClaimableAt === undefined
+      ? undefined
+      : Math.max(0, earliestClaimableAt - nowMs);
   }
 
   send(message: A2AMessage): Promise<SendResult> {

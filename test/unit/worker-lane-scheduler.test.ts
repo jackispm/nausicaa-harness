@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { A2AInbox } from "../../src/a2a/index.js";
 import type {
@@ -10,7 +10,12 @@ import type {
 } from "../../src/domain/index.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
-import { TaskDispatcher, WorkerLaneScheduler, WorkerTaskExecutor } from "../../src/runtime/index.js";
+import {
+  projectCommittedBoundaryMessageIds,
+  TaskDispatcher,
+  WorkerLaneScheduler,
+  WorkerTaskExecutor,
+} from "../../src/runtime/index.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
 import type { MainAfterStepContext } from "../../src/runtime/main-loop.js";
 
@@ -77,6 +82,10 @@ async function setup(model: ModelPort) {
 }
 
 describe("WorkerLaneScheduler", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("runs Worker work asynchronously and delivers terminal results at the next boundary", async () => {
     const { inbox, scheduler } = await setup(new ScriptedModel([{
       content: "Worker found the requested detail.",
@@ -266,6 +275,86 @@ describe("WorkerLaneScheduler", () => {
     await scheduler.stop();
   });
 
+  it("repairs a committed terminal receipt after restart without reinjecting it", async () => {
+    const ledger = new MemoryLedger();
+    const firstInbox = new A2AInbox({ sink: ledger });
+    const terminal = workerResultMessage();
+    await firstInbox.send(terminal);
+    await firstInbox.claim("main", "main", { claimId: "before-crash" });
+    await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "step.completed",
+      payload: {
+        step: 1,
+        hasToolCalls: false,
+        boundaryMessageIds: [terminal.messageId],
+      },
+      correlationId: "run-1",
+      idempotencyKey: "main:step:1:completed",
+      visibility: "run",
+    });
+
+    const committed = await ledger.read({ runId: "run-1" });
+    const recoveredInbox = A2AInbox.rehydrate(committed, { sink: ledger });
+    const recovered = new WorkerLaneScheduler({
+      executor: { runOnce: async () => ({ status: "idle" as const }) },
+      inbox: recoveredInbox,
+      runId: "run-1",
+      committedBoundaryMessageIds: projectCommittedBoundaryMessageIds(
+        committed,
+        "run-1",
+      ),
+    });
+
+    await expect(recovered.beforeMainStep()).resolves.toEqual([]);
+    expect(recoveredInbox.snapshot().records[0]?.status).toBe("handled");
+    await expect(recovered.beforeMainStep()).resolves.toEqual([]);
+    const finalEvents = await ledger.read({ runId: "run-1" });
+    expect(finalEvents.filter((event) => (
+      event.type === "message.handled"
+      && event.payload.messageId === terminal.messageId
+    ))).toHaveLength(1);
+    await recovered.stop();
+  });
+
+  it("waits for a recovered task lease and wakes automatically when it expires", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-27T12:00:00.000Z"));
+    const { inbox, runs, scheduler } = await setupClaimedWorkerTask();
+
+    scheduler.enqueue();
+    await scheduler.drain();
+    expect(runs.count).toBe(1);
+    expect(inbox.snapshot().records[0]?.status).toBe("claimed");
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(runs.count).toBe(1);
+    expect(inbox.snapshot().records[0]?.status).toBe("claimed");
+
+    await vi.advanceTimersByTimeAsync(1);
+    await scheduler.drain();
+    expect(runs.count).toBe(2);
+    expect(inbox.snapshot().records[0]?.status).toBe("handled");
+    await scheduler.stop();
+  });
+
+  it("cancels a recovered task lease wakeup when stopped", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-27T12:00:00.000Z"));
+    const { inbox, runs, scheduler } = await setupClaimedWorkerTask();
+
+    scheduler.enqueue();
+    await scheduler.drain();
+    expect(runs.count).toBe(1);
+    await scheduler.stop();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(runs.count).toBe(1);
+    expect(inbox.snapshot().records[0]?.status).toBe("claimed");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each([0, 65])("rejects an invalid pending activation bound (%s)", (maxPendingActivations) => {
     expect(() => new WorkerLaneScheduler({
       executor: { runOnce: async () => ({ status: "idle" as const }) },
@@ -308,6 +397,65 @@ function workerResultMessage(): A2AMessage {
       artifactRefs: [],
       openQuestions: [],
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    },
+  };
+}
+
+async function setupClaimedWorkerTask(): Promise<{
+  inbox: A2AInbox;
+  runs: { count: number };
+  scheduler: WorkerLaneScheduler;
+}> {
+  const ledger = new MemoryLedger();
+  const original = new A2AInbox({ sink: ledger, claimLeaseMs: 1_000 });
+  await original.send(workerRequestMessage());
+  await original.claim("worker", "worker", { claimId: "crashed-worker" });
+  const inbox = A2AInbox.rehydrate(await ledger.read({ runId: "run-1" }), {
+    sink: ledger,
+    claimLeaseMs: 1_000,
+  });
+  const runs = { count: 0 };
+  const scheduler = new WorkerLaneScheduler({
+    executor: {
+      runOnce: async () => {
+        runs.count += 1;
+        const [record] = await inbox.claim("worker", "worker", {
+          claimId: `recovered-worker-${runs.count}`,
+          limit: 1,
+          types: ["task.request"],
+        });
+        if (record === undefined) return { status: "idle" as const };
+        await inbox.handle(record.message.messageId, "worker");
+        return { status: "completed" as const };
+      },
+    },
+    inbox,
+    runId: "run-1",
+    maxTasksPerActivation: 1,
+  });
+  return { inbox, runs, scheduler };
+}
+
+function workerRequestMessage(): A2AMessage {
+  return {
+    messageId: "worker-request-1",
+    runId: "run-1",
+    conversationId: "run-1",
+    threadId: "run-1:worker",
+    from: "main",
+    to: "worker",
+    createdAt: "2026-08-27T12:00:00.000Z",
+    correlationId: "run-1",
+    idempotencyKey: "worker-request-1",
+    visibility: "run",
+    priority: 1,
+    delivery: "next-step",
+    payload: {
+      type: "task.request",
+      taskId: "task-1",
+      goal,
+      inputRefs: [],
+      budget: { maxModelTokens: 500, maxWallClockMs: 5_000 },
     },
   };
 }

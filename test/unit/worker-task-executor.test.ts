@@ -65,6 +65,7 @@ async function setup(
   const inbox = new A2AInbox({ sink: ledger });
   await inbox.send(taskMessage([inputRef], budget));
   let idSequence = 0;
+  const recoveryReads = { count: 0 };
   const executor = new WorkerTaskExecutor({
     inbox,
     eventSink: ledger,
@@ -75,8 +76,12 @@ async function setup(
     workerLaneId: "worker-1",
     createId: () => `fixed-id-${++idSequence}`,
     readWatermark: () => ledger.watermark(),
+    readEvents: async () => {
+      recoveryReads.count += 1;
+      return ledger.read({ runId: "run-1" });
+    },
   });
-  return { ledger, store, inbox, executor, inputRef };
+  return { ledger, store, inbox, executor, inputRef, recoveryReads };
 }
 
 describe("WorkerTaskExecutor", () => {
@@ -87,7 +92,7 @@ describe("WorkerTaskExecutor", () => {
       stopReason: "stop",
       usage: { input: 40, output: 8, cacheRead: 0, cacheWrite: 0 },
     })]);
-    const { executor, inbox, ledger, inputRef } = await setup(model);
+    const { executor, inbox, ledger, inputRef, recoveryReads } = await setup(model);
 
     await expect(executor.runOnce()).resolves.toMatchObject({
       status: "completed",
@@ -119,6 +124,7 @@ describe("WorkerTaskExecutor", () => {
     expect(request.messages[0]?.content).toContain(inputRef.contentHash);
     expect(request.messages[0]?.content).toContain("npm install");
     expect(request.maxOutputTokens).toBe(500);
+    expect(recoveryReads.count).toBe(0);
     await expect(executor.runOnce()).resolves.toEqual({ status: "idle" });
   });
 

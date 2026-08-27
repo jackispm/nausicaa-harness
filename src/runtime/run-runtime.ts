@@ -58,7 +58,10 @@ import type { TetoAdviceDelivery } from "./teto-scheduler.js";
 import { ReflectionScheduler } from "./reflection-scheduler.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
 import { TaskDispatcher } from "./task-dispatcher.js";
-import { WorkerLaneScheduler } from "./worker-lane-scheduler.js";
+import {
+  projectCommittedBoundaryMessageIds,
+  WorkerLaneScheduler,
+} from "./worker-lane-scheduler.js";
 import { WorkerTaskExecutor } from "./worker-task-executor.js";
 
 export interface RunExecutionRequest {
@@ -291,11 +294,13 @@ export const executeRun = async (
         clock,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
         readWatermark: () => sink.ledger.watermark(),
+        readEvents: () => sink.ledger.read({ runId }),
       });
       workerScheduler = new WorkerLaneScheduler({
         executor: workerExecutor,
         inbox,
         runId,
+        committedBoundaryMessageIds: projectCommittedBoundaryMessageIds(setup.events, runId),
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
       tools.push(createDelegateTaskTool({ dispatcher, store }));

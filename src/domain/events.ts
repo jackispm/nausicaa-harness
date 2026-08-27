@@ -46,7 +46,12 @@ export interface EventPayloadMap {
   "lane.registered": { kind: LaneKind };
   "lane.status": { status: LaneStatus; reason?: string };
   "step.started": { step: number };
-  "step.completed": { step: number; hasToolCalls: boolean };
+  "step.completed": {
+    step: number;
+    hasToolCalls: boolean;
+    /** Boundary messages durably consumed by this committed Main Step. */
+    boundaryMessageIds?: string[];
+  };
   "step.failed": { step: number; error: string };
   "input.admitted": {
     inputId: InputId;

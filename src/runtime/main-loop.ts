@@ -531,6 +531,7 @@ export class MainLoop {
         const delta = hookDelta ?? defaultDelta;
         previousDelta = delta;
         navigationDeltas.push(delta);
+        const boundaryMessageIds = boundaryMessages.map((message) => message.messageId);
         await this.emit(input, laneId, correlationId, eventState, {
           type: "navigation.updated",
           payload: { delta },
@@ -538,7 +539,11 @@ export class MainLoop {
         });
         await this.emit(input, laneId, correlationId, eventState, {
           type: "step.completed",
-          payload: { step, hasToolCalls: response.toolCalls.length > 0 },
+          payload: {
+            step,
+            hasToolCalls: response.toolCalls.length > 0,
+            boundaryMessageIds,
+          },
           idempotencyKey: `${eventPrefix}:step:${step}:completed`,
         });
 
@@ -552,7 +557,7 @@ export class MainLoop {
           toolResults: toolMessages.map((result) => result.message),
           delta,
           usage: response.usage,
-          boundaryMessageIds: boundaryMessages.map((message) => message.messageId),
+          boundaryMessageIds,
         });
 
         if (response.toolCalls.length === 0 && response.stopReason === "stop") {

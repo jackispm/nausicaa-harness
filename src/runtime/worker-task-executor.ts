@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { A2AInbox, EventSink, InboxRecord } from "../a2a/index.js";
 import type {
   A2AMessage,
+  AnyEvent,
   AppendEvent,
   ArtifactRef,
   Clock,
@@ -51,6 +52,7 @@ export interface WorkerTaskExecutorOptions {
   maxInputBytes?: number;
   signal?: AbortSignal;
   readWatermark?: () => Promise<number>;
+  readEvents?: () => Promise<readonly AnyEvent[]>;
 }
 
 export interface WorkerTaskRunResult {
@@ -90,6 +92,7 @@ export class WorkerTaskExecutor {
   private readonly maxInputBytes: number;
   private readonly signal: AbortSignal | undefined;
   private readonly readWatermark: (() => Promise<number>) | undefined;
+  private readonly readEvents: (() => Promise<readonly AnyEvent[]>) | undefined;
   private readonly stopController = new AbortController();
   private readonly activeRuns = new Set<Promise<WorkerTaskRunResult>>();
   // Keep the execution lane serial even when multiple wakeups arrive from
@@ -119,6 +122,7 @@ export class WorkerTaskExecutor {
     this.maxInputBytes = maxInputBytes;
     this.signal = options.signal;
     this.readWatermark = options.readWatermark;
+    this.readEvents = options.readEvents;
   }
 
   runOnce(): Promise<WorkerTaskRunResult> {
@@ -232,6 +236,11 @@ export class WorkerTaskExecutor {
     const evidenceRefs = task.inputRefs.map((ref) => ref.contentHash);
     const prefix = `${this.runId}:${this.laneId}:task:${task.taskId}:attempt:${attempt}`;
     try {
+      const recovered = attempt > 1
+        ? await this.recoverCompletedExecution(request, evidenceRefs, deadline.signal)
+        : undefined;
+      if (recovered !== undefined) return recovered;
+
       const content = await this.readInput(task.goal, task.inputRefs, deadline.signal);
       const messages: ConversationMessage[] = [{
         role: "user",
@@ -347,41 +356,15 @@ export class WorkerTaskExecutor {
         occurredAt: this.clock.now().toISOString(),
       });
 
-      const total = totalTokens(usage);
-      if (total > task.budget.maxModelTokens) {
-        return {
-          kind: "failed",
-          payload: failed(
-            task.taskId,
-            `Worker model token budget exceeded (${total} > ${task.budget.maxModelTokens})`,
-            false,
-            [...evidenceRefs, responseRef.contentHash],
-          ),
-        };
-      }
-      const partial = response.stopReason !== "stop" || response.toolCalls.length > 0;
-      return {
-        kind: "result",
-        payload: {
-          type: "task.result",
-          taskId: task.taskId,
-          status: partial ? "partial" : "completed",
-          summary: response.content.trim() || "Worker returned no textual summary.",
-          evidenceRefs: [...evidenceRefs, responseRef.contentHash],
-          artifactRefs: [responseRef],
-          openQuestions: partial
-            ? [
-                ...(response.stopReason === "length"
-                  ? ["Worker response reached its model output limit."]
-                  : []),
-                ...(response.toolCalls.length > 0
-                  ? ["Worker tool calls were not executed in this bounded slice."]
-                  : []),
-              ]
-            : [],
-          usage,
-        },
-      };
+      return completedExecution(
+        task,
+        responseRef,
+        response.content,
+        response.toolCalls.length,
+        response.stopReason,
+        usage,
+        evidenceRefs,
+      );
     } catch (error: unknown) {
       if (this.isStopping()) return { kind: "cancelled" };
       const reason = persistedErrorText(error, "Worker task failed");
@@ -389,6 +372,113 @@ export class WorkerTaskExecutor {
     } finally {
       deadline.dispose();
     }
+  }
+
+  private async recoverCompletedExecution(
+    request: TaskRequestMessage,
+    evidenceRefs: readonly string[],
+    signal: AbortSignal,
+  ): Promise<
+    | { kind: "result"; payload: TaskResult }
+    | { kind: "failed"; payload: TaskFailed }
+    | undefined
+  > {
+    if (this.readEvents === undefined) return undefined;
+    const taskPrefix = `${this.runId}:${this.laneId}:task:${request.payload.taskId}:attempt:`;
+    const sessionId = `${this.runId}:${this.laneId}:task:${request.payload.taskId}`;
+    const events = await withAbort(this.readEvents(), signal);
+    const completion = [...events].sort((left, right) => (
+      left.globalOffset - right.globalOffset
+    )).find((event): event is Extract<
+      AnyEvent,
+      { type: "model.completed" }
+    > => {
+      if (
+        event.runId !== this.runId
+        || event.laneId !== this.laneId
+        || event.type !== "model.completed"
+        || event.correlationId !== request.correlationId
+        || !event.idempotencyKey.startsWith(taskPrefix)
+        || !event.idempotencyKey.endsWith(":model:completed")
+      ) {
+        return false;
+      }
+      const eventPrefix = event.idempotencyKey.slice(0, -":model:completed".length);
+      return events.some((candidate) => (
+        candidate.runId === this.runId
+        && candidate.laneId === this.laneId
+        && candidate.type === "model.requested"
+        && candidate.correlationId === request.correlationId
+        && candidate.idempotencyKey === `${eventPrefix}:model:requested`
+        && candidate.payload.sessionId === sessionId
+      ));
+    });
+    if (completion === undefined) return undefined;
+
+    validateUsage(completion.payload.usage);
+    const assistant = await this.readCommittedAssistant(
+      completion.payload.responseRef,
+      signal,
+    );
+    const eventPrefix = completion.idempotencyKey.slice(
+      0,
+      -":model:completed".length,
+    );
+    await this.append({
+      runId: this.runId,
+      laneId: this.laneId,
+      type: "assistant.message",
+      payload: { messageRef: completion.payload.responseRef },
+      correlationId: completion.correlationId,
+      idempotencyKey: `${eventPrefix}:assistant`,
+      visibility: completion.visibility,
+      occurredAt: this.clock.now().toISOString(),
+    });
+    await this.append({
+      runId: this.runId,
+      laneId: this.laneId,
+      type: "budget.charged",
+      payload: {
+        laneId: this.laneId,
+        usage: structuredClone(completion.payload.usage),
+      },
+      correlationId: completion.correlationId,
+      idempotencyKey: `${eventPrefix}:budget`,
+      visibility: completion.visibility,
+      occurredAt: this.clock.now().toISOString(),
+    });
+    return completedExecution(
+      request.payload,
+      completion.payload.responseRef,
+      assistant.content,
+      assistant.toolCalls.length,
+      completion.payload.stopReason,
+      structuredClone(completion.payload.usage),
+      evidenceRefs,
+    );
+  }
+
+  private async readCommittedAssistant(
+    ref: ArtifactRef,
+    signal: AbortSignal,
+  ): Promise<Extract<ConversationMessage, { role: "assistant" }>> {
+    const bytes = await withAbort(this.store.get(ref), signal);
+    let value: unknown;
+    try {
+      value = JSON.parse(new TextDecoder().decode(bytes));
+    } catch {
+      throw new WorkerTaskExecutorError("Committed Worker response is not valid JSON");
+    }
+    if (
+      !isRecord(value)
+      || value.role !== "assistant"
+      || typeof value.content !== "string"
+      || !Array.isArray(value.toolCalls)
+      || !value.toolCalls.every(isToolCall)
+    ) {
+      throw new WorkerTaskExecutorError("Committed Worker response is not an assistant message");
+    }
+    return value as Extract<ConversationMessage, { role: "assistant" }>;
   }
 
   private async readInput(
@@ -455,6 +545,9 @@ export class WorkerTaskExecutor {
   ): Promise<{ messageId: string }> {
     if (this.isStopping()) throw new WorkerTaskCancelledError("Worker lane is stopping");
     const messageId = `${this.runId}:${this.laneId}:task:${request.payload.taskId}:${suffix}`;
+    const existing = this.inbox.snapshot().records.find((record) => (
+      record.message.messageId === messageId
+    ));
     const sent = await this.inbox.send({
       messageId,
       runId: this.runId,
@@ -464,7 +557,7 @@ export class WorkerTaskExecutor {
       to: request.from,
       parentId: request.messageId,
       replyTo: request.messageId,
-      createdAt: this.clock.now().toISOString(),
+      createdAt: existing?.message.createdAt ?? this.clock.now().toISOString(),
       correlationId: request.correlationId,
       idempotencyKey: messageId,
       visibility: request.visibility,
@@ -559,6 +652,52 @@ function failed(
   return { type: "task.failed", taskId, reason, retryable, evidenceRefs };
 }
 
+function completedExecution(
+  task: TaskRequestPayload,
+  responseRef: ArtifactRef,
+  content: string,
+  toolCallCount: number,
+  stopReason: string,
+  usage: TokenUsage,
+  evidenceRefs: readonly string[],
+): { kind: "result"; payload: TaskResult } | { kind: "failed"; payload: TaskFailed } {
+  const total = totalTokens(usage);
+  if (total > task.budget.maxModelTokens) {
+    return {
+      kind: "failed",
+      payload: failed(
+        task.taskId,
+        `Worker model token budget exceeded (${total} > ${task.budget.maxModelTokens})`,
+        false,
+        [...evidenceRefs, responseRef.contentHash],
+      ),
+    };
+  }
+  const partial = stopReason !== "stop" || toolCallCount > 0;
+  return {
+    kind: "result",
+    payload: {
+      type: "task.result",
+      taskId: task.taskId,
+      status: partial ? "partial" : "completed",
+      summary: content.trim() || "Worker returned no textual summary.",
+      evidenceRefs: [...evidenceRefs, responseRef.contentHash],
+      artifactRefs: [responseRef],
+      openQuestions: partial
+        ? [
+            ...(stopReason === "length"
+              ? ["Worker response reached its model output limit."]
+              : []),
+            ...(toolCallCount > 0
+              ? ["Worker tool calls were not executed in this bounded slice."]
+              : []),
+          ]
+        : [],
+      usage,
+    },
+  };
+}
+
 function terminalResult(payload: TerminalPayload): WorkerTaskRunResult {
   return payload.type === "task.result"
     ? {
@@ -612,4 +751,12 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function isToolCall(value: unknown): boolean {
+  return isRecord(value)
+    && typeof value.id === "string"
+    && typeof value.name === "string"
+    && isRecord(value.arguments)
+    && !Array.isArray(value.arguments);
 }
