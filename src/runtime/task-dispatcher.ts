@@ -109,7 +109,7 @@ export class TaskDispatcher {
     const from = request.from ?? this.defaults.from;
     const to = request.to ?? this.defaults.to;
     const conversationId = request.conversationId ?? this.defaults.conversationId;
-    const threadId = request.threadId ?? `${this.runId}:${from}`;
+    const threadId = request.threadId ?? this.defaults.threadId;
     const correlationId = request.correlationId ?? this.defaults.correlationId;
     const priority = request.priority ?? this.defaults.priority;
     const delivery = request.delivery ?? this.defaults.delivery;

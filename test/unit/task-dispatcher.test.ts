@@ -151,6 +151,24 @@ describe("TaskDispatcher", () => {
     });
   });
 
+  it("preserves a constructor thread when only the task sender is overridden", async () => {
+    const inbox = new A2AInbox();
+    const dispatcher = new TaskDispatcher({
+      inbox,
+      runId: "run-1",
+      threadId: "shared-thread",
+    });
+
+    await dispatcher.dispatch({
+      taskId: "task-thread",
+      goal: baseGoal,
+      budget: baseBudget,
+      from: "explorer",
+    });
+
+    expect(inbox.snapshot().records[0]?.message.threadId).toBe("shared-thread");
+  });
+
   it.each([
     ["model tokens", { maxModelTokens: MAX_TASK_MODEL_TOKENS + 1, maxWallClockMs: 1_000 }],
     ["wall clock", { maxModelTokens: 1_000, maxWallClockMs: MAX_TASK_WALL_CLOCK_MS + 1 }],
