@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,6 +22,7 @@ import {
   executeEvaluationArm,
   runEvaluationPair,
   runPhase24Evaluation,
+  verifyEvaluationArtifacts,
   verifyEvidenceCheckpoint,
 } from "./runner.js";
 import { FROZEN_TOOL_CONTRACT } from "./tool-contract.js";
@@ -226,13 +227,54 @@ describe("Phase 2.4 evaluation runner", () => {
     const redacted = await readFile(join(artifactDirectory, "report.json"), "utf8");
     expect(redacted).toContain(evaluation.report!.provenance.evidenceDigest);
     expect(redacted).not.toContain("Install with npm install");
+
+    const verified = await verifyEvaluationArtifacts(artifactDirectory);
+    expect(verified).toMatchObject({
+      recordCount: PREREGISTERED_MANIFEST.sampleCount * PREREGISTERED_ARMS.length,
+      sampleCount: PREREGISTERED_MANIFEST.sampleCount,
+      failureCount: expect.any(Number),
+      complete: true,
+      releaseDecision: { status: "hold", eligible: false },
+    });
+
+    await writeFile(
+      join(artifactDirectory, "raw", "records.json"),
+      `${JSON.stringify(changed, null, 2)}\n`,
+      "utf8",
+    );
+    await expect(verifyEvaluationArtifacts(artifactDirectory)).rejects.toThrow(/digest/);
+    await writeFile(
+      join(artifactDirectory, "raw", "records.json"),
+      `${JSON.stringify(raw, null, 2)}\n`,
+      "utf8",
+    );
+
+    const changedReport = JSON.parse(redacted) as {
+      releaseDecision: { status: string };
+    };
+    changedReport.releaseDecision.status = "release";
+    await writeFile(
+      join(artifactDirectory, "report.json"),
+      `${JSON.stringify(changedReport, null, 2)}\n`,
+      "utf8",
+    );
+    await expect(verifyEvaluationArtifacts(artifactDirectory)).rejects.toThrow(/release decision/);
   }, 120_000);
+
+  it("rejects path-like evaluation identifiers before writing artifacts", async () => {
+    await expect(runPhase24Evaluation({
+      evaluationId: "../outside",
+      maxPairs: 1,
+      writeArtifacts: false,
+      repositoryStateForTests: cleanRepository,
+    })).rejects.toThrow(/path-safe/);
+  });
 
   it("supports a bounded probe without pretending it is a complete evaluation", async () => {
     const root = await temporaryRoot();
     const evaluation = await runPhase24Evaluation({
       rootDirectory: join(root, "bounded-probe"),
-      writeArtifacts: false,
+      artifactDirectory: join(root, "bounded-probe-artifacts"),
       repositoryStateForTests: cleanRepository,
       modelFactory: () => new ImmediateFinalModel(),
       maxPairs: 1,
@@ -244,6 +286,11 @@ describe("Phase 2.4 evaluation runner", () => {
     ]));
     expect(evaluation.rows).toHaveLength(1);
     expect(evaluation.report).toBeUndefined();
+    await expect(verifyEvaluationArtifacts(evaluation.artifactDirectory!)).resolves.toMatchObject({
+      sampleCount: 1,
+      complete: false,
+      incompleteReason: `Only 1 of ${PREREGISTERED_MANIFEST.sampleCount} paired samples are complete`,
+    });
   });
 
   it("cancels a probe at its hard deadline and keeps only completed arm records", async () => {

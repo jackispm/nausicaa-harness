@@ -37,7 +37,8 @@
     "test:smoke": "npm run build && vitest run test/smoke",
     "test:live": "node --env-file-if-exists=.env ./node_modules/vitest/vitest.mjs run test/live --passWithNoTests --no-file-parallelism",
     "eval": "vitest run test/eval",
-    "eval:live": "node --env-file-if-exists=.env ./node_modules/vitest/vitest.mjs run test/live/openrouter-phase24.test.ts --no-file-parallelism",
+    "eval:live": "node --env-file-if-exists=.env --import tsx test/eval/live-runner.ts",
+    "eval:verify": "node --import tsx test/eval/verify-artifacts.ts",
     "check": "npm run typecheck && npm test && npm run eval && npm run test:smoke"
   },
   "dependencies": {

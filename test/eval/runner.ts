@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -18,6 +18,7 @@ import { boundedRedactedText } from "../../src/runtime/redaction.js";
 import { createWorkspaceTools } from "../../src/tools/index.js";
 import {
   buildPairedReport,
+  evaluateReleaseDecision,
   PREREGISTERED_ARMS,
   PREREGISTERED_MANIFEST,
   type ArmPlan,
@@ -25,8 +26,10 @@ import {
   type PairedTaskRow,
   type PreregisteredArmId,
   type PreregisteredManifest,
+  type ReleaseDecision,
   type SampleOutcome,
   validateManifest,
+  validateReport,
 } from "./preregistered-contract.js";
 import {
   createEvaluationFixture,
@@ -143,6 +146,17 @@ export interface Phase24EvaluationResult {
   cleanup(): Promise<void>;
 }
 
+export interface VerifiedEvaluationArtifacts {
+  artifactDirectory: string;
+  evidenceDigest: string;
+  recordCount: number;
+  sampleCount: number;
+  failureCount: number;
+  complete: boolean;
+  incompleteReason?: string;
+  releaseDecision?: ReleaseDecision;
+}
+
 export interface PairExecutionResult {
   pairId: string;
   records: readonly ArmExecutionRecord[];
@@ -204,9 +218,10 @@ export async function runPhase24Evaluation(
     ? await inspectRepository(manifest.provenance.repositoryCommit)
     : options.repositoryStateForTests ?? await inspectRepository(manifest.provenance.repositoryCommit);
   const operatorCostCap = live ? livePreflight(manifest, repository) : manifest.experimentBudget.maxCostUsd;
+  const evaluationId = options.evaluationId ?? PHASE24_EVALUATION_ID;
+  validateEvaluationId(evaluationId);
   const rootDirectory = resolve(options.rootDirectory ?? await mkdtemp(join(tmpdir(), "nausicaa-phase24-")));
   const ownsRoot = options.rootDirectory === undefined;
-  const evaluationId = options.evaluationId ?? PHASE24_EVALUATION_ID;
   const experimentBudget = new ExperimentBudgetMeter(manifest.experimentBudget, operatorCostCap);
   const records: ArmExecutionRecord[] = [];
   const pairs = evaluationPairOrder(manifest).slice(0, options.maxPairs);
@@ -760,6 +775,7 @@ async function writeEvaluationArtifacts(
       cumulativeWallClockMs: checkpoint.experimentBudget.cumulativeWallClockMs,
       canStart: checkpoint.experimentBudget.canStart,
       breached: checkpoint.experimentBudget.breached,
+      ...(checkpoint.experimentBudget.invalidReason === undefined ? {} : { invalidReason: checkpoint.experimentBudget.invalidReason }),
       ...(checkpoint.experimentBudget.breachReason === undefined ? {} : { breachReason: checkpoint.experimentBudget.breachReason }),
     },
     sampleCount: rows.length,
@@ -768,9 +784,176 @@ async function writeEvaluationArtifacts(
       armId: record.armId,
       failureKind: record.outcome?.failureKind ?? "runtime",
     })),
-    ...(report === undefined ? {} : { report }),
+    ...(report === undefined ? {} : {
+      report,
+      releaseDecision: evaluateReleaseDecision(report),
+    }),
   };
   await writeFile(join(artifactDirectory, "report.json"), JSON.stringify(redacted, null, 2) + "\n", "utf8");
+}
+
+/** Verify persisted Phase 2.4 evidence without trusting the producing process. */
+export async function verifyEvaluationArtifacts(
+  artifactDirectory: string,
+  manifest: PreregisteredManifest = PREREGISTERED_MANIFEST,
+): Promise<VerifiedEvaluationArtifacts> {
+  validateManifest(manifest);
+  const resolvedDirectory = resolve(artifactDirectory);
+  const checkpoint = await readJson(join(resolvedDirectory, "raw", "records.json"));
+  verifyEvidenceCheckpoint(checkpoint);
+  const envelope = await readJson(join(resolvedDirectory, "report.json"));
+  if (!isRecord(envelope)) throw new Error("Evaluation report envelope is malformed");
+
+  const identity = {
+    schemaVersion: envelope.schemaVersion,
+    manifestHash: envelope.manifestHash,
+    taskSetVersion: envelope.taskSetVersion,
+    model: envelope.model,
+    toolVersion: envelope.toolVersion,
+    seed: envelope.seed,
+  };
+  const expectedIdentity = {
+    schemaVersion: manifest.manifestVersion,
+    manifestHash: manifest.manifestHash,
+    taskSetVersion: manifest.taskSetVersion,
+    model: manifest.model,
+    toolVersion: manifest.toolVersion,
+    seed: manifest.seed,
+  };
+  if (hashJson(identity) !== hashJson(expectedIdentity)) {
+    throw new Error("Evaluation report does not match the preregistered manifest");
+  }
+  if (envelope.evidenceDigest !== checkpoint.evidenceDigest) {
+    throw new Error("Evaluation report does not match the raw evidence digest");
+  }
+  if (hashJson(envelope.experimentBudget) !== hashJson(checkpoint.experimentBudget)) {
+    throw new Error("Evaluation report budget does not match the raw evidence checkpoint");
+  }
+  if (!Number.isSafeInteger(envelope.sampleCount)
+    || (envelope.sampleCount as number) < 0
+    || (envelope.sampleCount as number) > manifest.sampleCount) {
+    throw new Error("Evaluation report sample count is invalid");
+  }
+  if (!Array.isArray(envelope.failures)) {
+    throw new Error("Evaluation report failure summary is malformed");
+  }
+  const sampleCount = envelope.sampleCount as number;
+  const projected = projectArtifactEvidence(checkpoint.records, manifest);
+  if (projected.rows.length !== sampleCount) {
+    throw new Error("Evaluation report sample count does not match its raw records");
+  }
+  if (hashJson(envelope.failures) !== hashJson(projected.failures)) {
+    throw new Error("Evaluation report failure summary does not match its raw records");
+  }
+
+  let releaseDecision: ReleaseDecision | undefined;
+  if (envelope.report !== undefined) {
+    validateReport(manifest, envelope.report);
+    const report = envelope.report as PairedReport;
+    if (sampleCount !== manifest.sampleCount
+      || report.provenance.evidenceDigest !== checkpoint.evidenceDigest
+      || hashJson(report.rows) !== hashJson(projected.rows)) {
+      throw new Error("Complete evaluation report is inconsistent with its checkpoint");
+    }
+    releaseDecision = evaluateReleaseDecision(report);
+    if (hashJson(envelope.releaseDecision) !== hashJson(releaseDecision)) {
+      throw new Error("Persisted release decision does not match the preregistered report");
+    }
+  } else if (envelope.releaseDecision !== undefined) {
+    throw new Error("Partial evaluation cannot contain a release decision");
+  }
+
+  return {
+    artifactDirectory: resolvedDirectory,
+    evidenceDigest: checkpoint.evidenceDigest,
+    recordCount: checkpoint.records.length,
+    sampleCount,
+    failureCount: envelope.failures.length,
+    complete: envelope.report !== undefined,
+    ...(envelope.report !== undefined ? {} : {
+      incompleteReason: checkpoint.experimentBudget.invalidReason
+        ?? checkpoint.experimentBudget.breachReason
+        ?? `Only ${sampleCount} of ${manifest.sampleCount} paired samples are complete`,
+    }),
+    ...(releaseDecision === undefined ? {} : { releaseDecision }),
+  };
+}
+
+async function readJson(path: string): Promise<unknown> {
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as unknown;
+  } catch (error: unknown) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Cannot read evaluation artifact ${path}: ${reason}`);
+  }
+}
+
+function projectArtifactEvidence(
+  records: readonly unknown[],
+  manifest: PreregisteredManifest,
+): {
+  rows: PairedTaskRow[];
+  failures: Array<{ pairId: string; armId: PreregisteredArmId; failureKind: string }>;
+} {
+  const taskIds = new Set(manifest.tasks.map((task) => task.taskId));
+  const arms = new Set<PreregisteredArmId>(PREREGISTERED_ARMS);
+  const seen = new Set<string>();
+  const grouped = new Map<string, {
+    taskId: string;
+    repetition: number;
+    outcomes: Partial<Record<PreregisteredArmId, SampleOutcome>>;
+  }>();
+  const failures: Array<{ pairId: string; armId: PreregisteredArmId; failureKind: string }> = [];
+
+  for (const record of records) {
+    if (!isRecord(record)
+      || typeof record.pairId !== "string"
+      || typeof record.taskId !== "string"
+      || !taskIds.has(record.taskId)
+      || !Number.isSafeInteger(record.repetition)
+      || !arms.has(record.armId as PreregisteredArmId)) {
+      throw new Error("Raw evidence contains a malformed arm record");
+    }
+    const armId = record.armId as PreregisteredArmId;
+    const repetition = record.repetition as number;
+    if (repetition < 0 || repetition >= manifest.repetitions
+      || record.pairId !== `${record.taskId}:${repetition}`) {
+      throw new Error("Raw evidence arm record has invalid pair identity");
+    }
+    const recordKey = `${record.pairId}\u0000${armId}`;
+    if (seen.has(recordKey)) throw new Error("Raw evidence contains a duplicate arm record");
+    seen.add(recordKey);
+    const group = grouped.get(record.pairId) ?? {
+      taskId: record.taskId,
+      repetition,
+      outcomes: {},
+    };
+    if (group.taskId !== record.taskId || group.repetition !== repetition) {
+      throw new Error("Raw evidence pair identity is inconsistent");
+    }
+    if (isRecord(record.outcome)) {
+      group.outcomes[armId] = record.outcome as unknown as SampleOutcome;
+    }
+    grouped.set(record.pairId, group);
+    if (typeof record.error === "string") {
+      const failureKind = isRecord(record.outcome) && typeof record.outcome.failureKind === "string"
+        ? record.outcome.failureKind
+        : "runtime";
+      failures.push({ pairId: record.pairId, armId, failureKind });
+    }
+  }
+
+  const rows = [...grouped.entries()].flatMap(([pairId, group]) =>
+    PREREGISTERED_ARMS.every((armId) => group.outcomes[armId] !== undefined)
+      ? [{
+          pairId,
+          taskId: group.taskId,
+          repetition: group.repetition,
+          outcomes: group.outcomes as Record<PreregisteredArmId, SampleOutcome>,
+        }]
+      : []
+  ).sort((left, right) => left.pairId.localeCompare(right.pairId));
+  return { rows, failures };
 }
 
 /** Meter shared limits for every model call in one arm and the experiment. */
@@ -1218,6 +1401,12 @@ function validateProbeOptions(
     || options.deadlineMs <= 0
   )) {
     throw new RangeError("deadlineMs must be a positive finite number");
+  }
+}
+
+function validateEvaluationId(evaluationId: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(evaluationId)) {
+    throw new Error("evaluationId must be 1-80 path-safe characters");
   }
 }
 

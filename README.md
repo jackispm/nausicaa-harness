@@ -76,10 +76,13 @@ npm run typecheck     # 严格 TypeScript 检查
 npm test              # 离线 unit、protocol 与 recovery 测试
 npm run test:smoke    # 构建并验证真实 CLI 产物
 npm run eval          # 确定性的 Main-only 与 Main+Teto 合同评测
+npm run eval:verify -- .nausicaa/evals/phase-2.4/<evaluation-id>
 npm run check         # 执行完整本地门禁
 ```
 
-真实 OpenRouter 测试不会默认运行。`npm run test:live` 会读取本地 `.env`；只有同时设置 `NAUSICAA_LIVE_TESTS=1`、`OPENROUTER_API_KEY`、`NAUSICAA_LIVE_MODEL`（未设置时回退到 `NAUSICAA_EVAL_MODEL`）和正数 `NAUSICAA_EVAL_BUDGET_USD` 时，才会运行最多 5 次请求的 Main-only 与 Main+Teto 有界对照，并把脱敏缓存证据写入被忽略的 `.nausicaa/evals/`。视觉验收另需显式设置具备图片输入能力的 `NAUSICAA_VISION_MODEL` 和正数 `NAUSICAA_VISION_BUDGET_USD`，且最多发起 1 次请求；没有视觉模型时不会退回默认模型。测试内预算只能在请求间停止后续调用，费用硬上限仍应由 OpenRouter 的限额 key 保证。
+真实 OpenRouter 测试不会默认运行。`npm run test:live` 会读取本地 `.env`；只有同时设置 `NAUSICAA_LIVE_TESTS=1`、`OPENROUTER_API_KEY`、`NAUSICAA_LIVE_MODEL`（未设置时回退到 `NAUSICAA_EVAL_MODEL`）和正数 `NAUSICAA_EVAL_BUDGET_USD` 时，才运行最多 7 次请求的 Main-only/Main+Teto 工具循环。缓存 probe 另有最多 2 次请求及独立的 `NAUSICAA_CACHE_EVAL_BUDGET_USD`。视觉验收还需显式设置具备图片输入能力的 `NAUSICAA_VISION_MODEL` 和正数 `NAUSICAA_VISION_BUDGET_USD`，且最多发起 1 次请求；没有视觉模型时不会退回默认模型。
+
+Phase 2.4 能力门禁与普通 live smoke 分开。完整实验使用预注册 manifest 中冻结的模型、10 个任务、3 次重复和 4 个 arm，不读取 `NAUSICAA_EVAL_MODEL`。执行前必须设置 `NAUSICAA_PHASE24_EVAL=1`、`OPENROUTER_API_KEY` 和正数 `NAUSICAA_EVAL_BUDGET_USD`，并保持工作树干净；然后运行 `npm run eval:live`。每次运行写入独立的 `.nausicaa/evals/phase-2.4/<evaluation-id>/`，也可用路径安全的 `NAUSICAA_EVAL_ID` 固定名称。命令会立即校验 raw digest、manifest、配对报告和 release decision；证据不完整或预注册收益门未通过时返回非零，但仍保留可审计结果。`npm run eval:verify -- <目录>` 可稍后重新验证。测试内预算只能在请求间停止后续调用，费用硬上限仍应由 OpenRouter 的限额 key 保证。
 
 ## 设计原则
 

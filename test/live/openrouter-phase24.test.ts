@@ -3,9 +3,12 @@ import { describe, expect, it } from "vitest";
 import {
   PREREGISTERED_ARMS,
   PREREGISTERED_MANIFEST,
-  evaluateReleaseDecision,
 } from "../eval/preregistered-contract.js";
-import { PHASE24_EVALUATION_ENV, runPhase24Evaluation } from "../eval/runner.js";
+import {
+  PHASE24_EVALUATION_ENV,
+  runPhase24Evaluation,
+  verifyEvaluationArtifacts,
+} from "../eval/runner.js";
 
 const enabled = process.env[PHASE24_EVALUATION_ENV] === "1";
 
@@ -23,9 +26,10 @@ describe.skipIf(!enabled)("preregistered OpenRouter Phase 2.4 evaluation", () =>
         evidenceDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
       });
       if (evaluation.report === undefined) throw new Error("Live evaluation did not produce a report");
-      expect(evaluateReleaseDecision(evaluation.report)).toMatchObject({
-        status: "release",
-        eligible: true,
+      if (evaluation.artifactDirectory === undefined) throw new Error("Live evaluation did not persist evidence");
+      await expect(verifyEvaluationArtifacts(evaluation.artifactDirectory)).resolves.toMatchObject({
+        complete: true,
+        releaseDecision: { status: "release", eligible: true },
       });
     } finally {
       await evaluation.cleanup();
