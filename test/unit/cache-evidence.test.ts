@@ -246,6 +246,45 @@ describe("projectCacheEvidence", () => {
     });
   });
 
+  it("starts a new continuity baseline when the Main model changes", async () => {
+    const ledger = new MemoryLedger();
+    await append(ledger, "model.requested", {
+      model: "model-a",
+      requestHash: "request-a",
+      contextWatermark: 1,
+      sessionId: "shared-session",
+      prefixHash: "shared-prefix",
+      truncations: [],
+    });
+    await append(ledger, "model.requested", {
+      model: "model-b",
+      requestHash: "request-b-1",
+      contextWatermark: 2,
+      sessionId: "shared-session",
+      prefixHash: "shared-prefix",
+      truncations: [],
+    });
+    await append(ledger, "model.requested", {
+      model: "model-b",
+      requestHash: "request-b-2",
+      contextWatermark: 3,
+      sessionId: "shared-session",
+      prefixHash: "shared-prefix",
+      truncations: [],
+    });
+
+    const report = projectCacheEvidence(await ledger.read(), "run-1");
+    expect(report.entries.map((entry) => ({
+      model: entry.model,
+      prefix: entry.prefixContinuity,
+      session: entry.sessionContinuity,
+    }))).toEqual([
+      { model: "model-a", prefix: "baseline", session: "baseline" },
+      { model: "model-b", prefix: "baseline", session: "baseline" },
+      { model: "model-b", prefix: "stable", session: "stable" },
+    ]);
+  });
+
   it("keeps legacy zero counters and missing prefix data unknown", async () => {
     const ledger = new MemoryLedger();
     await append(ledger, "model.requested", {

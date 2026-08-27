@@ -125,6 +125,7 @@ interface MutableEvidence extends CacheRequestEvidence {
 
 interface PreviousPrefix {
   hash: string | null;
+  model: string;
 }
 
 /**
@@ -155,14 +156,22 @@ export function projectCacheEvidence(
         const prefixContinuity = continuity(
           previousPrefixByLane.get(event.laneId),
           prefixHash,
+          event.payload.model,
         );
-        previousPrefixByLane.set(event.laneId, { hash: prefixHash });
+        previousPrefixByLane.set(event.laneId, {
+          hash: prefixHash,
+          model: event.payload.model,
+        });
         const sessionId = event.payload.sessionId ?? null;
         const sessionContinuity = continuity(
           previousSessionByLane.get(event.laneId),
           sessionId,
+          event.payload.model,
         );
-        previousSessionByLane.set(event.laneId, { hash: sessionId });
+        previousSessionByLane.set(event.laneId, {
+          hash: sessionId,
+          model: event.payload.model,
+        });
         const entry: MutableEvidence = {
           requestEventId: event.eventId,
           terminalEventId: null,
@@ -258,9 +267,10 @@ export function projectCacheEvidence(
 function continuity(
   previous: PreviousPrefix | undefined,
   current: string | null,
+  model: string,
 ): PrefixContinuity {
   if (current === null) return "unknown";
-  if (previous === undefined) return "baseline";
+  if (previous === undefined || previous.model !== model) return "baseline";
   if (previous.hash === null) return "unknown";
   return previous.hash === current ? "stable" : "changed";
 }
