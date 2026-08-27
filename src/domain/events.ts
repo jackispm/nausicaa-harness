@@ -109,7 +109,12 @@ export interface EventPayloadMap {
     modelLatencyMs?: number;
     cacheOutcome?: CacheOutcome;
   };
-  "model.failed": { model: string; error: string };
+  "model.failed": {
+    model: string;
+    error: string;
+    /** Optional for schema-v1 compatibility; absent legacy failures recover conservatively. */
+    retryable?: boolean;
+  };
   "model.cancelled": { requestId: EventId; reason: string };
   "tool.requested": {
     operationId: string;

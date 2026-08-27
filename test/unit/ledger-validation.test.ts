@@ -517,6 +517,70 @@ describe("event payload validation", () => {
     expect(() => validateEventPayload("user.message", { messageRef: artifact })).not.toThrow();
   });
 
+  it("accepts legacy and current model failure payloads", () => {
+    expect(() => validateEventPayload("model.failed", {
+      model: "model-1",
+      error: "provider failed",
+    })).not.toThrow();
+    expect(() => validateEventPayload("model.failed", {
+      model: "model-1",
+      error: "provider failed",
+      retryable: true,
+    })).not.toThrow();
+    expect(() => validateEventPayload("model.failed", {
+      model: "model-1",
+      error: "provider failed",
+      retryable: "yes",
+    })).toThrow(/retryable/);
+  });
+
+  it("validates durable task deadline and attempt bounds", () => {
+    const valid = {
+      maxModelTokens: 100,
+      maxWallClockMs: 1_000,
+      deadline: "2026-08-27T12:00:01.000Z",
+      maxAttempts: 2,
+    };
+    expect(() => validateEventPayload("message.sent", {
+      message: {
+        ...message,
+        createdAt: "2026-08-27T12:00:00.000Z",
+        expiresAt: undefined,
+        payload: {
+          type: "task.request",
+          taskId: "task-1",
+          goal,
+          inputRefs: [],
+          budget: valid,
+        },
+      },
+    })).not.toThrow();
+    expect(() => validateEventPayload("message.sent", {
+      message: {
+        ...message,
+        payload: {
+          type: "task.request",
+          taskId: "task-1",
+          goal,
+          inputRefs: [],
+          budget: { ...valid, deadline: "not-a-date" },
+        },
+      },
+    })).toThrow(/deadline/);
+    expect(() => validateEventPayload("message.sent", {
+      message: {
+        ...message,
+        payload: {
+          type: "task.request",
+          taskId: "task-1",
+          goal,
+          inputRefs: [],
+          budget: { ...valid, maxAttempts: 9 },
+        },
+      },
+    })).toThrow(/maxAttempts/);
+  });
+
   it("rejects a malformed payload with a valid content hash during replay", async () => {
     const memory = new MemoryLedger({ createEventId: () => "event-1" });
     await memory.append({

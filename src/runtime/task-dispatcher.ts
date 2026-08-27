@@ -12,6 +12,8 @@ import type {
   Visibility,
 } from "../domain/index.js";
 import {
+  DEFAULT_TASK_MAX_ATTEMPTS,
+  MAX_TASK_ATTEMPTS,
   MAX_TASK_MODEL_TOKENS,
   MAX_TASK_WALL_CLOCK_MS,
   systemClock,
@@ -183,6 +185,14 @@ export class TaskDispatcher {
       }
     }
     const createdAt = existing?.message.createdAt ?? now.toISOString();
+    const existingBudget = existing?.message.payload.type === "task.request"
+      ? existing.message.payload.budget
+      : undefined;
+    const budget = canonicalTaskBudget(
+      request.budget,
+      createdAt,
+      existing === undefined ? undefined : existingBudget,
+    );
     const result = await this.inbox.send({
       messageId,
       runId: this.runId,
@@ -201,7 +211,7 @@ export class TaskDispatcher {
         taskId,
         goal: structuredClone(request.goal),
         inputRefs: [...structuredClone(request.inputRefs ?? [])],
-        budget: structuredClone(request.budget),
+        budget,
       },
     });
     return { ...result, taskId };
@@ -266,6 +276,62 @@ function validateTaskBudget(budget: TaskBudget): void {
       `budget.maxWallClockMs must be between 1 and ${MAX_TASK_WALL_CLOCK_MS}`,
     );
   }
+  if (budget.deadline !== undefined && !isValidDate(budget.deadline)) {
+    throw new TypeError("budget.deadline must be a valid date-time");
+  }
+  if (budget.maxAttempts !== undefined && (
+    !Number.isSafeInteger(budget.maxAttempts)
+    || budget.maxAttempts < 1
+    || budget.maxAttempts > MAX_TASK_ATTEMPTS
+  )) {
+    throw new RangeError(
+      `budget.maxAttempts must be between 1 and ${MAX_TASK_ATTEMPTS}`,
+    );
+  }
+}
+
+function canonicalTaskBudget(
+  requested: TaskBudget,
+  createdAt: string,
+  existing: TaskBudget | undefined,
+): TaskBudget {
+  const expectedDeadline = new Date(
+    Date.parse(createdAt) + requested.maxWallClockMs,
+  ).toISOString();
+  if (existing === undefined) {
+    if (
+      requested.deadline !== undefined
+      && Date.parse(requested.deadline) !== Date.parse(expectedDeadline)
+    ) {
+      throw new RangeError(
+        "budget.deadline must equal createdAt plus budget.maxWallClockMs",
+      );
+    }
+    return {
+      maxModelTokens: requested.maxModelTokens,
+      maxWallClockMs: requested.maxWallClockMs,
+      deadline: expectedDeadline,
+      maxAttempts: requested.maxAttempts ?? DEFAULT_TASK_MAX_ATTEMPTS,
+    };
+  }
+
+  const deadline = requested.deadline === undefined
+    ? existing.deadline
+    : existing.deadline !== undefined
+      && Date.parse(requested.deadline) === Date.parse(existing.deadline)
+      ? existing.deadline
+      : requested.deadline;
+  const maxAttempts = requested.maxAttempts ?? existing.maxAttempts;
+  return {
+    maxModelTokens: requested.maxModelTokens,
+    maxWallClockMs: requested.maxWallClockMs,
+    ...(deadline === undefined ? {} : { deadline }),
+    ...(maxAttempts === undefined ? {} : { maxAttempts }),
+  };
+}
+
+function isValidDate(value: string): boolean {
+  return value.length > 0 && Number.isFinite(Date.parse(value));
 }
 
 function validatePriority(value: number): void {

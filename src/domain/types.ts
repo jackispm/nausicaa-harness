@@ -139,11 +139,17 @@ export type AuxiliaryMode = "none" | "teto" | "reflection";
 export interface TaskBudget {
   maxModelTokens: number;
   maxWallClockMs: number;
+  /** Absolute task deadline. Legacy task messages may omit this field. */
+  deadline?: string;
+  /** Maximum provider attempts. Legacy task messages default conservatively. */
+  maxAttempts?: number;
 }
 
 /** Hard protocol bounds keep delegated work finite even for untrusted senders. */
 export const MAX_TASK_MODEL_TOKENS = 1_000_000;
 export const MAX_TASK_WALL_CLOCK_MS = 30 * 60 * 1_000;
+export const DEFAULT_TASK_MAX_ATTEMPTS = 2;
+export const MAX_TASK_ATTEMPTS = 8;
 
 export interface TaskRequest {
   type: "task.request";

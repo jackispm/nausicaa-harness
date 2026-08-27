@@ -83,7 +83,12 @@ describe("TaskDispatcher", () => {
     expect(stored?.payload).toMatchObject({
       goal: { statement: "Inspect the package installation contract" },
       inputRefs: [{ byteLength: 12 }],
-      budget: { maxModelTokens: 1_000 },
+      budget: {
+        maxModelTokens: 1_000,
+        maxWallClockMs: 30_000,
+        deadline: "2026-08-27T12:00:30.000Z",
+        maxAttempts: 2,
+      },
     });
   });
 
@@ -106,6 +111,58 @@ describe("TaskDispatcher", () => {
       messageId: "run-1:task:task-1:request",
     });
     expect(inbox.snapshot().records).toHaveLength(1);
+    expect(inbox.snapshot().records[0]?.message.payload).toMatchObject({
+      type: "task.request",
+      budget: {
+        deadline: "2026-08-27T12:00:30.000Z",
+        maxAttempts: 2,
+      },
+    });
+  });
+
+  it("rejects an explicit deadline that is not derived from task creation", async () => {
+    const clock = new MutableClock(new Date("2026-08-27T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
+    const dispatcher = new TaskDispatcher({ inbox, runId: "run-1", clock });
+
+    await expect(dispatcher.dispatch({
+      taskId: "task-bad-deadline",
+      goal: baseGoal,
+      budget: {
+        ...baseBudget,
+        deadline: "2026-08-27T12:00:31.000Z",
+      },
+    })).rejects.toThrow(/deadline/);
+    expect(inbox.snapshot().records).toEqual([]);
+  });
+
+  it("rejects a changed explicit maxAttempts under an existing task id", async () => {
+    const clock = new MutableClock(new Date("2026-08-27T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
+    const dispatcher = new TaskDispatcher({ inbox, runId: "run-1", clock });
+    await dispatcher.dispatch({ taskId: "task-attempts", goal: baseGoal, budget: baseBudget });
+
+    await expect(dispatcher.dispatch({
+      taskId: "task-attempts",
+      goal: baseGoal,
+      budget: { ...baseBudget, maxAttempts: 3 },
+    })).rejects.toBeInstanceOf(A2AProtocolError);
+  });
+
+  it("rejects a changed explicit deadline under an existing task id", async () => {
+    const clock = new MutableClock(new Date("2026-08-27T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
+    const dispatcher = new TaskDispatcher({ inbox, runId: "run-1", clock });
+    await dispatcher.dispatch({ taskId: "task-deadline", goal: baseGoal, budget: baseBudget });
+
+    await expect(dispatcher.dispatch({
+      taskId: "task-deadline",
+      goal: baseGoal,
+      budget: {
+        ...baseBudget,
+        deadline: "2026-08-27T12:00:31.000Z",
+      },
+    })).rejects.toBeInstanceOf(A2AProtocolError);
   });
 
   it("uses an injected id factory when the caller omits a task id", async () => {

@@ -16,6 +16,7 @@ import type {
   TokenUsage,
 } from "../domain/index.js";
 import {
+  MAX_TASK_ATTEMPTS,
   MAX_TASK_MODEL_TOKENS,
   MAX_TASK_WALL_CLOCK_MS,
   systemClock,
@@ -336,6 +337,14 @@ export class A2AInbox {
         );
       }
       return { status: "duplicate", messageId: existing.message.messageId };
+    }
+    // Task deadlines are enforced against this Inbox's clock. A new task must
+    // share that clock so sender-controlled timestamps cannot extend budgets.
+    if (
+      message.payload.type === "task.request"
+      && Date.parse(message.createdAt) > now.getTime()
+    ) {
+      throw new A2AProtocolError("task request createdAt must not be in the future");
     }
     if (isExpired(message, now)) {
       return { status: "expired", messageId: message.messageId };
@@ -708,6 +717,15 @@ function validateMessage(message: A2AMessage): void {
     validateGoal(message.payload.goal);
     validateArtifactRefs(message.payload.inputRefs, "inputRefs");
     validateTaskBudget(message.payload.budget);
+    if (message.payload.budget.deadline !== undefined) {
+      const expectedDeadline = Date.parse(message.createdAt)
+        + message.payload.budget.maxWallClockMs;
+      if (Date.parse(message.payload.budget.deadline) !== expectedDeadline) {
+        throw new A2AProtocolError(
+          "task budget deadline must equal createdAt plus maxWallClockMs",
+        );
+      }
+    }
   } else if (message.payload.type === "task.accept") {
     validateTaskId(message.payload.taskId);
   } else if (message.payload.type === "task.result") {
@@ -765,6 +783,18 @@ function validateTaskBudget(budget: TaskBudget): void {
   ) {
     throw new A2AProtocolError(
       `task budget maxWallClockMs must be between 1 and ${MAX_TASK_WALL_CLOCK_MS}`,
+    );
+  }
+  if (budget.deadline !== undefined) {
+    validDate(budget.deadline, "task budget deadline");
+  }
+  if (budget.maxAttempts !== undefined && (
+    !Number.isSafeInteger(budget.maxAttempts)
+    || budget.maxAttempts < 1
+    || budget.maxAttempts > MAX_TASK_ATTEMPTS
+  )) {
+    throw new A2AProtocolError(
+      `task budget maxAttempts must be between 1 and ${MAX_TASK_ATTEMPTS}`,
     );
   }
 }

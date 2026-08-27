@@ -328,7 +328,8 @@ describe("A2AInbox", () => {
   });
 
   it("accepts and rehydrates a bounded task handoff", async () => {
-    const inbox = new A2AInbox();
+    const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
     const request = taskMessage({
       type: "task.request",
       taskId: "task-1",
@@ -350,6 +351,53 @@ describe("A2AInbox", () => {
     expect(inbox.snapshot().records[0]?.status).toBe("handled");
   });
 
+  it("rejects a future-dated task request at live admission", async () => {
+    const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
+    const request = taskMessage({
+      type: "task.request",
+      taskId: "task-1",
+      goal: {
+        version: 1,
+        statement: "Inspect the adapter contract",
+        successCriteria: ["Return evidence"],
+        hardConstraints: ["Do not modify files"],
+      },
+      inputRefs: [artifactRef],
+      budget: { maxModelTokens: 1_000, maxWallClockMs: 30_000 },
+    }, {
+      createdAt: "2099-01-01T00:00:00.000Z",
+    });
+
+    await expect(inbox.send(request)).rejects.toThrow(/createdAt.*future/);
+    expect(inbox.snapshot().records).toEqual([]);
+  });
+
+  it("keeps an admitted task idempotent after the Inbox clock moves backward", async () => {
+    const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
+    const request = taskMessage({
+      type: "task.request",
+      taskId: "task-1",
+      goal: {
+        version: 1,
+        statement: "Inspect the adapter contract",
+        successCriteria: ["Return evidence"],
+        hardConstraints: ["Do not modify files"],
+      },
+      inputRefs: [artifactRef],
+      budget: { maxModelTokens: 1_000, maxWallClockMs: 30_000 },
+    });
+    await inbox.send(request);
+    clock.advance(-1);
+
+    await expect(inbox.send(request)).resolves.toEqual({
+      status: "duplicate",
+      messageId: request.messageId,
+    });
+    expect(inbox.snapshot().records).toHaveLength(1);
+  });
+
   it.each([
     ["task id", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.taskId = ""; }],
     ["goal version", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.goal.version = 0; }],
@@ -358,7 +406,8 @@ describe("A2AInbox", () => {
     ["wall-clock budget upper bound", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.budget.maxWallClockMs = MAX_TASK_WALL_CLOCK_MS + 1; }],
     ["artifact ref", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.inputRefs[0]!.byteLength = -1; }],
   ])("rejects malformed task request %s", async (_label, mutate) => {
-    const inbox = new A2AInbox();
+    const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
     const payload = {
       type: "task.request" as const,
       taskId: "task-1",

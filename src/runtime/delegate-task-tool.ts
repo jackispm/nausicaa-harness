@@ -1,4 +1,5 @@
 import type { AgentTool } from "../domain/ports.js";
+import { MAX_TASK_ATTEMPTS } from "../domain/types.js";
 import type { ContentAddressedStore } from "../store/index.js";
 import { TaskDispatcher } from "./task-dispatcher.js";
 
@@ -35,6 +36,7 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
           input: { type: "string", description: "Optional bounded input data" },
           maxModelTokens: { type: "integer", minimum: 1 },
           maxWallClockMs: { type: "integer", minimum: 1 },
+          maxAttempts: { type: "integer", minimum: 1, maximum: MAX_TASK_ATTEMPTS },
         },
         required: ["statement", "maxModelTokens", "maxWallClockMs"],
         additionalProperties: false,
@@ -48,6 +50,7 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
         const hardConstraints = stringArray(arguments_.hardConstraints, "hardConstraints");
         const maxModelTokens = positiveInteger(arguments_.maxModelTokens, "maxModelTokens");
         const maxWallClockMs = positiveInteger(arguments_.maxWallClockMs, "maxWallClockMs");
+        const maxAttempts = optionalPositiveInteger(arguments_.maxAttempts, "maxAttempts");
         const input = optionalString(arguments_.input, "input");
         if (input !== undefined && Buffer.byteLength(input, "utf8") > maxInputBytes) {
           throw new RangeError(`input exceeds ${maxInputBytes} bytes`);
@@ -67,7 +70,11 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
             hardConstraints,
           },
           inputRefs,
-          budget: { maxModelTokens, maxWallClockMs },
+          budget: {
+            maxModelTokens,
+            maxWallClockMs,
+            ...(maxAttempts === undefined ? {} : { maxAttempts }),
+          },
         });
         return {
           content: JSON.stringify({
@@ -115,4 +122,8 @@ function positiveInteger(value: unknown, field: string): number {
     throw new TypeError(`${field} must be a positive integer`);
   }
   return value as number;
+}
+
+function optionalPositiveInteger(value: unknown, field: string): number | undefined {
+  return value === undefined ? undefined : positiveInteger(value, field);
 }

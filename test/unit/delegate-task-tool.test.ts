@@ -31,6 +31,7 @@ describe("delegate_task tool", () => {
       input: "package metadata",
       maxModelTokens: 500,
       maxWallClockMs: 30_000,
+      maxAttempts: 3,
     }, context);
 
     expect(result.isError).toBe(false);
@@ -43,7 +44,11 @@ describe("delegate_task tool", () => {
       type: "task.request",
       taskId: "task-1",
       goal: { statement: "Find the install command" },
-      budget: { maxModelTokens: 500, maxWallClockMs: 30_000 },
+      budget: {
+        maxModelTokens: 500,
+        maxWallClockMs: 30_000,
+        maxAttempts: 3,
+      },
     });
     const refs = message?.payload.type === "task.request" ? message.payload.inputRefs : [];
     expect(refs).toHaveLength(1);
@@ -80,6 +85,20 @@ describe("delegate_task tool", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content).toContain("exceeds");
+    expect(inbox.snapshot().records).toEqual([]);
+  });
+
+  it("rejects a Worker attempt budget beyond the protocol bound", async () => {
+    const { inbox, tool } = setup();
+    const result = await tool.execute({
+      statement: "Inspect input",
+      maxModelTokens: 100,
+      maxWallClockMs: 1_000,
+      maxAttempts: 9,
+    }, context);
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("maxAttempts");
     expect(inbox.snapshot().records).toEqual([]);
   });
 });

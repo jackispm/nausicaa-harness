@@ -1,5 +1,6 @@
 import type { EventPayloadMap, EventType } from "../domain/events.js";
 import {
+  MAX_TASK_ATTEMPTS,
   MAX_TASK_MODEL_TOKENS,
   MAX_TASK_WALL_CLOCK_MS,
 } from "../domain/types.js";
@@ -10,6 +11,7 @@ import type {
   Goal,
   NavigationDelta,
   RunPolicy,
+  TaskBudget,
   TokenUsage,
 } from "../domain/types.js";
 
@@ -127,6 +129,15 @@ function taskBudget(value: unknown, path: string): void {
   integer(item.maxWallClockMs, `${path}.maxWallClockMs`, 1);
   if ((item.maxWallClockMs as number) > MAX_TASK_WALL_CLOCK_MS) {
     invalid(`${path}.maxWallClockMs`, `at most ${MAX_TASK_WALL_CLOCK_MS}`);
+  }
+  if (item.deadline !== undefined) {
+    dateTime(item.deadline, `${path}.deadline`);
+  }
+  if (item.maxAttempts !== undefined) {
+    integer(item.maxAttempts, `${path}.maxAttempts`, 1);
+    if ((item.maxAttempts as number) > MAX_TASK_ATTEMPTS) {
+      invalid(`${path}.maxAttempts`, `at most ${MAX_TASK_ATTEMPTS}`);
+    }
   }
 }
 
@@ -307,6 +318,20 @@ function a2aMessage(value: unknown, path: string): asserts value is A2AMessage {
       goal(payload.goal, `${path}.payload.goal`);
       artifactRefArray(payload.inputRefs, `${path}.payload.inputRefs`);
       taskBudget(payload.budget, `${path}.payload.budget`);
+      {
+        const budget = payload.budget as TaskBudget;
+        const deadline = budget.deadline;
+        if (deadline !== undefined) {
+          const expectedDeadline = Date.parse(item.createdAt as string)
+            + budget.maxWallClockMs;
+          if (Date.parse(deadline) !== expectedDeadline) {
+            invalid(
+              `${path}.payload.budget.deadline`,
+              "equal to message createdAt plus maxWallClockMs",
+            );
+          }
+        }
+      }
       break;
     case "task.accept":
       taskId(payload.taskId, `${path}.payload.taskId`);
@@ -588,6 +613,9 @@ const payloadValidators = {
     const item = payloadObject(value, path, ["model", "error"]);
     string(item.model, `${path}.model`, false);
     string(item.error, `${path}.error`);
+    if (item.retryable !== undefined) {
+      boolean(item.retryable, `${path}.retryable`);
+    }
   },
   "model.cancelled": (value, path) => {
     const item = payloadObject(value, path, ["requestId", "reason"]);

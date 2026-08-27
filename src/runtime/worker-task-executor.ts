@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { A2AInbox, EventSink, InboxRecord } from "../a2a/index.js";
+import type { A2AInbox, EventSink } from "../a2a/index.js";
 import type {
   A2AMessage,
   AnyEvent,
@@ -15,6 +15,7 @@ import type {
   TaskResult,
   TokenUsage,
 } from "../domain/index.js";
+import { DEFAULT_TASK_MAX_ATTEMPTS } from "../domain/index.js";
 import type { ModelPort, ModelRequest, ModelResponse } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
 import { sha256, stableJson } from "../ledger/hash.js";
@@ -37,6 +38,17 @@ type TerminalPayload = Extract<
   A2AMessage["payload"],
   { type: "task.result" | "task.failed" }
 >;
+type ModelRequestedEvent = Extract<AnyEvent, { type: "model.requested" }>;
+type ModelCompletedEvent = Extract<AnyEvent, { type: "model.completed" }>;
+type ModelFailedEvent = Extract<AnyEvent, { type: "model.failed" }>;
+
+interface WorkerExecutionState {
+  requests: ModelRequestedEvent[];
+  completions: ModelCompletedEvent[];
+  failures: ModelFailedEvent[];
+  usage: TokenUsage;
+  nextAttempt: number;
+}
 
 export interface WorkerTaskExecutorOptions {
   inbox: A2AInbox;
@@ -162,7 +174,7 @@ export class WorkerTaskExecutor {
     if (record.message.runId !== this.runId) {
       throw new WorkerTaskExecutorError(`Task belongs to Run ${record.message.runId}`);
     }
-    return this.process(record, record.message as TaskRequestMessage);
+    return this.process(record.message as TaskRequestMessage, record.claim?.attempt ?? 1);
   }
 
   async drain(options: { maxTasks?: number } = {}): Promise<WorkerTaskRunResult[]> {
@@ -182,8 +194,8 @@ export class WorkerTaskExecutor {
   }
 
   private async process(
-    record: InboxRecord,
     request: TaskRequestMessage,
+    claimAttempt: number,
   ): Promise<WorkerTaskRunResult> {
     if (this.isStopping()) return { status: "idle", reason: "stopped" };
     const task = request.payload;
@@ -196,7 +208,7 @@ export class WorkerTaskExecutor {
 
     try {
       await this.sendReply(request, { type: "task.accept", taskId: task.taskId }, "accept");
-      const execution = await this.execute(request, record.claim?.attempt ?? 1);
+      const execution = await this.execute(request, claimAttempt);
       if (execution.kind === "cancelled" || this.isStopping()) {
         return { status: "idle", reason: "stopped" };
       }
@@ -222,25 +234,106 @@ export class WorkerTaskExecutor {
 
   private async execute(
     request: TaskRequestMessage,
-    attempt: number,
+    claimAttempt: number,
   ): Promise<
     | { kind: "result"; payload: TaskResult }
     | { kind: "failed"; payload: TaskFailed }
     | { kind: "cancelled" }
   > {
     const task = request.payload;
-    const deadline = new TaskDeadline(task.budget.maxWallClockMs, [
+    const evidenceRefs = task.inputRefs.map((ref) => ref.contentHash);
+    let state: WorkerExecutionState;
+    try {
+      if (claimAttempt > 1 && this.readEvents === undefined) {
+        return {
+          kind: "failed",
+          payload: failed(
+            task.taskId,
+            "Worker task recovery history is unavailable",
+            false,
+            evidenceRefs,
+          ),
+        };
+      }
+      state = claimAttempt > 1
+        ? await this.readExecutionState(request)
+        : emptyExecutionState();
+      // Multiple completions are possible after a crash around a provider
+      // boundary. The first durable completion owns the terminal result;
+      // every completion is still accounted for below.
+      const completion = state.completions[0];
+      if (completion !== undefined) {
+        return await this.recoverCompletedExecution(
+          request,
+          completion,
+          state.completions,
+          state.usage,
+          evidenceRefs,
+        );
+      }
+      const failure = state.failures[0];
+      if (failure !== undefined) {
+        return {
+          kind: "failed",
+          payload: failed(
+            task.taskId,
+            failure.payload.error,
+            failure.payload.retryable ?? false,
+            evidenceRefs,
+          ),
+        };
+      }
+    } catch (error: unknown) {
+      if (this.isStopping() || error instanceof WorkerTaskCancelledError) {
+        return { kind: "cancelled" };
+      }
+      return {
+        kind: "failed",
+        payload: failed(
+          task.taskId,
+          persistedErrorText(error, "Worker task recovery failed"),
+          isRetryable(error),
+          evidenceRefs,
+        ),
+      };
+    }
+
+    const deadlineAt = task.budget.deadline === undefined
+      ? Date.parse(request.createdAt) + task.budget.maxWallClockMs
+      : Date.parse(task.budget.deadline);
+    const remainingMs = deadlineAt - this.clock.now().getTime();
+    if (!Number.isFinite(deadlineAt) || remainingMs <= 0) {
+      return {
+        kind: "failed",
+        payload: failed(
+          task.taskId,
+          `Worker task deadline expired (${task.budget.deadline ?? "legacy budget"})`,
+          false,
+          evidenceRefs,
+        ),
+      };
+    }
+
+    const maxAttempts = task.budget.maxAttempts ?? DEFAULT_TASK_MAX_ATTEMPTS;
+    if (state.requests.length >= maxAttempts) {
+      return {
+        kind: "failed",
+        payload: failed(
+          task.taskId,
+          `Worker task model attempt budget exhausted (${state.requests.length}/${maxAttempts})`,
+          false,
+          evidenceRefs,
+        ),
+      };
+    }
+
+    const attempt = state.nextAttempt;
+    const prefix = `${this.runId}:${this.laneId}:task:${task.taskId}:attempt:${attempt}`;
+    const deadline = new TaskDeadline(remainingMs, [
       this.signal,
       this.stopController.signal,
     ]);
-    const evidenceRefs = task.inputRefs.map((ref) => ref.contentHash);
-    const prefix = `${this.runId}:${this.laneId}:task:${task.taskId}:attempt:${attempt}`;
     try {
-      const recovered = attempt > 1
-        ? await this.recoverCompletedExecution(request, evidenceRefs, deadline.signal)
-        : undefined;
-      if (recovered !== undefined) return recovered;
-
       const content = await this.readInput(task.goal, task.inputRefs, deadline.signal);
       const messages: ConversationMessage[] = [{
         role: "user",
@@ -295,17 +388,18 @@ export class WorkerTaskExecutor {
       } catch (error: unknown) {
         if (this.isStopping()) return { kind: "cancelled" };
         const reason = persistedErrorText(error, "Worker model failed");
+        const retryable = isRetryable(error);
         await this.append({
           runId: this.runId,
           laneId: this.laneId,
           type: "model.failed",
-          payload: { model: this.modelName, error: reason },
+          payload: { model: this.modelName, error: reason, retryable },
           correlationId: request.correlationId,
           idempotencyKey: `${prefix}:model:failed`,
           visibility: request.visibility,
           occurredAt: this.clock.now().toISOString(),
         });
-        return { kind: "failed", payload: failed(task.taskId, reason, isRetryable(error), evidenceRefs) };
+        return { kind: "failed", payload: failed(task.taskId, reason, retryable, evidenceRefs) };
       }
 
       validateUsage(response.usage);
@@ -356,13 +450,15 @@ export class WorkerTaskExecutor {
         occurredAt: this.clock.now().toISOString(),
       });
 
+      const cumulativeUsage = addUsage(state.usage, usage);
+
       return completedExecution(
         task,
         responseRef,
         response.content,
         response.toolCalls.length,
         response.stopReason,
-        usage,
+        cumulativeUsage,
         evidenceRefs,
       );
     } catch (error: unknown) {
@@ -374,86 +470,135 @@ export class WorkerTaskExecutor {
     }
   }
 
-  private async recoverCompletedExecution(
+  private async readExecutionState(
     request: TaskRequestMessage,
-    evidenceRefs: readonly string[],
-    signal: AbortSignal,
-  ): Promise<
-    | { kind: "result"; payload: TaskResult }
-    | { kind: "failed"; payload: TaskFailed }
-    | undefined
-  > {
-    if (this.readEvents === undefined) return undefined;
+  ): Promise<WorkerExecutionState> {
+    if (this.readEvents === undefined) {
+      return emptyExecutionState();
+    }
     const taskPrefix = `${this.runId}:${this.laneId}:task:${request.payload.taskId}:attempt:`;
     const sessionId = `${this.runId}:${this.laneId}:task:${request.payload.taskId}`;
-    const events = await withAbort(this.readEvents(), signal);
-    const completion = [...events].sort((left, right) => (
+    const events = [...await this.readEvents()].sort((left, right) => (
       left.globalOffset - right.globalOffset
-    )).find((event): event is Extract<
-      AnyEvent,
-      { type: "model.completed" }
-    > => {
+    ));
+    const requests = events.filter((event): event is ModelRequestedEvent => (
+      event.runId === this.runId
+      && event.laneId === this.laneId
+      && event.type === "model.requested"
+      && event.correlationId === request.correlationId
+      && event.idempotencyKey.startsWith(taskPrefix)
+      && event.idempotencyKey.endsWith(":model:requested")
+      && event.payload.sessionId === sessionId
+    ));
+    const requestedPrefixes = new Set(requests.map((event) => event.idempotencyKey.slice(
+      0,
+      -":model:requested".length,
+    )));
+    const completions = events.filter((event): event is ModelCompletedEvent => {
       if (
         event.runId !== this.runId
         || event.laneId !== this.laneId
         || event.type !== "model.completed"
         || event.correlationId !== request.correlationId
-        || !event.idempotencyKey.startsWith(taskPrefix)
         || !event.idempotencyKey.endsWith(":model:completed")
       ) {
         return false;
       }
-      const eventPrefix = event.idempotencyKey.slice(0, -":model:completed".length);
-      return events.some((candidate) => (
-        candidate.runId === this.runId
-        && candidate.laneId === this.laneId
-        && candidate.type === "model.requested"
-        && candidate.correlationId === request.correlationId
-        && candidate.idempotencyKey === `${eventPrefix}:model:requested`
-        && candidate.payload.sessionId === sessionId
+      return requestedPrefixes.has(event.idempotencyKey.slice(
+        0,
+        -":model:completed".length,
       ));
     });
-    if (completion === undefined) return undefined;
+    const failures = events.filter((event): event is ModelFailedEvent => {
+      if (
+        event.runId !== this.runId
+        || event.laneId !== this.laneId
+        || event.type !== "model.failed"
+        || event.correlationId !== request.correlationId
+        || !event.idempotencyKey.endsWith(":model:failed")
+      ) {
+        return false;
+      }
+      return requestedPrefixes.has(event.idempotencyKey.slice(
+        0,
+        -":model:failed".length,
+      ));
+    });
+    // ModelPort failures carry no usage today, so only completed responses can
+    // be accumulated and charged exactly.
+    const usage = completions.reduce((total, event) => {
+      validateUsage(event.payload.usage);
+      return addUsage(total, event.payload.usage);
+    }, zeroUsage());
+    const greatestAttempt = requests.reduce((maximum, event) => {
+      const value = event.idempotencyKey.slice(
+        taskPrefix.length,
+        -":model:requested".length,
+      );
+      const attempt = Number(value);
+      return Number.isSafeInteger(attempt) && attempt > 0
+        ? Math.max(maximum, attempt)
+        : maximum;
+    }, 0);
+    return {
+      requests,
+      completions,
+      failures,
+      usage,
+      nextAttempt: Math.max(requests.length, greatestAttempt) + 1,
+    };
+  }
 
-    validateUsage(completion.payload.usage);
+  private async recoverCompletedExecution(
+    request: TaskRequestMessage,
+    completion: Extract<AnyEvent, { type: "model.completed" }>,
+    completions: readonly Extract<AnyEvent, { type: "model.completed" }>[],
+    cumulativeUsage: TokenUsage,
+    evidenceRefs: readonly string[],
+  ): Promise<
+    | { kind: "result"; payload: TaskResult }
+    | { kind: "failed"; payload: TaskFailed }
+  > {
     const assistant = await this.readCommittedAssistant(
       completion.payload.responseRef,
-      signal,
+      this.stopController.signal,
     );
-    const eventPrefix = completion.idempotencyKey.slice(
-      0,
-      -":model:completed".length,
-    );
-    await this.append({
-      runId: this.runId,
-      laneId: this.laneId,
-      type: "assistant.message",
-      payload: { messageRef: completion.payload.responseRef },
-      correlationId: completion.correlationId,
-      idempotencyKey: `${eventPrefix}:assistant`,
-      visibility: completion.visibility,
-      occurredAt: this.clock.now().toISOString(),
-    });
-    await this.append({
-      runId: this.runId,
-      laneId: this.laneId,
-      type: "budget.charged",
-      payload: {
+    for (const committed of completions) {
+      const eventPrefix = committed.idempotencyKey.slice(
+        0,
+        -":model:completed".length,
+      );
+      await this.append({
+        runId: this.runId,
         laneId: this.laneId,
-        usage: structuredClone(completion.payload.usage),
-      },
-      correlationId: completion.correlationId,
-      idempotencyKey: `${eventPrefix}:budget`,
-      visibility: completion.visibility,
-      occurredAt: this.clock.now().toISOString(),
-    });
+        type: "assistant.message",
+        payload: { messageRef: committed.payload.responseRef },
+        correlationId: committed.correlationId,
+        idempotencyKey: `${eventPrefix}:assistant`,
+        visibility: committed.visibility,
+        occurredAt: this.clock.now().toISOString(),
+      });
+      await this.append({
+        runId: this.runId,
+        laneId: this.laneId,
+        type: "budget.charged",
+        payload: {
+          laneId: this.laneId,
+          usage: structuredClone(committed.payload.usage),
+        },
+        correlationId: committed.correlationId,
+        idempotencyKey: `${eventPrefix}:budget`,
+        visibility: committed.visibility,
+        occurredAt: this.clock.now().toISOString(),
+      });
+    }
     return completedExecution(
       request.payload,
       completion.payload.responseRef,
       assistant.content,
       assistant.toolCalls.length,
       completion.payload.stopReason,
-      structuredClone(completion.payload.usage),
+      structuredClone(cumulativeUsage),
       evidenceRefs,
     );
   }
@@ -722,6 +867,32 @@ function validateUsage(usage: TokenUsage): void {
 
 function totalTokens(usage: TokenUsage): number {
   return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+function zeroUsage(): TokenUsage {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+}
+
+function emptyExecutionState(): WorkerExecutionState {
+  return {
+    requests: [],
+    completions: [],
+    failures: [],
+    usage: zeroUsage(),
+    nextAttempt: 1,
+  };
+}
+
+function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
+  return {
+    input: left.input + right.input,
+    output: left.output + right.output,
+    cacheRead: left.cacheRead + right.cacheRead,
+    cacheWrite: left.cacheWrite + right.cacheWrite,
+    ...(left.costUsd === undefined && right.costUsd === undefined
+      ? {}
+      : { costUsd: (left.costUsd ?? 0) + (right.costUsd ?? 0) }),
+  };
 }
 
 function cacheOutcome(usage: TokenUsage): "hit" | "write" | "hit-write" | "unknown" {

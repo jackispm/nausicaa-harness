@@ -13,6 +13,7 @@ import { hostname, tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { AnyEvent, AppendEvent } from "../../src/domain/events.js";
+import type { A2AMessage, TaskBudget } from "../../src/domain/types.js";
 import {
   computeEventContentHash,
   JsonlLedger,
@@ -151,6 +152,71 @@ describe("JsonlLedger recovery", () => {
     await reopened.close();
   });
 
+  it("reopens mixed legacy and current Worker events without changing hashes", async () => {
+    const { path } = await fixture();
+    let eventId = 0;
+    const ledger = await JsonlLedger.open(path, {
+      createEventId: () => `worker-event-${++eventId}`,
+    });
+    const legacy = workerRequest("legacy-task", {
+      maxModelTokens: 100,
+      maxWallClockMs: 1_000,
+    });
+    const current = workerRequest("current-task", {
+      maxModelTokens: 100,
+      maxWallClockMs: 1_000,
+      deadline: "2026-08-27T12:00:01.000Z",
+      maxAttempts: 2,
+    });
+    await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "message.sent",
+      payload: { message: legacy },
+      correlationId: legacy.correlationId,
+      idempotencyKey: "legacy-task-sent",
+      occurredAt: legacy.createdAt,
+    });
+    await ledger.append({
+      runId: "run-1",
+      laneId: "worker",
+      type: "model.failed",
+      payload: { model: "model-1", error: "legacy failure" },
+      correlationId: legacy.correlationId,
+      idempotencyKey: "legacy-model-failed",
+      occurredAt: legacy.createdAt,
+    });
+    await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "message.sent",
+      payload: { message: current },
+      correlationId: current.correlationId,
+      idempotencyKey: "current-task-sent",
+      occurredAt: current.createdAt,
+    });
+    await ledger.append({
+      runId: "run-1",
+      laneId: "worker",
+      type: "model.failed",
+      payload: { model: "model-1", error: "current failure", retryable: true },
+      correlationId: current.correlationId,
+      idempotencyKey: "current-model-failed",
+      occurredAt: current.createdAt,
+    });
+    const before = await ledger.read({ runId: "run-1" });
+    await ledger.close();
+
+    const reopened = await JsonlLedger.open(path);
+    const after = await reopened.read({ runId: "run-1" });
+    expect(after).toEqual(before);
+    expect(after.map((event) => event.contentHash)).toEqual(
+      before.map((event) => event.contentHash),
+    );
+    expect(after.every((event) => event.schemaVersion === 1)).toBe(true);
+    await reopened.close();
+  });
+
   it("does not persist a duplicate generated event id", async () => {
     const { path } = await fixture();
     const ledger = await JsonlLedger.open(path, { createEventId: () => "same" });
@@ -226,3 +292,32 @@ describe("JsonlLedger recovery", () => {
     });
   });
 });
+
+function workerRequest(taskId: string, budget: TaskBudget): A2AMessage {
+  return {
+    messageId: `${taskId}-message`,
+    runId: "run-1",
+    conversationId: "conversation-1",
+    threadId: "thread-1",
+    from: "main",
+    to: "worker",
+    createdAt: "2026-08-27T12:00:00.000Z",
+    correlationId: `${taskId}-correlation`,
+    idempotencyKey: `${taskId}-message`,
+    visibility: "run",
+    priority: 1,
+    delivery: "next-step",
+    payload: {
+      type: "task.request",
+      taskId,
+      goal: {
+        version: 1,
+        statement: "Inspect the project",
+        successCriteria: [],
+        hardConstraints: [],
+      },
+      inputRefs: [],
+      budget,
+    },
+  };
+}

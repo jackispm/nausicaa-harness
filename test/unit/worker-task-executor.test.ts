@@ -4,6 +4,7 @@ import { A2AInbox } from "../../src/a2a/index.js";
 import type {
   A2AMessage,
   ArtifactRef,
+  Clock,
   Goal,
   ModelPort,
   ModelRequest,
@@ -59,10 +60,13 @@ async function setup(
   input = "npm install",
   budget?: { maxModelTokens: number; maxWallClockMs: number },
 ) {
-  const ledger = new MemoryLedger();
+  const clock: Clock = {
+    now: () => new Date("2026-08-27T12:00:00.000Z"),
+  };
+  const ledger = new MemoryLedger({ clock });
   const store = new MemoryContentAddressedStore();
   const inputRef = await store.put(input, "text/plain");
-  const inbox = new A2AInbox({ sink: ledger });
+  const inbox = new A2AInbox({ sink: ledger, clock });
   await inbox.send(taskMessage([inputRef], budget));
   let idSequence = 0;
   const recoveryReads = { count: 0 };
@@ -74,6 +78,7 @@ async function setup(
     modelName: "scripted/worker",
     runId: "run-1",
     workerLaneId: "worker-1",
+    clock,
     createId: () => `fixed-id-${++idSequence}`,
     readWatermark: () => ledger.watermark(),
     readEvents: async () => {
