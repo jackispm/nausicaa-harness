@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import type { A2AMessage, AdviceDisposition, Clock, ArtifactRef } from "../../src/domain/index.js";
+import {
+  MAX_TASK_MODEL_TOKENS,
+  MAX_TASK_WALL_CLOCK_MS,
+} from "../../src/domain/index.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
 import {
   A2AInbox,
@@ -206,6 +210,8 @@ describe("A2AInbox", () => {
     ["task id", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.taskId = ""; }],
     ["goal version", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.goal.version = 0; }],
     ["model budget", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.budget.maxModelTokens = 0; }],
+    ["model budget upper bound", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.budget.maxModelTokens = MAX_TASK_MODEL_TOKENS + 1; }],
+    ["wall-clock budget upper bound", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.budget.maxWallClockMs = MAX_TASK_WALL_CLOCK_MS + 1; }],
     ["artifact ref", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.inputRefs[0]!.byteLength = -1; }],
   ])("rejects malformed task request %s", async (_label, mutate) => {
     const inbox = new A2AInbox();

@@ -1,4 +1,8 @@
 import type { EventPayloadMap, EventType } from "../domain/events.js";
+import {
+  MAX_TASK_MODEL_TOKENS,
+  MAX_TASK_WALL_CLOCK_MS,
+} from "../domain/types.js";
 import type {
   A2AMessage,
   Advice,
@@ -117,7 +121,13 @@ function taskId(value: unknown, path: string): void {
 function taskBudget(value: unknown, path: string): void {
   const item = record(value, path);
   integer(item.maxModelTokens, `${path}.maxModelTokens`, 1);
+  if ((item.maxModelTokens as number) > MAX_TASK_MODEL_TOKENS) {
+    invalid(`${path}.maxModelTokens`, `at most ${MAX_TASK_MODEL_TOKENS}`);
+  }
   integer(item.maxWallClockMs, `${path}.maxWallClockMs`, 1);
+  if ((item.maxWallClockMs as number) > MAX_TASK_WALL_CLOCK_MS) {
+    invalid(`${path}.maxWallClockMs`, `at most ${MAX_TASK_WALL_CLOCK_MS}`);
+  }
 }
 
 function artifactRefArray(value: unknown, path: string): void {

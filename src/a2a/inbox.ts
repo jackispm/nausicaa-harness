@@ -14,7 +14,11 @@ import type {
   TaskBudget,
   TokenUsage,
 } from "../domain/index.js";
-import { systemClock } from "../domain/index.js";
+import {
+  MAX_TASK_MODEL_TOKENS,
+  MAX_TASK_WALL_CLOCK_MS,
+  systemClock,
+} from "../domain/index.js";
 import { sha256, stableJson } from "../ledger/hash.js";
 
 export interface EventSink {
@@ -691,11 +695,23 @@ function validateGoal(goal: Goal): void {
 
 function validateTaskBudget(budget: TaskBudget): void {
   if (!isRecord(budget)) throw new A2AProtocolError("task budget must be an object");
-  if (!Number.isSafeInteger(budget.maxModelTokens) || budget.maxModelTokens < 1) {
-    throw new A2AProtocolError("task budget maxModelTokens must be a positive integer");
+  if (
+    !Number.isSafeInteger(budget.maxModelTokens)
+    || budget.maxModelTokens < 1
+    || budget.maxModelTokens > MAX_TASK_MODEL_TOKENS
+  ) {
+    throw new A2AProtocolError(
+      `task budget maxModelTokens must be between 1 and ${MAX_TASK_MODEL_TOKENS}`,
+    );
   }
-  if (!Number.isSafeInteger(budget.maxWallClockMs) || budget.maxWallClockMs < 1) {
-    throw new A2AProtocolError("task budget maxWallClockMs must be a positive integer");
+  if (
+    !Number.isSafeInteger(budget.maxWallClockMs)
+    || budget.maxWallClockMs < 1
+    || budget.maxWallClockMs > MAX_TASK_WALL_CLOCK_MS
+  ) {
+    throw new A2AProtocolError(
+      `task budget maxWallClockMs must be between 1 and ${MAX_TASK_WALL_CLOCK_MS}`,
+    );
   }
 }
 

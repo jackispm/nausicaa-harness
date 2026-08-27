@@ -141,6 +141,10 @@ export interface TaskBudget {
   maxWallClockMs: number;
 }
 
+/** Hard protocol bounds keep delegated work finite even for untrusted senders. */
+export const MAX_TASK_MODEL_TOKENS = 1_000_000;
+export const MAX_TASK_WALL_CLOCK_MS = 30 * 60 * 1_000;
+
 export interface TaskRequest {
   type: "task.request";
   taskId: string;
