@@ -138,11 +138,15 @@ describe("IntentNavigator", () => {
     })).resolves.satisfy((result: { advice?: unknown }) => result.advice === undefined);
 
     const malformed = new ScriptedModel(response("not JSON"));
-    await expect(navigator(malformed).observe({
+    const malformedObservation = navigator(malformed).observe({
       runId: "run-1",
       sessionId: "teto-session",
       frame,
-    })).rejects.toBeInstanceOf(TetoOutputError);
+    });
+    await expect(malformedObservation).rejects.toBeInstanceOf(TetoOutputError);
+    await expect(malformedObservation).rejects.toMatchObject({
+      usage: { input: 120, output: 40, cacheRead: 50, cacheWrite: 0 },
+    });
 
     const expanded = new ScriptedModel(response(
       '{"action":"silent"}\n{"action":"silent"}',
@@ -189,10 +193,14 @@ describe("IntentNavigator", () => {
     truncated.stopReason = "length";
     truncated.usage.output = 64;
 
-    await expect(navigator(new ScriptedModel(truncated)).observe({
+    const observation = navigator(new ScriptedModel(truncated)).observe({
       runId: "run-1",
       sessionId: "teto-session",
       frame,
-    })).rejects.toThrow("Teto output was truncated at the 64-token limit");
+    });
+    await expect(observation).rejects.toThrow(
+      "Teto output was truncated at the 64-token limit",
+    );
+    await expect(observation).rejects.toMatchObject({ usage: truncated.usage });
   });
 });

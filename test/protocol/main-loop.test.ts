@@ -17,8 +17,10 @@ import { MemoryLedger } from "../../src/ledger/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import {
   MainLoop,
+  MainRunTokenBudgetExhaustedError,
   type MainStreamEvent,
 } from "../../src/runtime/main-loop.js";
+import { RunTokenBudget } from "../../src/runtime/run-token-budget.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
 
 const temporaryDirectories: string[] = [];
@@ -30,6 +32,125 @@ afterEach(async () => {
 });
 
 describe("MainLoop", () => {
+  it("admits Main with a shared Run budget, narrows output, and settles actual usage", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const runTokenBudget = new RunTokenBudget(400);
+    const model = new ScriptedModel([{
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const loop = new MainLoop({
+      model,
+      runTokenBudget,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+    });
+
+    await expect(loop.run({
+      runId: "main-budget-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    })).resolves.toMatchObject({ completed: true, usage: tokenUsage(10, 5) });
+
+    expect(model.requests[0]?.maxOutputTokens).toBeGreaterThan(0);
+    expect(model.requests[0]?.maxOutputTokens).toBeLessThan(400);
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 15,
+      reservedTokens: 0,
+      availableTokens: 385,
+      settlements: [{
+        id: "main-budget-run:lane:main:legacy:step:1:provider:attempt:1",
+        reservedTokens: 400,
+        actualTokens: 15,
+      }],
+    });
+    const eventTypes = (await ledger.read({ runId: "main-budget-run" }))
+      .map((event) => event.type);
+    expect(eventTypes.indexOf("budget.charged"))
+      .toBeLessThan(eventTypes.indexOf("model.completed"));
+  });
+
+  it("does not call Main when the shared Run budget cannot fit its input", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const runTokenBudget = new RunTokenBudget(1);
+    const model = new ScriptedModel([{
+      content: "must not run",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(1, 1),
+    }]);
+    const loop = new MainLoop({
+      model,
+      runTokenBudget,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+    });
+
+    const error = await loop.run({
+      runId: "main-budget-denied",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    }).catch((failure: unknown) => failure);
+
+    expect(error).toBeInstanceOf(MainRunTokenBudgetExhaustedError);
+    expect(error).toMatchObject({ code: "run-budget-exhausted" });
+    expect(model.requests).toHaveLength(0);
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 0,
+      reservedTokens: 0,
+      availableTokens: 1,
+    });
+    expect((await ledger.read({ runId: "main-budget-denied" })).some((event) => (
+      event.type === "model.requested"
+    ))).toBe(false);
+  });
+
+  it("releases Main's shared reservation when the provider fails", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const runTokenBudget = new RunTokenBudget(400);
+    const loop = new MainLoop({
+      model: new ScriptedModel([new Error("provider unavailable")]),
+      runTokenBudget,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+    });
+
+    await expect(loop.run({
+      runId: "main-budget-failure",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    })).rejects.toThrow("provider unavailable");
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 0,
+      reservedTokens: 0,
+      availableTokens: 400,
+      settlements: [],
+    });
+  });
+
   it("reconciles partial deltas with the committed assistant message", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();

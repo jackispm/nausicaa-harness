@@ -44,15 +44,21 @@ import {
 import { IntentNavigator, ObservationFrameBuilder } from "../teto/index.js";
 import { createWorkspaceTools } from "../tools/index.js";
 import { createAdviceResponseTool } from "./advice-tool.js";
-import { MainLoop } from "./main-loop.js";
+import {
+  MainLoop,
+  MainRunTokenBudgetExhaustedError,
+} from "./main-loop.js";
 import { persistedErrorText } from "./redaction.js";
 import {
   commitRunCheckpoint,
+  projectMainExecutionRecovery,
   recoverRun,
   resolvePendingToolOperation,
   type RunRecoveryState,
 } from "./recovery.js";
 import { resolveRunPolicy } from "./run-policy.js";
+import { RunTokenBudget } from "./run-token-budget.js";
+import { recoverRunTokenUsage } from "./run-token-budget-recovery.js";
 import { TetoScheduler } from "./teto-scheduler.js";
 import type { TetoAdviceDelivery } from "./teto-scheduler.js";
 import { ReflectionScheduler } from "./reflection-scheduler.js";
@@ -199,8 +205,12 @@ export const executeRun = async (
     ) {
       throw new Error("Cannot change workerEnabled while resuming a Run");
     }
-    const priorTokens = totalTokens(setup.priorUsage);
-    const remainingModelTokens = Math.max(0, policy.maxModelTokens - priorTokens);
+    const recoveredUsage = recoverRunTokenUsage(setup.events, runId);
+    const runTokenBudget = new RunTokenBudget(
+      policy.maxModelTokens,
+      totalTokens(recoveredUsage),
+    );
+    const remainingModelTokens = runTokenBudget.availableTokens();
     const legacyStepLimitExhausted = "maxMainSteps" in policy
       && setup.startStep > mainStepAllowance(policy);
     if (remainingModelTokens === 0 || legacyStepLimitExhausted) {
@@ -259,6 +269,7 @@ export const executeRun = async (
         policy: { ...policy, tetoEnabled: true },
         events: setup.events,
         clock,
+        runTokenBudget,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
         adviceDelivery,
       });
@@ -273,6 +284,7 @@ export const executeRun = async (
         policy,
         events: setup.events,
         clock,
+        runTokenBudget,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
     }
@@ -291,6 +303,7 @@ export const executeRun = async (
         model: workerModel,
         modelName: request.workerModel ?? request.model,
         runId,
+        runTokenBudget,
         clock,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
         readWatermark: () => sink.ledger.watermark(),
@@ -322,6 +335,7 @@ export const executeRun = async (
       eventSink: sink,
       tools,
       clock,
+      runTokenBudget,
       ...(outputContinuationMessageId === undefined
         && scheduler === undefined
         && workerScheduler === undefined
@@ -419,6 +433,43 @@ export const executeRun = async (
     } catch (error: unknown) {
       await scheduler?.stop();
       await workerScheduler?.stop();
+      if (error instanceof MainRunTokenBudgetExhaustedError) {
+        const watermark = await ledger.watermark();
+        await appendLaneStatus(
+          sink,
+          runId,
+          "main",
+          "waiting",
+          "Run budget or Step limit exhausted",
+          `main:waiting:${watermark}`,
+          clock,
+        );
+        await commitRunCheckpoint(ledger, runId);
+        const events = await ledger.read({ runId });
+        const activationEvents = events.filter(
+          (event) => event.globalOffset > setup.upperWatermark,
+        );
+        const latestCompletion = activationEvents.findLast((event): event is Extract<
+          AnyEvent,
+          { type: "model.completed" }
+        > => event.type === "model.completed" && event.laneId === "main");
+        const activation = projectMainExecutionRecovery(activationEvents);
+        const metrics = projectRunMetrics(events, runId);
+        return {
+          runId,
+          finalText: latestCompletion === undefined
+            ? ""
+            : await readAssistantText(store, latestCompletion.payload.responseRef),
+          completed: false,
+          steps: activationEvents.filter((event) => (
+            event.type === "step.completed" && event.laneId === "main"
+          )).length,
+          usage: activation.usage,
+          metrics,
+          stateDir,
+          blocker: "run-budget-or-step-limit",
+        };
+      }
       const message = persistedErrorText(error, "Run failed");
       await appendLaneStatus(
         sink,
@@ -456,7 +507,6 @@ interface RunSetup {
   startStep: number;
   upperWatermark: number;
   conversationRefs: RunRecoveryState["conversationRefs"];
-  priorUsage: TokenUsage;
   events: AnyEvent[];
 }
 
@@ -563,7 +613,6 @@ const createNewRun = async (
     startStep: 1,
     upperWatermark: await sink.ledger.watermark(),
     conversationRefs: [],
-    priorUsage: emptyUsage(),
     events,
   };
 };
@@ -599,7 +648,6 @@ const resumeExistingRun = async (
     startStep: recovered.startStep,
     upperWatermark: await sink.ledger.watermark(),
     conversationRefs: recovered.conversationRefs,
-    priorUsage: recovered.priorUsage,
     events: await sink.ledger.read({ runId: recovered.runId }),
   };
 };

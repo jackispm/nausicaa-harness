@@ -21,6 +21,7 @@ import type {
   MainBoundaryMessage,
 } from "./main-loop.js";
 import { persistedErrorText } from "./redaction.js";
+import type { RunTokenBudget } from "./run-token-budget.js";
 
 const DEFAULT_REFLECTION_LANE = "reflection";
 const OBSERVATION_DEADLINE_MS = 30_000;
@@ -40,6 +41,8 @@ export interface ReflectionSchedulerOptions {
   laneId?: string;
   createId?: () => string;
   signal?: AbortSignal;
+  /** Shared admission gate for every provider call in this Run. */
+  runTokenBudget?: RunTokenBudget;
 }
 
 export interface ReflectionSchedulerState {
@@ -71,6 +74,7 @@ export class ReflectionScheduler {
   private readonly clock: Clock;
   private readonly laneId: string;
   private readonly createId: () => string;
+  private readonly runTokenBudget: RunTokenBudget | undefined;
   private readonly signal: AbortSignal | undefined;
   private readonly stopController = new AbortController();
   private readonly cadence: TetoCadence;
@@ -93,6 +97,7 @@ export class ReflectionScheduler {
     this.clock = options.clock ?? systemClock;
     this.laneId = options.laneId ?? DEFAULT_REFLECTION_LANE;
     this.createId = options.createId ?? randomUUID;
+    this.runTokenBudget = options.runTokenBudget;
     this.signal = options.signal;
     const recovered = recoverReflectionSchedulerState(options.events ?? [], {
       runId: this.runId,
@@ -192,6 +197,10 @@ export class ReflectionScheduler {
     let mainCallIndex: number | undefined;
     let reservationId: string | undefined;
     let reservationSettled = false;
+    let runReservationId: string | undefined;
+    let runReservationSettled = false;
+    let providerUsage: TokenUsage | undefined;
+    let budgetChargeRecorded = false;
     let passCommitted = false;
     let observationSignal: AbortSignal | undefined;
     try {
@@ -212,6 +221,19 @@ export class ReflectionScheduler {
         this.cadence.skipPass(decision.mainCallIndex);
         wakePending = false;
         return;
+      }
+      if (this.runTokenBudget !== undefined) {
+        runReservationId = runModelReservationId(
+          this.runId,
+          this.laneId,
+          decision.mainCallIndex,
+        );
+        if (this.runTokenBudget.reserve(runReservationId, reservationTokens) === undefined) {
+          this.tokenGate.cancel(reservationId);
+          this.cadence.skipPass(decision.mainCallIndex);
+          wakePending = false;
+          return;
+        }
       }
 
       await this.recordLaneStatus(
@@ -239,6 +261,17 @@ export class ReflectionScheduler {
         maxOutputTokens: this.policy.tetoMaxOutputTokens,
         ...(signal === undefined ? {} : { signal }),
       }), signal);
+      providerUsage = response.usage;
+      if (runReservationId !== undefined) {
+        this.runTokenBudget?.settle(runReservationId, response.usage);
+        runReservationSettled = true;
+      }
+      await this.recordBudgetCharge(
+        decision.mainCallIndex,
+        context.delta.boundaryId,
+        response.usage,
+      );
+      budgetChargeRecorded = true;
       if (response.stopReason === "length") {
         throw new Error(
           `Reflection output was truncated at the ${this.policy.tetoMaxOutputTokens}-token limit`,
@@ -274,19 +307,8 @@ export class ReflectionScheduler {
         visibility: "run",
         occurredAt: this.clock.now().toISOString(),
       });
-      await this.eventSink.append({
-        runId: this.runId,
-        laneId: this.laneId,
-        type: "budget.charged",
-        payload: { laneId: this.laneId, usage: response.usage },
-        causationId: context.delta.boundaryId,
-        correlationId: this.runId,
-        idempotencyKey: `reflection:${decision.mainCallIndex}:budget`,
-        visibility: "run",
-        occurredAt: this.clock.now().toISOString(),
-      });
-      this.tokenGate.settle(reservationId, response.usage);
       reservationSettled = true;
+      this.settleReservation(reservationId, response.usage);
       if (reflection.action === "revise") {
         this.pendingReflections.push({
           mainCallIndex: decision.mainCallIndex,
@@ -295,8 +317,42 @@ export class ReflectionScheduler {
       }
       await this.recordLaneStatus(decision.mainCallIndex, "dormant");
     } catch (error: unknown) {
+      let failure = error;
+      if (
+        runReservationId !== undefined
+        && !runReservationSettled
+        && providerUsage !== undefined
+      ) {
+        try {
+          this.runTokenBudget?.settle(runReservationId, providerUsage);
+          runReservationSettled = true;
+        } catch (settlementError: unknown) {
+          failure = new AggregateError(
+            [asError(error), asError(settlementError)],
+            "Reflection usage could not be settled",
+          );
+        }
+      }
+      if (
+        reservationId !== undefined
+        && !reservationSettled
+        && providerUsage !== undefined
+      ) {
+        reservationSettled = true;
+        try {
+          this.settleReservation(reservationId, providerUsage);
+        } catch (settlementError: unknown) {
+          failure = new AggregateError(
+            [asError(failure), asError(settlementError)],
+            "Reflection ratio usage could not be settled",
+          );
+        }
+      }
       if (reservationId !== undefined && !reservationSettled) {
         this.tokenGate.cancel(reservationId);
+      }
+      if (runReservationId !== undefined && !runReservationSettled) {
+        this.runTokenBudget?.cancel(runReservationId);
       }
       if (wakePending && !passCommitted) {
         try {
@@ -305,14 +361,26 @@ export class ReflectionScheduler {
           // Keep the original failure authoritative.
         }
       }
-      if (isSignalAbort(error, observationSignal)) {
+      if (
+        providerUsage !== undefined
+        && !budgetChargeRecorded
+        && mainCallIndex !== undefined
+      ) {
+        await this.recordBudgetCharge(
+          mainCallIndex,
+          context.delta.boundaryId,
+          providerUsage,
+        );
+        budgetChargeRecorded = true;
+      }
+      if (isSignalAbort(failure, observationSignal)) {
         await this.recordLaneStatus(
           mainCallIndex ?? context.step,
           "cancelled",
-          persistedErrorText(error, "Reflection cancelled before completion"),
+          persistedErrorText(failure, "Reflection cancelled before completion"),
         );
       } else {
-        await this.recordFailure(`step:${context.step}`, error);
+        await this.recordFailure(`step:${context.step}`, failure);
       }
     }
   }
@@ -348,6 +416,41 @@ export class ReflectionScheduler {
     });
   }
 
+  private async recordBudgetCharge(
+    mainCallIndex: number,
+    causationId: string,
+    usage: TokenUsage,
+  ): Promise<void> {
+    await this.eventSink.append({
+      runId: this.runId,
+      laneId: this.laneId,
+      type: "budget.charged",
+      payload: { laneId: this.laneId, usage },
+      causationId,
+      correlationId: this.runId,
+      idempotencyKey: `reflection:${mainCallIndex}:budget`,
+      visibility: "run",
+      occurredAt: this.clock.now().toISOString(),
+    });
+  }
+
+  private settleReservation(reservationId: string, usage: TokenUsage): void {
+    try {
+      this.tokenGate.settle(reservationId, usage);
+    } catch (error: unknown) {
+      const state = this.tokenGate.snapshot();
+      this.tokenGate.cancel(reservationId);
+      this.tokenGate = new TokenRatioGate(this.policy.tetoTokenRatio, {
+        mainTokens: state.mainTokens,
+        tetoTokens: state.tetoTokens + totalTokens(usage),
+        reservations: state.reservations.filter(
+          (reservation) => reservation.id !== reservationId,
+        ),
+      });
+      throw error;
+    }
+  }
+
   private async recordFailure(scope: string, error: unknown): Promise<void> {
     await this.eventSink.append({
       runId: this.runId,
@@ -375,7 +478,9 @@ export function recoverReflectionSchedulerState(
   const mainCalls: Array<{ trigger: MainTriggerKind; usage: TokenUsage }> = [];
   const pendingMainUsage: TokenUsage[] = [];
   const passCalls = new Set<number>();
-  let reflectionTokens = 0;
+  const observedUsageByCall = new Map<number, TokenUsage>();
+  const chargedCalls = new Set<number>();
+  let chargedReflectionTokens = 0;
   for (const event of ordered) {
     if (event.laneId === mainLaneId && event.type === "model.completed") {
       pendingMainUsage.push(event.payload.usage);
@@ -393,7 +498,30 @@ export function recoverReflectionSchedulerState(
     }
     if (event.laneId === reflectionLaneId && event.type === "reflection.observed") {
       passCalls.add(event.payload.mainCallIndex);
-      reflectionTokens += totalTokens(event.payload.usage);
+      observedUsageByCall.set(event.payload.mainCallIndex, event.payload.usage);
+      continue;
+    }
+    if (
+      event.laneId === reflectionLaneId
+      && event.type === "budget.charged"
+      && event.payload.laneId === reflectionLaneId
+    ) {
+      chargedReflectionTokens += totalTokens(event.payload.usage);
+      const match = /^reflection:(\d+):budget$/.exec(event.idempotencyKey);
+      if (match !== null) {
+        const call = Number(match[1]);
+        chargedCalls.add(call);
+        passCalls.add(call);
+      }
+      continue;
+    }
+    if (
+      event.laneId === reflectionLaneId
+      && event.type === "lane.status"
+      && event.payload.status === "running"
+    ) {
+      const match = /^reflection:(\d+):status:running$/.exec(event.idempotencyKey);
+      if (match !== null) passCalls.add(Number(match[1]));
     }
   }
   let credit = 0;
@@ -415,7 +543,9 @@ export function recoverReflectionSchedulerState(
         (sum, call) => sum + totalTokens(call.usage),
         0,
       ),
-      tetoTokens: reflectionTokens,
+      tetoTokens: chargedReflectionTokens + [...observedUsageByCall]
+        .filter(([call]) => !chargedCalls.has(call))
+        .reduce((sum, [, usage]) => sum + totalTokens(usage), 0),
       reservations: [],
     },
   };
@@ -556,6 +686,14 @@ function validateOptions(options: ReflectionSchedulerOptions): void {
 
 function estimateTokens(value: string): number {
   return Math.ceil(Buffer.byteLength(value, "utf8") / 4);
+}
+
+function runModelReservationId(
+  runId: RunId,
+  laneId: string,
+  mainCallIndex: number,
+): string {
+  return `${runId}:lane:${laneId}:model:${mainCallIndex}`;
 }
 
 function totalTokens(usage: TokenUsage): number {

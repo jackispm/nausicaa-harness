@@ -232,6 +232,63 @@ describe("Run recovery", () => {
     });
   });
 
+  it("does not double count a budget charge persisted before its completion", async () => {
+    const ledger = new MemoryLedger();
+    const usage = { input: 12, output: 4, cacheRead: 3, cacheWrite: 1 };
+    await append(ledger, "run.created", {
+      goal: { version: 1, statement: "Inspect", successCriteria: [], hardConstraints: [] },
+      workspace: "/workspace",
+      policy,
+    }, "created");
+    await append(
+      ledger,
+      "budget.charged",
+      { laneId: "main", usage },
+      "run-1:turn:turn-1:step:1:budget",
+    );
+    await append(ledger, "model.completed", {
+      model: "scripted",
+      responseRef: ref("answer-1"),
+      stopReason: "stop",
+      usage,
+    }, "run-1:turn:turn-1:step:1:model:completed");
+
+    await expect(recoverRun(ledger, "run-1")).resolves.toMatchObject({
+      priorUsage: usage,
+    });
+  });
+
+  it("counts distinct modern calls that report identical usage", async () => {
+    const ledger = new MemoryLedger();
+    const usage = { input: 12, output: 4, cacheRead: 3, cacheWrite: 1 };
+    await append(ledger, "run.created", {
+      goal: { version: 1, statement: "Inspect", successCriteria: [], hardConstraints: [] },
+      workspace: "/workspace",
+      policy,
+    }, "created");
+    await append(
+      ledger,
+      "budget.charged",
+      { laneId: "main", usage },
+      "run-1:turn:turn-1:step:1:budget",
+    );
+    await append(ledger, "model.completed", {
+      model: "scripted",
+      responseRef: ref("answer-2"),
+      stopReason: "stop",
+      usage,
+    }, "run-1:turn:turn-1:step:2:model:completed");
+
+    await expect(recoverRun(ledger, "run-1")).resolves.toMatchObject({
+      priorUsage: {
+        input: 24,
+        output: 8,
+        cacheRead: 6,
+        cacheWrite: 2,
+      },
+    });
+  });
+
   it("verifies the latest committed projection checkpoint", async () => {
     const ledger = new MemoryLedger();
     await append(ledger, "run.created", {

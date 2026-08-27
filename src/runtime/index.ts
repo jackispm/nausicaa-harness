@@ -3,6 +3,8 @@ export * from "./main-loop.js";
 export * from "./recovery.js";
 export * from "./run-policy.js";
 export * from "./run-runtime.js";
+export * from "./run-token-budget.js";
+export * from "./run-token-budget-recovery.js";
 export * from "./reflection-scheduler.js";
 export * from "./session-controller.js";
 export * from "./teto-scheduler.js";

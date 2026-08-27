@@ -77,6 +77,8 @@ interface MutableLaneMetrics {
   modelFailures: number;
   chargedUsage: TokenUsage;
   modelUsage: TokenUsage;
+  usageCharges: UsageFact[];
+  usageTerminals: UsageFact[];
   contextBuildMs: number[];
   modelLatencyMs: number[];
   cacheOutcomes: CacheOutcome[];
@@ -84,6 +86,11 @@ interface MutableLaneMetrics {
   tetoPasses: number;
   advice: AdviceMetrics;
   budgetEvents: number;
+}
+
+interface UsageFact {
+  callKey?: string;
+  usage: TokenUsage;
 }
 
 interface PrefixObservation {
@@ -159,6 +166,8 @@ export function projectRunMetrics(
       modelFailures: 0,
       chargedUsage: emptyUsage(),
       modelUsage: emptyUsage(),
+      usageCharges: [],
+      usageTerminals: [],
       contextBuildMs: [],
       modelLatencyMs: [],
       cacheOutcomes: [],
@@ -200,6 +209,11 @@ export function projectRunMetrics(
       case "model.completed":
         current.modelCompletions += 1;
         current.modelUsage = addUsage(current.modelUsage, event.payload.usage);
+        current.usageTerminals.push(usageFact(
+          event.idempotencyKey,
+          ":model:completed",
+          event.payload.usage,
+        ));
         if (event.payload.modelLatencyMs !== undefined) {
           current.modelLatencyMs.push(event.payload.modelLatencyMs);
         }
@@ -213,10 +227,28 @@ export function projectRunMetrics(
       case "budget.charged":
         current.budgetEvents += 1;
         current.chargedUsage = addUsage(current.chargedUsage, event.payload.usage);
+        current.usageCharges.push(usageFact(
+          event.idempotencyKey,
+          ":budget",
+          event.payload.usage,
+        ));
         break;
       case "teto.observed":
         current.tetoPasses += 1;
         current.modelUsage = addUsage(current.modelUsage, event.payload.usage);
+        current.usageTerminals.push(usageFact(
+          event.idempotencyKey,
+          ":observed",
+          event.payload.usage,
+        ));
+        break;
+      case "reflection.observed":
+        current.modelUsage = addUsage(current.modelUsage, event.payload.usage);
+        current.usageTerminals.push(usageFact(
+          event.idempotencyKey,
+          ":observed",
+          event.payload.usage,
+        ));
         break;
       case "tool.requested":
         toolCalls += 1;
@@ -260,7 +292,14 @@ export function projectRunMetrics(
     materialized.set(laneId, finalizeLane(item));
   }
   const laneValues = [...materialized.values()];
-  const total = finalizeLane(mergeMutableLanes("total", [...lanes.values()]));
+  const mergedTotal = finalizeLane(mergeMutableLanes("total", [...lanes.values()]));
+  const total: LaneRunMetrics = {
+    ...mergedTotal,
+    usage: laneValues.reduce(
+      (sum, item) => addUsage(sum, item.usage),
+      emptyUsage(),
+    ),
+  };
   const advice = laneValues.reduce((sum, item) => mergeAdvice(sum, item.advice), emptyAdvice());
   const cacheTokens = total.usage.input + total.usage.cacheRead + total.usage.cacheWrite;
   return {
@@ -284,9 +323,7 @@ export function projectRunMetrics(
 function finalizeLane(item: MutableLaneMetrics): LaneRunMetrics {
   const cache = cacheMetrics(item.cacheOutcomes, item.prefixObservations);
   const chargedUsage = item.chargedUsage;
-  const usage = item.modelCompletions + item.tetoPasses > 0
-    ? item.modelUsage
-    : chargedUsage;
+  const usage = billableUsage(item.usageCharges, item.usageTerminals);
   return {
     laneId: item.laneId,
     modelRequests: item.modelRequests,
@@ -320,6 +357,8 @@ function mergeMutableLanes(
       (sum, item) => addUsage(sum, item.modelUsage),
       emptyUsage(),
     ),
+    usageCharges: values.flatMap((item) => item.usageCharges),
+    usageTerminals: values.flatMap((item) => item.usageTerminals),
     contextBuildMs: values.flatMap((item) => item.contextBuildMs),
     modelLatencyMs: values.flatMap((item) => item.modelLatencyMs),
     cacheOutcomes: values.flatMap((item) => item.cacheOutcomes),
@@ -330,6 +369,59 @@ function mergeMutableLanes(
     advice: values.reduce((sum, item) => mergeAdvice(sum, item.advice), emptyAdvice()),
     budgetEvents: values.reduce((sum, item) => sum + item.budgetEvents, 0),
   };
+}
+
+function usageFact(
+  idempotencyKey: string,
+  suffix: string,
+  usage: TokenUsage,
+): UsageFact {
+  return {
+    ...(idempotencyKey.endsWith(suffix)
+      ? { callKey: idempotencyKey.slice(0, -suffix.length) }
+      : {}),
+    usage,
+  };
+}
+
+function billableUsage(
+  charges: readonly UsageFact[],
+  terminals: readonly UsageFact[],
+): TokenUsage {
+  let total = charges.reduce(
+    (usage, fact) => addUsage(usage, fact.usage),
+    emptyUsage(),
+  );
+  const chargedCalls = new Set(charges.flatMap((fact) => (
+    fact.callKey === undefined ? [] : [fact.callKey]
+  )));
+  const unkeyedCharges = charges
+    .filter((fact) => fact.callKey === undefined)
+    .map((fact) => fact.usage);
+
+  for (const terminal of terminals) {
+    if (terminal.callKey !== undefined) {
+      if (!chargedCalls.has(terminal.callKey)) {
+        total = addUsage(total, terminal.usage);
+      }
+      continue;
+    }
+    const charge = unkeyedCharges.findIndex((usage) => sameUsage(usage, terminal.usage));
+    if (charge >= 0) {
+      unkeyedCharges.splice(charge, 1);
+    } else {
+      total = addUsage(total, terminal.usage);
+    }
+  }
+  return total;
+}
+
+function sameUsage(left: TokenUsage, right: TokenUsage): boolean {
+  return left.input === right.input
+    && left.output === right.output
+    && left.cacheRead === right.cacheRead
+    && left.cacheWrite === right.cacheWrite
+    && (left.costUsd ?? 0) === (right.costUsd ?? 0);
 }
 
 function mergeAdvice(left: AdviceMetrics, right: AdviceMetrics): AdviceMetrics {

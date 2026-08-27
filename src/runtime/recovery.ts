@@ -402,23 +402,66 @@ const recoverMainUsage = (
   events: readonly AnyEvent[],
   chargedUsage: TokenUsage,
 ): TokenUsage => {
-  const pending: TokenUsage[] = [];
-  for (const event of events) {
-    if (event.type === "model.completed" && event.laneId === "main") {
-      pending.push(event.payload.usage);
-    } else if (
-      event.type === "budget.charged"
-      && event.payload.laneId === "main"
-    ) {
-      const completedIndex = pending.findIndex((usage) =>
-        sameUsage(usage, event.payload.usage)
-      );
-      if (completedIndex >= 0) {
-        pending.splice(completedIndex, 1);
-      }
+  const charges = events.flatMap((event) => {
+    if (event.type !== "budget.charged" || event.payload.laneId !== "main") {
+      return [];
     }
+    return [{
+      usage: event.payload.usage,
+      callPrefix: stripUsageEventSuffix(event.idempotencyKey, ":budget"),
+    }];
+  });
+  const completions = events.flatMap((event) => {
+    if (event.type !== "model.completed" || event.laneId !== "main") return [];
+    return [{
+      usage: event.payload.usage,
+      callPrefix: stripUsageEventSuffix(event.idempotencyKey, ":model:completed"),
+    }];
+  });
+  const pairedCharges = new Set<number>();
+  const pairedCompletions = new Set<number>();
+
+  // Modern events identify the same physical provider call by their common
+  // idempotency prefix. Usage values are not identities: separate calls can
+  // legitimately report identical counters.
+  for (const [completionIndex, completion] of completions.entries()) {
+    if (completion.callPrefix === undefined) continue;
+    const chargeIndex = charges.findIndex((charge, index) =>
+      !pairedCharges.has(index) && charge.callPrefix === completion.callPrefix
+    );
+    if (chargeIndex < 0) continue;
+    pairedCharges.add(chargeIndex);
+    pairedCompletions.add(completionIndex);
   }
-  return pending.reduce(addUsage, chargedUsage);
+
+  // Historical ledgers used arbitrary keys. Retain their usage-based pairing,
+  // but never let it collapse two modern calls whose prefixes disagree.
+  for (const [completionIndex, completion] of completions.entries()) {
+    if (pairedCompletions.has(completionIndex)) continue;
+    const chargeIndex = charges.findIndex((charge, index) =>
+      !pairedCharges.has(index)
+      && (completion.callPrefix === undefined || charge.callPrefix === undefined)
+      && sameUsage(charge.usage, completion.usage)
+    );
+    if (chargeIndex < 0) continue;
+    pairedCharges.add(chargeIndex);
+    pairedCompletions.add(completionIndex);
+  }
+
+  const unchargedCompletions: TokenUsage[] = [];
+  for (const [index, completion] of completions.entries()) {
+    if (!pairedCompletions.has(index)) unchargedCompletions.push(completion.usage);
+  }
+  return unchargedCompletions.reduce(addUsage, chargedUsage);
+};
+
+const stripUsageEventSuffix = (
+  idempotencyKey: string,
+  suffix: string,
+): string | undefined => {
+  if (!idempotencyKey.endsWith(suffix)) return undefined;
+  const prefix = idempotencyKey.slice(0, -suffix.length);
+  return prefix.length === 0 ? undefined : prefix;
 };
 
 const addUsage = (left: TokenUsage, right: TokenUsage): TokenUsage => ({

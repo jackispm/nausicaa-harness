@@ -7,6 +7,7 @@ import type {
   ModelPort,
   ObservationFrame,
   RunId,
+  TokenUsage,
 } from "../domain/index.js";
 import { parseSingleJsonObject, systemClock } from "../domain/index.js";
 
@@ -86,23 +87,33 @@ export class IntentNavigator {
     if (response.stopReason === "length") {
       throw new TetoOutputError(
         `Teto output was truncated at the ${maxOutputTokens}-token limit`,
+        response.usage,
       );
     }
     if (response.toolCalls.length !== 0) {
-      throw new TetoOutputError("Teto must not request tools");
+      throw new TetoOutputError("Teto must not request tools", response.usage);
     }
     if (response.usage.output > maxOutputTokens) {
       throw new TetoOutputError(
         `Teto output used ${response.usage.output} tokens; limit is ${maxOutputTokens}`,
+        response.usage,
       );
     }
 
-    const advice = parseAdviceJson(response.content, {
-      adviceId: this.createAdviceId(),
-      sourceLane: this.laneId,
-      now,
-      boundaryId: request.frame.mainDelta.boundaryId,
-    });
+    let advice: Advice | undefined;
+    try {
+      advice = parseAdviceJson(response.content, {
+        adviceId: this.createAdviceId(),
+        sourceLane: this.laneId,
+        now,
+        boundaryId: request.frame.mainDelta.boundaryId,
+      });
+    } catch (error: unknown) {
+      if (error instanceof TetoOutputError) {
+        throw new TetoOutputError(error.message, response.usage);
+      }
+      throw error;
+    }
     return {
       ...(advice === undefined ? {} : { advice }),
       usage: response.usage,
@@ -127,6 +138,12 @@ const adviceKeys = [
 
 export class TetoOutputError extends Error {
   override readonly name = "TetoOutputError";
+  readonly usage: TokenUsage | undefined;
+
+  constructor(message: string, usage?: TokenUsage) {
+    super(message);
+    this.usage = usage === undefined ? undefined : structuredClone(usage);
+  }
 }
 
 export function parseAdviceJson(

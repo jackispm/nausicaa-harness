@@ -12,7 +12,7 @@ import type {
   TokenUsage,
 } from "../../src/domain/index.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
-import { WorkerTaskExecutor } from "../../src/runtime/index.js";
+import { RunTokenBudget, WorkerTaskExecutor } from "../../src/runtime/index.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
 
 class MutableClock implements Clock {
@@ -185,10 +185,11 @@ describe("Worker durable task budgets", () => {
     await appendModelRequested(fixture, 1);
     fixture.clock.advance(1_001);
     let providerCalls = 0;
+    const runTokenBudget = new RunTokenBudget(500);
     const executor = fixture.executor(async () => {
       providerCalls += 1;
       return response("second attempt completed", usage(3, 2));
-    });
+    }, runTokenBudget);
 
     await expect(executor.runOnce()).resolves.toMatchObject({ status: "completed" });
     expect(providerCalls).toBe(1);
@@ -198,6 +199,41 @@ describe("Worker durable task budgets", () => {
     expect(requests.map((event) => event.idempotencyKey)).toEqual([
       expect.stringContaining(":attempt:1:model:requested"),
       expect.stringContaining(":attempt:2:model:requested"),
+    ]);
+    expect(runTokenBudget.snapshot().settlements).toMatchObject([{
+      id: "run-1:worker:task:task-1:attempt:2:provider",
+      actualTokens: 5,
+    }]);
+  });
+
+  it("recovers charged-only attempt usage without double counting the retry", async () => {
+    const fixture = await claimedFixture({
+      maxModelTokens: 20,
+      maxWallClockMs: 60_000,
+      deadline: "2026-08-27T12:01:00.000Z",
+      maxAttempts: 2,
+    });
+    await appendModelRequested(fixture, 1);
+    await appendBudgetCharged(fixture, 1, usage(3, 2));
+    fixture.clock.advance(1_001);
+    let requestMaxOutput = 0;
+    const executor = fixture.executor(async (request) => {
+      requestMaxOutput = request.maxOutputTokens;
+      return response("retry completed", usage(4, 1));
+    });
+
+    await expect(executor.runOnce()).resolves.toMatchObject({
+      status: "completed",
+      usage: { input: 7, output: 3, cacheRead: 0, cacheWrite: 0 },
+    });
+    expect(requestMaxOutput).toBe(15);
+    const charges = (await fixture.ledger.read({ runId: "run-1" })).filter((event) => (
+      event.type === "budget.charged"
+    ));
+    expect(charges).toHaveLength(2);
+    expect(charges.map((event) => event.idempotencyKey)).toEqual([
+      attemptPrefix(1) + ":budget",
+      attemptPrefix(2) + ":budget",
     ]);
   });
 
@@ -349,7 +385,7 @@ interface Fixture {
   inbox: A2AInbox;
   store: MemoryContentAddressedStore;
   request: A2AMessage;
-  executor(complete: ModelPort["complete"]): WorkerTaskExecutor;
+  executor(complete: ModelPort["complete"], runTokenBudget?: RunTokenBudget): WorkerTaskExecutor;
 }
 
 async function claimedFixture(budget: TaskBudget): Promise<Fixture> {
@@ -373,13 +409,14 @@ async function claimedFixture(budget: TaskBudget): Promise<Fixture> {
     inbox,
     store,
     request,
-    executor: (complete) => new WorkerTaskExecutor({
+    executor: (complete, runTokenBudget) => new WorkerTaskExecutor({
       inbox,
       eventSink: ledger,
       store,
       model: { complete },
       modelName: "scripted/worker",
       runId: "run-1",
+      ...(runTokenBudget === undefined ? {} : { runTokenBudget }),
       workerLaneId: "worker",
       clock,
       createId: () => `recovered-claim-${++ids}`,
@@ -469,6 +506,23 @@ async function appendModelCompletion(
     occurredAt: fixture.clock.now().toISOString(),
   });
   return responseRef;
+}
+
+async function appendBudgetCharged(
+  fixture: Fixture,
+  attempt: number,
+  modelUsage: TokenUsage,
+): Promise<void> {
+  await fixture.ledger.append({
+    runId: "run-1",
+    laneId: "worker",
+    type: "budget.charged",
+    payload: { laneId: "worker", usage: modelUsage },
+    correlationId: "task-correlation-1",
+    idempotencyKey: attemptPrefix(attempt) + ":budget",
+    visibility: "run",
+    occurredAt: fixture.clock.now().toISOString(),
+  });
 }
 
 async function appendModelFailed(

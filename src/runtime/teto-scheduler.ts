@@ -20,6 +20,7 @@ import {
   IntentNavigator,
   ObservationFrameBuilder,
   TETO_SYSTEM_PROMPT,
+  TetoOutputError,
   TetoCadence,
   TokenRatioGate,
   type TetoCadenceState,
@@ -31,6 +32,7 @@ import type {
   MainBeforeStepContext,
   MainBoundaryMessage,
 } from "./main-loop.js";
+import type { RunTokenBudget } from "./run-token-budget.js";
 
 const DEFAULT_TETO_LANE = "teto";
 const DEFAULT_MAIN_LANE = "main";
@@ -59,6 +61,8 @@ export interface TetoSchedulerOptions {
   tetoLaneId?: LaneId;
   createId?: () => string;
   signal?: AbortSignal;
+  /** Shared admission gate for every provider call in this Run. */
+  runTokenBudget?: RunTokenBudget;
   /** Shadow preserves the observation and generated Advice facts without
    * claiming or delivering Advice to Main. */
   adviceDelivery?: TetoAdviceDelivery;
@@ -105,6 +109,7 @@ export class TetoScheduler {
   private readonly mainLaneId: LaneId;
   private readonly tetoLaneId: LaneId;
   private readonly createId: () => string;
+  private readonly runTokenBudget: RunTokenBudget | undefined;
   private readonly cadence: TetoCadence;
   private tokenGate: TokenRatioGate;
   private readonly signal: AbortSignal | undefined;
@@ -129,6 +134,7 @@ export class TetoScheduler {
     this.mainLaneId = options.mainLaneId ?? DEFAULT_MAIN_LANE;
     this.tetoLaneId = options.tetoLaneId ?? DEFAULT_TETO_LANE;
     this.createId = options.createId ?? randomUUID;
+    this.runTokenBudget = options.runTokenBudget;
     this.signal = options.signal;
     this.adviceDelivery = options.adviceDelivery ?? "live";
     this.goal = structuredClone(options.goal);
@@ -250,6 +256,10 @@ export class TetoScheduler {
     let mainCallIndex: number | undefined;
     let reservationId: string | undefined;
     let reservationSettled = false;
+    let runReservationId: string | undefined;
+    let runReservationSettled = false;
+    let providerUsage: TokenUsage | undefined;
+    let budgetChargeRecorded = false;
     let passCommitted = false;
     let observationSignal: AbortSignal | undefined;
     try {
@@ -289,6 +299,19 @@ export class TetoScheduler {
         wakePending = false;
         return;
       }
+      if (this.runTokenBudget !== undefined) {
+        runReservationId = runModelReservationId(
+          this.runId,
+          this.tetoLaneId,
+          decision.mainCallIndex,
+        );
+        if (this.runTokenBudget.reserve(runReservationId, reservationTokens) === undefined) {
+          this.tokenGate.cancel(reservationId);
+          this.cadence.skipPass(decision.mainCallIndex);
+          wakePending = false;
+          return;
+        }
+      }
 
       await this.recordLaneStatus(
         decision.mainCallIndex,
@@ -306,6 +329,17 @@ export class TetoScheduler {
         frame,
         signal,
       }), signal);
+      providerUsage = result.usage;
+      if (runReservationId !== undefined) {
+        this.runTokenBudget?.settle(runReservationId, result.usage);
+        runReservationSettled = true;
+      }
+      await this.recordBudgetCharge(
+        decision.mainCallIndex,
+        context.delta.boundaryId,
+        result.usage,
+      );
+      budgetChargeRecorded = true;
 
       await this.eventSink.append({
         runId: this.runId,
@@ -323,19 +357,8 @@ export class TetoScheduler {
         visibility: "run",
         occurredAt: this.clock.now().toISOString(),
       });
-      await this.eventSink.append({
-        runId: this.runId,
-        laneId: this.tetoLaneId,
-        type: "budget.charged",
-        payload: { laneId: this.tetoLaneId, usage: result.usage },
-        causationId: context.delta.boundaryId,
-        correlationId: this.runId,
-        idempotencyKey: `teto:${decision.mainCallIndex}:budget`,
-        visibility: "run",
-        occurredAt: this.clock.now().toISOString(),
-      });
-      this.settleReservation(reservationId, result.usage);
       reservationSettled = true;
+      this.settleReservation(reservationId, result.usage);
 
       if (result.advice !== undefined) {
         await this.eventSink.append({
@@ -375,8 +398,45 @@ export class TetoScheduler {
 
       await this.recordLaneStatus(decision.mainCallIndex, "dormant");
     } catch (error: unknown) {
+      providerUsage ??= error instanceof TetoOutputError
+        ? error.usage
+        : undefined;
+      let failure = error;
+      if (
+        runReservationId !== undefined
+        && !runReservationSettled
+        && providerUsage !== undefined
+      ) {
+        try {
+          this.runTokenBudget?.settle(runReservationId, providerUsage);
+          runReservationSettled = true;
+        } catch (settlementError: unknown) {
+          failure = new AggregateError(
+            [asError(error), asError(settlementError)],
+            "Teto usage could not be settled",
+          );
+        }
+      }
+      if (
+        reservationId !== undefined
+        && !reservationSettled
+        && providerUsage !== undefined
+      ) {
+        reservationSettled = true;
+        try {
+          this.settleReservation(reservationId, providerUsage);
+        } catch (settlementError: unknown) {
+          failure = new AggregateError(
+            [asError(failure), asError(settlementError)],
+            "Teto ratio usage could not be settled",
+          );
+        }
+      }
       if (reservationId !== undefined && !reservationSettled) {
         this.tokenGate.cancel(reservationId);
+      }
+      if (runReservationId !== undefined && !runReservationSettled) {
+        this.runTokenBudget?.cancel(runReservationId);
       }
       if (wakePending && !passCommitted) {
         try {
@@ -385,14 +445,26 @@ export class TetoScheduler {
           // The original failure remains authoritative; no pending pass remains.
         }
       }
-      if (isSignalAbort(error, observationSignal)) {
+      if (
+        providerUsage !== undefined
+        && !budgetChargeRecorded
+        && mainCallIndex !== undefined
+      ) {
+        await this.recordBudgetCharge(
+          mainCallIndex,
+          context.delta.boundaryId,
+          providerUsage,
+        );
+        budgetChargeRecorded = true;
+      }
+      if (isSignalAbort(failure, observationSignal)) {
         await this.recordLaneStatus(
           mainCallIndex ?? context.step,
           "cancelled",
-          persistedErrorText(error, "Observation cancelled before completion"),
+          persistedErrorText(failure, "Observation cancelled before completion"),
         );
       } else {
-        await this.recordFailure(`step:${context.step}`, error);
+        await this.recordFailure(`step:${context.step}`, failure);
       }
     }
   }
@@ -445,6 +517,24 @@ export class TetoScheduler {
     }
   }
 
+  private async recordBudgetCharge(
+    mainCallIndex: number,
+    causationId: string,
+    usage: TokenUsage,
+  ): Promise<void> {
+    await this.eventSink.append({
+      runId: this.runId,
+      laneId: this.tetoLaneId,
+      type: "budget.charged",
+      payload: { laneId: this.tetoLaneId, usage },
+      causationId,
+      correlationId: this.runId,
+      idempotencyKey: `teto:${mainCallIndex}:budget`,
+      visibility: "run",
+      occurredAt: this.clock.now().toISOString(),
+    });
+  }
+
   private async recordFailure(scope: string, error: unknown): Promise<void> {
     await this.eventSink.append({
       runId: this.runId,
@@ -473,7 +563,9 @@ export function recoverTetoSchedulerState(
   const pendingMainUsage: TokenUsage[] = [];
   const passCalls = new Set<number>();
   const observedCalls = new Set<number>();
-  let tetoTokens = 0;
+  const observedUsageByCall = new Map<number, TokenUsage>();
+  const chargedCalls = new Set<number>();
+  let chargedTetoTokens = 0;
   const adviceSources = new Map<string, LaneId>();
   let previousAdviceOutcome: PreviousAdviceOutcome | undefined;
 
@@ -496,7 +588,17 @@ export function recoverTetoSchedulerState(
       }
       observedCalls.add(call);
       passCalls.add(call);
-      tetoTokens += totalTokens(event.payload.usage);
+      observedUsageByCall.set(call, event.payload.usage);
+      continue;
+    }
+    if (
+      event.laneId === tetoLaneId
+      && event.type === "budget.charged"
+      && event.payload.laneId === tetoLaneId
+    ) {
+      chargedTetoTokens += totalTokens(event.payload.usage);
+      const match = /^teto:(\d+):budget$/.exec(event.idempotencyKey);
+      if (match !== null) chargedCalls.add(Number(match[1]));
       continue;
     }
     if (
@@ -556,7 +658,9 @@ export function recoverTetoSchedulerState(
         (total, call) => total + totalTokens(call.usage),
         0,
       ),
-      tetoTokens,
+      tetoTokens: chargedTetoTokens + [...observedUsageByCall]
+        .filter(([call]) => !chargedCalls.has(call))
+        .reduce((total, [, usage]) => total + totalTokens(usage), 0),
       reservations: [],
     },
     ...(previousAdviceOutcome === undefined ? {} : { previousAdviceOutcome }),
@@ -637,6 +741,14 @@ function estimateObservationTokens(frame: unknown): number {
 
 function estimateTokens(value: string): number {
   return Math.ceil(Buffer.byteLength(value, "utf8") / 4);
+}
+
+function runModelReservationId(
+  runId: RunId,
+  laneId: LaneId,
+  mainCallIndex: number,
+): string {
+  return `${runId}:lane:${laneId}:model:${mainCallIndex}`;
 }
 
 function createObservationSignal(

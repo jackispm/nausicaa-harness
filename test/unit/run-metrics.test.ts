@@ -166,6 +166,75 @@ describe("projectRunMetrics", () => {
     expect(projectRunMetrics([other, ...events].reverse(), "run-1").total.usage).toEqual(mainUsage);
   });
 
+  it("includes charged-only lane usage when another lane has model completions", async () => {
+    const ledger = new MemoryLedger();
+    await append(ledger, "model.completed", {
+      model: "main-model",
+      responseRef: ref("main-answer"),
+      stopReason: "stop",
+      usage: mainUsage,
+    }, "main", "2026-01-01T00:00:00.000Z");
+    await append(ledger, "budget.charged", {
+      laneId: "main",
+      usage: mainUsage,
+    }, "main", "2026-01-01T00:00:00.001Z");
+    await append(ledger, "budget.charged", {
+      laneId: "reflection",
+      usage: tetoUsage,
+    }, "reflection", "2026-01-01T00:00:00.002Z");
+
+    const metrics = projectRunMetrics(await ledger.read(), "run-1");
+
+    expect(metrics.lanes.reflection).toMatchObject({
+      modelCompletions: 0,
+      usage: tetoUsage,
+      chargedUsage: tetoUsage,
+      modelUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    expect(metrics.total.usage).toEqual({
+      input: 120,
+      output: 25,
+      cacheRead: 80,
+      cacheWrite: 10,
+      costUsd: 0.012,
+    });
+    expect(metrics.total.modelUsage).toEqual(mainUsage);
+    expect(metrics.total.chargedUsage).toEqual({
+      input: 120,
+      output: 25,
+      cacheRead: 80,
+      cacheWrite: 10,
+      costUsd: 0.012,
+    });
+  });
+
+  it("includes charged-only usage beside a successful call in the same lane", async () => {
+    const ledger = new MemoryLedger();
+    await append(ledger, "model.completed", {
+      model: "main-model",
+      responseRef: ref("main-answer"),
+      stopReason: "stop",
+      usage: mainUsage,
+    }, "main", "2026-01-01T00:00:00.000Z");
+    await append(ledger, "budget.charged", {
+      laneId: "main",
+      usage: mainUsage,
+    }, "main", "2026-01-01T00:00:00.001Z");
+    await append(ledger, "budget.charged", {
+      laneId: "main",
+      usage: tetoUsage,
+    }, "main", "2026-01-01T00:00:00.002Z");
+
+    expect(projectRunMetrics(await ledger.read(), "run-1").lanes.main?.usage)
+      .toEqual({
+        input: 120,
+        output: 25,
+        cacheRead: 80,
+        cacheWrite: 10,
+        costUsd: 0.012,
+      });
+  });
+
   it("reports prefix churn separately from provider cache outcomes", async () => {
     const ledger = new MemoryLedger();
     await append(ledger, "model.requested", {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { A2AInbox } from "../../src/a2a/index.js";
+import { A2AInbox, type EventSink } from "../../src/a2a/index.js";
 import type {
   A2AMessage,
   Goal,
@@ -11,7 +11,10 @@ import type {
 } from "../../src/domain/index.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
+import { projectRunMetrics } from "../../src/observability/index.js";
 import type { MainAfterStepContext } from "../../src/runtime/main-loop.js";
+import { RunTokenBudget } from "../../src/runtime/run-token-budget.js";
+import { recoverRunTokenUsage } from "../../src/runtime/run-token-budget-recovery.js";
 import {
   recoverTetoSchedulerState,
   TetoScheduler,
@@ -76,6 +79,146 @@ describe("TetoScheduler", () => {
     });
     expect((await ledger.read()).some((event) => event.type === "teto.observed"))
       .toBe(false);
+  });
+
+  it("silently skips when the shared Run budget cannot admit the provider call", async () => {
+    const model = new ScriptedModel([]);
+    const runTokenBudget = new RunTokenBudget(100, 100);
+    const { scheduler, ledger } = setup(model, { runTokenBudget });
+    enqueueFive(scheduler);
+
+    await scheduler.drain();
+
+    expect(model.callCount).toBe(0);
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 100,
+      reservedTokens: 0,
+      reservations: [],
+      settlements: [],
+    });
+    expect(scheduler.snapshot()).toMatchObject({
+      cadenceState: { mainCallIndex: 5, passCalls: [] },
+      tokenGateState: { tetoTokens: 0, reservations: [] },
+    });
+    expect((await ledger.read({ runId: "run-1" })).some((event) => (
+      event.type === "lane.status" && event.payload.status === "failed"
+    ))).toBe(false);
+  });
+
+  it("settles successful Teto usage under a lane-scoped reservation id", async () => {
+    const model = new ScriptedModel([silentResponse()]);
+    const runTokenBudget = new RunTokenBudget(100_000);
+    const { scheduler } = setup(model, { runTokenBudget });
+    enqueueFive(scheduler);
+
+    await scheduler.drain();
+
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 200,
+      reservedTokens: 0,
+      reservations: [],
+      settlements: [{
+        id: "run-1:lane:teto:model:2",
+        actualTokens: 200,
+      }],
+    });
+  });
+
+  it("charges a provider response even when Teto rejects its output protocol", async () => {
+    const malformed = silentResponse();
+    malformed.content = "not JSON";
+    malformed.usage = usage(120, 20, 30, 10);
+    const model = new ScriptedModel([malformed]);
+    const runTokenBudget = new RunTokenBudget(100_000);
+    const { scheduler, ledger } = setup(model, { runTokenBudget });
+    for (let step = 1; step <= 5; step += 1) {
+      const context = mainStep(step);
+      await recordMainBoundary(ledger, context);
+      scheduler.enqueue(context);
+    }
+
+    await scheduler.drain();
+    const events = await ledger.read({ runId: "run-1" });
+
+    expect(events.filter((event) => (
+      event.type === "budget.charged" && event.laneId === "teto"
+    ))).toHaveLength(1);
+    expect(events.some((event) => event.type === "teto.observed")).toBe(false);
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 180,
+      reservedTokens: 0,
+      settlements: [{
+        id: "run-1:lane:teto:model:2",
+        actualTokens: 180,
+      }],
+    });
+    expect(scheduler.snapshot().tokenGateState).toMatchObject({
+      tetoTokens: 180,
+      reservations: [],
+    });
+    expect(recoverRunTokenUsage(events, "run-1")).toEqual({
+      input: 6_620,
+      output: 1_020,
+      cacheRead: 30,
+      cacheWrite: 10,
+    });
+    expect(recoverTetoSchedulerState(events, { runId: "run-1" }))
+      .toMatchObject({ tokenGateState: { tetoTokens: 180 } });
+    expect(projectRunMetrics(events, "run-1").lanes.teto).toMatchObject({
+      tetoPasses: 0,
+      usage: malformed.usage,
+      chargedUsage: malformed.usage,
+    });
+  });
+
+  it("persists usage before a downstream observed-event failure", async () => {
+    const ledger = new MemoryLedger({ clock });
+    const eventSink: EventSink = {
+      append: async (event) => {
+        if (event.type === "teto.observed") {
+          throw new Error("observed sink unavailable");
+        }
+        return ledger.append(event);
+      },
+    };
+    const model = new ScriptedModel([silentResponse()]);
+    const runTokenBudget = new RunTokenBudget(100_000);
+    const { scheduler } = setup(model, {
+      ledger,
+      eventSink,
+      runTokenBudget,
+    });
+    for (let step = 1; step <= 5; step += 1) {
+      const context = mainStep(step);
+      await recordMainBoundary(ledger, context);
+      scheduler.enqueue(context);
+    }
+
+    await expect(scheduler.drain()).resolves.toBeUndefined();
+    const events = await ledger.read({ runId: "run-1" });
+
+    expect(events.filter((event) => (
+      event.type === "budget.charged" && event.laneId === "teto"
+    ))).toHaveLength(1);
+    expect(events.some((event) => event.type === "teto.observed")).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      type: "lane.status",
+      payload: {
+        status: "failed",
+        reason: expect.stringContaining("observed sink unavailable"),
+      },
+    });
+    expect(recoverRunTokenUsage(events, "run-1")).toEqual(usage(6_650, 1_050));
+    expect(recoverTetoSchedulerState(events, { runId: "run-1" }))
+      .toMatchObject({ tokenGateState: { tetoTokens: 200 } });
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 200,
+      reservedTokens: 0,
+      settlements: [{
+        id: "run-1:lane:teto:model:2",
+        actualTokens: 200,
+      }],
+    });
   });
 
   it("records a silent pass without publishing an Inbox message", async () => {
@@ -143,7 +286,8 @@ describe("TetoScheduler", () => {
       new Error("Teto provider unavailable"),
       silentResponse(),
     ]);
-    const { scheduler, ledger } = setup(model);
+    const runTokenBudget = new RunTokenBudget(100_000);
+    const { scheduler, ledger } = setup(model, { runTokenBudget });
     for (let step = 1; step <= 10; step += 1) {
       scheduler.enqueue(mainStep(step));
     }
@@ -163,6 +307,12 @@ describe("TetoScheduler", () => {
     expect(events.at(-1)).toMatchObject({
       type: "lane.status",
       payload: { status: "dormant" },
+    });
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 200,
+      reservedTokens: 0,
+      reservations: [],
+      settlements: [{ id: "run-1:lane:teto:model:7", actualTokens: 200 }],
     });
   });
 
@@ -194,7 +344,11 @@ describe("TetoScheduler", () => {
     const model = new ScriptedModel([
       () => new Promise<ModelResponse>(() => undefined),
     ]);
-    const { scheduler, ledger } = setup(model, { signal: controller.signal });
+    const runTokenBudget = new RunTokenBudget(100_000);
+    const { scheduler, ledger } = setup(model, {
+      signal: controller.signal,
+      runTokenBudget,
+    });
     enqueueFive(scheduler);
     await waitFor(() => model.callCount === 1);
 
@@ -207,6 +361,12 @@ describe("TetoScheduler", () => {
       && event.payload.status === "cancelled"
       && event.payload.reason?.includes("run cancelled")
     ))).toBe(true);
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 0,
+      reservedTokens: 0,
+      reservations: [],
+      settlements: [],
+    });
   });
 
   it("does not start an observer after caller cancellation", async () => {

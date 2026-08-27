@@ -53,6 +53,7 @@ import { createWorkspaceTools } from "../tools/index.js";
 import { createAdviceResponseTool } from "./advice-tool.js";
 import {
   MainLoop,
+  MainRunTokenBudgetExhaustedError,
   type MainBoundaryMessage,
   type MainStreamEvent,
 } from "./main-loop.js";
@@ -63,6 +64,8 @@ import {
 } from "./recovery.js";
 import { persistedErrorText } from "./redaction.js";
 import { resolveRunPolicy } from "./run-policy.js";
+import { RunTokenBudget } from "./run-token-budget.js";
+import { recoverRunTokenUsage } from "./run-token-budget-recovery.js";
 import { TetoScheduler } from "./teto-scheduler.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
 import { TaskDispatcher } from "./task-dispatcher.js";
@@ -192,6 +195,7 @@ interface AttachedRun {
   store: ContentAddressedStore;
   goal: Goal;
   policy: RunPolicy;
+  tokenBudget: RunTokenBudget;
   mainModel: string;
   worker?: WorkerLaneRuntime;
 }
@@ -363,7 +367,9 @@ export class SessionController {
 
   snapshot(): SessionSnapshot {
     const events = this.attached?.sink.cachedEvents ?? [];
-    const usage = usageFromEvents(events);
+    const usage = this.attached === undefined
+      ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+      : recoverRunTokenUsage(events, this.attached.runId);
     const pending = projectPendingAdmissions(events);
     const blocker = blockingReason(events);
     return {
@@ -911,6 +917,7 @@ export class SessionController {
         store,
         goal,
         policy: this.policy,
+        tokenBudget: new RunTokenBudget(this.policy.maxModelTokens),
         mainModel: this.model,
       };
       if (this.policy.workerEnabled === true) {
@@ -947,6 +954,7 @@ export class SessionController {
       model: this.deps.workerModel ?? this.deps.mainModel ?? createOpenRouterModelPort(),
       modelName: this.workerModel,
       runId: attached.runId,
+      runTokenBudget: attached.tokenBudget,
       clock: this.clock,
       readWatermark: () => attached.ledger.watermark(),
       readEvents: () => attached.ledger.read({ runId: attached.runId }),
@@ -997,6 +1005,10 @@ export class SessionController {
         store,
         goal: projection.goal,
         policy: projection.run.policy,
+        tokenBudget: new RunTokenBudget(
+          projection.run.policy.maxModelTokens,
+          totalTokens(recoverRunTokenUsage(events, runId)),
+        ),
         // Schema-v1 Runs created before model.selected keep the caller's
         // configured selector until the first explicit selection is recorded.
         mainModel: projection.lanes.main?.model ?? this.model,
@@ -1139,8 +1151,7 @@ export class SessionController {
         `turn:${turn.turnId}:running:${startStep}`,
         turn.turnId,
       );
-      const used = totalTokens(projectMainExecutionRecovery(events).usage);
-      const remaining = Math.max(0, attached.policy.maxModelTokens - used);
+      const remaining = attached.tokenBudget.availableTokens();
       if (remaining === 0) {
         await this.failRunBudget(turn.turnId);
         return;
@@ -1176,6 +1187,7 @@ export class SessionController {
           policy: attached.policy,
           events,
           clock: this.clock,
+          runTokenBudget: attached.tokenBudget,
           signal: turn.controller.signal,
         });
       }
@@ -1193,6 +1205,7 @@ export class SessionController {
         eventSink: attached.sink,
         tools,
         clock: this.clock,
+        runTokenBudget: attached.tokenBudget,
         beforeStep: async ({ step }) => {
           const continuation = outputContinuationMessageId === undefined
             ? []
@@ -1284,6 +1297,8 @@ export class SessionController {
           turn.controller.signal.reason,
           "Cancelled by user",
         ));
+      } else if (error instanceof MainRunTokenBudgetExhaustedError) {
+        await this.failRunBudget(turn.turnId);
       } else {
         const message = persistedErrorText(error);
         await attached.sink.append({
@@ -1873,23 +1888,6 @@ function latestResumableTurn(
     ...(turn.retryable === undefined ? {} : { retryable: turn.retryable }),
     ...(turn.resumeRequires === undefined ? {} : { resumeRequires: turn.resumeRequires }),
   };
-}
-
-function usageFromEvents(events: readonly AnyEvent[]): TokenUsage {
-  return events.reduce<TokenUsage>((total, event) => {
-    if (event.type !== "budget.charged") return total;
-    return {
-      input: total.input + event.payload.usage.input,
-      output: total.output + event.payload.usage.output,
-      cacheRead: total.cacheRead + event.payload.usage.cacheRead,
-      cacheWrite: total.cacheWrite + event.payload.usage.cacheWrite,
-      ...(
-        total.costUsd === undefined && event.payload.usage.costUsd === undefined
-          ? {}
-          : { costUsd: (total.costUsd ?? 0) + (event.payload.usage.costUsd ?? 0) }
-      ),
-    };
-  }, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 }
 
 function totalTokens(usage: TokenUsage): number {

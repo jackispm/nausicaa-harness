@@ -682,7 +682,7 @@ describe("SessionController", () => {
       model: "scripted",
       policy: {
         maxMainStepsPerActivation: 1,
-        maxModelTokens: 30,
+        maxModelTokens: 10_000,
         tetoEnabled: false,
       },
     }, {
@@ -786,8 +786,9 @@ describe("SessionController", () => {
     expect(resumedModel.requests[0]?.messages.map((message) => message.content))
       .toContain("orphan committed answer");
     // Main used 12 tokens before the crash and committed another 8 without a
-    // charge. The unrelated 6,000-token Teto charge must not consume Main's 30.
-    expect(resumedModel.requests[0]?.maxOutputTokens).toBe(10);
+    // charge. The 6,000-token Teto charge shares the same 10,000-token Run cap.
+    expect(resumedModel.requests[0]?.maxOutputTokens).toBeGreaterThan(0);
+    expect(resumedModel.requests[0]?.maxOutputTokens).toBeLessThanOrEqual(3_980);
     await resumed.close();
 
     const recoveredLedger = await JsonlLedger.open(join(stateDir, "ledger.jsonl"));

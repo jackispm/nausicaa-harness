@@ -14,6 +14,7 @@ import { MemoryLedger } from "../../src/ledger/index.js";
 import { sha256, stableJson } from "../../src/ledger/hash.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import {
+  RunTokenBudget,
   WorkerTaskExecutor,
   WorkerTaskTimeoutError,
 } from "../../src/runtime/index.js";
@@ -60,6 +61,7 @@ async function setup(
   model: ModelPort,
   input = "npm install",
   budget?: { maxModelTokens: number; maxWallClockMs: number },
+  runTokenBudget?: RunTokenBudget,
 ) {
   const clock: Clock = {
     now: () => new Date("2026-08-27T12:00:00.000Z"),
@@ -78,6 +80,7 @@ async function setup(
     model,
     modelName: "scripted/worker",
     runId: "run-1",
+    ...(runTokenBudget === undefined ? {} : { runTokenBudget }),
     workerLaneId: "worker-1",
     clock,
     createId: () => `fixed-id-${++idSequence}`,
@@ -91,6 +94,83 @@ async function setup(
 }
 
 describe("WorkerTaskExecutor", () => {
+  it("admits Worker with a shared Run budget, narrows output, and settles actual usage", async () => {
+    const runTokenBudget = new RunTokenBudget(400);
+    const model = new ScriptedModel([{
+      content: "Bounded result",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: { input: 20, output: 5, cacheRead: 0, cacheWrite: 0 },
+    }]);
+    const { executor, ledger } = await setup(model, "input", {
+      maxModelTokens: 1_000,
+      maxWallClockMs: 5_000,
+    }, runTokenBudget);
+
+    await expect(executor.runOnce()).resolves.toMatchObject({ status: "completed" });
+    expect(model.requests[0]?.maxOutputTokens).toBeGreaterThan(0);
+    expect(model.requests[0]?.maxOutputTokens).toBeLessThan(400);
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 25,
+      reservedTokens: 0,
+      availableTokens: 375,
+      settlements: [{
+        id: "run-1:worker-1:task:task-1:attempt:1:provider",
+        reservedTokens: 400,
+        actualTokens: 25,
+      }],
+    });
+    const eventTypes = (await ledger.read({ runId: "run-1" })).map((event) => event.type);
+    expect(eventTypes.indexOf("budget.charged"))
+      .toBeLessThan(eventTypes.indexOf("model.completed"));
+  });
+
+  it("fails only its task when the shared Run budget cannot fit Worker input", async () => {
+    const runTokenBudget = new RunTokenBudget(1);
+    const model = new ScriptedModel([{
+      content: "must not run",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    }]);
+    const { executor, ledger } = await setup(model, "input", undefined, runTokenBudget);
+
+    await expect(executor.runOnce()).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("run-budget-exhausted"),
+    });
+    expect(model.requests).toHaveLength(0);
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 0,
+      reservedTokens: 0,
+      availableTokens: 1,
+    });
+    expect((await ledger.read({ runId: "run-1" })).some((event) => (
+      event.type === "model.requested"
+    ))).toBe(false);
+  });
+
+  it("releases Worker's shared reservation when the provider fails", async () => {
+    const runTokenBudget = new RunTokenBudget(400);
+    const { executor } = await setup(
+      new ScriptedModel([new Error("provider unavailable")]),
+      "input",
+      undefined,
+      runTokenBudget,
+    );
+
+    await expect(executor.runOnce()).resolves.toMatchObject({
+      status: "failed",
+      reason: "provider unavailable",
+    });
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 0,
+      reservedTokens: 0,
+      availableTokens: 400,
+      settlements: [],
+    });
+  });
+
   it("executes one bounded handoff and returns artifact evidence", async () => {
     const model = new ScriptedModel([(_request: ModelRequest): ModelResponse => ({
       content: "Run `npm install`.",
@@ -120,9 +200,9 @@ describe("WorkerTaskExecutor", () => {
       "message.claimed",
       "message.sent",
       "model.requested",
+      "budget.charged",
       "model.completed",
       "assistant.message",
-      "budget.charged",
       "message.sent",
       "message.handled",
     ]);
@@ -236,10 +316,11 @@ describe("WorkerTaskExecutor", () => {
         resolveModel = resolve;
       }),
     };
+    const runTokenBudget = new RunTokenBudget(400);
     const { executor, inbox, ledger } = await setup(model, "input", {
       maxModelTokens: 100,
       maxWallClockMs: 5_000,
-    });
+    }, runTokenBudget);
 
     const running = executor.runOnce();
     for (let attempt = 0; attempt < 20 && resolveModel === undefined; attempt += 1) {
@@ -270,6 +351,11 @@ describe("WorkerTaskExecutor", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(await ledger.read({ runId: "run-1" })).toEqual(beforeLateResponse);
     expect(inbox.snapshot().records[0]?.status).toBe("claimed");
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 0,
+      reservedTokens: 0,
+      availableTokens: 400,
+    });
     await expect(executor.runOnce()).resolves.toEqual({ status: "idle", reason: "stopped" });
   });
 

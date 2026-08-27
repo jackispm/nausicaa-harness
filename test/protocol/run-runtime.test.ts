@@ -507,6 +507,126 @@ describe("executeRun", () => {
     await ledger.close();
   });
 
+  it("restores all-lane usage before admitting Main on resume", async () => {
+    const root = await temporaryRoot();
+    const dataDir = join(root, "state");
+    const first = await executeRun({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      message: "Start a bounded task",
+      policy: {
+        maxMainSteps: 2,
+        maxModelTokens: 10_000,
+        tetoEnabled: false,
+      },
+    }, {
+      mainModel: new ScriptedModel([{
+        ...response("Partial answer"),
+        stopReason: "length",
+      }]),
+      createRunId: () => "all-lane-budget-resume",
+    });
+    const ledger = await JsonlLedger.open(join(first.stateDir, "ledger.jsonl"));
+    await ledger.append({
+      runId: first.runId,
+      laneId: "worker",
+      type: "budget.charged",
+      payload: {
+        laneId: "worker",
+        usage: { input: 9_980, output: 0, cacheRead: 0, cacheWrite: 0 },
+      },
+      correlationId: `run:${first.runId}`,
+      idempotencyKey: `${first.runId}:worker:recovered:budget`,
+      visibility: "run",
+    });
+    await ledger.close();
+
+    const resumedModel = new ScriptedModel([response("must not run")]);
+    const resumed = await executeRun({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      resumeRunId: first.runId,
+    }, { mainModel: resumedModel });
+
+    expect(resumed).toMatchObject({
+      completed: false,
+      steps: 0,
+      blocker: "run-budget-or-step-limit",
+    });
+    expect(resumedModel.callCount).toBe(0);
+    expect(resumed.metrics.total.usage).toEqual({
+      input: 10_000,
+      output: 5,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
+  });
+
+  it("returns durable progress when Teto wins a reservation race after preflight", async () => {
+    const root = await temporaryRoot();
+    const firstText = `First committed step ${"a".repeat(1_200)}`;
+    const secondText = `Second committed step ${"b".repeat(1_200)}`;
+    const toolUse = (content: string, id: string): ModelResponse => ({
+      ...response(content, 1_800, 200),
+      stopReason: "toolUse",
+      toolCalls: [{ id, name: "noop", arguments: {} }],
+    });
+    const mainModel = new ScriptedModel([
+      toolUse(firstText, "race-call-1"),
+      toolUse(secondText, "race-call-2"),
+      response("must not run"),
+    ]);
+    const tetoModel = new ScriptedModel([
+      async () => new Promise<ModelResponse>(() => undefined),
+    ]);
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "main-scripted",
+      tetoModel: "teto-scripted",
+      message: "Complete three bounded tool steps",
+      maxOutputTokens: 200,
+      policy: {
+        maxMainSteps: 3,
+        maxModelTokens: 5_000,
+        tetoMaxOutputTokens: 200,
+        tetoTokenRatio: 0.25,
+      },
+    }, {
+      mainModel,
+      tetoModel,
+      tools: [noopTool],
+      createRunId: () => "main-reservation-race",
+    });
+
+    expect(result).toMatchObject({
+      finalText: secondText,
+      completed: false,
+      steps: 2,
+      usage: { input: 3_600, output: 400, cacheRead: 0, cacheWrite: 0 },
+      blocker: "run-budget-or-step-limit",
+    });
+    expect(mainModel.callCount).toBe(2);
+    expect(tetoModel.callCount).toBe(1);
+    const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
+    const events = await ledger.read({ runId: result.runId });
+    expect(events.filter((event) => (
+      event.type === "model.requested" && event.laneId === "main"
+    ))).toHaveLength(2);
+    expect(events.some((event) => event.type === "run.failed")).toBe(false);
+    expect(events.some((event) => (
+      event.type === "lane.status"
+      && event.laneId === "main"
+      && event.payload.status === "waiting"
+      && event.payload.reason === "Run budget or Step limit exhausted"
+    ))).toBe(true);
+    expect(events.at(-1)?.type).toBe("checkpoint.committed");
+    await ledger.close();
+  });
+
   it("preserves one-shot images across recovery without writing them to the Ledger", async () => {
     const root = await temporaryRoot();
     const dataDir = join(root, "state");
