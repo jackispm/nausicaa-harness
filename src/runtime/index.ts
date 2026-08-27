@@ -7,4 +7,5 @@ export * from "./reflection-scheduler.js";
 export * from "./session-controller.js";
 export * from "./teto-scheduler.js";
 export * from "./task-dispatcher.js";
+export * from "./delegate-task-tool.js";
 export * from "./worker-task-executor.js";
