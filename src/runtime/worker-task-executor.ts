@@ -92,6 +92,10 @@ export class WorkerTaskExecutor {
   private readonly readWatermark: (() => Promise<number>) | undefined;
   private readonly stopController = new AbortController();
   private readonly activeRuns = new Set<Promise<WorkerTaskRunResult>>();
+  // Keep the execution lane serial even when multiple wakeups arrive from
+  // different schedulers. Inbox claiming is atomic, but the model call and
+  // terminal reply must also have one bounded owner at a time.
+  private runTail: Promise<void> = Promise.resolve();
   private stopped = false;
 
   constructor(options: WorkerTaskExecutorOptions) {
@@ -118,9 +122,12 @@ export class WorkerTaskExecutor {
   }
 
   runOnce(): Promise<WorkerTaskRunResult> {
-    if (this.stopped) return Promise.resolve({ status: "idle", reason: "stopped" });
-    throwIfAborted(this.signal);
-    const operation = this.runOnceInternal();
+    const operation = this.runTail.then(() => {
+      if (this.stopped) return { status: "idle" as const, reason: "stopped" };
+      throwIfAborted(this.signal);
+      return this.runOnceInternal();
+    });
+    this.runTail = operation.then(() => undefined, () => undefined);
     this.activeRuns.add(operation);
     const remove = (): void => {
       this.activeRuns.delete(operation);

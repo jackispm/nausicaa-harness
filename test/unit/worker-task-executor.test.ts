@@ -229,4 +229,37 @@ describe("WorkerTaskExecutor", () => {
     expect(inbox.snapshot().records[0]?.status).toBe("claimed");
     await expect(executor.runOnce()).resolves.toEqual({ status: "idle", reason: "stopped" });
   });
+
+  it("serializes concurrent runOnce calls on the Worker lane", async () => {
+    let active = 0;
+    let maximum = 0;
+    const model: ModelPort = {
+      complete: async () => {
+        active += 1;
+        maximum = Math.max(maximum, active);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        active -= 1;
+        return {
+          content: "done",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+        };
+      },
+    };
+    const { executor, inbox } = await setup(model);
+    const second = taskMessage([]);
+    second.messageId = "task-message-2";
+    second.idempotencyKey = "task-send-2";
+    if (second.payload.type !== "task.request") throw new Error("expected task request");
+    second.payload.taskId = "task-2";
+    await inbox.send(second);
+    const results = await Promise.all([executor.runOnce(), executor.runOnce()]);
+    expect(results.map((result) => result.status)).toEqual(["completed", "completed"]);
+    expect(maximum).toBe(1);
+    const requests = inbox.snapshot().records.filter((record) => (
+      record.message.payload.type === "task.request"
+    ));
+    expect(requests.map((record) => record.status)).toEqual(["handled", "handled"]);
+  });
 });

@@ -9,6 +9,10 @@ const DEFAULT_MAIN_LANE = "main";
 const DEFAULT_WORKER_LANE = "worker";
 const DEFAULT_BOUNDARY_LIMIT = 4;
 const MAX_BOUNDARY_LIMIT = 32;
+const DEFAULT_MAX_PENDING_ACTIVATIONS = 8;
+const MAX_PENDING_ACTIVATIONS = 64;
+const DEFAULT_MAX_TASKS_PER_ACTIVATION = 8;
+const MAX_TASKS_PER_ACTIVATION = 64;
 const DEFAULT_STOP_WAIT_MS = 250;
 const MAX_STOP_WAIT_MS = 10_000;
 
@@ -31,6 +35,10 @@ export interface WorkerLaneSchedulerOptions {
   mainLaneId?: LaneId;
   workerLaneId?: LaneId;
   maxResultsPerBoundary?: number;
+  /** Maximum active + queued Worker activations; extra enqueues coalesce. */
+  maxPendingActivations?: number;
+  /** Maximum tasks consumed by one activation before yielding to Main. */
+  maxTasksPerActivation?: number;
   createId?: () => string;
   signal?: AbortSignal;
   stopWaitMs?: number;
@@ -47,6 +55,8 @@ export class WorkerLaneScheduler {
   private readonly mainLaneId: LaneId;
   private readonly workerLaneId: LaneId;
   private readonly maxResultsPerBoundary: number;
+  private readonly maxPendingActivations: number;
+  private readonly maxTasksPerActivation: number;
   private readonly createId: () => string;
   private readonly signal: AbortSignal | undefined;
   private readonly stopWaitMs: number;
@@ -54,6 +64,9 @@ export class WorkerLaneScheduler {
   private readonly delivered = new Map<string, InboxRecord>();
   private readonly failures: Error[] = [];
   private tail: Promise<void> = Promise.resolve();
+  private receiptTail: Promise<void> = Promise.resolve();
+  private pendingActivationCount = 0;
+  private droppedWakeups = 0;
   private accepting = true;
 
   constructor(options: WorkerLaneSchedulerOptions) {
@@ -74,6 +87,29 @@ export class WorkerLaneScheduler {
     this.mainLaneId = options.mainLaneId ?? DEFAULT_MAIN_LANE;
     this.workerLaneId = options.workerLaneId ?? DEFAULT_WORKER_LANE;
     this.maxResultsPerBoundary = maxResultsPerBoundary;
+    const maxPendingActivations = options.maxPendingActivations ?? DEFAULT_MAX_PENDING_ACTIVATIONS;
+    if (
+      !Number.isSafeInteger(maxPendingActivations)
+      || maxPendingActivations < 1
+      || maxPendingActivations > MAX_PENDING_ACTIVATIONS
+    ) {
+      throw new RangeError(
+        `maxPendingActivations must be an integer between 1 and ${MAX_PENDING_ACTIVATIONS}`,
+      );
+    }
+    this.maxPendingActivations = maxPendingActivations;
+    const maxTasksPerActivation = options.maxTasksPerActivation
+      ?? DEFAULT_MAX_TASKS_PER_ACTIVATION;
+    if (
+      !Number.isSafeInteger(maxTasksPerActivation)
+      || maxTasksPerActivation < 1
+      || maxTasksPerActivation > MAX_TASKS_PER_ACTIVATION
+    ) {
+      throw new RangeError(
+        `maxTasksPerActivation must be an integer between 1 and ${MAX_TASKS_PER_ACTIVATION}`,
+      );
+    }
+    this.maxTasksPerActivation = maxTasksPerActivation;
     this.createId = options.createId ?? randomUUID;
     this.signal = options.signal;
     const stopWaitMs = options.stopWaitMs ?? DEFAULT_STOP_WAIT_MS;
@@ -96,31 +132,33 @@ export class WorkerLaneScheduler {
     return this.stopController.signal;
   }
 
+  /** Number of active or queued Worker activations. */
+  get pendingActivations(): number {
+    return this.pendingActivationCount;
+  }
+
+  /** Number of redundant wakeups coalesced by the activation bound. */
+  get droppedWakeupsCount(): number {
+    return this.droppedWakeups;
+  }
+
   /** Called from Main's synchronous afterStep hook. */
   enqueue(context?: MainAfterStepContext): void {
     if (!this.accepting) return;
-    const boundary = context === undefined
-      ? undefined
-      : {
-          runId: context.runId,
-          laneId: context.laneId,
-          boundaryMessageIds: [...context.boundaryMessageIds],
-        };
-    const operation = this.tail.then(async () => {
-      if (boundary !== undefined) {
-        if (boundary.runId !== this.runId || boundary.laneId !== this.mainLaneId) {
-          throw new Error(
-            `Worker lane scheduler for ${this.runId}/${this.mainLaneId} received ${boundary.runId}/${boundary.laneId}`,
-          );
-        }
-        await this.acknowledgeDelivered(boundary.boundaryMessageIds);
+    if (context !== undefined) {
+      if (context.runId !== this.runId || context.laneId !== this.mainLaneId) {
+        this.failures.push(new Error(
+          `Worker lane scheduler for ${this.runId}/${this.mainLaneId} received ${context.runId}/${context.laneId}`,
+        ));
+        return;
       }
-      if (this.stopController.signal.aborted || this.signal?.aborted) return;
-      await this.executor.runOnce();
-    });
-    this.tail = operation.catch((error: unknown) => {
-      this.failures.push(asError(error));
-    });
+      this.scheduleAcknowledgements(context.boundaryMessageIds);
+    }
+    if (this.pendingActivationCount >= this.maxPendingActivations) {
+      this.droppedWakeups += 1;
+      return;
+    }
+    this.scheduleActivation();
   }
 
   /** Claim completed Worker replies for the next Main natural boundary. */
@@ -166,9 +204,10 @@ export class WorkerLaneScheduler {
   /** Wait for already scheduled work without starting an unbounded drain. */
   async drain(): Promise<readonly Error[]> {
     while (true) {
-      const observed = this.tail;
-      await observed;
-      if (observed === this.tail) break;
+      const observedWorker = this.tail;
+      const observedReceipts = this.receiptTail;
+      await Promise.all([observedWorker, observedReceipts]);
+      if (observedWorker === this.tail && observedReceipts === this.receiptTail) break;
     }
     return [...this.failures];
   }
@@ -187,6 +226,33 @@ export class WorkerLaneScheduler {
       this.failures.push(asError(error));
     }
     return this.drainWithin(this.stopWaitMs);
+  }
+
+  private scheduleActivation(): void {
+    if (!this.accepting || this.pendingActivationCount >= this.maxPendingActivations) return;
+    this.pendingActivationCount += 1;
+    const operation = this.tail.then(async () => {
+      if (this.stopController.signal.aborted || this.signal?.aborted) return;
+      for (let index = 0; index < this.maxTasksPerActivation; index += 1) {
+        const result = await this.executor.runOnce();
+        if (result.status === "idle") break;
+        if (this.stopController.signal.aborted || this.signal?.aborted) break;
+      }
+    });
+    this.tail = operation.catch((error: unknown) => {
+      this.failures.push(asError(error));
+    }).finally(() => {
+      this.pendingActivationCount -= 1;
+    });
+  }
+
+  private scheduleAcknowledgements(messageIds: readonly string[]): void {
+    if (messageIds.length === 0) return;
+    const ids = [...new Set(messageIds)];
+    const operation = this.receiptTail.then(() => this.acknowledgeDelivered(ids));
+    this.receiptTail = operation.catch((error: unknown) => {
+      this.failures.push(asError(error));
+    });
   }
 
   private async acknowledgeDelivered(messageIds: readonly string[]): Promise<void> {
