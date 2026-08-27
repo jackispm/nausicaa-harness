@@ -82,6 +82,102 @@ describe("SessionController", () => {
     await session.close();
   });
 
+  it("runs an opt-in Worker lane and delivers its result at a later Main boundary", async () => {
+    const root = await temporaryRoot();
+    let markWorkerStarted: (() => void) | undefined;
+    const workerStarted = new Promise<void>((resolve) => {
+      markWorkerStarted = resolve;
+    });
+    let releaseWorker: ((value: ModelResponse) => void) | undefined;
+    const workerModel = new ScriptedModel([async () => {
+      markWorkerStarted?.();
+      return new Promise<ModelResponse>((resolve) => {
+        releaseWorker = resolve;
+      });
+    }]);
+    const mainModel = new ScriptedModel([
+      {
+        ...response("Delegating a bounded inspection"),
+        toolCalls: [{
+          id: "delegate-1",
+          name: "delegate_task",
+          arguments: {
+            taskId: "task-1",
+            statement: "Inspect the package metadata",
+            successCriteria: ["Return the package name"],
+            maxModelTokens: 200,
+            maxWallClockMs: 5_000,
+          },
+        }],
+        stopReason: "toolUse",
+      },
+      async () => {
+        await workerStarted;
+        releaseWorker?.(response("package name: nausicaa"));
+        return {
+          ...response("Give the Worker one more boundary"),
+          toolCalls: [{ id: "wait-1", name: "noop", arguments: {} }],
+          stopReason: "toolUse",
+        };
+      },
+      (request) => {
+        expect(request.messages.some((message) => (
+          message.role === "user"
+          && message.content.includes("Worker task task-1 completed")
+          && message.content.includes("package name: nausicaa")
+        ))).toBe(true);
+        return response("Worker result incorporated");
+      },
+    ]);
+    const events: SessionRuntimeEvent[] = [];
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted/main",
+      workerModel: "scripted/worker",
+      workerEnabled: true,
+      policy: {
+        maxMainStepsPerActivation: 4,
+        maxModelTokens: 10_000,
+        tetoEnabled: false,
+      },
+    }, {
+      mainModel,
+      workerModel,
+      tools: [noopTool],
+      createRunId: () => "session-worker-run",
+    });
+    session.subscribe((event) => events.push(event));
+
+    expect(session.snapshot()).toMatchObject({ workerEnabled: true });
+    await session.submit({ inputId: "worker-input", text: "Inspect the package metadata" });
+    await session.waitForIdle();
+
+    expect(mainModel.requests[0]?.tools.some((tool) => tool.name === "delegate_task")).toBe(true);
+    expect(workerModel.callCount).toBe(1);
+    expect(mainModel.requests[2]?.messages.some((message) => (
+      message.role === "user" && message.content.includes("Worker task task-1 completed")
+    ))).toBe(true);
+    expect(mainModel.requests[2]?.messages.some((message) => (
+      message.role === "user" && message.content.includes("package name: nausicaa")
+    ))).toBe(true);
+    expect(durableEvents(events).some((event) => (
+      event.type === "lane.registered"
+      && event.laneId === "worker"
+      && event.payload.kind === "worker"
+    ))).toBe(true);
+    expect(durableEvents(events).some((event) => (
+      event.type === "message.sent"
+      && event.payload.message.payload.type === "task.request"
+    ))).toBe(true);
+    expect(durableEvents(events).some((event) => (
+      event.type === "message.sent"
+      && event.payload.message.payload.type === "task.result"
+      && event.payload.message.payload.taskId === "task-1"
+    ))).toBe(true);
+    await session.close();
+  });
+
   it("passes the configured per-call output limit to Main", async () => {
     const root = await temporaryRoot();
     const model = new ScriptedModel([response("bounded answer")]);

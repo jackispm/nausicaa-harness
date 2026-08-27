@@ -60,6 +60,10 @@ import {
 import { persistedErrorText } from "./redaction.js";
 import { resolveRunPolicy } from "./run-policy.js";
 import { TetoScheduler } from "./teto-scheduler.js";
+import { createDelegateTaskTool } from "./delegate-task-tool.js";
+import { TaskDispatcher } from "./task-dispatcher.js";
+import { WorkerLaneScheduler } from "./worker-lane-scheduler.js";
+import { WorkerTaskExecutor } from "./worker-task-executor.js";
 import {
   MESSAGE_MEDIA_TYPE,
   projectPendingAdmissions,
@@ -109,6 +113,7 @@ export interface SessionSnapshot {
   status: SessionControllerStatus;
   model: string;
   tetoEnabled: boolean;
+  workerEnabled: boolean;
   allowWrite: boolean;
   allowShell: boolean;
   pendingInputs: number;
@@ -136,6 +141,9 @@ export interface SessionControllerOptions {
   dataDir: string;
   model: string;
   tetoModel?: string;
+  workerModel?: string;
+  /** Opt-in bounded Worker lane; omitted or false preserves Main-only behavior. */
+  workerEnabled?: boolean;
   policy?: Partial<RunPolicy>;
   maxOutputTokens?: number;
   allowWrite?: boolean;
@@ -146,6 +154,7 @@ export interface SessionControllerOptions {
 export interface SessionControllerDeps {
   mainModel?: ModelPort;
   tetoModel?: ModelPort;
+  workerModel?: ModelPort;
   tools?: readonly AgentTool[];
   clock?: Clock;
   createRunId?: () => string;
@@ -175,6 +184,7 @@ export class SessionController {
   readonly dataDir: string;
   readonly model: string;
   readonly tetoModel: string;
+  readonly workerModel: string;
   readonly maxOutputTokens: number;
   readonly allowWrite: boolean;
   readonly allowShell: boolean;
@@ -182,6 +192,7 @@ export class SessionController {
   private readonly deps: SessionControllerDeps;
   private readonly clock: Clock;
   private readonly policy: RunPolicy;
+  private readonly requestedWorkerEnabled: boolean | undefined;
   private readonly listeners = new Set<(event: SessionRuntimeEvent) => void>();
   private attached: AttachedRun | undefined;
   private active: ActiveTurn | undefined;
@@ -201,12 +212,19 @@ export class SessionController {
     this.dataDir = dataDir;
     this.model = options.model;
     this.tetoModel = options.tetoModel ?? options.model;
+    this.workerModel = options.workerModel ?? options.model;
     this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS;
     this.allowWrite = options.allowWrite === true;
     this.allowShell = options.allowShell === true;
     this.deps = deps;
     this.clock = deps.clock ?? systemClock;
-    this.policy = resolveRunPolicy(options.policy);
+    this.requestedWorkerEnabled = options.workerEnabled ?? options.policy?.workerEnabled;
+    this.policy = resolveRunPolicy({
+      ...options.policy,
+      ...(options.workerEnabled === undefined
+        ? {}
+        : { workerEnabled: options.workerEnabled }),
+    });
   }
 
   static async open(
@@ -259,6 +277,8 @@ export class SessionController {
       status: this.status,
       model: this.model,
       tetoEnabled: this.attached?.policy.tetoEnabled ?? this.policy.tetoEnabled,
+      workerEnabled: this.attached?.policy.workerEnabled === true
+        || (this.attached === undefined && this.policy.workerEnabled === true),
       allowWrite: this.allowWrite,
       allowShell: this.allowShell,
       pendingInputs: pending.length,
@@ -727,6 +747,17 @@ export class SessionController {
           visibility: "run",
         });
       }
+      if (this.policy.workerEnabled === true) {
+        await sink.append({
+          runId,
+          laneId: "worker",
+          type: "lane.registered",
+          payload: { kind: "worker" },
+          correlationId: `run:${runId}`,
+          idempotencyKey: "lane:worker:registered",
+          visibility: "run",
+        });
+      }
       this.attached = { runId, ledger, sink, store, goal, policy: this.policy };
       this.status = "idle";
     } catch (error: unknown) {
@@ -754,6 +785,12 @@ export class SessionController {
         throw new SessionProtocolError(
           `Run ${runId} belongs to ${recordedWorkspace}, not ${this.workspace}`,
         );
+      }
+      if (
+        this.requestedWorkerEnabled !== undefined
+        && this.requestedWorkerEnabled !== (projection.run.policy.workerEnabled === true)
+      ) {
+        throw new SessionProtocolError("Cannot change workerEnabled while resuming a Run");
       }
       return {
         runId,
@@ -873,6 +910,7 @@ export class SessionController {
   private async runTurn(turn: ActiveTurn): Promise<void> {
     const attached = this.requireAttached();
     let scheduler: TetoScheduler | undefined;
+    let workerScheduler: WorkerLaneScheduler | undefined;
     try {
       const events = await attached.ledger.read({ runId: attached.runId });
       const projection = projectRun(events, attached.runId);
@@ -930,6 +968,34 @@ export class SessionController {
           signal: turn.controller.signal,
         });
       }
+      if (attached.policy.workerEnabled === true) {
+        const dispatcher = new TaskDispatcher({
+          inbox,
+          runId: attached.runId,
+          clock: this.clock,
+        });
+        const workerExecutor = new WorkerTaskExecutor({
+          inbox,
+          eventSink: attached.sink,
+          store: attached.store,
+          model: this.deps.workerModel ?? model,
+          modelName: this.workerModel,
+          runId: attached.runId,
+          clock: this.clock,
+          signal: turn.controller.signal,
+          readWatermark: () => attached.ledger.watermark(),
+        });
+        workerScheduler = new WorkerLaneScheduler({
+          executor: workerExecutor,
+          inbox,
+          runId: attached.runId,
+          signal: turn.controller.signal,
+        });
+        tools.push(createDelegateTaskTool({
+          dispatcher,
+          store: attached.store,
+        }));
+      }
       const loop = new MainLoop({
         model,
         contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(attached.store)),
@@ -951,11 +1017,17 @@ export class SessionController {
             ...continuation,
             ...await this.deliverSteering(turn.turnId, step),
             ...await (scheduler?.beforeMainStep() ?? Promise.resolve([])),
+            ...await (workerScheduler?.beforeMainStep() ?? Promise.resolve([])),
           ];
         },
-        ...(scheduler === undefined
+        ...(scheduler === undefined && workerScheduler === undefined
           ? {}
-          : { afterStep: (context) => scheduler!.enqueue(context) }),
+          : {
+              afterStep: (context) => {
+                scheduler?.enqueue(context);
+                workerScheduler?.enqueue(context);
+              },
+            }),
         onStreamEvent: (event) => this.publish({ kind: "stream", event }),
       });
       const latestEvents = await attached.ledger.read({ runId: attached.runId });
@@ -976,7 +1048,9 @@ export class SessionController {
         signal: turn.controller.signal,
       });
       await settlesWithin(scheduler?.drain() ?? Promise.resolve(), 25);
+      await settlesWithin(workerScheduler?.drain() ?? Promise.resolve(), 25);
       await scheduler?.stop();
+      await workerScheduler?.stop();
       if (!result.completed) {
         const waitingReason = result.stopReason === "length"
           ? "model-output-limit"
@@ -1015,6 +1089,7 @@ export class SessionController {
       }
     } catch (error: unknown) {
       await scheduler?.stop().catch(() => undefined);
+      await workerScheduler?.stop().catch(() => undefined);
       if (turn.controller.signal.aborted) {
         await this.appendTurnCancelled(turn.turnId, persistedErrorText(
           turn.controller.signal.reason,
@@ -1042,6 +1117,7 @@ export class SessionController {
       }
     } finally {
       await scheduler?.stop().catch(() => undefined);
+      await workerScheduler?.stop().catch(() => undefined);
       if (this.status !== "closed") {
         await commitRunCheckpoint(attached.ledger, attached.runId).catch(() => undefined);
       }
@@ -1680,6 +1756,12 @@ async function readTurnObjective(
 function validateOptions(options: SessionControllerOptions): void {
   if (options.workspace.length === 0 || options.dataDir.length === 0 || options.model.length === 0) {
     throw new SessionProtocolError("workspace, dataDir, and model are required");
+  }
+  if (options.workerModel !== undefined && options.workerModel.length === 0) {
+    throw new SessionProtocolError("workerModel must not be empty");
+  }
+  if (options.workerEnabled !== undefined && typeof options.workerEnabled !== "boolean") {
+    throw new SessionProtocolError("workerEnabled must be a boolean");
   }
   if (options.runId !== undefined) validateRunId(options.runId);
   if (
