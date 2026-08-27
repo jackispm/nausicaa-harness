@@ -58,6 +58,16 @@ export interface Phase24RunnerOptions {
   manifest?: PreregisteredManifest;
   /** Real providers are never selected unless this is explicitly true. */
   live?: boolean;
+  /**
+   * Probe-only limit. When omitted, every task/repetition pair in the frozen
+   * manifest is executed. A partial probe can never produce a release report.
+   */
+  maxPairs?: number;
+  /**
+   * Probe-only hard deadline for the whole evaluation, in milliseconds. The
+   * signal is propagated to the active arm so provider requests can cancel.
+   */
+  deadlineMs?: number;
   /** A deterministic root is useful for tests; otherwise a temporary root is used. */
   rootDirectory?: string;
   evaluationId?: string;
@@ -149,6 +159,7 @@ export interface ArmExecutionOptions {
   rootDirectory: string;
   experimentBudget?: ExperimentBudgetMeter;
   repositoryStateForTests?: RepositoryState;
+  signal?: AbortSignal;
 }
 
 export class BudgetExceededError extends Error {
@@ -186,6 +197,7 @@ export async function runPhase24Evaluation(
 ): Promise<Phase24EvaluationResult> {
   const manifest = options.manifest ?? PREREGISTERED_MANIFEST;
   validateManifest(manifest);
+  validateProbeOptions(options, manifest.sampleCount);
   const live = options.live === true;
   const startedAt = new Date().toISOString();
   const repository = live
@@ -197,11 +209,15 @@ export async function runPhase24Evaluation(
   const evaluationId = options.evaluationId ?? PHASE24_EVALUATION_ID;
   const experimentBudget = new ExperimentBudgetMeter(manifest.experimentBudget, operatorCostCap);
   const records: ArmExecutionRecord[] = [];
-  const pairs = evaluationPairOrder(manifest);
-  for (let pairIndex = 0; pairIndex < pairs.length; pairIndex += 1) {
-    const pair = pairs[pairIndex]!;
-    const pairId = `${pair.task.taskId}:${pair.repetition}`;
-    for (const arm of balancedArmOrder(manifest, pairIndex)) {
+  const pairs = evaluationPairOrder(manifest).slice(0, options.maxPairs);
+  const deadline = createProbeDeadline(options.deadlineMs);
+  try {
+    for (let pairIndex = 0; pairIndex < pairs.length; pairIndex += 1) {
+      if (deadline?.signal.aborted) break;
+      const pair = pairs[pairIndex]!;
+      const pairId = `${pair.task.taskId}:${pair.repetition}`;
+      for (const arm of balancedArmOrder(manifest, pairIndex)) {
+        if (deadline?.signal.aborted) break;
         if (!experimentBudget.canStart()) {
           records.push(skippedRecord(pairId, pair.task.taskId, pair.repetition, arm.id, rootDirectory, "whole-experiment budget exhausted before arm start"));
           continue;
@@ -213,8 +229,12 @@ export async function runPhase24Evaluation(
           rootDirectory: join(rootDirectory, "pairs", pairId, arm.id),
           experimentBudget,
           repositoryStateForTests: repository,
+          ...(deadline === undefined ? {} : { signal: deadline.signal }),
         }));
+      }
     }
+  } finally {
+    deadline?.dispose();
   }
 
   const rows = pairRows(records);
@@ -370,6 +390,9 @@ export async function executeEvaluationArm(
     const timeout = setTimeout(() => controller.abort(new BudgetExceededError(
       `Arm wall-clock budget of ${arm.budget.maxWallClockMs}ms was exceeded`,
     )), arm.budget.maxWallClockMs);
+    const signal = options.signal === undefined
+      ? controller.signal
+      : AbortSignal.any([options.signal, controller.signal]);
     try {
       runResult = await executeRun({
         workspace: fixture.workspace,
@@ -401,7 +424,7 @@ export async function executeEvaluationArm(
         maxOutputTokens: 512,
         allowWrite: fixture.allowWrite,
         allowShell: false,
-        signal: controller.signal,
+        signal,
       }, {
         mainModel: wrappedModel,
         tetoModel: wrappedModel,
@@ -584,7 +607,11 @@ async function outcomeFromRun(
 
 function classifyFailure(error: string | undefined, budget: BudgetSnapshot): SampleOutcome["failureKind"] {
   if (budget.breached) return budget.breachReason?.includes("wall-clock") ? "timeout" : "budget";
-  if (error?.toLowerCase().includes("timeout") || error?.toLowerCase().includes("aborted")) return "timeout";
+  if (
+    error?.toLowerCase().includes("timeout")
+    || error?.toLowerCase().includes("aborted")
+    || error?.toLowerCase().includes("deadline")
+  ) return "timeout";
   if (error?.toLowerCase().includes("provider") || error?.toLowerCase().includes("model")) return "provider";
   if (error === "Run did not complete") return "incomplete";
   return "runtime";
@@ -1163,6 +1190,42 @@ function plannedReads(task: PublicEvaluationFixture["task"]): readonly string[] 
 
 async function delay(milliseconds: number): Promise<void> {
   await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+}
+
+interface ProbeDeadline {
+  signal: AbortSignal;
+  dispose(): void;
+}
+
+function validateProbeOptions(
+  options: Pick<Phase24RunnerOptions, "maxPairs" | "deadlineMs">,
+  sampleCount: number,
+): void {
+  if (options.maxPairs !== undefined && (
+    !Number.isSafeInteger(options.maxPairs)
+    || options.maxPairs < 1
+    || options.maxPairs > sampleCount
+  )) {
+    throw new RangeError(`maxPairs must be an integer between 1 and ${sampleCount}`);
+  }
+  if (options.deadlineMs !== undefined && (
+    !Number.isFinite(options.deadlineMs)
+    || options.deadlineMs <= 0
+  )) {
+    throw new RangeError("deadlineMs must be a positive finite number");
+  }
+}
+
+function createProbeDeadline(deadlineMs: number | undefined): ProbeDeadline | undefined {
+  if (deadlineMs === undefined) return undefined;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new BudgetExceededError(
+    `Evaluation hard deadline of ${deadlineMs}ms was exceeded`,
+  )), deadlineMs);
+  return {
+    signal: controller.signal,
+    dispose: () => clearTimeout(timer),
+  };
 }
 
 function seededPermutation<T>(values: readonly T[], seed: string): T[] {

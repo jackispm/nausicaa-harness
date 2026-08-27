@@ -214,6 +214,41 @@ describe("Phase 2.4 evaluation runner", () => {
     expect(redacted).toContain(evaluation.report!.provenance.evidenceDigest);
     expect(redacted).not.toContain("Install with npm install");
   }, 120_000);
+
+  it("supports a bounded probe without pretending it is a complete evaluation", async () => {
+    const root = await temporaryRoot();
+    const evaluation = await runPhase24Evaluation({
+      rootDirectory: join(root, "bounded-probe"),
+      writeArtifacts: false,
+      repositoryStateForTests: cleanRepository,
+      modelFactory: () => new ImmediateFinalModel(),
+      maxPairs: 1,
+    });
+
+    expect(evaluation.records).toHaveLength(PREREGISTERED_ARMS.length);
+    expect(new Set(evaluation.records.map((record) => record.pairId))).toEqual(new Set([
+      `${evaluationPairOrder(PREREGISTERED_MANIFEST)[0]!.task.taskId}:${evaluationPairOrder(PREREGISTERED_MANIFEST)[0]!.repetition}`,
+    ]));
+    expect(evaluation.rows).toHaveLength(1);
+    expect(evaluation.report).toBeUndefined();
+  });
+
+  it("cancels a probe at its hard deadline and keeps only completed arm records", async () => {
+    const root = await temporaryRoot();
+    const evaluation = await runPhase24Evaluation({
+      rootDirectory: join(root, "deadline-probe"),
+      writeArtifacts: false,
+      repositoryStateForTests: cleanRepository,
+      modelFactory: () => new BlockingModel(),
+      deadlineMs: 20,
+    });
+
+    expect(evaluation.records.length).toBe(1);
+    expect(evaluation.records[0]?.outcome?.completed).toBe(false);
+    expect(evaluation.records[0]?.outcome?.failureKind).toBe("timeout");
+    expect(evaluation.rows).toHaveLength(0);
+    expect(evaluation.report).toBeUndefined();
+  });
 });
 
 function requestFor(model: string, tools: readonly unknown[]): ModelRequest {
@@ -252,6 +287,15 @@ class ImmediateFinalModel implements ModelPort {
       stopReason: "stop",
       usage: { input: 100, output: 12, cacheRead: 0, cacheWrite: 0, costUsd: 0.001 },
     };
+  }
+}
+
+class BlockingModel implements ModelPort {
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    if (request.signal?.aborted) throw request.signal.reason;
+    return new Promise<ModelResponse>((_resolve, reject) => {
+      request.signal?.addEventListener("abort", () => reject(request.signal?.reason), { once: true });
+    });
   }
 }
 
