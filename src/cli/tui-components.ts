@@ -270,7 +270,10 @@ export class SessionTray implements Component {
     const snapshot = this.readSnapshot();
     const safeWidth = Math.max(1, width);
     const state = snapshot.status === "detached" ? "new" : snapshot.status;
-    const topology = snapshot.tetoEnabled ? `main + Teto/${state}` : `main/${state}`;
+    const lanes = ["main"];
+    if (snapshot.tetoEnabled) lanes.push("Teto");
+    if (snapshot.workerEnabled) lanes.push("Worker");
+    const topology = `${lanes.join(" + ")}/${state}`;
     const transientStatus = this.readTransientStatus();
     const left = transientStatus === undefined
       ? ` ← ${topology}   ${shortModel(snapshot.model)}`

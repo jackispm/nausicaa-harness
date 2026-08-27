@@ -28,6 +28,7 @@ const snapshot: SessionSnapshot = {
   status: "running",
   model: "openrouter:openai/gpt-5-mini",
   tetoEnabled: true,
+  workerEnabled: false,
   allowWrite: false,
   allowShell: false,
   pendingInputs: 2,
@@ -76,6 +77,12 @@ describe("TUI components", () => {
     const activity = stripTerminalSequences(new ActivityLine(() => snapshot).render(80).join("\n"));
     expect(activity).toContain("Thinking");
     expect(activity).toContain("step 3");
+  });
+
+  it("shows the opt-in Worker lane in the topology tray", () => {
+    const workerSnapshot = { ...snapshot, workerEnabled: true };
+    const tray = stripTerminalSequences(new SessionTray(() => workerSnapshot).render(100).join("\n"));
+    expect(tray).toContain("main + Teto + Worker/running");
   });
 
   it("keeps the Prime-style brand header useful at wide and narrow widths", () => {

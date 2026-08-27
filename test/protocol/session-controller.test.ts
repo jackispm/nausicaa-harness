@@ -178,6 +178,96 @@ describe("SessionController", () => {
     await session.close();
   });
 
+  it("keeps Worker work alive across completed Turns", async () => {
+    const root = await temporaryRoot();
+    let markWorkerStarted: (() => void) | undefined;
+    const workerStarted = new Promise<void>((resolve) => {
+      markWorkerStarted = resolve;
+    });
+    let releaseWorker: ((value: ModelResponse) => void) | undefined;
+    const workerModel = new ScriptedModel([async () => {
+      markWorkerStarted?.();
+      return new Promise<ModelResponse>((resolve) => {
+        releaseWorker = resolve;
+      });
+    }]);
+    let markWorkerResult: (() => void) | undefined;
+    const workerResult = new Promise<void>((resolve) => {
+      markWorkerResult = resolve;
+    });
+    const events: SessionRuntimeEvent[] = [];
+    const mainModel = new ScriptedModel([
+      {
+        ...response("queued inspection"),
+        toolCalls: [{
+          id: "delegate-cross-turn",
+          name: "delegate_task",
+          arguments: {
+            taskId: "cross-turn-task",
+            statement: "Inspect the package name",
+            maxModelTokens: 100,
+            maxWallClockMs: 5_000,
+          },
+        }],
+        stopReason: "toolUse",
+      },
+      response("first Turn is complete"),
+      (request) => {
+        expect(request.messages.some((message) => (
+          message.role === "user"
+          && message.content.includes("Worker task cross-turn-task completed")
+          && message.content.includes("package name: nausicaa")
+        ))).toBe(true);
+        return response("second Turn used the Worker result");
+      },
+    ]);
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted/main",
+      workerModel: "scripted/worker",
+      workerEnabled: true,
+      policy: {
+        maxMainStepsPerActivation: 4,
+        maxModelTokens: 10_000,
+        tetoEnabled: false,
+      },
+    }, {
+      mainModel,
+      workerModel,
+      tools: [],
+      createRunId: () => "cross-turn-worker-run",
+    });
+    session.subscribe((event) => {
+      events.push(event);
+      if (
+        event.kind === "event"
+        && event.event.type === "message.sent"
+        && event.event.payload.message.payload.type === "task.result"
+      ) {
+        markWorkerResult?.();
+      }
+    });
+
+    await session.submit({ inputId: "cross-turn-input", text: "Queue an inspection" });
+    await workerStarted;
+    await session.waitForIdle();
+    expect(mainModel.callCount).toBe(2);
+    expect(workerModel.callCount).toBe(1);
+
+    releaseWorker?.(response("package name: nausicaa"));
+    await workerResult;
+    await session.submit({ inputId: "cross-turn-follow-up", text: "Use the inspection" });
+    await session.waitForIdle();
+
+    expect(mainModel.callCount).toBe(3);
+    expect(durableEvents(events).filter((event) => (
+      event.type === "message.sent"
+      && event.payload.message.payload.type === "task.result"
+    ))).toHaveLength(1);
+    await session.close();
+  });
+
   it("passes the configured per-call output limit to Main", async () => {
     const root = await temporaryRoot();
     const model = new ScriptedModel([response("bounded answer")]);

@@ -13,6 +13,7 @@ export interface CliOptions {
   resume?: string;
   resolveOperation?: string;
   tetoEnabled?: boolean;
+  workerEnabled?: boolean;
   workspace: string;
   dataDir?: string;
   maxSteps?: number;
@@ -96,6 +97,9 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
         break;
       case "--main-only":
         options.tetoEnabled = false;
+        break;
+      case "--worker":
+        options.workerEnabled = true;
         break;
       case "--allow-write":
         options.allowWrite = true;
@@ -181,6 +185,7 @@ Options:
   --continue              Resume the latest Run for this workspace
   --resolve-operation <id> Resolve one unknown tool operation as failed (requires --resume)
   --main-only             Disable the Teto lane for this run
+  --worker                Enable the bounded Worker sub-agent lane
   --allow-write           Allow workspace file writes for this run
   --allow-shell           Explicit high privilege: shell may read/write outside the workspace
   --workspace <path>      Bound tools to this workspace

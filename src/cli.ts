@@ -97,6 +97,9 @@ const main = async (): Promise<number> => {
         dataDir: resolvedSettings.dataDir,
         model: resolvedSettings.model,
         tetoModel: resolvedSettings.tetoModel,
+        ...(options.workerEnabled === undefined
+          ? {}
+          : { workerEnabled: options.workerEnabled }),
         maxOutputTokens: resolvedSettings.maxOutputTokens,
         policy: {
           maxMainStepsPerActivation: resolvedSettings.maxSteps,
@@ -135,6 +138,9 @@ const main = async (): Promise<number> => {
         dataDir: resolvedSettings.dataDir,
         model: resolvedSettings.model,
         tetoModel: resolvedSettings.tetoModel,
+        ...(options.workerEnabled === undefined
+          ? {}
+          : { workerEnabled: options.workerEnabled }),
         maxOutputTokens: resolvedSettings.maxOutputTokens,
         ...(initialMessage === undefined ? {} : { message: initialMessage }),
         ...(processedImages.images.length === 0

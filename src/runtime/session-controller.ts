@@ -167,6 +167,13 @@ interface AttachedRun {
   store: ContentAddressedStore;
   goal: Goal;
   policy: RunPolicy;
+  worker?: WorkerLaneRuntime;
+}
+
+interface WorkerLaneRuntime {
+  inbox: A2AInbox;
+  dispatcher: TaskDispatcher;
+  scheduler: WorkerLaneScheduler;
 }
 
 interface Admission {
@@ -649,13 +656,16 @@ export class SessionController {
       try {
         await this.recordInterruptedTurnOnAttach(candidate);
       } catch (error: unknown) {
+        await this.stopWorkerLane(candidate);
         candidate.sink.deactivate();
         await candidate.ledger.close().catch(() => undefined);
         throw error;
       }
       const previous = this.attached;
       this.attached = candidate;
+      candidate.worker?.scheduler.enqueue();
       if (previous !== undefined) {
+        await this.stopWorkerLane(previous);
         previous.sink.deactivate();
         await previous.ledger.close();
       }
@@ -692,6 +702,9 @@ export class SessionController {
         }
       }
       if (this.attached !== undefined) {
+        // Stop the Run-scoped Worker before checkpointing so a terminal reply
+        // cannot race the checksum and land after the final checkpoint.
+        await this.stopWorkerLane(this.attached);
         await commitRunCheckpoint(this.attached.ledger, this.attached.runId).catch(() => undefined);
       }
       await this.detach();
@@ -708,6 +721,7 @@ export class SessionController {
     validateRunId(runId);
     const stateDir = resolve(this.dataDir, "runs", runId);
     const ledger = await JsonlLedger.open(resolve(stateDir, "ledger.jsonl"));
+    let attached: AttachedRun | undefined;
     try {
       const store = await FileContentAddressedStore.open(resolve(stateDir, "store"));
       const sink = new SessionEventSink(ledger, [], (event) => this.publish(event));
@@ -758,17 +772,55 @@ export class SessionController {
           visibility: "run",
         });
       }
-      this.attached = { runId, ledger, sink, store, goal, policy: this.policy };
+      attached = { runId, ledger, sink, store, goal, policy: this.policy };
+      if (this.policy.workerEnabled === true) {
+        attached.worker = this.createWorkerLaneRuntime(attached);
+      }
+      this.attached = attached;
+      attached.worker?.scheduler.enqueue();
       this.status = "idle";
     } catch (error: unknown) {
+      if (attached !== undefined) {
+        await this.stopWorkerLane(attached);
+      }
       await ledger.close();
       throw error;
     }
   }
 
+  private createWorkerLaneRuntime(attached: AttachedRun): WorkerLaneRuntime {
+    const inbox = new A2AInbox({
+      sink: attached.sink,
+      events: attached.sink.cachedEvents,
+      clock: this.clock,
+    });
+    const dispatcher = new TaskDispatcher({
+      inbox,
+      runId: attached.runId,
+      clock: this.clock,
+    });
+    const executor = new WorkerTaskExecutor({
+      inbox,
+      eventSink: attached.sink,
+      store: attached.store,
+      model: this.deps.workerModel ?? this.deps.mainModel ?? createOpenRouterModelPort(),
+      modelName: this.workerModel,
+      runId: attached.runId,
+      clock: this.clock,
+      readWatermark: () => attached.ledger.watermark(),
+    });
+    const scheduler = new WorkerLaneScheduler({
+      executor,
+      inbox,
+      runId: attached.runId,
+    });
+    return { inbox, dispatcher, scheduler };
+  }
+
   private async openAttachment(runId: string): Promise<AttachedRun> {
     const stateDir = resolve(this.dataDir, "runs", runId);
     const ledger = await JsonlLedger.open(resolve(stateDir, "ledger.jsonl"));
+    let attached: AttachedRun | undefined;
     try {
       const store = await FileContentAddressedStore.open(resolve(stateDir, "store"));
       const events = await ledger.read({ runId });
@@ -792,7 +844,7 @@ export class SessionController {
       ) {
         throw new SessionProtocolError("Cannot change workerEnabled while resuming a Run");
       }
-      return {
+      attached = {
         runId,
         ledger,
         sink: new SessionEventSink(ledger, events, (event) => this.publish(event)),
@@ -800,7 +852,14 @@ export class SessionController {
         goal: projection.goal,
         policy: projection.run.policy,
       };
+      if (projection.run.policy.workerEnabled === true) {
+        attached.worker = this.createWorkerLaneRuntime(attached);
+      }
+      return attached;
     } catch (error: unknown) {
+      if (attached !== undefined) {
+        await this.stopWorkerLane(attached);
+      }
       await ledger.close().catch(() => undefined);
       throw error;
     }
@@ -910,7 +969,6 @@ export class SessionController {
   private async runTurn(turn: ActiveTurn): Promise<void> {
     const attached = this.requireAttached();
     let scheduler: TetoScheduler | undefined;
-    let workerScheduler: WorkerLaneScheduler | undefined;
     try {
       const events = await attached.ledger.read({ runId: attached.runId });
       const projection = projectRun(events, attached.runId);
@@ -939,7 +997,11 @@ export class SessionController {
         return;
       }
       const model = this.deps.mainModel ?? createOpenRouterModelPort();
-      const inbox = new A2AInbox({ sink: attached.sink, events, clock: this.clock });
+      const inbox = attached.worker?.inbox ?? new A2AInbox({
+        sink: attached.sink,
+        events,
+        clock: this.clock,
+      });
       const tools = [...(this.deps.tools ?? createWorkspaceTools({
         allowWrite: this.allowWrite,
         allowShell: this.allowShell,
@@ -968,31 +1030,9 @@ export class SessionController {
           signal: turn.controller.signal,
         });
       }
-      if (attached.policy.workerEnabled === true) {
-        const dispatcher = new TaskDispatcher({
-          inbox,
-          runId: attached.runId,
-          clock: this.clock,
-        });
-        const workerExecutor = new WorkerTaskExecutor({
-          inbox,
-          eventSink: attached.sink,
-          store: attached.store,
-          model: this.deps.workerModel ?? model,
-          modelName: this.workerModel,
-          runId: attached.runId,
-          clock: this.clock,
-          signal: turn.controller.signal,
-          readWatermark: () => attached.ledger.watermark(),
-        });
-        workerScheduler = new WorkerLaneScheduler({
-          executor: workerExecutor,
-          inbox,
-          runId: attached.runId,
-          signal: turn.controller.signal,
-        });
+      if (attached.worker !== undefined) {
         tools.push(createDelegateTaskTool({
-          dispatcher,
+          dispatcher: attached.worker.dispatcher,
           store: attached.store,
         }));
       }
@@ -1017,15 +1057,15 @@ export class SessionController {
             ...continuation,
             ...await this.deliverSteering(turn.turnId, step),
             ...await (scheduler?.beforeMainStep() ?? Promise.resolve([])),
-            ...await (workerScheduler?.beforeMainStep() ?? Promise.resolve([])),
+            ...await (attached.worker?.scheduler.beforeMainStep() ?? Promise.resolve([])),
           ];
         },
-        ...(scheduler === undefined && workerScheduler === undefined
+        ...(scheduler === undefined && attached.worker === undefined
           ? {}
           : {
               afterStep: (context) => {
                 scheduler?.enqueue(context);
-                workerScheduler?.enqueue(context);
+                attached.worker?.scheduler.enqueue(context);
               },
             }),
         onStreamEvent: (event) => this.publish({ kind: "stream", event }),
@@ -1048,9 +1088,9 @@ export class SessionController {
         signal: turn.controller.signal,
       });
       await settlesWithin(scheduler?.drain() ?? Promise.resolve(), 25);
-      await settlesWithin(workerScheduler?.drain() ?? Promise.resolve(), 25);
+      // Worker work remains live after this Turn. Its terminal messages stay in
+      // the Inbox until a later Main boundary accepts them.
       await scheduler?.stop();
-      await workerScheduler?.stop();
       if (!result.completed) {
         const waitingReason = result.stopReason === "length"
           ? "model-output-limit"
@@ -1089,7 +1129,6 @@ export class SessionController {
       }
     } catch (error: unknown) {
       await scheduler?.stop().catch(() => undefined);
-      await workerScheduler?.stop().catch(() => undefined);
       if (turn.controller.signal.aborted) {
         await this.appendTurnCancelled(turn.turnId, persistedErrorText(
           turn.controller.signal.reason,
@@ -1117,7 +1156,6 @@ export class SessionController {
       }
     } finally {
       await scheduler?.stop().catch(() => undefined);
-      await workerScheduler?.stop().catch(() => undefined);
       if (this.status !== "closed") {
         await commitRunCheckpoint(attached.ledger, attached.runId).catch(() => undefined);
       }
@@ -1407,6 +1445,7 @@ export class SessionController {
     this.active = undefined;
     this.execution = undefined;
     if (attached !== undefined) {
+      await this.stopWorkerLane(attached);
       attached.sink.deactivate();
       await attached.ledger.close();
     }
@@ -1418,6 +1457,7 @@ export class SessionController {
     this.active = undefined;
     this.execution = undefined;
     if (attached !== undefined) {
+      await this.stopWorkerLane(attached);
       attached.sink.deactivate();
       await commitRunCheckpoint(attached.ledger, attached.runId).catch(() => undefined);
       await attached.ledger.close().catch(() => undefined);
@@ -1426,6 +1466,10 @@ export class SessionController {
       this.status = "detached";
       this.publishState();
     }
+  }
+
+  private async stopWorkerLane(attached: AttachedRun): Promise<void> {
+    await attached.worker?.scheduler.stop().catch(() => undefined);
   }
 
   private requireAttached(): AttachedRun {
