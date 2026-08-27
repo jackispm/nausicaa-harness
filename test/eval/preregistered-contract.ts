@@ -934,10 +934,16 @@ function releaseReason(check: ReleaseArmCheck): string {
   if (check.secondaryQualityDeltaCiLow !== undefined && check.secondaryQualityDeltaCiLow < -check.maximumQualityRegression) {
     failed.push(`Main-only quality delta CI low ${check.secondaryQualityDeltaCiLow} regresses beyond ${check.maximumQualityRegression}`);
   }
-  if (!check.budgetPass) failed.push(`observed max cost ${check.costMaxUsdObserved} exceeds ${check.maxCostUsd}`);
+  if (!check.budgetPass) {
+    if (check.costMaxUsdObserved > check.maxCostUsd) {
+      failed.push(`observed max cost ${check.costMaxUsdObserved} exceeds ${check.maxCostUsd}`);
+    } else {
+      failed.push("one or more non-cost arm limits were breached");
+    }
+  }
   if (!check.completionPass) failed.push(`completion rate ${check.completionRate} is below 1`);
   if (!check.harmfulAdvicePass) failed.push("harmful Advice rate is not zero");
-  return `${check.armId}: ${failed.join("; ")}`;
+  return failed.join("; ");
 }
 
 function deepFreeze<T>(value: T): T {

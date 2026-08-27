@@ -183,4 +183,16 @@ describe("IntentNavigator", () => {
       frame,
     })).rejects.toThrow(/must not request tools/);
   });
+
+  it("reports an explicit bounded failure when the provider truncates JSON", async () => {
+    const truncated = response('{"action":"silent"}');
+    truncated.stopReason = "length";
+    truncated.usage.output = 64;
+
+    await expect(navigator(new ScriptedModel(truncated)).observe({
+      runId: "run-1",
+      sessionId: "teto-session",
+      frame,
+    })).rejects.toThrow("Teto output was truncated at the 64-token limit");
+  });
 });

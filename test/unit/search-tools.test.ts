@@ -16,6 +16,18 @@ afterEach(async () => {
 });
 
 describe("workspace search tools", () => {
+  it("treats ripgrep exit 1 as a successful empty search", async () => {
+    const workspace = await temporaryDirectory("nausicaa-search-empty-");
+
+    const found = await createFindTool().execute({ pattern: "**/*.ts" }, context(workspace));
+    const searched = await createGrepTool().execute({ pattern: "missing" }, context(workspace));
+
+    expect(found.isError).toBe(false);
+    expect(JSON.parse(found.content)).toMatchObject({ files: [], count: 0, truncated: false });
+    expect(searched.isError).toBe(false);
+    expect(JSON.parse(searched.content)).toMatchObject({ matches: [], matchCount: 0, truncated: false });
+  });
+
   it("finds globbed files in stable order and reports limits as JSON", async () => {
     const workspace = await temporaryDirectory("nausicaa-find-");
     await mkdir(path.join(workspace, "src", "nested"), { recursive: true });
@@ -156,7 +168,8 @@ describe("workspace search tools", () => {
 
     expect(grep.isError).toBe(false);
     expect(JSON.parse(grep.content).matchCount).toBe(1);
-    expect(find.isError).toBe(true);
+    expect(find.isError).toBe(false);
+    expect(JSON.parse(find.content).files).toEqual([]);
     await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

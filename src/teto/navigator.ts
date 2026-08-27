@@ -10,7 +10,7 @@ import type {
 } from "../domain/index.js";
 import { parseSingleJsonObject, systemClock } from "../domain/index.js";
 
-export const TETO_SYSTEM_PROMPT = `Teto navigates intent. From mission and boundary only, flag drift, missing user intent, or a materially simpler method. Never inspect bugs or invent facts. JSON only: {"action":"silent"} or {"action":"advise","kind":"orientation|intent-gap|method-alternative","claim":"brief","suggestedAction":"brief","risk":"low|medium|high"}.`;
+export const TETO_SYSTEM_PROMPT = `Check mission and boundary for drift, missing intent, or a simpler method; never bugs or invented facts. Minified JSON only, immediately: {"action":"silent"} or {"action":"advise","kind":"orientation|intent-gap|method-alternative","claim":"<=8 words","suggestedAction":"<=8 words","risk":"low|medium|high"}.`;
 
 const ADVICE_TTL_MS = 10 * 60 * 1_000;
 
@@ -83,6 +83,11 @@ export class IntentNavigator {
       ...(request.signal === undefined ? {} : { signal: request.signal }),
     });
 
+    if (response.stopReason === "length") {
+      throw new TetoOutputError(
+        `Teto output was truncated at the ${maxOutputTokens}-token limit`,
+      );
+    }
     if (response.toolCalls.length !== 0) {
       throw new TetoOutputError("Teto must not request tools");
     }

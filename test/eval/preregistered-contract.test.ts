@@ -256,11 +256,35 @@ describe("preregistered Phase 2.4 contract", () => {
       quality: 0,
     });
     expect(report.aggregates[PRIMARY_TREATMENT_ARM]?.budgetBreachRate).toBeGreaterThan(0);
-    expect(evaluateReleaseDecision(report)).toMatchObject({
+    const decision = evaluateReleaseDecision(report);
+    expect(decision).toMatchObject({
       status: "hold",
       eligible: false,
       primaryCheck: { budgetPass: false, completionPass: false },
     });
+    const reason = decision.reasons.find((candidate) => candidate.startsWith(`${PRIMARY_TREATMENT_ARM}:`))!;
+    expect(reason).toContain("non-cost arm limits were breached");
+    expect(reason).not.toContain("observed max cost");
+    expect(reason).not.toContain(`${PRIMARY_TREATMENT_ARM}: ${PRIMARY_TREATMENT_ARM}:`);
+  });
+
+  it("reports cost budget failures as cost rather than a generic non-cost breach", () => {
+    const rows = buildRows(0.04);
+    const outcome = rows[0]!.outcomes[PRIMARY_TREATMENT_ARM]!;
+    const maxCostUsd = PREREGISTERED_MANIFEST.arms.find((arm) => (
+      arm.id === PRIMARY_TREATMENT_ARM
+    ))!.budget.maxCostUsd;
+    outcome.completed = false;
+    outcome.failureKind = "budget";
+    outcome.budgetBreached = true;
+    outcome.quality = 0;
+    outcome.costUsd = maxCostUsd + 0.001;
+
+    const reason = evaluateReleaseDecision(
+      buildPairedReport(PREREGISTERED_MANIFEST, rows, reportOptions),
+    ).reasons.find((candidate) => candidate.startsWith(`${PRIMARY_TREATMENT_ARM}:`))!;
+    expect(reason).toContain("observed max cost");
+    expect(reason).not.toContain("non-cost arm limits were breached");
   });
 
   it("accepts live Advice that is still pending acknowledgement", () => {

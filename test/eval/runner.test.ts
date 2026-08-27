@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { ModelPort, ModelRequest, ModelResponse } from "../../src/domain/index.js";
+import { JsonlLedger } from "../../src/ledger/index.js";
 import {
   PRIMARY_TREATMENT_ARM,
   PREREGISTERED_ARMS,
@@ -199,6 +200,31 @@ describe("Phase 2.4 evaluation runner", () => {
     });
   });
 
+  it("continues the same Run after an activation boundary without resetting budgets", async () => {
+    const root = await temporaryRoot();
+    const task = PREREGISTERED_MANIFEST.tasks.find((candidate) => (
+      candidate.taskId === "goal-drift-intervention-001"
+    ))!;
+    const arm = PREREGISTERED_MANIFEST.arms.find((candidate) => candidate.id === "main-only")!;
+    const model = new BoundaryContinuationModel();
+
+    const record = await executeEvaluationArm(task, 0, arm, {
+      rootDirectory: join(root, "boundary-continuation"),
+      modelFactory: () => model,
+    });
+
+    expect(record.outcome).toMatchObject({ completed: true, failureKind: "none" });
+    expect(record.result).toMatchObject({ completed: true, steps: 9 });
+    expect(record.budget).toMatchObject({ requests: 9, breached: false });
+    expect(new Set(model.requests.map((request) => request.runId))).toEqual(new Set([record.runId]));
+    expect(model.requests).toHaveLength(9);
+    const ledger = await JsonlLedger.open(join(record.stateDir, "ledger.jsonl"));
+    const events = await ledger.read({ runId: record.runId });
+    expect(events.filter((event) => event.type === "run.resumed")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "user.message")).toHaveLength(1);
+    await ledger.close();
+  });
+
   it("checkpoints raw evidence and detects any mutation", async () => {
     const root = await temporaryRoot();
     const artifactDirectory = join(root, "artifacts");
@@ -380,6 +406,29 @@ class BlockingModel implements ModelPort {
     return new Promise<ModelResponse>((_resolve, reject) => {
       request.signal?.addEventListener("abort", () => reject(request.signal?.reason), { once: true });
     });
+  }
+}
+
+class BoundaryContinuationModel implements ModelPort {
+  readonly requests: ModelRequest[] = [];
+
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(structuredClone(request));
+    const call = this.requests.length;
+    if (call <= 8) {
+      return {
+        content: "",
+        toolCalls: [{ id: `read-${call}`, name: "read_file", arguments: { path: "package.json" } }],
+        stopReason: "toolUse",
+        usage: { input: 100, output: 8, cacheRead: 0, cacheWrite: 0, costUsd: 0.001 },
+      };
+    }
+    return {
+      content: "Install with npm install on Node.js >=22.19.",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: { input: 100, output: 12, cacheRead: 0, cacheWrite: 0, costUsd: 0.001 },
+    };
   }
 }
 

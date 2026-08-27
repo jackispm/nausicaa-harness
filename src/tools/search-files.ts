@@ -69,7 +69,8 @@ export async function discoverSearchFiles(
   arguments_.push("--", ".");
 
   const result = await executeRipgrep(arguments_, root.absolute, signal, MAX_DISCOVERY_BYTES);
-  if (result.exitCode !== 0 && !result.outputTruncated) {
+  // ripgrep uses exit 1 for a successful search with no matching files.
+  if (result.exitCode !== 0 && result.exitCode !== 1 && !result.outputTruncated) {
     throw new Error(ripgrepError(result.stderr, result.exitCode));
   }
   await revalidateExistingWorkspacePath(root);

@@ -25,7 +25,7 @@ import { persistedErrorText } from "./redaction.js";
 const DEFAULT_REFLECTION_LANE = "reflection";
 const OBSERVATION_DEADLINE_MS = 30_000;
 const REFLECTION_SYSTEM_PROMPT = `You are a private reflection lane beside a primary agent.
-Review only the current mission and the latest bounded decision. Do not use tools, request more context, or invent evidence. Return exactly one JSON object: {"action":"silent"} or {"action":"revise","note":"brief concern"}. A revise note is returned to the same Main at its next natural boundary.`;
+Use only the mission and latest decision. No tools, extra context, invented evidence, or analysis. Output minified JSON immediately: {"action":"silent"} or {"action":"revise","note":"<=12 words"}. A revise note reaches Main at its next boundary.`;
 
 export interface ReflectionSchedulerOptions {
   eventSink: EventSink;
@@ -239,6 +239,11 @@ export class ReflectionScheduler {
         maxOutputTokens: this.policy.tetoMaxOutputTokens,
         ...(signal === undefined ? {} : { signal }),
       }), signal);
+      if (response.stopReason === "length") {
+        throw new Error(
+          `Reflection output was truncated at the ${this.policy.tetoMaxOutputTokens}-token limit`,
+        );
+      }
       if (response.toolCalls.length !== 0) {
         throw new Error("Reflection lane must not request tools");
       }

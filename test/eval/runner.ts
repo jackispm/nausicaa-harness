@@ -12,7 +12,12 @@ import type {
 } from "../../src/domain/index.js";
 import { createOpenRouterModelPort, RetryingModelPort } from "../../src/model/index.js";
 import { projectCacheEvidence, projectRunMetrics, type CacheEvidenceReport, type RunMetrics } from "../../src/observability/index.js";
-import { executeRun, type RunExecutionResult } from "../../src/runtime/index.js";
+import {
+  executeRun,
+  type RunExecutionDeps,
+  type RunExecutionRequest,
+  type RunExecutionResult,
+} from "../../src/runtime/index.js";
 import { JsonlLedger } from "../../src/ledger/index.js";
 import { boundedRedactedText } from "../../src/runtime/redaction.js";
 import { createWorkspaceTools } from "../../src/tools/index.js";
@@ -409,7 +414,7 @@ export async function executeEvaluationArm(
       ? controller.signal
       : AbortSignal.any([options.signal, controller.signal]);
     try {
-      runResult = await executeRun({
+      const commonRequest = {
         workspace: fixture.workspace,
         dataDir,
         model: manifest.model.main,
@@ -417,6 +422,14 @@ export async function executeEvaluationArm(
         reflectionModel: manifest.model.main,
         auxiliaryMode: config.auxiliaryMode,
         ...(config.adviceDelivery === undefined ? {} : { adviceDelivery: config.adviceDelivery }),
+        // Avoid confounding quality with an artificial 128-token Main ceiling.
+        maxOutputTokens: 512,
+        allowWrite: fixture.allowWrite,
+        allowShell: false,
+        signal,
+      } satisfies RunExecutionRequest;
+      const initialRequest = {
+        ...commonRequest,
         message: fixture.message,
         goal: fixture.goal,
         policy: {
@@ -434,19 +447,29 @@ export async function executeEvaluationArm(
               : "none",
           ...(config.adviceDelivery === undefined ? {} : { tetoAdviceDelivery: config.adviceDelivery }),
         },
-        // Keep the experiment from confounding quality with an artificial
-        // 128-token Main response ceiling.
-        maxOutputTokens: 512,
-        allowWrite: fixture.allowWrite,
-        allowShell: false,
-        signal,
-      }, {
+      } satisfies RunExecutionRequest;
+      const runDeps = {
         mainModel: wrappedModel,
         tetoModel: wrappedModel,
         reflectionModel: wrappedModel,
         tools,
         createRunId: () => runId,
-      });
+      } satisfies RunExecutionDeps;
+
+      let activation = await executeRun(initialRequest, runDeps);
+      let steps = activation.steps;
+      runResult = { ...activation, steps };
+      while (!activation.completed && activation.blocker === "resumable-boundary") {
+        if (activation.steps === 0) {
+          throw new Error("Run made no progress at a resumable boundary");
+        }
+        activation = await executeRun({
+          ...commonRequest,
+          resumeRunId: runId,
+        }, runDeps);
+        steps += activation.steps;
+        runResult = { ...activation, steps };
+      }
     } finally {
       clearTimeout(timeout);
     }
