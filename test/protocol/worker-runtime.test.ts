@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import type { AgentTool, ModelRequest, ModelResponse } from "../../src/domain/index.js";
-import { JsonlLedger } from "../../src/ledger/index.js";
+import { JsonlLedger, projectTaskGraph } from "../../src/ledger/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import { executeRun } from "../../src/runtime/index.js";
 
@@ -100,6 +100,16 @@ describe("executeRun Worker lane", () => {
       && event.payload.message.payload.taskId === "task-1"
     ))).toBe(true);
     expect(events.some((event) => event.type === "message.handled")).toBe(true);
+    expect(projectTaskGraph(events, result.runId)).toMatchObject({
+      anomalies: [],
+      tasks: [{
+        taskId: "task-1",
+        state: {
+          kind: "joined",
+          terminal: { type: "task.result" },
+        },
+      }],
+    });
     await ledger.close();
   });
 });
