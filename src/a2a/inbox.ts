@@ -151,7 +151,7 @@ export class InboxProjector {
   list(to?: LaneId): InboxRecord[] {
     return [...this.records.values()]
       .filter((record) => to === undefined || record.message.to === to)
-      .sort(compareRecords)
+      .sort((left, right) => compareRecords(left, right, this.offset))
       .map(clone);
   }
 
@@ -809,9 +809,27 @@ function compareEvents(left: AnyEvent, right: AnyEvent): number {
   return left.globalOffset - right.globalOffset;
 }
 
-function compareRecords(left: InboxRecord, right: InboxRecord): number {
-  return right.message.priority - left.message.priority
+const SCHEDULING_PRIORITY_CEILING = 10;
+const PRIORITY_AGING_OFFSETS = 8;
+
+function compareRecords(
+  left: InboxRecord,
+  right: InboxRecord,
+  currentOffset: number,
+): number {
+  return effectivePriority(right, currentOffset) - effectivePriority(left, currentOffset)
     || left.sentAtOffset - right.sentAtOffset;
+}
+
+function effectivePriority(record: InboxRecord, currentOffset: number): number {
+  const base = Math.min(
+    SCHEDULING_PRIORITY_CEILING,
+    Math.max(0, record.message.priority),
+  );
+  const age = Math.floor(
+    Math.max(0, currentOffset - record.sentAtOffset) / PRIORITY_AGING_OFFSETS,
+  );
+  return Math.min(SCHEDULING_PRIORITY_CEILING, base + age);
 }
 
 function sameLogicalSend(left: A2AMessage, right: A2AMessage): boolean {

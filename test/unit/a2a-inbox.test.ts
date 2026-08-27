@@ -196,6 +196,67 @@ describe("A2AInbox", () => {
       .toBe("pending");
   });
 
+  it("ages old low-priority work until it cannot be starved, including after replay", async () => {
+    const ledger = new MemoryLedger();
+    const inbox = new A2AInbox({ sink: ledger });
+    await inbox.send(taskMessage(
+      { type: "task.accept", taskId: "old-low" },
+      {
+        messageId: "old-low",
+        idempotencyKey: "old-low",
+        from: "worker-1",
+        to: "main",
+        priority: 0,
+      },
+    ));
+    await inbox.send(taskMessage(
+      { type: "task.accept", taskId: "first-high" },
+      {
+        messageId: "first-high",
+        idempotencyKey: "first-high",
+        from: "worker-1",
+        to: "main",
+        priority: Number.MAX_SAFE_INTEGER,
+      },
+    ));
+
+    const first = await inbox.claim("main", "main", {
+      claimId: "first-priority-claim",
+    });
+    expect(first.map((record) => record.message.messageId)).toEqual(["first-high"]);
+    await inbox.handle("first-high", "main");
+
+    for (let index = 0; index < 80; index += 1) {
+      await inbox.send(taskMessage(
+        { type: "task.accept", taskId: `aging-${index}` },
+        {
+          messageId: `aging-${index}`,
+          idempotencyKey: `aging-${index}`,
+          from: "worker-1",
+          to: "other-lane",
+          priority: 10,
+        },
+      ));
+    }
+    await inbox.send(taskMessage(
+      { type: "task.accept", taskId: "new-high" },
+      {
+        messageId: "new-high",
+        idempotencyKey: "new-high",
+        from: "worker-1",
+        to: "main",
+        priority: Number.MAX_SAFE_INTEGER,
+      },
+    ));
+
+    const events = await ledger.read({ runId: "run-1" });
+    const recovered = A2AInbox.rehydrate(events, { sink: ledger });
+    const aged = await recovered.claim("main", "main", {
+      claimId: "aged-priority-claim",
+    });
+    expect(aged.map((record) => record.message.messageId)).toEqual(["old-low"]);
+  });
+
   it("deduplicates Advice until TTL and never delivers expired messages", async () => {
     const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
     const inbox = new A2AInbox({ clock });
