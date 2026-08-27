@@ -172,15 +172,28 @@ describe("Phase 2.4 evaluation runner", () => {
 
     const task = PREREGISTERED_MANIFEST.tasks[0]!;
     const liveArm = PREREGISTERED_MANIFEST.arms.find((arm) => arm.id === PRIMARY_TREATMENT_ARM)!;
-    const fidelityFailure = await executeEvaluationArm(task, 0, liveArm, {
+    const sparseSuccess = await executeEvaluationArm(task, 0, liveArm, {
       rootDirectory: join(root, "fidelity-failure"),
       modelFactory: () => new ImmediateFinalModel(),
     });
+    expect(sparseSuccess.result?.completed).toBe(true);
+    expect(sparseSuccess.treatmentFidelity).toMatchObject({
+      required: true,
+      passed: true,
+      auxiliaryCompleted: 0,
+    });
+    expect(sparseSuccess.error).toBeUndefined();
+
+    const fidelityFailure = await executeEvaluationArm(task, 0, liveArm, {
+      rootDirectory: join(root, "explicit-fidelity-failure"),
+      modelFactory: () => new AuxiliaryFailureModel(),
+    });
     expect(fidelityFailure.result?.completed).toBe(true);
     expect(fidelityFailure.treatmentFidelity.passed).toBe(false);
+    expect(fidelityFailure.treatmentFidelity.reason).toContain("auxiliary failed");
     expect(fidelityFailure.outcome).toMatchObject({
       completed: false,
-      failureKind: "runtime",
+      failureKind: "provider",
       quality: 0,
     });
   });
@@ -193,7 +206,7 @@ describe("Phase 2.4 evaluation runner", () => {
       artifactDirectory,
       evaluationId: "offline-proof",
       repositoryStateForTests: cleanRepository,
-      modelFactory: () => new ImmediateFinalModel(),
+      modelFactory: () => new AuxiliaryFailureModel(),
     });
 
     expect(evaluation.records).toHaveLength(PREREGISTERED_MANIFEST.sampleCount * PREREGISTERED_ARMS.length);
@@ -286,6 +299,30 @@ class ImmediateFinalModel implements ModelPort {
       toolCalls: [],
       stopReason: "stop",
       usage: { input: 100, output: 12, cacheRead: 0, cacheWrite: 0, costUsd: 0.001 },
+    };
+  }
+}
+
+class AuxiliaryFailureModel implements ModelPort {
+  private readonly mainCallsByRun = new Map<string, number>();
+
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    if (request.laneId !== "main") throw new Error("auxiliary provider unavailable");
+    const call = (this.mainCallsByRun.get(request.runId) ?? 0) + 1;
+    this.mainCallsByRun.set(request.runId, call);
+    if (call <= 2) {
+      return {
+        content: "",
+        toolCalls: [{ id: `read-package-${call}`, name: "read_file", arguments: { path: "package.json" } }],
+        stopReason: "toolUse",
+        usage: { input: 4_500, output: 56, cacheRead: 0, cacheWrite: 0, costUsd: 0.004 },
+      };
+    }
+    return {
+      content: "npm install on Node.js >=22.19",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: { input: 4_500, output: 56, cacheRead: 0, cacheWrite: 0, costUsd: 0.004 },
     };
   }
 }

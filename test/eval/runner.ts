@@ -677,18 +677,23 @@ function evaluateTreatmentFidelity(
   const claimed = events.filter((event) => event.type === "message.claimed");
   const acknowledged = events.filter((event) => event.type === "advice.acknowledged");
   const required = auxiliaryLane !== undefined;
-  let passed = !required || auxiliaryCompleted > 0;
-  let reason: string | undefined;
-  if (!passed) {
-    const auxiliaryFailure = events.find((event) => (
+  // A sidecar is intentionally sparse: cadence/token gates may leave a short
+  // successful Main run with no eligible wake, and the terminal complete
+  // boundary is never scheduled for observation. Absence of an observation is
+  // therefore not a treatment failure. Only an explicit auxiliary failure is
+  // authoritative here; publication and delivery contracts below remain
+  // strict when an observation did produce Advice.
+  const auxiliaryFailure = auxiliaryLane === undefined
+    ? undefined
+    : events.find((event) => (
       event.laneId === auxiliaryLane
       && event.type === "lane.status"
       && event.payload.status === "failed"
     ));
-    reason = auxiliaryFailure?.type === "lane.status"
-      ? `${arm.id} auxiliary failed: ${auxiliaryFailure.payload.reason ?? "unknown failure"}`
-      : `${arm.id} did not complete an auxiliary observation`;
-  }
+  let passed = auxiliaryFailure === undefined;
+  let reason: string | undefined = auxiliaryFailure?.type === "lane.status"
+    ? `${arm.id} auxiliary failed: ${auxiliaryFailure.payload.reason ?? "unknown failure"}`
+    : undefined;
   if (arm.id === "teto-shadow" && (published.length > 0 || claimed.length > 0)) {
     passed = false;
     reason = "Teto shadow Advice was published or claimed";
