@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { A2AMessage, AdviceDisposition, Clock } from "../../src/domain/index.js";
+import type { A2AMessage, AdviceDisposition, Clock, ArtifactRef } from "../../src/domain/index.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
 import {
   A2AInbox,
@@ -52,6 +52,35 @@ function adviceMessage(overrides: Partial<A2AMessage> = {}): A2AMessage {
         sourceLane: "teto",
       },
     },
+    ...overrides,
+  };
+}
+
+const artifactRef: ArtifactRef = {
+  id: "sha256:input",
+  contentHash: "sha256:input",
+  mediaType: "text/plain",
+  byteLength: 12,
+};
+
+function taskMessage(
+  payload: A2AMessage["payload"],
+  overrides: Partial<A2AMessage> = {},
+): A2AMessage {
+  return {
+    messageId: "task-message-1",
+    runId: "run-1",
+    conversationId: "conversation-1",
+    threadId: "thread-1",
+    from: "main",
+    to: "worker-1",
+    createdAt: "2026-08-25T12:00:00.000Z",
+    correlationId: "correlation-task-1",
+    idempotencyKey: "task-send-1",
+    visibility: "run",
+    priority: 1,
+    delivery: "next-step",
+    payload,
     ...overrides,
   };
 }
@@ -148,6 +177,73 @@ describe("A2AInbox", () => {
 
     await expect(inbox.send(message)).rejects.toThrow(/confidence/);
     expect(inbox.snapshot().records).toEqual([]);
+  });
+
+  it("accepts and rehydrates a bounded task handoff", async () => {
+    const inbox = new A2AInbox();
+    const request = taskMessage({
+      type: "task.request",
+      taskId: "task-1",
+      goal: {
+        version: 1,
+        statement: "Inspect the adapter contract",
+        successCriteria: ["Return evidence"],
+        hardConstraints: ["Do not modify files"],
+      },
+      inputRefs: [artifactRef],
+      budget: { maxModelTokens: 1_000, maxWallClockMs: 30_000 },
+    });
+    await expect(inbox.send(request)).resolves.toMatchObject({ status: "queued" });
+    await expect(inbox.send(request)).resolves.toMatchObject({ status: "duplicate" });
+
+    const claimed = await inbox.claim("worker-1", "worker-1", { claimId: "task-claim" });
+    expect(claimed[0]?.message.payload).toMatchObject({ type: "task.request", taskId: "task-1" });
+    await inbox.handle("task-message-1", "worker-1");
+    expect(inbox.snapshot().records[0]?.status).toBe("handled");
+  });
+
+  it.each([
+    ["task id", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.taskId = ""; }],
+    ["goal version", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.goal.version = 0; }],
+    ["model budget", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.budget.maxModelTokens = 0; }],
+    ["artifact ref", (payload: Extract<A2AMessage["payload"], { type: "task.request" }>) => { payload.inputRefs[0]!.byteLength = -1; }],
+  ])("rejects malformed task request %s", async (_label, mutate) => {
+    const inbox = new A2AInbox();
+    const payload = {
+      type: "task.request" as const,
+      taskId: "task-1",
+      goal: {
+        version: 1,
+        statement: "Inspect the adapter contract",
+        successCriteria: ["Return evidence"],
+        hardConstraints: [],
+      },
+      inputRefs: [structuredClone(artifactRef)],
+      budget: { maxModelTokens: 1_000, maxWallClockMs: 30_000 },
+    };
+    mutate(payload);
+    await expect(inbox.send(taskMessage(payload))).rejects.toThrow(/task|goal|budget|artifact|inputRefs/);
+    expect(inbox.snapshot().records).toEqual([]);
+  });
+
+  it("validates task result usage and status at the protocol boundary", async () => {
+    const inbox = new A2AInbox();
+    const payload = {
+      type: "task.result" as const,
+      taskId: "task-1",
+      status: "completed" as const,
+      summary: "The adapter contract is explicit.",
+      evidenceRefs: ["sha256:evidence"],
+      artifactRefs: [],
+      openQuestions: [],
+      usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 },
+    };
+    await expect(inbox.send(taskMessage(payload))).resolves.toMatchObject({ status: "queued" });
+    payload.usage.output = -1;
+    await expect(inbox.send(taskMessage(payload, {
+      messageId: "task-message-2",
+      idempotencyKey: "task-send-2",
+    }))).rejects.toThrow(/usage/);
   });
 
   it.each<AdviceDisposition>(["accept", "defer", "reject"])(

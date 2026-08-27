@@ -8,7 +8,11 @@ import type {
   Clock,
   EventEnvelope,
   EventType,
+  ArtifactRef,
+  Goal,
   LaneId,
+  TaskBudget,
+  TokenUsage,
 } from "../domain/index.js";
 import { systemClock } from "../domain/index.js";
 import { sha256, stableJson } from "../ledger/hash.js";
@@ -641,8 +645,93 @@ function validateMessage(message: A2AMessage): void {
     nonEmpty(message.payload.answer, "answer");
   } else if (message.payload.type === "message.inform") {
     nonEmpty(message.payload.text, "text");
+  } else if (message.payload.type === "task.request") {
+    validateTaskId(message.payload.taskId);
+    validateGoal(message.payload.goal);
+    validateArtifactRefs(message.payload.inputRefs, "inputRefs");
+    validateTaskBudget(message.payload.budget);
+  } else if (message.payload.type === "task.accept") {
+    validateTaskId(message.payload.taskId);
+  } else if (message.payload.type === "task.result") {
+    validateTaskId(message.payload.taskId);
+    if (message.payload.status !== "completed" && message.payload.status !== "partial") {
+      throw new A2AProtocolError("task result status is invalid");
+    }
+    nonEmpty(message.payload.summary, "summary");
+    validateStringArray(message.payload.evidenceRefs, "evidenceRefs");
+    validateArtifactRefs(message.payload.artifactRefs, "artifactRefs");
+    validateStringArray(message.payload.openQuestions, "openQuestions");
+    validateUsage(message.payload.usage);
+  } else if (message.payload.type === "task.failed") {
+    validateTaskId(message.payload.taskId);
+    nonEmpty(message.payload.reason, "reason");
+    if (typeof message.payload.retryable !== "boolean") {
+      throw new A2AProtocolError("task failed retryable must be boolean");
+    }
+    validateStringArray(message.payload.evidenceRefs, "evidenceRefs");
   } else {
     throw new A2AProtocolError("payload type is invalid");
+  }
+}
+
+function validateTaskId(value: string): void {
+  nonEmpty(value, "taskId");
+  if (value.length > 128) throw new A2AProtocolError("taskId exceeds 128 characters");
+}
+
+function validateGoal(goal: Goal): void {
+  if (!isRecord(goal)) throw new A2AProtocolError("task goal must be an object");
+  if (!Number.isSafeInteger(goal.version) || goal.version < 1) {
+    throw new A2AProtocolError("task goal version must be a positive integer");
+  }
+  nonEmpty(goal.statement, "goal.statement");
+  validateStringArray(goal.successCriteria, "goal.successCriteria");
+  validateStringArray(goal.hardConstraints, "goal.hardConstraints");
+}
+
+function validateTaskBudget(budget: TaskBudget): void {
+  if (!isRecord(budget)) throw new A2AProtocolError("task budget must be an object");
+  if (!Number.isSafeInteger(budget.maxModelTokens) || budget.maxModelTokens < 1) {
+    throw new A2AProtocolError("task budget maxModelTokens must be a positive integer");
+  }
+  if (!Number.isSafeInteger(budget.maxWallClockMs) || budget.maxWallClockMs < 1) {
+    throw new A2AProtocolError("task budget maxWallClockMs must be a positive integer");
+  }
+}
+
+function validateArtifactRefs(
+  refs: ArtifactRef[],
+  field: string,
+): void {
+  if (!Array.isArray(refs)) throw new A2AProtocolError(`${field} must be an array`);
+  for (const ref of refs) {
+    if (ref === null || typeof ref !== "object") throw new A2AProtocolError(`${field} contains an invalid artifact ref`);
+    nonEmpty(ref.id, `${field}.id`);
+    nonEmpty(ref.contentHash, `${field}.contentHash`);
+    nonEmpty(ref.mediaType, `${field}.mediaType`);
+    if (!Number.isSafeInteger(ref.byteLength) || ref.byteLength < 0) {
+      throw new A2AProtocolError(`${field}.byteLength must be a non-negative integer`);
+    }
+  }
+}
+
+function validateStringArray(values: string[], field: string): void {
+  if (!Array.isArray(values)) throw new A2AProtocolError(`${field} must be an array`);
+  for (const value of values) {
+    if (typeof value !== "string") throw new A2AProtocolError(`${field} must contain strings`);
+  }
+}
+
+function validateUsage(usage: TokenUsage): void {
+  if (!isRecord(usage)) throw new A2AProtocolError("task result usage must be an object");
+  for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+    const value = usage[field];
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new A2AProtocolError(`task result usage ${field} must be a non-negative integer`);
+    }
+  }
+  if (usage.costUsd !== undefined && (!Number.isFinite(usage.costUsd) || usage.costUsd < 0)) {
+    throw new A2AProtocolError("task result usage costUsd must be non-negative");
   }
 }
 
@@ -693,10 +782,14 @@ function claimIdFromEvent(
   return markerIndex < 0 ? event.eventId : suffix.slice(0, markerIndex);
 }
 
-function nonEmpty(value: string, field: string): void {
-  if (value.trim().length === 0) {
+function nonEmpty(value: unknown, field: string): asserts value is string {
+  if (typeof value !== "string" || value.trim().length === 0) {
     throw new A2AProtocolError(`${field} must not be empty`);
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function validDate(value: string, field: string): void {

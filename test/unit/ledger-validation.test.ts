@@ -249,7 +249,7 @@ const invalidPayloads = {
   "run.completed": { answerRef: null },
   "run.failed": {},
   "goal.revised": { goal: { ...goal, version: 0 } },
-  "lane.registered": { kind: "worker" },
+  "lane.registered": { kind: "unknown" },
   "lane.status": { status: "unknown" },
   "step.started": { step: 0 },
   "step.completed": { step: 1, hasToolCalls: "no" },
@@ -368,6 +368,22 @@ describe("event payload validation", () => {
       expect(() => validateEventPayload(type, validPayloads[type])).not.toThrow();
     }
     expect(() => validateEventPayload("lane.registered", { kind: "reflection" })).not.toThrow();
+    expect(() => validateEventPayload("lane.registered", { kind: "worker" })).not.toThrow();
+    expect(() => validateEventPayload("message.sent", {
+      message: {
+        ...message,
+        messageId: "task-request-message",
+        from: "main",
+        to: "worker-1",
+        payload: {
+          type: "task.request",
+          taskId: "task-1",
+          goal,
+          inputRefs: [artifact],
+          budget: { maxModelTokens: 1_000, maxWallClockMs: 30_000 },
+        },
+      },
+    })).not.toThrow();
     expect(() => validateEventPayload("teto.advice.generated", {
       advice,
       delivery: "live",

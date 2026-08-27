@@ -107,6 +107,26 @@ function goal(value: unknown, path: string): asserts value is Goal {
   stringArray(item.hardConstraints, `${path}.hardConstraints`);
 }
 
+function taskId(value: unknown, path: string): void {
+  string(value, path, false);
+  if ((value as string).length > 128) {
+    invalid(path, "at most 128 characters");
+  }
+}
+
+function taskBudget(value: unknown, path: string): void {
+  const item = record(value, path);
+  integer(item.maxModelTokens, `${path}.maxModelTokens`, 1);
+  integer(item.maxWallClockMs, `${path}.maxWallClockMs`, 1);
+}
+
+function artifactRefArray(value: unknown, path: string): void {
+  if (!Array.isArray(value)) {
+    invalid(path, "an array of artifact refs");
+  }
+  value.forEach((ref, index) => artifactRef(ref, `${path}[${index}]`));
+}
+
 function runPolicy(value: unknown, path: string): asserts value is RunPolicy {
   const item = record(value, path);
   const hasActivationAllowance = Object.hasOwn(item, "maxMainStepsPerActivation");
@@ -254,6 +274,10 @@ function a2aMessage(value: unknown, path: string): asserts value is A2AMessage {
   const payload = record(item.payload, `${path}.payload`);
   oneOf(payload.type, `${path}.payload.type`, [
     "advice.propose",
+    "task.request",
+    "task.accept",
+    "task.result",
+    "task.failed",
     "question.ask",
     "question.answer",
     "message.inform",
@@ -264,6 +288,30 @@ function a2aMessage(value: unknown, path: string): asserts value is A2AMessage {
       if ((payload.advice as Advice).sourceLane !== item.from) {
         invalid(`${path}.payload.advice.sourceLane`, "equal to the message sender");
       }
+      break;
+    case "task.request":
+      taskId(payload.taskId, `${path}.payload.taskId`);
+      goal(payload.goal, `${path}.payload.goal`);
+      artifactRefArray(payload.inputRefs, `${path}.payload.inputRefs`);
+      taskBudget(payload.budget, `${path}.payload.budget`);
+      break;
+    case "task.accept":
+      taskId(payload.taskId, `${path}.payload.taskId`);
+      break;
+    case "task.result":
+      taskId(payload.taskId, `${path}.payload.taskId`);
+      oneOf(payload.status, `${path}.payload.status`, ["completed", "partial"] as const);
+      string(payload.summary, `${path}.payload.summary`, false);
+      stringArray(payload.evidenceRefs, `${path}.payload.evidenceRefs`);
+      artifactRefArray(payload.artifactRefs, `${path}.payload.artifactRefs`);
+      stringArray(payload.openQuestions, `${path}.payload.openQuestions`);
+      usage(payload.usage, `${path}.payload.usage`);
+      break;
+    case "task.failed":
+      taskId(payload.taskId, `${path}.payload.taskId`);
+      string(payload.reason, `${path}.payload.reason`, false);
+      boolean(payload.retryable, `${path}.payload.retryable`);
+      stringArray(payload.evidenceRefs, `${path}.payload.evidenceRefs`);
       break;
     case "question.ask":
       string(payload.question, `${path}.payload.question`, false);
@@ -319,7 +367,7 @@ const payloadValidators = {
   },
   "lane.registered": (value, path) => {
     const item = payloadObject(value, path, ["kind"]);
-    oneOf(item.kind, `${path}.kind`, ["main", "intent-navigator", "reflection"] as const);
+    oneOf(item.kind, `${path}.kind`, ["main", "intent-navigator", "reflection", "worker"] as const);
   },
   "lane.status": (value, path) => {
     const item = payloadObject(value, path, ["status"]);

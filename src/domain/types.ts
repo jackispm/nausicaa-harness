@@ -9,7 +9,7 @@ export type ArtifactId = string;
 export type MessageId = string;
 export type OperationId = string;
 
-export type LaneKind = "main" | "intent-navigator" | "reflection";
+export type LaneKind = "main" | "intent-navigator" | "reflection" | "worker";
 export type LaneStatus =
   | "dormant"
   | "ready"
@@ -136,8 +136,49 @@ export interface Advice {
 export type DeliveryMode = "next-step" | "next-turn" | "deferred" | "urgent";
 export type AuxiliaryMode = "none" | "teto" | "reflection";
 
+export interface TaskBudget {
+  maxModelTokens: number;
+  maxWallClockMs: number;
+}
+
+export interface TaskRequest {
+  type: "task.request";
+  taskId: string;
+  goal: Goal;
+  inputRefs: ArtifactRef[];
+  budget: TaskBudget;
+}
+
+export interface TaskAccept {
+  type: "task.accept";
+  taskId: string;
+}
+
+export interface TaskResult {
+  type: "task.result";
+  taskId: string;
+  status: "completed" | "partial";
+  summary: string;
+  evidenceRefs: string[];
+  artifactRefs: ArtifactRef[];
+  openQuestions: string[];
+  usage: TokenUsage;
+}
+
+export interface TaskFailed {
+  type: "task.failed";
+  taskId: string;
+  reason: string;
+  retryable: boolean;
+  evidenceRefs: string[];
+}
+
 export type A2APayload =
   | { type: "advice.propose"; advice: Advice }
+  | TaskRequest
+  | TaskAccept
+  | TaskResult
+  | TaskFailed
   | { type: "question.ask"; question: string }
   | { type: "question.answer"; answer: string }
   | { type: "message.inform"; text: string };
