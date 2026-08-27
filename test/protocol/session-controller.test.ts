@@ -268,6 +268,70 @@ describe("SessionController", () => {
     await session.close();
   });
 
+  it("cancels Run-scoped Worker work when the Session closes", async () => {
+    const root = await temporaryRoot();
+    let markWorkerStarted: (() => void) | undefined;
+    const workerStarted = new Promise<void>((resolve) => {
+      markWorkerStarted = resolve;
+    });
+    const workerModel = new ScriptedModel([async () => {
+      markWorkerStarted?.();
+      return new Promise<ModelResponse>(() => {
+        // The Session close signal must end this bounded Worker activation.
+      });
+    }]);
+    const mainModel = new ScriptedModel([
+      {
+        ...response("queued inspection"),
+        toolCalls: [{
+          id: "delegate-close",
+          name: "delegate_task",
+          arguments: {
+            taskId: "close-task",
+            statement: "Inspect the package name",
+            maxModelTokens: 100,
+            maxWallClockMs: 5_000,
+          },
+        }],
+        stopReason: "toolUse",
+      },
+      response("first Turn is complete"),
+    ]);
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted/main",
+      workerModel: "scripted/worker",
+      workerEnabled: true,
+      policy: {
+        maxMainStepsPerActivation: 4,
+        maxModelTokens: 10_000,
+        tetoEnabled: false,
+      },
+    }, {
+      mainModel,
+      workerModel,
+      tools: [],
+      createRunId: () => "close-worker-run",
+    });
+
+    await session.submit({ inputId: "close-input", text: "Queue an inspection" });
+    await workerStarted;
+    await session.waitForIdle();
+    await session.close();
+
+    expect(session.snapshot().status).toBe("closed");
+    const ledger = await JsonlLedger.open(
+      join(root, "state", "runs", "close-worker-run", "ledger.jsonl"),
+    );
+    const events = await ledger.read({ runId: "close-worker-run" });
+    expect(events.some((event) => (
+      event.type === "message.sent"
+      && event.payload.message.payload.type === "task.result"
+    ))).toBe(false);
+    await ledger.close();
+  });
+
   it("passes the configured per-call output limit to Main", async () => {
     const root = await temporaryRoot();
     const model = new ScriptedModel([response("bounded answer")]);
