@@ -78,7 +78,7 @@ import {
   assertEvaluationToolContract,
 } from "./tool-contract.js";
 
-export const WORKER_LIVE_EVALUATION_ID = "worker-live-ab-v1";
+export const WORKER_LIVE_EVALUATION_ID = "worker-live-ab-v2";
 export const WORKER_LIVE_EVALUATION_ENV = "NAUSICAA_WORKER_EVAL";
 export const WORKER_LIVE_BUDGET_ENV = "NAUSICAA_WORKER_EVAL_BUDGET_USD";
 
@@ -476,7 +476,8 @@ export async function executeWorkerLiveArm(
     protectedPaths: [resolve(dataDir)],
   });
   assertEvaluationToolContract(workspaceTools, false);
-  const tools = traceWorkerLiveTools(workspaceTools, toolTrace);
+  const tools = traceWorkerLiveTools(workspaceTools, toolTrace, "main");
+  const workerTools = traceWorkerLiveTools(workspaceTools, toolTrace, "worker");
   const meter = new WorkerLiveArmMeter(
     manifest,
     arm,
@@ -533,6 +534,7 @@ export async function executeWorkerLiveArm(
         mainModel: model,
         workerModel: model,
         tools,
+        workerTools,
         createRunId: () => runId,
       } satisfies RunExecutionDeps;
       let activation = await executeRun({
@@ -2014,13 +2016,13 @@ function validateProviderUsage(value: unknown): asserts value is WorkerLiveProvi
 function validateToolTrace(
   values: readonly unknown[],
 ): WorkerLiveRecordedToolTraceEntry[] {
-  const allowed = new Set(WORKER_LIVE_TOOL_CONTRACT.definitions["main-only"]
+  const allowed = new Set(WORKER_LIVE_TOOL_CONTRACT.definitions["worker"]
     .map((tool) => tool.name));
   return values.map((value) => {
     if (!isRecord(value)
       || typeof value.operationId !== "string"
       || value.operationId.length === 0
-      || value.laneId !== "main"
+      || (value.laneId !== "main" && value.laneId !== "worker")
       || typeof value.name !== "string"
       || !allowed.has(value.name)
       || !isRecord(value.arguments)
@@ -2377,6 +2379,7 @@ function publicFixture(fixture: WorkerLiveFixture): WorkerLivePublicFixture {
 function traceWorkerLiveTools(
   tools: readonly AgentTool[],
   trace: WorkerLiveRecordedToolTraceEntry[],
+  laneId: "main" | "worker",
 ): AgentTool[] {
   return tools.map((tool) => ({
     definition: structuredClone(tool.definition),
@@ -2385,7 +2388,7 @@ function traceWorkerLiveTools(
         const result = await tool.execute(arguments_, context);
         trace.push({
           operationId: context.operationId,
-          laneId: "main",
+          laneId,
           name: tool.definition.name,
           arguments: structuredClone(arguments_),
           isError: result.isError,
@@ -2394,7 +2397,7 @@ function traceWorkerLiveTools(
       } catch (error: unknown) {
         trace.push({
           operationId: context.operationId,
-          laneId: "main",
+          laneId,
           name: tool.definition.name,
           arguments: structuredClone(arguments_),
           isError: true,

@@ -15,7 +15,7 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 - JSONL Ledger 与内容寻址 Store 保存事实和大对象，支持 checkpoint 与 Run 恢复。
 - Teto 辅助线读取固定大小的观察帧，低频检查目标偏离、意图缺失和更优方法。
 - Advice 通过持久 Inbox 在 Main 的自然边界进入上下文，可明确接受、延后或拒绝。
-- Worker 作为显式 opt-in 的 bounded sub-agent lane，通过 A2A 接收 Main 委派的任务；默认不会增加模型调用。
+- Worker 作为显式 opt-in 的 bounded sub-agent lane，通过 A2A 接收 Main 委派的任务；它可在同一工作区使用受限的 `read_file`、`list_files`、`grep` 和 `find`，最多 2 次模型轮次和 4 次只读工具调用，不能写文件、执行 Shell 或继续委派；默认不会增加模型调用。
 - TTY 默认进入持续 Session：一个 Run 可包含多个 Turn，支持 steering、取消、恢复和 `--continue`。
 - 运行中按 Enter 注入 steering，按 Alt+Enter 排队 follow-up；输入和 ACK 都写入 Ledger。
 - `pi-tui` 只负责终端 surface；SessionController、Ledger 和模型执行保持独立，未来可接桌面 UI。

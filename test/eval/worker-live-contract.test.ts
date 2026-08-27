@@ -83,7 +83,7 @@ describe("real-model Worker A/B preregistration", () => {
     ]))).toEqual({
       "main-only": ["read_file", "list_files", "grep", "find"],
       "main-worker": ["read_file", "list_files", "grep", "find", "delegate_task"],
-      worker: [],
+      worker: ["read_file", "list_files", "grep", "find"],
     });
     for (const mode of WORKER_LIVE_TOOL_MODES) {
       expect(WORKER_LIVE_TOOL_CONTRACT.hashes[mode])
@@ -91,19 +91,19 @@ describe("real-model Worker A/B preregistration", () => {
     }
     expect(WORKER_LIVE_TOOL_CONTRACT.hashes).toEqual({
       "main-only": "sha256:a795d65bd6082de91edf860bbabacdd96d9709874f6d01fd8873de8efd9851de",
-      "main-worker": "sha256:6c880607fa5a282f10313dd57f0111c1646bf3806b7070e50e1b617d21a37f68",
-      worker: "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "main-worker": "sha256:b244aee6e49a3b32bc1073dbe4f1a3fa3d4e01b7dc7c41e909809b122448b950",
+      worker: "sha256:a795d65bd6082de91edf860bbabacdd96d9709874f6d01fd8873de8efd9851de",
     });
     expect(WORKER_LIVE_MANIFEST.provenance).toMatchObject({
       baselineCommit: WORKER_LIVE_BASELINE_COMMIT,
-      runnerVersion: "nausicaa-worker-live-runner-v1",
+      runnerVersion: "nausicaa-worker-live-runner-v2",
     });
     expect(WORKER_LIVE_BASELINE_COMMIT)
       .toBe("617a0b2f97c59da526b961542d4f3580fb4f43c8");
     expect(WORKER_LIVE_MANIFEST.manifestHash)
       .toBe(hashWorkerLiveManifest(WORKER_LIVE_MANIFEST));
     expect(WORKER_LIVE_MANIFEST.manifestHash)
-      .toBe("sha256:e0b138553f48a4b31d81b67be24a1e639158c8a0d2760421df24dc7381b3394d");
+      .toBe("sha256:8a5777772f7e61734af72a676ca4fbb4e351e6739c4bf52e4679eee66ae97fb9");
     expect(Object.isFrozen(WORKER_LIVE_MANIFEST)).toBe(true);
     expect(Object.isFrozen(WORKER_LIVE_MANIFEST.arms[0]?.budget)).toBe(true);
     expect(Object.isFrozen(WORKER_LIVE_MANIFEST.execution)).toBe(true);

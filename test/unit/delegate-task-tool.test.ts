@@ -3,7 +3,12 @@ import { describe, expect, it } from "vitest";
 import { A2AInbox } from "../../src/a2a/index.js";
 import type { ToolExecutionContext } from "../../src/domain/index.js";
 import { TaskDispatcher } from "../../src/runtime/index.js";
-import { createDelegateTaskTool } from "../../src/runtime/index.js";
+import {
+  createDelegateTaskTool,
+  DEFAULT_DELEGATED_ATTEMPTS,
+  DEFAULT_DELEGATED_MODEL_TOKENS,
+  DEFAULT_DELEGATED_WALL_CLOCK_MS,
+} from "../../src/runtime/index.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
 
 const context: ToolExecutionContext = {
@@ -21,6 +26,14 @@ function setup(maxInputBytes?: number) {
 }
 
 describe("delegate_task tool", () => {
+  it("exposes an optional-budget async delegation contract", () => {
+    const { tool } = setup();
+    expect(tool.definition.parameters.required).toEqual(["statement"]);
+    expect(tool.definition.description).toMatch(/asynchronously/i);
+    expect(tool.definition.description).toMatch(/read-only workspace tools/i);
+    expect(tool.definition.description).toMatch(/continue other work/i);
+  });
+
   it("stores optional input and queues a bounded task request", async () => {
     const { inbox, store, tool } = setup();
     const result = await tool.execute({
@@ -57,12 +70,10 @@ describe("delegate_task tool", () => {
     );
   });
 
-  it("uses empty criteria and input refs when optional fields are omitted", async () => {
+  it("uses conservative runtime defaults when budget fields are omitted", async () => {
     const { inbox, tool } = setup();
     const result = await tool.execute({
       statement: "Summarize the supplied context",
-      maxModelTokens: 100,
-      maxWallClockMs: 1_000,
     }, context);
 
     expect(result.isError).toBe(false);
@@ -71,6 +82,11 @@ describe("delegate_task tool", () => {
       type: "task.request",
       inputRefs: [],
       goal: { successCriteria: [], hardConstraints: [] },
+      budget: {
+        maxModelTokens: DEFAULT_DELEGATED_MODEL_TOKENS,
+        maxWallClockMs: DEFAULT_DELEGATED_WALL_CLOCK_MS,
+        maxAttempts: DEFAULT_DELEGATED_ATTEMPTS,
+      },
     });
   });
 

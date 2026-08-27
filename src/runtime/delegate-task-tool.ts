@@ -1,9 +1,16 @@
 import type { AgentTool } from "../domain/ports.js";
-import { MAX_TASK_ATTEMPTS } from "../domain/types.js";
+import {
+  DEFAULT_TASK_MAX_ATTEMPTS,
+  MAX_TASK_ATTEMPTS,
+} from "../domain/types.js";
 import type { ContentAddressedStore } from "../store/index.js";
 import { TaskDispatcher } from "./task-dispatcher.js";
 
 const DEFAULT_MAX_INPUT_BYTES = 64 * 1024;
+/** Small defaults keep an unconfigured Worker slice bounded and cheap. */
+export const DEFAULT_DELEGATED_MODEL_TOKENS = 2_000;
+export const DEFAULT_DELEGATED_WALL_CLOCK_MS = 30_000;
+export const DEFAULT_DELEGATED_ATTEMPTS = DEFAULT_TASK_MAX_ATTEMPTS;
 const MAX_STRING_LENGTH = 4_096;
 
 export interface DelegateTaskToolOptions {
@@ -25,20 +32,20 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
   return {
     definition: {
       name: "delegate_task",
-      description: "Queue one bounded read-only Worker task and return its task id.",
+      description: "Queue an independent, bounded read-only Worker task. The Worker can independently use bounded read-only workspace tools and returns its result asynchronously at a later Main step or turn; continue other work after queueing. Batch independent tasks when useful. Do not use for trivial, tightly coupled, mutating, shell, or immediate-result work.",
       parameters: {
         type: "object",
         properties: {
           taskId: { type: "string", description: "Stable id for retrying this task" },
           statement: { type: "string", description: "The delegated task objective" },
-          successCriteria: { type: "array", items: { type: "string" } },
-          hardConstraints: { type: "array", items: { type: "string" } },
+          successCriteria: { type: "array", items: { type: "string" }, description: "Optional observable completion criteria" },
+          hardConstraints: { type: "array", items: { type: "string" }, description: "Optional constraints, such as read-only or path limits" },
           input: { type: "string", description: "Optional bounded input data" },
-          maxModelTokens: { type: "integer", minimum: 1 },
-          maxWallClockMs: { type: "integer", minimum: 1 },
-          maxAttempts: { type: "integer", minimum: 1, maximum: MAX_TASK_ATTEMPTS },
+          maxModelTokens: { type: "integer", minimum: 1, description: `Optional model-token budget (default ${DEFAULT_DELEGATED_MODEL_TOKENS})` },
+          maxWallClockMs: { type: "integer", minimum: 1, description: `Optional wall-clock budget in milliseconds (default ${DEFAULT_DELEGATED_WALL_CLOCK_MS})` },
+          maxAttempts: { type: "integer", minimum: 1, maximum: MAX_TASK_ATTEMPTS, description: `Optional provider-attempt budget (default ${DEFAULT_DELEGATED_ATTEMPTS})` },
         },
-        required: ["statement", "maxModelTokens", "maxWallClockMs"],
+        required: ["statement"],
         additionalProperties: false,
       },
     },
@@ -48,9 +55,15 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
         const statement = requiredString(arguments_.statement, "statement");
         const successCriteria = stringArray(arguments_.successCriteria, "successCriteria");
         const hardConstraints = stringArray(arguments_.hardConstraints, "hardConstraints");
-        const maxModelTokens = positiveInteger(arguments_.maxModelTokens, "maxModelTokens");
-        const maxWallClockMs = positiveInteger(arguments_.maxWallClockMs, "maxWallClockMs");
-        const maxAttempts = optionalPositiveInteger(arguments_.maxAttempts, "maxAttempts");
+        const maxModelTokens = arguments_.maxModelTokens === undefined
+          ? DEFAULT_DELEGATED_MODEL_TOKENS
+          : positiveInteger(arguments_.maxModelTokens, "maxModelTokens");
+        const maxWallClockMs = arguments_.maxWallClockMs === undefined
+          ? DEFAULT_DELEGATED_WALL_CLOCK_MS
+          : positiveInteger(arguments_.maxWallClockMs, "maxWallClockMs");
+        const maxAttempts = arguments_.maxAttempts === undefined
+          ? DEFAULT_DELEGATED_ATTEMPTS
+          : optionalPositiveInteger(arguments_.maxAttempts, "maxAttempts");
         const input = optionalString(arguments_.input, "input");
         if (input !== undefined && Buffer.byteLength(input, "utf8") > maxInputBytes) {
           throw new RangeError(`input exceeds ${maxInputBytes} bytes`);

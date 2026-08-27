@@ -43,10 +43,10 @@ describe("Worker real-model fixture catalog", () => {
     expect(Object.isFrozen(WORKER_LIVE_FIXTURE_CATALOG[0]?.hiddenOracle)).toBe(true);
     expect(WORKER_LIVE_FIXTURE_HASH).toBe(hashJson(WORKER_LIVE_FIXTURE_CATALOG));
     expect(WORKER_LIVE_FIXTURE_HASH)
-      .toBe("sha256:75a8affcf2dd41892fdcb726edda543dd9fbec25efee0fa1f1da18b39b12cdc5");
+      .toBe("sha256:9c76cb2f3d3355de4be966a15edad0869861756150b62a0b6d2e08a5b212e7b3");
     expect(WORKER_LIVE_SCORER_HASH).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(WORKER_LIVE_SCORER_HASH)
-      .toBe("sha256:3e8dfc6e95d884df3777eec3fd74b09bcf6c78f72af70c1497f22ba91e1dcc24");
+      .toBe("sha256:6a1ab4b74c462135bd487f64f37cdcb8a3225ca34c6a3a6f0ff042e301912f29");
   });
 
   it("scores answer concepts and cross-lane read evidence deterministically", async () => {
@@ -63,7 +63,25 @@ describe("Worker real-model fixture catalog", () => {
     await expect(fixture.score(answer, trace)).resolves.toBe(1);
     await expect(fixture.score(answer, [])).resolves.toBeCloseTo(0.8, 12);
     await expect(fixture.score("Use kubectl for a production deploy.", trace)).resolves.toBe(0);
+    await expect(fixture.score(
+      `${answer} The release policy says do not include production deployment commands.`,
+      trace,
+    )).resolves.toBe(1);
     await expect(fixture.score(answer, trace)).resolves.toBe(1);
+
+    const incident = await createWorkerLiveFixture(
+      WORKER_LIVE_FIXTURE_CATALOG.find((candidate) => candidate.task.taskId === "incident-triage")!.task,
+      root,
+    );
+    await expect(incident.score(
+      "The payment service first failed at 09:14:03 because PAYMENT_REGION was missing; the gateway had an upstream timed out error. Restore the validated regional value and restart only the payment service; do not retry captured charges manually.",
+      [
+        read("main", "logs/gateway.log"),
+        read("main", "logs/payment.log"),
+        read("main", "config/payment.example"),
+        read("main", "runbooks/checkout.md"),
+      ],
+    )).resolves.toBe(1);
   });
 
   it("invalidates evidence after any visible fixture mutation", async () => {

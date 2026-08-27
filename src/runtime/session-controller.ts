@@ -184,6 +184,8 @@ export interface SessionControllerDeps {
   tetoModel?: ModelPort;
   workerModel?: ModelPort;
   tools?: readonly AgentTool[];
+  /** Optional bounded read-only tools for Worker; defaults to the workspace set. */
+  workerTools?: readonly AgentTool[];
   clock?: Clock;
   createRunId?: () => string;
 }
@@ -954,6 +956,12 @@ export class SessionController {
       model: this.deps.workerModel ?? this.deps.mainModel ?? createOpenRouterModelPort(),
       modelName: this.workerModel,
       runId: attached.runId,
+      workspace: this.workspace,
+      tools: this.deps.workerTools ?? createWorkspaceTools({
+        allowWrite: false,
+        allowShell: false,
+        protectedPaths: [this.dataDir],
+      }),
       runTokenBudget: attached.tokenBudget,
       clock: this.clock,
       readWatermark: () => attached.ledger.watermark(),

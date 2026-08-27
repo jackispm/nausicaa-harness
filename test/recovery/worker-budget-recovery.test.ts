@@ -322,13 +322,13 @@ describe("Worker durable task budgets", () => {
       deadline: "2026-08-27T12:01:00.000Z",
       maxAttempts: 2,
     });
-    const firstResponseRef = await appendModelCompletion(
+    await appendModelCompletion(
       fixture,
       1,
       "first",
       usage(3, 2),
     );
-    await appendModelCompletion(fixture, 2, "second", usage(2, 1));
+    const secondResponseRef = await appendModelCompletion(fixture, 2, "second", usage(2, 1));
     fixture.clock.advance(1_001);
     const executor = fixture.executor(async () => {
       throw new Error("committed completions must prevent provider execution");
@@ -346,8 +346,8 @@ describe("Worker durable task budgets", () => {
     ));
     expect(result?.type === "message.sent" ? result.payload.message.payload : undefined)
       .toMatchObject({
-        summary: "first",
-        artifactRefs: [firstResponseRef],
+        summary: "second",
+        artifactRefs: [secondResponseRef],
         usage: { input: 5, output: 3, cacheRead: 0, cacheWrite: 0 },
       });
   });

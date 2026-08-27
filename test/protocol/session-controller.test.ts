@@ -89,7 +89,13 @@ describe("SessionController", () => {
       markWorkerStarted = resolve;
     });
     let releaseWorker: ((value: ModelResponse) => void) | undefined;
-    const workerModel = new ScriptedModel([async () => {
+    const workerModel = new ScriptedModel([async (request) => {
+      expect(request.tools.map((tool) => tool.name)).toEqual([
+        "read_file",
+        "list_files",
+        "grep",
+        "find",
+      ]);
       markWorkerStarted?.();
       return new Promise<ModelResponse>((resolve) => {
         releaseWorker = resolve;

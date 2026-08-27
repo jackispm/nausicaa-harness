@@ -10,7 +10,7 @@ export interface WorkerLiveTaskPlan {
   taskId: string;
   familyId: string;
   kind: WorkerLiveFixtureKind;
-  fixtureVersion: "worker-live-natural-v1";
+  fixtureVersion: "worker-live-natural-v2";
   oracle: "hidden";
   expectedWorkerUse: boolean;
 }
@@ -158,8 +158,8 @@ const catalog: readonly FrozenWorkerLiveFixtureSpec[] = [
 ];
 
 export const WORKER_LIVE_SCORER_CONTRACT = deepFreeze({
-  version: "worker-live-hidden-scorer-v1",
-  formula: "0.8 * required-answer-concepts + 0.2 * required-read-evidence",
+  version: "worker-live-hidden-scorer-v2",
+  formula: "0.8 * required-answer-concepts + 0.2 * required-read-evidence; forbidden concepts use token boundaries and negation-aware matching; evidence paths are workspace-normalized",
   mutationScore: 0,
   forbiddenConceptScore: 0,
 } as const);
@@ -211,7 +211,7 @@ async function scoreFixture(
 ): Promise<number> {
   if (await workspaceChanged(workspace, initialFiles)) return 0;
   const answer = canonicalText(finalText);
-  if (oracle.forbiddenConcepts.some((value) => answer.includes(canonicalText(value)))) {
+  if (oracle.forbiddenConcepts.some((value) => containsUnnegatedConcept(answer, value))) {
     return 0;
   }
   const concepts = ratio(oracle.requiredConcepts.filter((alternatives) => (
@@ -219,7 +219,7 @@ async function scoreFixture(
   )).length, oracle.requiredConcepts.length);
   const reads = ratio(oracle.requiredReads.filter((path) => toolTrace.some((entry) => (
     entry.name === "read_file"
-    && entry.arguments.path === path
+    && normalizeWorkspacePath(entry.arguments.path) === normalizeWorkspacePath(path)
     && !entry.isError
   ))).length, oracle.requiredReads.length);
   return concepts * 0.8 + reads * 0.2;
@@ -247,7 +247,7 @@ function task(
     taskId,
     familyId,
     kind,
-    fixtureVersion: "worker-live-natural-v1",
+    fixtureVersion: "worker-live-natural-v2",
     oracle: "hidden",
     expectedWorkerUse,
   };
@@ -264,6 +264,37 @@ function goal(statement: string, successCriteria: string[]): Goal {
 
 function canonicalText(value: string): string {
   return value.normalize("NFKC").toLowerCase().replace(/[`*_]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeWorkspacePath(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const normalized = value.replaceAll("\\", "/").replace(/^\.\//u, "");
+  const parts: string[] = [];
+  for (const part of normalized.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (parts.length > 0) parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.join("/");
+}
+
+function containsUnnegatedConcept(answer: string, forbidden: string): boolean {
+  const concept = canonicalText(forbidden);
+  if (concept.length === 0) return false;
+  const escaped = concept.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replaceAll(" ", "\\s+");
+  const matcher = new RegExp(`(?:^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, "giu");
+  for (const match of answer.matchAll(matcher)) {
+    const start = match.index ?? 0;
+    const contextStart = Math.max(0, answer.lastIndexOf(".", start - 1) + 1, answer.lastIndexOf("\n", start - 1) + 1);
+    const before = answer.slice(contextStart, start);
+    if (!/(?:\b(?:do not|don't|must not|not|never|avoid|without|no)(?:\s+[a-z0-9'-]+){0,3}\s*$|禁止|不要|避免|不得|不能)\s*$/iu.test(before)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function ratio(numerator: number, denominator: number): number {

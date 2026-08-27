@@ -62,7 +62,7 @@ export interface WorkerLiveArmPlan {
 }
 
 export interface WorkerLiveScoringPlan {
-  scorerVersion: "worker-live-hidden-scorer-v1";
+  scorerVersion: "worker-live-hidden-scorer-v2";
   scorerHash: string;
   utilityFormula: "quality-cost-wall-clock";
   qualityWeight: number;
@@ -86,8 +86,8 @@ export interface WorkerLiveToolContract {
 
 export interface WorkerLiveManifest {
   schemaVersion: typeof WORKER_LIVE_SCHEMA_VERSION;
-  experimentId: "worker-live-ab-v1";
-  taskSetVersion: "worker-live-natural-v1";
+  experimentId: "worker-live-ab-v2";
+  taskSetVersion: "worker-live-natural-v2";
   model: { main: typeof WORKER_LIVE_MODEL; worker: typeof WORKER_LIVE_MODEL };
   seed: string;
   repetitions: number;
@@ -118,7 +118,7 @@ export interface WorkerLiveManifest {
   scoring: WorkerLiveScoringPlan;
   provenance: {
     baselineCommit: typeof WORKER_LIVE_BASELINE_COMMIT;
-    runnerVersion: "nausicaa-worker-live-runner-v1";
+    runnerVersion: "nausicaa-worker-live-runner-v2";
     fixtureHash: string;
     scorerHash: string;
   };
@@ -284,7 +284,7 @@ const workerLiveToolDefinitions: Record<WorkerLiveToolMode, ToolDefinition[]> = 
     ...mainOnlyToolDefinitions.map((definition) => structuredClone(definition)),
     structuredClone(delegateTaskDefinition),
   ],
-  worker: [],
+  worker: mainOnlyToolDefinitions.map((definition) => structuredClone(definition)),
 };
 const workerLiveToolHashes = Object.fromEntries(WORKER_LIVE_TOOL_MODES.map((mode) => [
   mode,
@@ -312,8 +312,8 @@ const armRunCount = sampleCount * WORKER_LIVE_ARMS.length;
 
 const manifestDraft: Omit<WorkerLiveManifest, "manifestHash"> = {
   schemaVersion: WORKER_LIVE_SCHEMA_VERSION,
-  experimentId: "worker-live-ab-v1",
-  taskSetVersion: "worker-live-natural-v1",
+  experimentId: "worker-live-ab-v2",
+  taskSetVersion: "worker-live-natural-v2",
   model: { main: WORKER_LIVE_MODEL, worker: WORKER_LIVE_MODEL },
   seed: "nausicaa-worker-live-ab-seed-1",
   repetitions,
@@ -353,7 +353,7 @@ const manifestDraft: Omit<WorkerLiveManifest, "manifestHash"> = {
     maxCumulativeWallClockMs: runBudget.maxWallClockMs * armRunCount,
   },
   scoring: {
-    scorerVersion: "worker-live-hidden-scorer-v1",
+    scorerVersion: "worker-live-hidden-scorer-v2",
     scorerHash: WORKER_LIVE_SCORER_HASH,
     utilityFormula: "quality-cost-wall-clock",
     qualityWeight: 1,
@@ -370,7 +370,7 @@ const manifestDraft: Omit<WorkerLiveManifest, "manifestHash"> = {
   },
   provenance: {
     baselineCommit: WORKER_LIVE_BASELINE_COMMIT,
-    runnerVersion: "nausicaa-worker-live-runner-v1",
+    runnerVersion: "nausicaa-worker-live-runner-v2",
     fixtureHash: WORKER_LIVE_FIXTURE_HASH,
     scorerHash: WORKER_LIVE_SCORER_HASH,
   },

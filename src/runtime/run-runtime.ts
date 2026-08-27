@@ -100,6 +100,8 @@ export interface RunExecutionDeps {
   reflectionModel?: ModelPort;
   workerModel?: ModelPort;
   tools?: readonly AgentTool[];
+  /** Optional bounded read-only tools for Worker; defaults to the workspace set. */
+  workerTools?: readonly AgentTool[];
   clock?: Clock;
   createRunId?: () => string;
   onEvent?: (event: AnyEvent) => void;
@@ -296,6 +298,11 @@ export const executeRun = async (
         clock,
       });
       const workerModel = deps.workerModel ?? mainModel;
+      const workerTools = deps.workerTools ?? createWorkspaceTools({
+        allowWrite: false,
+        allowShell: false,
+        protectedPaths: [resolve(request.dataDir)],
+      });
       const workerExecutor = new WorkerTaskExecutor({
         inbox,
         eventSink: sink,
@@ -303,6 +310,8 @@ export const executeRun = async (
         model: workerModel,
         modelName: request.workerModel ?? request.model,
         runId,
+        workspace,
+        tools: workerTools,
         runTokenBudget,
         clock,
         ...(request.signal === undefined ? {} : { signal: request.signal }),

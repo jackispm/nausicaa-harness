@@ -1,8 +1,13 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { A2AInbox } from "../../src/a2a/index.js";
 import type {
   A2AMessage,
+  AgentTool,
   ArtifactRef,
   Clock,
   Goal,
@@ -19,6 +24,7 @@ import {
   WorkerTaskTimeoutError,
 } from "../../src/runtime/index.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
+import { createWorkspaceTools } from "../../src/tools/index.js";
 
 const goal: Goal = {
   version: 1,
@@ -62,6 +68,7 @@ async function setup(
   input = "npm install",
   budget?: { maxModelTokens: number; maxWallClockMs: number },
   runTokenBudget?: RunTokenBudget,
+  options: { workspace?: string; tools?: readonly AgentTool[] } = {},
 ) {
   const clock: Clock = {
     now: () => new Date("2026-08-27T12:00:00.000Z"),
@@ -80,6 +87,8 @@ async function setup(
     model,
     modelName: "scripted/worker",
     runId: "run-1",
+    ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
+    ...(options.tools === undefined ? {} : { tools: options.tools }),
     ...(runTokenBudget === undefined ? {} : { runTokenBudget }),
     workerLaneId: "worker-1",
     clock,
@@ -212,6 +221,251 @@ describe("WorkerTaskExecutor", () => {
     expect(request.maxOutputTokens).toBe(500);
     expect(recoveryReads.count).toBe(0);
     await expect(executor.runOnce()).resolves.toEqual({ status: "idle" });
+  });
+
+  it("lets Worker gather workspace evidence through a bounded read-only tool loop", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "nausicaa-worker-tools-"));
+    try {
+      await writeFile(join(workspace, "notes.md"), "Install with npm install.\n", "utf8");
+      const tools = createWorkspaceTools({ allowWrite: false, allowShell: false });
+      const model = new ScriptedModel([
+        (request): ModelResponse => {
+          expect(request.tools.map((tool) => tool.name)).toEqual([
+            "read_file",
+            "list_files",
+            "grep",
+            "find",
+          ]);
+          return {
+            content: "I will inspect the installation note.",
+            toolCalls: [{
+              id: "read-notes",
+              name: "read_file",
+              arguments: { path: "notes.md" },
+            }],
+            stopReason: "toolUse",
+            usage: { input: 40, output: 8, cacheRead: 0, cacheWrite: 0 },
+          };
+        },
+        (request): ModelResponse => {
+          const toolMessage = request.messages.find((message) => message.role === "tool");
+          expect(toolMessage?.content).toContain("npm install");
+          expect(toolMessage?.toolName).toBe("read_file");
+          return {
+            content: "Use npm install.",
+            toolCalls: [],
+            stopReason: "stop",
+            usage: { input: 70, output: 6, cacheRead: 0, cacheWrite: 0 },
+          };
+        },
+      ]);
+      const { executor, ledger } = await setup(
+        model,
+        "Find the installation command",
+        undefined,
+        undefined,
+        { workspace, tools },
+      );
+
+      await expect(executor.runOnce()).resolves.toMatchObject({
+        status: "completed",
+        usage: { input: 110, output: 14 },
+      });
+      expect(model.requests).toHaveLength(2);
+      expect(model.requests[1]?.messages.map((message) => message.role)).toEqual([
+        "user",
+        "assistant",
+        "tool",
+      ]);
+      const events = await ledger.read({ runId: "run-1" });
+      expect(events.filter((event) => event.type === "tool.requested")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "tool.succeeded")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "tool.failed")).toHaveLength(0);
+      expect(events.filter((event) => event.type === "model.requested")).toHaveLength(2);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects write and shell tools at the Worker boundary", async () => {
+    const ledger = new MemoryLedger();
+    const store = new MemoryContentAddressedStore();
+    const inbox = new A2AInbox({ sink: ledger });
+    const unsafeTools = createWorkspaceTools({ allowWrite: true, allowShell: true });
+
+    expect(() => new WorkerTaskExecutor({
+      inbox,
+      eventSink: ledger,
+      store,
+      model: new ScriptedModel([]),
+      modelName: "scripted/worker",
+      runId: "run-1",
+      tools: unsafeTools,
+    })).toThrow(/not an allowed read-only tool/);
+  });
+
+  it("fails closed on recovery after a durable tool-call response", async () => {
+    const model = new ScriptedModel([]);
+    const { executor, inbox, ledger, store, inputRef } = await setup(model);
+    await inbox.claim("worker-1", "worker-1", { claimId: "crashed-worker" });
+
+    const responseRef = await store.put(
+      stableJson({
+        role: "assistant",
+        content: "Inspecting the workspace.",
+        toolCalls: [{
+          id: "read-after-restart",
+          name: "read_file",
+          arguments: { path: "README.md" },
+        }],
+        createdAt: "2026-08-27T12:00:00.000Z",
+      }),
+      "application/vnd.nausicaa.conversation-message+json",
+    );
+    const prefix = "run-1:worker-1:task:task-1:attempt:1";
+    await ledger.append({
+      runId: "run-1",
+      laneId: "worker-1",
+      type: "model.requested",
+      payload: {
+        model: "scripted/worker",
+        requestHash: "request-hash",
+        contextWatermark: 2,
+        sessionId: "run-1:worker-1:task:task-1",
+        prefixHash: "prefix-hash",
+        dependencyRefs: [inputRef.contentHash],
+        contextBuildMs: 0,
+      },
+      correlationId: "task-correlation-1",
+      idempotencyKey: `${prefix}:model:requested`,
+      visibility: "run",
+    });
+    await ledger.append({
+      runId: "run-1",
+      laneId: "worker-1",
+      type: "model.completed",
+      payload: {
+        model: "scripted/worker",
+        responseRef,
+        stopReason: "toolUse",
+        usage: { input: 20, output: 5, cacheRead: 0, cacheWrite: 0 },
+      },
+      correlationId: "task-correlation-1",
+      idempotencyKey: `${prefix}:model:completed`,
+      visibility: "run",
+    });
+
+    const recoveryClock: Clock = {
+      now: () => new Date("2026-08-27T12:01:00.000Z"),
+    };
+    const recoveredInbox = A2AInbox.rehydrate(await ledger.read({ runId: "run-1" }), {
+      sink: ledger,
+      clock: recoveryClock,
+    });
+    const recoveryModel = new ScriptedModel([]);
+    const recoveryExecutor = new WorkerTaskExecutor({
+      inbox: recoveredInbox,
+      eventSink: ledger,
+      store,
+      model: recoveryModel,
+      modelName: "scripted/worker",
+      runId: "run-1",
+      workerLaneId: "worker-1",
+      clock: recoveryClock,
+      readWatermark: () => ledger.watermark(),
+      readEvents: () => ledger.read({ runId: "run-1" }),
+    });
+
+    await expect(recoveryExecutor.runOnce()).resolves.toMatchObject({
+      status: "failed",
+      taskId: "task-1",
+      reason: expect.stringContaining("tool-loop recovery is unavailable"),
+    });
+    expect(recoveryModel.requests).toHaveLength(0);
+    expect(recoveredInbox.snapshot().records.map((record) => record.message.payload.type))
+      .toEqual(["task.request", "task.accept", "task.failed"]);
+    expect(recoveredInbox.snapshot().records[0]?.status).toBe("handled");
+
+    // Keep the original executor reference live long enough for its test-owned
+    // resources to be unambiguous; it must never claim the recovered task.
+    await expect(executor.runOnce()).resolves.toEqual({ status: "idle" });
+  });
+
+  it("records but does not execute tool calls truncated by the model output limit", async () => {
+    let executions = 0;
+    const readTool: AgentTool = {
+      definition: {
+        name: "read_file",
+        description: "read",
+        parameters: { type: "object" },
+      },
+      async execute() {
+        executions += 1;
+        return { content: "must not execute", isError: false };
+      },
+    };
+    const model = new ScriptedModel([{
+      content: "The tool call was cut off.",
+      toolCalls: [{ id: "truncated-read", name: "read_file", arguments: { path: "x" } }],
+      stopReason: "length",
+      usage: { input: 30, output: 512, cacheRead: 0, cacheWrite: 0 },
+    }]);
+    const { executor, inbox, ledger } = await setup(
+      model,
+      "Inspect the file",
+      { maxModelTokens: 1_000, maxWallClockMs: 5_000 },
+      undefined,
+      { tools: [readTool] },
+    );
+
+    await expect(executor.runOnce()).resolves.toMatchObject({
+      status: "partial",
+      taskId: "task-1",
+    });
+    expect(executions).toBe(0);
+    const events = await ledger.read({ runId: "run-1" });
+    expect(events.filter((event) => event.type === "tool.requested")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "tool.failed")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "tool.succeeded")).toHaveLength(0);
+    expect(inbox.snapshot().records.some((record) => (
+      record.message.payload.type === "task.result"
+      && record.message.payload.status === "partial"
+    ))).toBe(true);
+  });
+
+  it("charges valid provider usage before rejecting malformed tool calls", async () => {
+    const runTokenBudget = new RunTokenBudget(600);
+    const model = new ScriptedModel([{
+      content: "invalid duplicate calls",
+      toolCalls: [
+        { id: "duplicate", name: "read_file", arguments: { path: "a" } },
+        { id: "duplicate", name: "read_file", arguments: { path: "b" } },
+      ],
+      stopReason: "toolUse",
+      usage: { input: 30, output: 5, cacheRead: 0, cacheWrite: 0 },
+    }]);
+    const { executor, ledger } = await setup(
+      model,
+      "Inspect evidence",
+      { maxModelTokens: 1_000, maxWallClockMs: 5_000 },
+      runTokenBudget,
+      { tools: [createWorkspaceTools()[0]!] },
+    );
+
+    await expect(executor.runOnce()).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("Duplicate Worker tool call id"),
+    });
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 35,
+      reservedTokens: 0,
+      availableTokens: 565,
+    });
+    const events = await ledger.read({ runId: "run-1" });
+    expect(events.filter((event) => event.type === "budget.charged")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "model.failed")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "model.completed")).toHaveLength(0);
+    expect(events.filter((event) => event.type === "tool.requested")).toHaveLength(0);
   });
 
   it("returns task.failed when reported usage exceeds the task token budget", async () => {
