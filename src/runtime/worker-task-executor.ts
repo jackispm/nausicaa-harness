@@ -33,6 +33,11 @@ import {
   WorkerTaskExecutorError,
   WorkerTaskTimeoutError,
 } from "./worker-task-errors.js";
+import {
+  readCommittedWorkerAssistant,
+  readWorkerExecutionState,
+} from "./worker-task-recovery.js";
+import type { WorkerExecutionState } from "./worker-task-recovery.js";
 import { WorkerToolExecutor } from "./worker-tool-executor.js";
 
 export { WorkerTaskExecutorError, WorkerTaskTimeoutError } from "./worker-task-errors.js";
@@ -59,19 +64,6 @@ type TerminalPayload = Extract<
   A2AMessage["payload"],
   { type: "task.result" | "task.failed" }
 >;
-type ModelRequestedEvent = Extract<AnyEvent, { type: "model.requested" }>;
-type ModelCompletedEvent = Extract<AnyEvent, { type: "model.completed" }>;
-type ModelFailedEvent = Extract<AnyEvent, { type: "model.failed" }>;
-type BudgetChargedEvent = Extract<AnyEvent, { type: "budget.charged" }>;
-
-interface WorkerExecutionState {
-  requests: ModelRequestedEvent[];
-  completions: ModelCompletedEvent[];
-  failures: ModelFailedEvent[];
-  usage: TokenUsage;
-  nextAttempt: number;
-}
-
 export interface WorkerTaskExecutorOptions {
   inbox: A2AInbox;
   eventSink: EventSink;
@@ -284,7 +276,12 @@ export class WorkerTaskExecutor {
         };
       }
       state = claimAttempt > 1
-        ? await this.readExecutionState(request)
+        ? await readWorkerExecutionState({
+            runId: this.runId,
+            laneId: this.laneId,
+            request,
+            ...(this.readEvents === undefined ? {} : { readEvents: this.readEvents }),
+          })
         : emptyExecutionState();
       // Multiple completions are possible after a crash around a provider
       // boundary. The latest durable completion owns the terminal result;
@@ -294,7 +291,8 @@ export class WorkerTaskExecutor {
       // an earlier tool-call completion alone is not sufficient evidence.
       const completion = state.completions[state.completions.length - 1];
       if (completion !== undefined) {
-        const committed = await this.readCommittedAssistant(
+        const committed = await readCommittedWorkerAssistant(
+          this.store,
           completion.payload.responseRef,
           this.stopController.signal,
         );
@@ -726,114 +724,6 @@ export class WorkerTaskExecutor {
     }
   }
 
-  private async readExecutionState(
-    request: TaskRequestMessage,
-  ): Promise<WorkerExecutionState> {
-    if (this.readEvents === undefined) {
-      return emptyExecutionState();
-    }
-    const taskPrefix = `${this.runId}:${this.laneId}:task:${request.payload.taskId}:attempt:`;
-    const sessionId = `${this.runId}:${this.laneId}:task:${request.payload.taskId}`;
-    const events = [...await this.readEvents()].sort((left, right) => (
-      left.globalOffset - right.globalOffset
-    ));
-    const requests = events.filter((event): event is ModelRequestedEvent => (
-      event.runId === this.runId
-      && event.laneId === this.laneId
-      && event.type === "model.requested"
-      && event.correlationId === request.correlationId
-      && event.idempotencyKey.startsWith(taskPrefix)
-      && event.idempotencyKey.endsWith(":model:requested")
-      && event.payload.sessionId === sessionId
-    ));
-    const requestedPrefixes = new Set(requests.map((event) => event.idempotencyKey.slice(
-      0,
-      -":model:requested".length,
-    )));
-    const completions = events.filter((event): event is ModelCompletedEvent => {
-      if (
-        event.runId !== this.runId
-        || event.laneId !== this.laneId
-        || event.type !== "model.completed"
-        || event.correlationId !== request.correlationId
-        || !event.idempotencyKey.endsWith(":model:completed")
-      ) {
-        return false;
-      }
-      return requestedPrefixes.has(event.idempotencyKey.slice(
-        0,
-        -":model:completed".length,
-      ));
-    });
-    const failures = events.filter((event): event is ModelFailedEvent => {
-      if (
-        event.runId !== this.runId
-        || event.laneId !== this.laneId
-        || event.type !== "model.failed"
-        || event.correlationId !== request.correlationId
-        || !event.idempotencyKey.endsWith(":model:failed")
-      ) {
-        return false;
-      }
-      return requestedPrefixes.has(event.idempotencyKey.slice(
-        0,
-        -":model:failed".length,
-      ));
-    });
-    const charges = events.filter((event): event is BudgetChargedEvent => {
-      if (
-        event.runId !== this.runId
-        || event.laneId !== this.laneId
-        || event.type !== "budget.charged"
-        || event.payload.laneId !== this.laneId
-        || event.correlationId !== request.correlationId
-        || !event.idempotencyKey.endsWith(":budget")
-      ) {
-        return false;
-      }
-      return requestedPrefixes.has(event.idempotencyKey.slice(
-        0,
-        -":budget".length,
-      ));
-    });
-    const completionsByPrefix = new Map(completions.map((event) => [
-      event.idempotencyKey.slice(0, -":model:completed".length),
-      event,
-    ]));
-    const chargesByPrefix = new Map(charges.map((event) => [
-      event.idempotencyKey.slice(0, -":budget".length),
-      event,
-    ]));
-    // A durable charge closes the provider-to-CAS crash window. Older logs may
-    // have only a completion, so use it strictly as a per-attempt fallback.
-    let usage = zeroUsage();
-    for (const prefix of requestedPrefixes) {
-      const charged = chargesByPrefix.get(prefix);
-      const completed = completionsByPrefix.get(prefix);
-      const attemptUsage = charged?.payload.usage ?? completed?.payload.usage;
-      if (attemptUsage === undefined) continue;
-      validateUsage(attemptUsage);
-      usage = addUsage(usage, attemptUsage);
-    }
-    const greatestAttempt = requests.reduce((maximum, event) => {
-      const value = event.idempotencyKey.slice(
-        taskPrefix.length,
-        -":model:requested".length,
-      ).split(":", 1)[0];
-      const attempt = Number(value);
-      return Number.isSafeInteger(attempt) && attempt > 0
-        ? Math.max(maximum, attempt)
-        : maximum;
-    }, 0);
-    return {
-      requests,
-      completions,
-      failures,
-      usage,
-      nextAttempt: Math.max(requests.length, greatestAttempt) + 1,
-    };
-  }
-
   private async recoverCompletedExecution(
     request: TaskRequestMessage,
     completion: Extract<AnyEvent, { type: "model.completed" }>,
@@ -844,7 +734,8 @@ export class WorkerTaskExecutor {
     | { kind: "result"; payload: TaskResult }
     | { kind: "failed"; payload: TaskFailed }
   > {
-    const assistant = await this.readCommittedAssistant(
+    const assistant = await readCommittedWorkerAssistant(
+      this.store,
       completion.payload.responseRef,
       this.stopController.signal,
     );
@@ -887,29 +778,6 @@ export class WorkerTaskExecutor {
       evidenceRefs,
       false,
     );
-  }
-
-  private async readCommittedAssistant(
-    ref: ArtifactRef,
-    signal: AbortSignal,
-  ): Promise<Extract<ConversationMessage, { role: "assistant" }>> {
-    const bytes = await withAbort(this.store.get(ref), signal);
-    let value: unknown;
-    try {
-      value = JSON.parse(new TextDecoder().decode(bytes));
-    } catch {
-      throw new WorkerTaskExecutorError("Committed Worker response is not valid JSON");
-    }
-    if (
-      !isRecord(value)
-      || value.role !== "assistant"
-      || typeof value.content !== "string"
-      || !Array.isArray(value.toolCalls)
-      || !value.toolCalls.every(isToolCall)
-    ) {
-      throw new WorkerTaskExecutorError("Committed Worker response is not an assistant message");
-    }
-    return value as Extract<ConversationMessage, { role: "assistant" }>;
   }
 
   private async readInput(
