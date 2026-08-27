@@ -142,6 +142,7 @@ const validPayloads = {
   "user.message": { inputId: "input-1", messageRef: artifact, kind: "initial" },
   "assistant.message": { messageRef: artifact },
   "navigation.updated": { delta },
+  "model.selected": { model: "openrouter:model-1" },
   "model.requested": {
     model: "model-1",
     requestHash: "request-hash",
@@ -280,6 +281,7 @@ const invalidPayloads = {
   "user.message": { inputId: "input-1", messageRef: artifact },
   "assistant.message": { messageRef: null },
   "navigation.updated": { delta: { ...delta, triggerKind: "wander" } },
+  "model.selected": { model: "openrouter:model 1" },
   "model.requested": { model: "model-1", requestHash: "hash", contextWatermark: -1 },
   "model.completed": {
     model: "model-1",

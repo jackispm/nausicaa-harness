@@ -215,6 +215,20 @@ export function parseModelSelector(
   return { provider, model };
 }
 
+/** Normalize and validate a user/config supplied model selector. */
+export function normalizeModelSelector(value: string): string {
+  const selector = value.trim();
+  if (
+    selector.length === 0
+    || selector.length > 256
+    || /[\s\u0000-\u001f\u007f]/u.test(selector)
+  ) {
+    throw new Error("Model selector must be non-empty, at most 256 characters, and contain no spaces");
+  }
+  parseModelSelector(selector);
+  return selector;
+}
+
 function toPiMessage(
   message: ConversationMessage,
   model: Model<Api>,

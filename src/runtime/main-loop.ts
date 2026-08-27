@@ -103,6 +103,8 @@ export interface MainAfterStepContext extends MainNavigationContext {
 
 export interface MainLoopDeps {
   model: ModelPort;
+  /** Read once at each provider boundary; an in-flight request keeps its selector. */
+  resolveModel?: () => string;
   contextProvider: MainContextProvider;
   conversationStore: MainConversationStore;
   eventSink: MainEventSink;
@@ -195,6 +197,7 @@ export interface MainLoopResult {
 
 export class MainLoop {
   private readonly model: ModelPort;
+  private readonly resolveModel: MainLoopDeps["resolveModel"];
   private readonly contextProvider: MainContextProvider;
   private readonly conversationStore: MainConversationStore;
   private readonly eventSink: MainEventSink;
@@ -210,6 +213,7 @@ export class MainLoop {
 
   constructor(deps: MainLoopDeps) {
     this.model = deps.model;
+    this.resolveModel = deps.resolveModel;
     this.contextProvider = deps.contextProvider;
     this.conversationStore = deps.conversationStore;
     this.eventSink = deps.eventSink;
@@ -347,16 +351,19 @@ export class MainLoop {
           input.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS,
           remainingTokens,
         );
+        // Freeze the selector for this request. A Session may update its Main
+        // selection concurrently, but that update only affects the next call.
+        const requestModel = this.resolveModel?.() ?? input.model;
         const requestHash = hashStable({
           context: view.cacheKey,
-          model: input.model,
+          model: requestModel,
           maxOutputTokens,
           sessionId,
         });
         const requestEvent = await this.emit(input, laneId, correlationId, eventState, {
           type: "model.requested",
           payload: {
-            model: input.model,
+            model: requestModel,
             requestHash,
             contextWatermark: view.upperWatermark,
             sessionId,
@@ -375,7 +382,7 @@ export class MainLoop {
             runId: input.runId,
             laneId,
             sessionId,
-            model: input.model,
+            model: requestModel,
             systemPrompt: view.systemPrompt,
             messages: view.messages,
             tools: this.tools.map((tool) => tool.definition),
@@ -409,7 +416,7 @@ export class MainLoop {
             const message = persistedErrorText(error);
             await this.emit(input, laneId, correlationId, eventState, {
               type: "model.failed",
-              payload: { model: input.model, error: message },
+              payload: { model: requestModel, error: message },
               idempotencyKey: `${eventPrefix}:step:${step}:model:failed`,
               causationId: requestEvent.eventId,
             });
@@ -449,7 +456,7 @@ export class MainLoop {
         await this.emit(input, laneId, correlationId, eventState, {
           type: "model.completed",
           payload: {
-            model: input.model,
+            model: requestModel,
             responseRef: assistantRef,
             stopReason: response.stopReason,
             usage: response.usage,

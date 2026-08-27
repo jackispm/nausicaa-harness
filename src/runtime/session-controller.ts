@@ -39,7 +39,10 @@ import {
   projectRun,
   validateEvent,
 } from "../ledger/index.js";
-import { createOpenRouterModelPort } from "../model/index.js";
+import {
+  createOpenRouterModelPort,
+  normalizeModelSelector,
+} from "../model/index.js";
 import {
   FileContentAddressedStore,
   type ContentAddressedStore,
@@ -108,6 +111,14 @@ export interface SessionModelCapabilities {
   imageInput: "supported" | "unsupported" | "unknown";
 }
 
+export interface SessionModelSelectionResult {
+  model: string;
+  previousModel: string;
+  changed: boolean;
+  /** Any request already handed to the provider retains previousModel. */
+  activeRequestUnaffected: boolean;
+}
+
 export interface SessionSnapshot {
   workspace: string;
   runId?: string;
@@ -170,6 +181,7 @@ interface AttachedRun {
   store: ContentAddressedStore;
   goal: Goal;
   policy: RunPolicy;
+  mainModel: string;
   worker?: WorkerLaneRuntime;
 }
 
@@ -192,7 +204,6 @@ interface ActiveTurn {
 export class SessionController {
   readonly workspace: string;
   readonly dataDir: string;
-  readonly model: string;
   readonly tetoModel: string;
   readonly workerModel: string;
   readonly maxOutputTokens: number;
@@ -203,6 +214,7 @@ export class SessionController {
   private readonly clock: Clock;
   private readonly policy: RunPolicy;
   private readonly requestedWorkerEnabled: boolean | undefined;
+  private selectedMainModel: string;
   private readonly listeners = new Set<(event: SessionRuntimeEvent) => void>();
   private attached: AttachedRun | undefined;
   private active: ActiveTurn | undefined;
@@ -220,9 +232,9 @@ export class SessionController {
   ) {
     this.workspace = workspace;
     this.dataDir = dataDir;
-    this.model = options.model;
-    this.tetoModel = options.tetoModel ?? options.model;
-    this.workerModel = options.workerModel ?? options.model;
+    this.selectedMainModel = normalizeModelSelector(options.model);
+    this.tetoModel = normalizeModelSelector(options.tetoModel ?? options.model);
+    this.workerModel = normalizeModelSelector(options.workerModel ?? options.model);
     this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS;
     this.allowWrite = options.allowWrite === true;
     this.allowShell = options.allowShell === true;
@@ -257,6 +269,10 @@ export class SessionController {
     return () => this.listeners.delete(listener);
   }
 
+  get model(): string {
+    return this.selectedMainModel;
+  }
+
   modelCapabilities(): SessionModelCapabilities {
     this.assertOpen();
     try {
@@ -272,6 +288,61 @@ export class SessionController {
       // selector and provider errors when a request is actually attempted.
       return { imageInput: "unknown" };
     }
+  }
+
+  /**
+   * Select Main's model for this Session and attached Run. The selector is
+   * durable before it becomes observable; an already-issued provider request
+   * is never rewritten and the next request reads the new value.
+   */
+  async selectModel(value: string): Promise<SessionModelSelectionResult> {
+    return this.runAdmission(async () => {
+      this.assertOpen();
+      let model: string;
+      try {
+        model = normalizeModelSelector(value);
+      } catch (error: unknown) {
+        throw new SessionProtocolError(
+          error instanceof Error ? error.message : "Invalid model selector",
+        );
+      }
+      const previousModel = this.selectedMainModel;
+      const activeRequestUnaffected = this.active !== undefined;
+      if (model === previousModel) {
+        return {
+          model,
+          previousModel,
+          changed: false,
+          activeRequestUnaffected,
+        };
+      }
+
+      const attached = this.attached;
+      if (attached !== undefined) {
+        const revision = attached.sink.cachedEvents.filter((event) => (
+          event.type === "model.selected" && event.laneId === "main"
+        )).length + 1;
+        await attached.sink.append({
+          runId: attached.runId,
+          laneId: "main",
+          type: "model.selected",
+          payload: { model },
+          correlationId: `run:${attached.runId}`,
+          idempotencyKey: `${attached.runId}:main:model:selected:${revision}`,
+          visibility: "run",
+          occurredAt: this.clock.now().toISOString(),
+        });
+        attached.mainModel = model;
+      }
+      this.selectedMainModel = model;
+      this.publishState();
+      return {
+        model,
+        previousModel,
+        changed: true,
+        activeRequestUnaffected,
+      };
+    });
   }
 
   snapshot(): SessionSnapshot {
@@ -666,6 +737,7 @@ export class SessionController {
       }
       const previous = this.attached;
       this.attached = candidate;
+      this.selectedMainModel = candidate.mainModel;
       candidate.worker?.scheduler.enqueue();
       if (previous !== undefined) {
         await this.stopWorkerLane(previous);
@@ -775,7 +847,15 @@ export class SessionController {
           visibility: "run",
         });
       }
-      attached = { runId, ledger, sink, store, goal, policy: this.policy };
+      attached = {
+        runId,
+        ledger,
+        sink,
+        store,
+        goal,
+        policy: this.policy,
+        mainModel: this.model,
+      };
       if (this.policy.workerEnabled === true) {
         attached.worker = this.createWorkerLaneRuntime(attached);
       }
@@ -860,6 +940,9 @@ export class SessionController {
         store,
         goal: projection.goal,
         policy: projection.run.policy,
+        // Schema-v1 Runs created before model.selected keep the caller's
+        // configured selector until the first explicit selection is recorded.
+        mainModel: projection.lanes.main?.model ?? this.model,
       };
       if (projection.run.policy.workerEnabled === true) {
         attached.worker = this.createWorkerLaneRuntime(attached);
@@ -1047,6 +1130,7 @@ export class SessionController {
       }
       const loop = new MainLoop({
         model,
+        resolveModel: () => this.model,
         contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(attached.store)),
         conversationStore: attached.store,
         eventSink: attached.sink,
@@ -1810,8 +1894,19 @@ function validateOptions(options: SessionControllerOptions): void {
   if (options.workspace.length === 0 || options.dataDir.length === 0 || options.model.length === 0) {
     throw new SessionProtocolError("workspace, dataDir, and model are required");
   }
-  if (options.workerModel !== undefined && options.workerModel.length === 0) {
-    throw new SessionProtocolError("workerModel must not be empty");
+  for (const [name, selector] of [
+    ["model", options.model],
+    ["tetoModel", options.tetoModel],
+    ["workerModel", options.workerModel],
+  ] as const) {
+    if (selector === undefined) continue;
+    try {
+      normalizeModelSelector(selector);
+    } catch (error: unknown) {
+      throw new SessionProtocolError(
+        `${name}: ${error instanceof Error ? error.message : "invalid model selector"}`,
+      );
+    }
   }
   if (options.workerEnabled !== undefined && typeof options.workerEnabled !== "boolean") {
     throw new SessionProtocolError("workerEnabled must be a boolean");

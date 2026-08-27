@@ -1002,7 +1002,7 @@ describe("interactive TUI", () => {
     }
   });
 
-  it("uses Prime-style focused selectors and restores the editor without mutating the current model", async () => {
+  it("uses Prime-style focused selectors to switch Main and restores editor focus", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-selectors-"));
     const terminal = new MemoryTerminal(100, 28);
     const previousExitCode = process.exitCode;
@@ -1030,8 +1030,13 @@ describe("interactive TUI", () => {
       terminal.type("next");
       await waitForOutput(terminal, "openrouter:next-model");
       terminal.send("\r");
-      await waitForOutput(terminal, "Next session model: openrouter:next-model");
-      expect(session.snapshot().model).toBe("scripted-main");
+      await waitForOutput(terminal, "Main model set to openrouter:next-model");
+      expect(session.snapshot().model).toBe("openrouter:next-model");
+
+      terminal.type("/model openrouter:direct-model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Main model set to openrouter:direct-model");
+      expect(session.snapshot().model).toBe("openrouter:direct-model");
 
       terminal.type("/theme");
       terminal.send("\r");

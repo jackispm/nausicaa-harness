@@ -190,7 +190,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider([
     { name: "help", description: "Show commands" },
     { name: "status", description: "Show session state" },
-    { name: "model", description: "Select a model for the next session" },
+    { name: "model", description: "Switch the Main model" },
     { name: "theme", description: "Select the TUI color scheme" },
     { name: "goal", description: "Show or revise the Run Goal" },
     { name: "new", description: "Start a new Run" },
@@ -854,23 +854,37 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const current = options.session.snapshot().model;
     const selector = new SelectorOverlay({
       title: "Models",
-      subtitle: "Choose the model for the next session; the current Run is unchanged.",
+      subtitle: "Switch Main at the next provider request boundary.",
       options: readModelOptions(),
       current,
       onSelect: (value) => {
         closeSelector(false);
-        if (value === current) {
-          appendNotice(`Already using model ${current}.`, "info");
-          return;
-        }
-        appendNotice(
-          `Next session model: ${value}. Start it with: nausicaa --model ${value}`,
-          "success",
-        );
+        void applyModelSelection(value);
       },
       onCancel: () => closeSelector(true),
     });
     mountSelector(selector);
+  };
+
+  const applyModelSelection = async (value: string): Promise<void> => {
+    try {
+      const result = await options.session.selectModel(value);
+      if (!result.changed) {
+        appendNotice(`Already using model ${result.model}.`, "info");
+        return;
+      }
+      appendNotice(
+        result.activeRequestUnaffected
+          ? `Main model set to ${result.model}. Any request already in flight keeps ${result.previousModel}; the next request uses the new model.`
+          : `Main model set to ${result.model}. The next request will use it.`,
+        "success",
+      );
+    } catch (error: unknown) {
+      appendNotice(
+        `Model was not changed: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    }
   };
 
   const applyThemeChoice = (choice: ThemeChoice): void => {
@@ -926,7 +940,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           appendBlock(new Markdown([
             "### Commands",
             "`/status` session details  ·  `/goal [statement]` show or revise Goal",
-            "`/model [selector]` show models or prepare the next session model  ·  `/theme [auto|light|dark]` change colors",
+            "`/model [selector]` show or switch Main model  ·  `/theme [auto|light|dark]` change colors",
             "`/new` new Run  ·  `/resume` resume",
             "`/cancel` cancel active Turn  ·  `/resolve <operation-id>` resolve recovery",
             "`/copy` copy the last assistant answer",
@@ -944,15 +958,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             break;
           }
           const selected = normalizeModelSelector(args.join(" "));
-          const current = options.session.snapshot().model;
-          if (selected === current) {
-            appendNotice(`Already using model ${current}.`, "info");
-            break;
-          }
-          appendNotice(
-            `Next session model: ${selected}. Start it with: nausicaa --model ${selected}`,
-            "success",
-          );
+          await applyModelSelection(selected);
           break;
         }
         case "/theme": {

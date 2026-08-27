@@ -32,6 +32,8 @@ export interface RunView {
 export interface LaneView {
   laneId: LaneId;
   kind?: LaneKind;
+  /** Latest durable selector for this lane, when explicitly recorded. */
+  model?: string;
   status: LaneStatus;
   reason?: string;
   lastSeq: number;
@@ -421,6 +423,9 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
       }
       case "navigation.updated":
         lane.navigation = cloneJson(event.payload.delta);
+        break;
+      case "model.selected":
+        lane.model = event.payload.model;
         break;
       case "user.message":
       case "assistant.message":

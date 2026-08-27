@@ -1,5 +1,7 @@
 import { fuzzyFilter } from "@earendil-works/pi-tui";
 
+import { normalizeModelSelector as normalizeRuntimeModelSelector } from "../model/index.js";
+
 /** Small helpers for Prime-style command selectors. */
 
 export interface SelectorOption {
@@ -62,11 +64,11 @@ export function parseThemeChoice(value: string): ThemeChoice {
   return choice;
 }
 
-/** Validate a model selector before displaying a restart command. */
+/** Validate a model selector before applying it to the Session. */
 export function normalizeModelSelector(value: string): string {
-  const selector = value.trim();
-  if (selector.length === 0 || selector.length > 256 || /[\s\u0000-\u001f\u007f]/u.test(selector)) {
+  try {
+    return normalizeRuntimeModelSelector(value);
+  } catch {
     throw new Error("/model expects a non-empty model selector without spaces");
   }
-  return selector;
 }

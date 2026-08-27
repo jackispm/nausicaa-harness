@@ -83,6 +83,8 @@ export interface EventPayloadMap {
     | { inputId: InputId; messageRef: ArtifactRef; kind: UserMessageKind };
   "assistant.message": { messageRef: ArtifactRef };
   "navigation.updated": { delta: NavigationDelta };
+  /** Run-scoped Main-lane selection. Teto and Worker keep independent selectors. */
+  "model.selected": { model: string };
   "model.requested": {
     model: string;
     requestHash: string;

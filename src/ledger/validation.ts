@@ -516,6 +516,23 @@ const payloadValidators = {
     const item = payloadObject(value, path, ["delta"]);
     navigationDelta(item.delta, `${path}.delta`);
   },
+  "model.selected": (value, path) => {
+    const item = payloadObject(value, path, ["model"]);
+    string(item.model, `${path}.model`, false);
+    if (
+      (item.model as string).length > 256
+      || /[\s\u0000-\u001f\u007f]/u.test(item.model as string)
+    ) {
+      invalid(`${path}.model`, "at most 256 characters without spaces or control characters");
+    }
+    const separator = (item.model as string).indexOf(":");
+    if (
+      separator === 0
+      || (separator >= 0 && separator === (item.model as string).length - 1)
+    ) {
+      invalid(`${path}.model`, "a valid provider:model or model selector");
+    }
+  },
   "model.requested": (value, path) => {
     const item = payloadObject(value, path, [
       "model",
