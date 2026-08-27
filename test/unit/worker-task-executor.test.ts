@@ -185,4 +185,48 @@ describe("WorkerTaskExecutor", () => {
       retryable: true,
     });
   });
+
+  it("cancels an in-flight model on stop and ignores its late response", async () => {
+    let resolveModel: ((response: ModelResponse) => void) | undefined;
+    const model: ModelPort = {
+      complete: async () => new Promise<ModelResponse>((resolve) => {
+        resolveModel = resolve;
+      }),
+    };
+    const { executor, inbox, ledger } = await setup(model, "input", {
+      maxModelTokens: 100,
+      maxWallClockMs: 5_000,
+    });
+
+    const running = executor.runOnce();
+    for (let attempt = 0; attempt < 20 && resolveModel === undefined; attempt += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(resolveModel).toBeTypeOf("function");
+
+    await expect(executor.stop()).resolves.toBeUndefined();
+    await expect(running).resolves.toEqual({ status: "idle", reason: "stopped" });
+    const beforeLateResponse = await ledger.read({ runId: "run-1" });
+    expect(beforeLateResponse.map((event) => event.type)).toEqual([
+      "message.sent",
+      "message.claimed",
+      "message.sent",
+      "model.requested",
+    ]);
+    expect(inbox.snapshot().records.some((record) => (
+      record.message.payload.type === "task.result"
+        || record.message.payload.type === "task.failed"
+    ))).toBe(false);
+
+    resolveModel?.({
+      content: "late response",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(await ledger.read({ runId: "run-1" })).toEqual(beforeLateResponse);
+    expect(inbox.snapshot().records[0]?.status).toBe("claimed");
+    await expect(executor.runOnce()).resolves.toEqual({ status: "idle", reason: "stopped" });
+  });
 });

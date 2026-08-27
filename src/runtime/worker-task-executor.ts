@@ -10,8 +10,6 @@ import type {
   EventType,
   Goal,
   LaneId,
-  MAX_TASK_MODEL_TOKENS,
-  MAX_TASK_WALL_CLOCK_MS,
   TaskFailed,
   TaskResult,
   TokenUsage,
@@ -73,6 +71,10 @@ export class WorkerTaskTimeoutError extends WorkerTaskExecutorError {
   override readonly name: string = "WorkerTaskTimeoutError";
 }
 
+class WorkerTaskCancelledError extends WorkerTaskExecutorError {
+  override readonly name: string = "WorkerTaskCancelledError";
+}
+
 /** A serial, bounded task consumer. It owns no graph or persistence state. */
 export class WorkerTaskExecutor {
   private readonly inbox: A2AInbox;
@@ -88,6 +90,9 @@ export class WorkerTaskExecutor {
   private readonly maxInputBytes: number;
   private readonly signal: AbortSignal | undefined;
   private readonly readWatermark: (() => Promise<number>) | undefined;
+  private readonly stopController = new AbortController();
+  private readonly activeRuns = new Set<Promise<WorkerTaskRunResult>>();
+  private stopped = false;
 
   constructor(options: WorkerTaskExecutorOptions) {
     if (options.runId.trim().length === 0 || options.modelName.trim().length === 0) {
@@ -112,8 +117,30 @@ export class WorkerTaskExecutor {
     this.readWatermark = options.readWatermark;
   }
 
-  async runOnce(): Promise<WorkerTaskRunResult> {
+  runOnce(): Promise<WorkerTaskRunResult> {
+    if (this.stopped) return Promise.resolve({ status: "idle", reason: "stopped" });
     throwIfAborted(this.signal);
+    const operation = this.runOnceInternal();
+    this.activeRuns.add(operation);
+    const remove = (): void => {
+      this.activeRuns.delete(operation);
+    };
+    operation.then(remove, remove);
+    return operation;
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    if (!this.stopController.signal.aborted) {
+      this.stopController.abort(new WorkerTaskCancelledError(
+        "Worker task cancelled during lane shutdown",
+      ));
+    }
+    await Promise.allSettled([...this.activeRuns]);
+  }
+
+  private async runOnceInternal(): Promise<WorkerTaskRunResult> {
+    if (this.isStopping()) return { status: "idle", reason: "stopped" };
     const records = await this.inbox.claim(this.laneId, this.laneId, {
       claimId: `${this.laneId}:claim:${this.createId()}`,
       limit: 1,
@@ -147,26 +174,39 @@ export class WorkerTaskExecutor {
     record: InboxRecord,
     request: TaskRequestMessage,
   ): Promise<WorkerTaskRunResult> {
+    if (this.isStopping()) return { status: "idle", reason: "stopped" };
     const task = request.payload;
     const terminal = this.findTerminal(request);
     if (terminal !== undefined) {
+      if (this.isStopping()) return { status: "idle", reason: "stopped" };
       await this.inbox.handle(request.messageId, this.laneId);
       return terminalResult(terminal);
     }
 
-    await this.sendReply(request, { type: "task.accept", taskId: task.taskId }, "accept");
-    const execution = await this.execute(request, record.claim?.attempt ?? 1);
-    const reply = await this.sendReply(request, execution.payload, execution.kind);
-    await this.inbox.handle(request.messageId, this.laneId);
-    return {
-      status: execution.kind === "result" ? execution.payload.status : "failed",
-      taskId: task.taskId,
-      requestMessageId: request.messageId,
-      replyMessageId: reply.messageId,
-      ...(execution.kind === "result"
-        ? { usage: execution.payload.usage, artifactRefs: [...execution.payload.artifactRefs] }
-        : { reason: execution.payload.reason }),
-    };
+    try {
+      await this.sendReply(request, { type: "task.accept", taskId: task.taskId }, "accept");
+      const execution = await this.execute(request, record.claim?.attempt ?? 1);
+      if (execution.kind === "cancelled" || this.isStopping()) {
+        return { status: "idle", reason: "stopped" };
+      }
+      const reply = await this.sendReply(request, execution.payload, execution.kind);
+      if (this.isStopping()) return { status: "idle", reason: "stopped" };
+      await this.inbox.handle(request.messageId, this.laneId);
+      return {
+        status: execution.kind === "result" ? execution.payload.status : "failed",
+        taskId: task.taskId,
+        requestMessageId: request.messageId,
+        replyMessageId: reply.messageId,
+        ...(execution.kind === "result"
+          ? { usage: execution.payload.usage, artifactRefs: [...execution.payload.artifactRefs] }
+          : { reason: execution.payload.reason }),
+      };
+    } catch (error: unknown) {
+      if (this.isStopping() || error instanceof WorkerTaskCancelledError) {
+        return { status: "idle", reason: "stopped" };
+      }
+      throw error;
+    }
   }
 
   private async execute(
@@ -175,9 +215,13 @@ export class WorkerTaskExecutor {
   ): Promise<
     | { kind: "result"; payload: TaskResult }
     | { kind: "failed"; payload: TaskFailed }
+    | { kind: "cancelled" }
   > {
     const task = request.payload;
-    const deadline = new TaskDeadline(task.budget.maxWallClockMs, this.signal);
+    const deadline = new TaskDeadline(task.budget.maxWallClockMs, [
+      this.signal,
+      this.stopController.signal,
+    ]);
     const evidenceRefs = task.inputRefs.map((ref) => ref.contentHash);
     const prefix = `${this.runId}:${this.laneId}:task:${task.taskId}:attempt:${attempt}`;
     try {
@@ -233,6 +277,7 @@ export class WorkerTaskExecutor {
           signal: deadline.signal,
         }), deadline.signal);
       } catch (error: unknown) {
+        if (this.isStopping()) return { kind: "cancelled" };
         const reason = persistedErrorText(error, "Worker model failed");
         await this.append({
           runId: this.runId,
@@ -331,6 +376,7 @@ export class WorkerTaskExecutor {
         },
       };
     } catch (error: unknown) {
+      if (this.isStopping()) return { kind: "cancelled" };
       const reason = persistedErrorText(error, "Worker task failed");
       return { kind: "failed", payload: failed(task.taskId, reason, isRetryable(error), evidenceRefs) };
     } finally {
@@ -400,6 +446,7 @@ export class WorkerTaskExecutor {
     }>,
     suffix: "accept" | "result" | "failed",
   ): Promise<{ messageId: string }> {
+    if (this.isStopping()) throw new WorkerTaskCancelledError("Worker lane is stopping");
     const messageId = `${this.runId}:${this.laneId}:task:${request.payload.taskId}:${suffix}`;
     const sent = await this.inbox.send({
       messageId,
@@ -422,27 +469,39 @@ export class WorkerTaskExecutor {
   }
 
   private async append<K extends EventType>(event: AppendEvent<K>): Promise<void> {
+    if (this.isStopping()) throw new WorkerTaskCancelledError("Worker lane is stopping");
     await this.eventSink.append(event);
+  }
+
+  private isStopping(): boolean {
+    return this.stopped || this.stopController.signal.aborted || this.signal?.aborted === true;
   }
 }
 
 class TaskDeadline {
   readonly controller = new AbortController();
   private readonly timer: ReturnType<typeof setTimeout>;
-  private readonly parent: AbortSignal | undefined;
+  private readonly parents: AbortSignal[];
   private readonly onParentAbort: (() => void) | undefined;
 
-  constructor(milliseconds: number, parent: AbortSignal | undefined) {
+  constructor(milliseconds: number, parents: readonly (AbortSignal | undefined)[]) {
     if (!Number.isSafeInteger(milliseconds) || milliseconds <= 0) {
       throw new WorkerTaskExecutorError("maxWallClockMs must be a positive integer");
     }
-    this.parent = parent;
-    this.onParentAbort = parent === undefined
+    this.parents = parents.filter((parent): parent is AbortSignal => parent !== undefined);
+    this.onParentAbort = this.parents.length === 0
       ? undefined
-      : () => this.controller.abort(parent.reason ?? new DOMException("Aborted", "AbortError"));
+      : () => {
+          const parent = this.parents.find((candidate) => candidate.aborted);
+          if (parent !== undefined && !this.controller.signal.aborted) {
+            this.controller.abort(parent.reason ?? new DOMException("Aborted", "AbortError"));
+          }
+        };
     if (this.onParentAbort !== undefined) {
-      parent!.addEventListener("abort", this.onParentAbort, { once: true });
-      if (parent!.aborted) this.onParentAbort();
+      for (const parent of this.parents) {
+        parent.addEventListener("abort", this.onParentAbort, { once: true });
+      }
+      this.onParentAbort();
     }
     this.timer = setTimeout(() => this.controller.abort(
       new WorkerTaskTimeoutError(`Worker task exceeded wall-clock budget (${milliseconds} ms)`),
@@ -455,8 +514,10 @@ class TaskDeadline {
 
   dispose(): void {
     clearTimeout(this.timer);
-    if (this.parent !== undefined && this.onParentAbort !== undefined) {
-      this.parent.removeEventListener("abort", this.onParentAbort);
+    if (this.onParentAbort !== undefined) {
+      for (const parent of this.parents) {
+        parent.removeEventListener("abort", this.onParentAbort);
+      }
     }
   }
 }
