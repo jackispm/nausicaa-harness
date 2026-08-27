@@ -1,11 +1,21 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import type { ModelResponse } from "../../src/domain/index.js";
+import type { AgentTool } from "../../src/domain/index.js";
 import { createOpenRouterModelPort } from "../../src/model/index.js";
+import {
+  SessionController,
+  type SessionRuntimeEvent,
+} from "../../src/runtime/index.js";
+import {
+  buildCacheProbeArtifact,
+  inspectCacheProbeRepository,
+  writeCacheProbeArtifact,
+} from "../eval/cache-artifact.js";
 
 const apiKey = process.env.OPENROUTER_API_KEY;
 const configuredModel = process.env.NAUSICAA_CACHE_EVAL_MODEL
@@ -27,79 +37,82 @@ const model = configuredModel?.startsWith("openrouter:")
 const MAX_REQUESTS = 2;
 const MAX_OUTPUT_TOKENS = 8;
 describe.skipIf(!liveEnabled)("OpenRouter prompt-cache evidence", () => {
-  it("reads a stable prefix on the second request and writes redacted evidence", async () => {
+  it("reads a stable prefix on the second runtime request and writes reconciled evidence", async () => {
     const port = createOpenRouterModelPort();
     const probeId = randomUUID();
-    const stableSystemPrompt = [
-      `Stable evaluation prefix ${probeId}. Treat this as policy, not user data.`,
-      ...Array.from({ length: 1_800 }, (_, index) =>
-        `policy-${index % 17}: preserve the task objective and use only grounded evidence.`,
-      ),
-    ].join("\n");
-    const base = {
-      runId: "phase-2.3-cache-probe",
-      laneId: "main" as const,
-      sessionId: `phase-2.3-cache-probe:${probeId}`,
-      model,
-      systemPrompt: stableSystemPrompt,
-      tools: [],
-      maxOutputTokens: MAX_OUTPUT_TOKENS,
-    };
-
-    const responses: ModelResponse[] = [];
-    for (const content of ["first cache probe", "second cache probe"]) {
-      if (responses.length >= MAX_REQUESTS) {
-        throw new Error("Cache probe request limit exceeded");
-      }
-      responses.push(await port.complete({
-        ...base,
-        messages: [{
-          role: "user",
-          content,
-          createdAt: new Date(0).toISOString(),
-        }],
-        signal: AbortSignal.timeout(20_000),
-      }));
-    }
-
-    const spentUsd = responses.reduce((sum, response) =>
-      sum + (response.usage.costUsd ?? Number.NaN), 0);
-    expect(responses).toHaveLength(2);
-    expect(responses.every((response) =>
-      response.usage.costUsd !== undefined
-      && Number.isFinite(response.usage.costUsd)
-      && response.usage.costUsd >= 0,
-    )).toBe(true);
-    expect(spentUsd).toBeLessThanOrEqual(budgetUsd);
-    expect(responses[1]?.usage.cacheRead ?? 0).toBeGreaterThan(0);
-
-    const evidenceDir = join(process.cwd(), ".nausicaa", "evals");
-    await mkdir(evidenceDir, { recursive: true });
-    await writeFile(join(evidenceDir, "phase-2.3-cache.json"), JSON.stringify({
-      schemaVersion: 1,
-      generatedAt: new Date().toISOString(),
-      provider: "openrouter",
-      model,
-      sessionContinuity: "same-session-id",
-      stablePrefix: "long-deterministic-system-prefix",
-      limits: {
-        maxRequests: MAX_REQUESTS,
-        maxOutputTokens: MAX_OUTPUT_TOKENS,
-        budgetUsd,
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-cache-probe-"));
+    const runId = `phase-2.3-cache-probe-${probeId}`;
+    const events: SessionRuntimeEvent[] = [];
+    const repository = await inspectCacheProbeRepository();
+    const startedAt = new Date().toISOString();
+    // OpenRouter prompt caching requires a sufficiently large stable prefix.
+    // Keep that padding in a probe-only tool description so production tools
+    // and the SessionController contract remain unchanged.
+    const cachePadding = Array.from({ length: 1_800 }, (_, index) =>
+      `cache-policy-${index % 17}: preserve the task objective and use grounded evidence.`,
+    ).join("\n");
+    const probeTool: AgentTool = {
+      definition: {
+        name: "cache_probe_noop",
+        description: `Probe-only inert tool ${probeId}. ${cachePadding}`,
+        parameters: { type: "object", properties: {}, additionalProperties: false },
       },
-      requests: responses.map((response, index) => ({
-        ordinal: index + 1,
-        inputTokens: response.usage.input,
-        outputTokens: response.usage.output,
-        cacheReadTokens: response.usage.cacheRead,
-        cacheWriteTokens: response.usage.cacheWrite,
-        costUsd: response.usage.costUsd,
-      })),
-      spentUsd,
-      cacheReadTokens: responses.reduce(
-        (sum, response) => sum + response.usage.cacheRead,
-        0,
-      ),
-    }, null, 2), "utf8");
+      execute: async () => ({ content: "unused", isError: false }),
+    };
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model,
+      maxOutputTokens: MAX_OUTPUT_TOKENS,
+      policy: {
+        maxMainStepsPerActivation: 1,
+        maxModelTokens: 100_000,
+        tetoEnabled: false,
+      },
+    }, {
+      mainModel: port,
+      createRunId: () => runId,
+      tools: [probeTool],
+    });
+    session.subscribe((event) => events.push(event));
+    try {
+      await session.submit({
+        inputId: "cache-probe-1",
+        text: "Do not call tools. Reply with exactly CACHE_PROBE_OK.",
+      });
+      await session.waitForIdle();
+      await session.submit({
+        inputId: "cache-probe-2",
+        text: "Do not call tools. Reply with exactly CACHE_PROBE_OK again.",
+      });
+      await session.waitForIdle();
+      const completedAt = new Date().toISOString();
+      const durableEvents = events
+        .filter((event): event is Extract<SessionRuntimeEvent, { kind: "event" }> =>
+          event.kind === "event")
+        .map((event) => event.event);
+      const artifact = buildCacheProbeArtifact({
+        events: durableEvents,
+        runId,
+        model,
+        limits: {
+          maxRequests: MAX_REQUESTS,
+          maxOutputTokens: MAX_OUTPUT_TOKENS,
+          budgetUsd,
+        },
+        provenance: {
+          executionCommit: repository.executionCommit,
+          repositoryDirty: repository.repositoryDirty,
+          startedAt,
+          completedAt,
+        },
+      });
+      const evidencePath = join(process.cwd(), ".nausicaa", "evals", "phase-2.3-cache.json");
+      await writeCacheProbeArtifact(evidencePath, artifact);
+      expect(artifact.releaseDecision).toMatchObject({ status: "pass", eligible: true });
+    } finally {
+      await session.close();
+      await rm(root, { recursive: true, force: true });
+    }
   }, 60_000);
 });

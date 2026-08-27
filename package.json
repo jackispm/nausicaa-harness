@@ -39,6 +39,7 @@
     "eval": "vitest run test/eval",
     "eval:live": "node --env-file-if-exists=.env --import tsx test/eval/live-runner.ts",
     "eval:verify": "node --import tsx test/eval/verify-artifacts.ts",
+    "eval:cache:verify": "node --import tsx test/eval/verify-cache-artifact.ts",
     "check": "npm run typecheck && npm test && npm run eval && npm run test:smoke"
   },
   "dependencies": {

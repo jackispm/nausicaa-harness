@@ -4,6 +4,7 @@ import {
   runPhase24Evaluation,
   verifyEvaluationArtifacts,
 } from "./runner.js";
+import { phase24VerificationExitCode } from "./verification-exit.js";
 
 const configuredId = process.env.NAUSICAA_EVAL_ID?.trim();
 const requestedId = configuredId === "" ? undefined : configuredId;
@@ -32,7 +33,7 @@ try {
       reasons: verified.releaseDecision?.reasons
         ?? (verified.incompleteReason === undefined ? [] : [verified.incompleteReason]),
     }, null, 2)}\n`);
-    if (verified.releaseDecision?.eligible !== true) process.exitCode = 2;
+    process.exitCode = phase24VerificationExitCode(verified);
   } finally {
     await evaluation.cleanup();
   }
