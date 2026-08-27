@@ -38,6 +38,8 @@
     "test:live": "node --env-file-if-exists=.env ./node_modules/vitest/vitest.mjs run test/live --passWithNoTests --no-file-parallelism",
     "eval": "vitest run test/eval",
     "eval:worker": "vitest run test/eval/worker-contract.test.ts test/eval/worker-runner.test.ts",
+    "eval:worker:live": "node --env-file-if-exists=.env --import tsx test/eval/worker-live-cli.ts",
+    "eval:worker:verify": "node --import tsx test/eval/verify-worker-live.ts",
     "eval:live": "node --env-file-if-exists=.env --import tsx test/eval/live-runner.ts",
     "eval:verify": "node --import tsx test/eval/verify-artifacts.ts",
     "eval:cache:verify": "node --import tsx test/eval/verify-cache-artifact.ts",
