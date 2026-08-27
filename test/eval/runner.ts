@@ -385,10 +385,9 @@ export async function executeEvaluationArm(
           maxMainStepsPerActivation: 8,
           maxModelTokens: arm.budget.maxInputTokens + arm.budget.maxOutputTokens,
           tetoEnabled: config.auxiliaryMode === "teto",
-          // The live evaluation needs enough room for providers that wrap
-          // structured advice in a short explanation. Production Teto keeps
-          // the tighter 64-token policy default.
-          tetoMaxOutputTokens: 128,
+          // Keep the evaluation aligned with the production Teto budget. The
+          // parser tolerates provider wrappers without spending extra tokens.
+          tetoMaxOutputTokens: 64,
           tetoTokenRatio: 0.1,
           auxiliaryMode: config.auxiliaryMode === "teto"
             ? "teto"
