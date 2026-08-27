@@ -30,5 +30,5 @@ describe.skipIf(!enabled)("preregistered OpenRouter Phase 2.4 evaluation", () =>
     } finally {
       await evaluation.cleanup();
     }
-  }, 3_000_000);
+  }, PREREGISTERED_MANIFEST.experimentBudget.maxCumulativeWallClockMs + 120_000);
 });
