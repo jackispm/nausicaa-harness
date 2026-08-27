@@ -7,6 +7,7 @@ export const DEFAULT_RUN_POLICY: RunPolicy = {
   tetoEnabled: true,
   tetoMaxOutputTokens: 64,
   tetoTokenRatio: 0.1,
+  workerEnabled: false,
 };
 
 export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
@@ -19,6 +20,7 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
     tetoEnabled: input.tetoEnabled ?? DEFAULT_RUN_POLICY.tetoEnabled,
     tetoMaxOutputTokens: input.tetoMaxOutputTokens ?? DEFAULT_RUN_POLICY.tetoMaxOutputTokens,
     tetoTokenRatio: input.tetoTokenRatio ?? DEFAULT_RUN_POLICY.tetoTokenRatio,
+    workerEnabled: input.workerEnabled ?? DEFAULT_RUN_POLICY.workerEnabled ?? false,
     ...(input.auxiliaryMode === undefined ? {} : { auxiliaryMode: input.auxiliaryMode }),
     ...(input.tetoAdviceDelivery === undefined
       ? {}
@@ -35,6 +37,9 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
     || policy.tetoMaxOutputTokens < 1
   ) {
     throw new RangeError("tetoMaxOutputTokens must be a positive integer");
+  }
+  if (typeof policy.workerEnabled !== "boolean") {
+    throw new TypeError("workerEnabled must be a boolean");
   }
   if (policy.tetoTokenRatio <= 0 || policy.tetoTokenRatio >= 1) {
     throw new RangeError("tetoTokenRatio must be between zero and one");

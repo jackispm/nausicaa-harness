@@ -56,6 +56,10 @@ import { resolveRunPolicy } from "./run-policy.js";
 import { TetoScheduler } from "./teto-scheduler.js";
 import type { TetoAdviceDelivery } from "./teto-scheduler.js";
 import { ReflectionScheduler } from "./reflection-scheduler.js";
+import { createDelegateTaskTool } from "./delegate-task-tool.js";
+import { TaskDispatcher } from "./task-dispatcher.js";
+import { WorkerLaneScheduler } from "./worker-lane-scheduler.js";
+import { WorkerTaskExecutor } from "./worker-task-executor.js";
 
 export interface RunExecutionRequest {
   workspace: string;
@@ -63,8 +67,11 @@ export interface RunExecutionRequest {
   model: string;
   tetoModel?: string;
   reflectionModel?: string;
+  workerModel?: string;
   /** Evaluation-only auxiliary topology. Defaults to Teto when enabled by policy. */
   auxiliaryMode?: AuxiliaryMode;
+  /** Opt-in bounded Worker lane; omitted or false preserves Main-only behavior. */
+  workerEnabled?: boolean;
   adviceDelivery?: TetoAdviceDelivery;
   message?: string;
   images?: UserImage[];
@@ -82,6 +89,7 @@ export interface RunExecutionDeps {
   mainModel?: ModelPort;
   tetoModel?: ModelPort;
   reflectionModel?: ModelPort;
+  workerModel?: ModelPort;
   tools?: readonly AgentTool[];
   clock?: Clock;
   createRunId?: () => string;
@@ -111,6 +119,7 @@ export const executeRun = async (
   const stateDir = resolve(request.dataDir, "runs", runId);
   const ledger = await JsonlLedger.open(resolve(stateDir, "ledger.jsonl"));
   let scheduler: TetoScheduler | ReflectionScheduler | undefined;
+  let workerScheduler: WorkerLaneScheduler | undefined;
 
   try {
     const sink = new ObservableEventSink(ledger, deps.onEvent);
@@ -141,8 +150,17 @@ export const executeRun = async (
 
     const requestedAuxiliaryMode = request.auxiliaryMode
       ?? (request.policy?.tetoEnabled === false ? "none" : "teto");
+    const requestedWorkerEnabled = request.workerEnabled ?? request.policy?.workerEnabled;
     const setup = recovered === undefined
-      ? await createNewRun(sink, request, runId, workspace, clock, requestedAuxiliaryMode)
+      ? await createNewRun(
+          sink,
+          request,
+          runId,
+          workspace,
+          clock,
+          requestedAuxiliaryMode,
+          requestedWorkerEnabled,
+        )
       : await resumeExistingRun(sink, recovered, clock);
     const policy = setup.policy;
     const auxiliaryMode = request.auxiliaryMode
@@ -151,6 +169,10 @@ export const executeRun = async (
     const adviceDelivery = request.adviceDelivery
       ?? policy.tetoAdviceDelivery
       ?? "live";
+    const workerEnabled = request.workerEnabled
+      ?? (request.policy?.workerEnabled !== undefined
+        ? request.policy.workerEnabled
+        : policy.workerEnabled === true);
     if (
       recovered !== undefined
       && request.auxiliaryMode !== undefined
@@ -166,6 +188,13 @@ export const executeRun = async (
       && request.adviceDelivery !== policy.tetoAdviceDelivery
     ) {
       throw new Error("Cannot change adviceDelivery while resuming a Run");
+    }
+    if (
+      recovered !== undefined
+      && requestedWorkerEnabled !== undefined
+      && requestedWorkerEnabled !== (policy.workerEnabled === true)
+    ) {
+      throw new Error("Cannot change workerEnabled while resuming a Run");
     }
     const priorTokens = totalTokens(setup.priorUsage);
     const remainingModelTokens = Math.max(0, policy.maxModelTokens - priorTokens);
@@ -245,6 +274,33 @@ export const executeRun = async (
       });
     }
 
+    if (workerEnabled) {
+      const dispatcher = new TaskDispatcher({
+        inbox,
+        runId,
+        clock,
+      });
+      const workerModel = deps.workerModel ?? mainModel;
+      const workerExecutor = new WorkerTaskExecutor({
+        inbox,
+        eventSink: sink,
+        store,
+        model: workerModel,
+        modelName: request.workerModel ?? request.model,
+        runId,
+        clock,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+        readWatermark: () => sink.ledger.watermark(),
+      });
+      workerScheduler = new WorkerLaneScheduler({
+        executor: workerExecutor,
+        inbox,
+        runId,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+      });
+      tools.push(createDelegateTaskTool({ dispatcher, store }));
+    }
+
     const lastModelCompletion = [...setup.events].reverse().find((event): event is Extract<
       AnyEvent,
       { type: "model.completed" }
@@ -261,7 +317,9 @@ export const executeRun = async (
       eventSink: sink,
       tools,
       clock,
-      ...(outputContinuationMessageId === undefined && scheduler === undefined
+      ...(outputContinuationMessageId === undefined
+        && scheduler === undefined
+        && workerScheduler === undefined
         ? {}
         : {
             beforeStep: async () => {
@@ -281,11 +339,17 @@ export const executeRun = async (
                     ? scheduler.beforeMainStep()
                     : Promise.resolve([])
                 ),
+                ...await (workerScheduler?.beforeMainStep() ?? Promise.resolve([])),
               ];
             },
-            ...(scheduler === undefined
+            ...(scheduler === undefined && workerScheduler === undefined
               ? {}
-              : { afterStep: (context) => scheduler!.enqueue(context) }),
+              : {
+                  afterStep: (context) => {
+                    scheduler?.enqueue(context);
+                    workerScheduler?.enqueue(context);
+                  },
+                }),
           }),
     });
 
@@ -312,6 +376,9 @@ export const executeRun = async (
       if (scheduler !== undefined) {
         await settlesWithin(scheduler.drain(), 25);
       }
+      if (workerScheduler !== undefined) {
+        await settlesWithin(workerScheduler.drain(), 25);
+      }
       const blocker: RunExecutionResult["blocker"] = result.completed
         ? undefined
         : result.stopReason === "length"
@@ -331,6 +398,7 @@ export const executeRun = async (
         clock,
       );
       await scheduler?.stop();
+      await workerScheduler?.stop();
       await commitRunCheckpoint(ledger, runId);
       const metrics = projectRunMetrics(await ledger.read({ runId }), runId);
       return {
@@ -345,6 +413,7 @@ export const executeRun = async (
       };
     } catch (error: unknown) {
       await scheduler?.stop();
+      await workerScheduler?.stop();
       const message = persistedErrorText(error, "Run failed");
       await appendLaneStatus(
         sink,
@@ -370,6 +439,7 @@ export const executeRun = async (
     }
   } finally {
     await scheduler?.stop().catch(() => undefined);
+    await workerScheduler?.stop().catch(() => undefined);
     await ledger.close();
   }
 };
@@ -392,6 +462,7 @@ const createNewRun = async (
   workspace: string,
   clock: Clock,
   auxiliaryMode: AuxiliaryMode,
+  workerEnabled?: boolean,
 ): Promise<RunSetup> => {
   if (request.message === undefined && (request.images?.length ?? 0) === 0) {
     throw new Error("A new Run requires a task message or image");
@@ -411,6 +482,7 @@ const createNewRun = async (
     ...(request.adviceDelivery === undefined
       ? {}
       : { tetoAdviceDelivery: request.adviceDelivery }),
+    ...(workerEnabled === undefined ? {} : { workerEnabled }),
     ...(auxiliaryMode === "teto"
       ? { tetoEnabled: true }
       : auxiliaryMode === "reflection" || auxiliaryMode === "none"
@@ -455,6 +527,17 @@ const createNewRun = async (
       payload: { kind: "reflection" },
       correlationId: `run:${runId}`,
       idempotencyKey: "lane:reflection:registered",
+      visibility: "run",
+    });
+  }
+  if (workerEnabled === true) {
+    await sink.append({
+      runId,
+      laneId: "worker",
+      type: "lane.registered",
+      payload: { kind: "worker" },
+      correlationId: `run:${runId}`,
+      idempotencyKey: "lane:worker:registered",
       visibility: "run",
     });
   }
@@ -585,6 +668,12 @@ const validateRequest = (request: RunExecutionRequest): void => {
   }
   if (request.model.length === 0) {
     throw new Error("model is required");
+  }
+  if (request.workerModel !== undefined && request.workerModel.length === 0) {
+    throw new Error("workerModel must not be empty");
+  }
+  if (request.workerEnabled !== undefined && typeof request.workerEnabled !== "boolean") {
+    throw new Error("workerEnabled must be a boolean");
   }
   if (
     request.auxiliaryMode !== undefined

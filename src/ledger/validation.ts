@@ -158,6 +158,9 @@ function runPolicy(value: unknown, path: string): asserts value is RunPolicy {
   }
   integer(item.maxModelTokens, `${path}.maxModelTokens`, 1);
   boolean(item.tetoEnabled, `${path}.tetoEnabled`);
+  if (item.workerEnabled !== undefined) {
+    boolean(item.workerEnabled, `${path}.workerEnabled`);
+  }
   integer(item.tetoMaxOutputTokens, `${path}.tetoMaxOutputTokens`);
   finiteNumber(item.tetoTokenRatio, `${path}.tetoTokenRatio`);
   if ((item.tetoTokenRatio as number) > 1) {

@@ -212,6 +212,8 @@ interface RunPolicyBase {
   tetoEnabled: boolean;
   tetoMaxOutputTokens: number;
   tetoTokenRatio: number;
+  /** Optional for schema-v1 compatibility; omitted means the Worker lane is off. */
+  workerEnabled?: boolean;
   /** Present only for preregistered evaluation arms. */
   auxiliaryMode?: AuxiliaryMode;
   /** Shadow records generated Advice without publishing it to Main's Inbox. */
