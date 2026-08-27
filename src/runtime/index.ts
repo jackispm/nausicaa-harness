@@ -6,3 +6,4 @@ export * from "./run-runtime.js";
 export * from "./reflection-scheduler.js";
 export * from "./session-controller.js";
 export * from "./teto-scheduler.js";
+export * from "./worker-task-executor.js";
