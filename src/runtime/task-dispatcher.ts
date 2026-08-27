@@ -22,6 +22,11 @@ const DEFAULT_TO: LaneId = "worker";
 const DEFAULT_PRIORITY = 1;
 const DEFAULT_DELIVERY: DeliveryMode = "next-step";
 const DEFAULT_VISIBILITY: Visibility = "run";
+const DEFAULT_MAX_OUTSTANDING_TASKS = 8;
+const MAX_OUTSTANDING_TASKS = 64;
+// One Inbox is the single-process admission boundary. A multi-process runtime
+// must move this check into its transactional Inbox repository.
+const admissionTails = new WeakMap<A2AInbox, Promise<void>>();
 
 export interface TaskDispatcherOptions {
   inbox: A2AInbox;
@@ -34,6 +39,8 @@ export interface TaskDispatcherOptions {
   priority?: number;
   delivery?: DeliveryMode;
   visibility?: Visibility;
+  /** Maximum unhandled task requests admitted to one destination lane. */
+  maxOutstandingTasks?: number;
   clock?: Clock;
   createId?: () => string;
 }
@@ -57,13 +64,21 @@ export interface TaskDispatchResult extends SendResult {
   taskId: string;
 }
 
+export class TaskBackpressureError extends Error {
+  override readonly name = "TaskBackpressureError";
+}
+
 /** Builds one bounded, replayable task handoff without owning execution state. */
 export class TaskDispatcher {
   private readonly inbox: A2AInbox;
   private readonly runId: RunId;
-  private readonly defaults: Omit<Required<TaskDispatcherOptions>, "inbox" | "clock" | "createId">;
+  private readonly defaults: Omit<
+    Required<TaskDispatcherOptions>,
+    "inbox" | "clock" | "createId" | "maxOutstandingTasks"
+  >;
   private readonly clock: Clock;
   private readonly createId: () => string;
+  private readonly maxOutstandingTasks: number;
 
   constructor(options: TaskDispatcherOptions) {
     nonEmpty(options.runId, "runId");
@@ -96,11 +111,27 @@ export class TaskDispatcher {
       delivery,
       visibility,
     };
+    const maxOutstandingTasks = options.maxOutstandingTasks ?? DEFAULT_MAX_OUTSTANDING_TASKS;
+    if (
+      !Number.isSafeInteger(maxOutstandingTasks)
+      || maxOutstandingTasks < 1
+      || maxOutstandingTasks > MAX_OUTSTANDING_TASKS
+    ) {
+      throw new RangeError(
+        `maxOutstandingTasks must be an integer between 1 and ${MAX_OUTSTANDING_TASKS}`,
+      );
+    }
+    this.maxOutstandingTasks = maxOutstandingTasks;
     this.clock = options.clock ?? systemClock;
     this.createId = options.createId ?? randomUUID;
   }
 
   async dispatch(request: TaskDispatchRequest): Promise<TaskDispatchResult> {
+    const input = structuredClone(request);
+    return runInboxAdmission(this.inbox, () => this.dispatchCommand(input));
+  }
+
+  private async dispatchCommand(request: TaskDispatchRequest): Promise<TaskDispatchResult> {
     validateGoal(request.goal);
     validateTaskBudget(request.budget);
     const taskId = request.taskId ?? this.createId();
@@ -133,7 +164,25 @@ export class TaskDispatcher {
       record.message.runId === this.runId
       && record.message.messageId === messageId
     ));
-    const createdAt = existing?.message.createdAt ?? this.clock.now().toISOString();
+    const now = this.clock.now();
+    if (existing === undefined) {
+      const outstanding = this.inbox.snapshot().records.filter((record) => (
+        record.message.runId === this.runId
+        && record.message.to === to
+        && record.message.payload.type === "task.request"
+        && record.status !== "handled"
+        && (
+          record.message.expiresAt === undefined
+          || Date.parse(record.message.expiresAt) > now.getTime()
+        )
+      )).length;
+      if (outstanding >= this.maxOutstandingTasks) {
+        throw new TaskBackpressureError(
+          `Worker lane ${to} is at task capacity (${outstanding}/${this.maxOutstandingTasks})`,
+        );
+      }
+    }
+    const createdAt = existing?.message.createdAt ?? now.toISOString();
     const result = await this.inbox.send({
       messageId,
       runId: this.runId,
@@ -157,6 +206,13 @@ export class TaskDispatcher {
     });
     return { ...result, taskId };
   }
+}
+
+function runInboxAdmission<T>(inbox: A2AInbox, operation: () => Promise<T>): Promise<T> {
+  const tail = admissionTails.get(inbox) ?? Promise.resolve();
+  const result = tail.then(operation);
+  admissionTails.set(inbox, result.then(() => undefined, () => undefined));
+  return result;
 }
 
 function nonEmpty(value: unknown, field: string): asserts value is string {

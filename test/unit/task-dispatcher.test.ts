@@ -6,7 +6,10 @@ import {
   MAX_TASK_MODEL_TOKENS,
   MAX_TASK_WALL_CLOCK_MS,
 } from "../../src/domain/index.js";
-import { TaskDispatcher } from "../../src/runtime/task-dispatcher.js";
+import {
+  TaskBackpressureError,
+  TaskDispatcher,
+} from "../../src/runtime/task-dispatcher.js";
 
 class MutableClock implements Clock {
   constructor(private instant: Date) {}
@@ -190,5 +193,101 @@ describe("TaskDispatcher", () => {
       goal: { ...baseGoal, statement: "a different task" },
       budget: baseBudget,
     })).rejects.toBeInstanceOf(A2AProtocolError);
+  });
+
+  it("bounds outstanding tasks while preserving idempotent retries", async () => {
+    const inbox = new A2AInbox();
+    const dispatcher = new TaskDispatcher({
+      inbox,
+      runId: "run-1",
+      maxOutstandingTasks: 1,
+    });
+    const first = { taskId: "task-1", goal: baseGoal, budget: baseBudget };
+
+    await expect(dispatcher.dispatch(first)).resolves.toMatchObject({ status: "queued" });
+    await expect(dispatcher.dispatch(first)).resolves.toMatchObject({ status: "duplicate" });
+    await expect(dispatcher.dispatch({
+      taskId: "task-2",
+      goal: baseGoal,
+      budget: baseBudget,
+    })).rejects.toBeInstanceOf(TaskBackpressureError);
+
+    const [claimed] = await inbox.claim("worker", "worker", { claimId: "claim-1" });
+    await inbox.handle(claimed!.message.messageId, "worker");
+    await expect(dispatcher.dispatch({
+      taskId: "task-2",
+      goal: baseGoal,
+      budget: baseBudget,
+    })).resolves.toMatchObject({ status: "queued" });
+  });
+
+  it("serializes concurrent dispatchers sharing an Inbox at the capacity boundary", async () => {
+    const inbox = new A2AInbox();
+    const first = new TaskDispatcher({
+      inbox,
+      runId: "run-1",
+      maxOutstandingTasks: 1,
+    });
+    const second = new TaskDispatcher({
+      inbox,
+      runId: "run-1",
+      maxOutstandingTasks: 1,
+    });
+
+    const settled = await Promise.allSettled([
+      first.dispatch({ taskId: "task-1", goal: baseGoal, budget: baseBudget }),
+      second.dispatch({ taskId: "task-2", goal: baseGoal, budget: baseBudget }),
+    ]);
+
+    expect(settled.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+    expect(inbox.snapshot().records).toHaveLength(1);
+  });
+
+  it("does not let an expired task occupy queue capacity forever", async () => {
+    const clock = new MutableClock(new Date("2026-08-27T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
+    const expiring = new TaskDispatcher({
+      inbox,
+      runId: "run-1",
+      clock,
+      maxOutstandingTasks: 1,
+    });
+    await inbox.send({
+      messageId: "external-task",
+      runId: "run-1",
+      conversationId: "run-1",
+      threadId: "run-1:main",
+      from: "main",
+      to: "worker",
+      createdAt: clock.now().toISOString(),
+      expiresAt: "2026-08-27T12:00:01.000Z",
+      correlationId: "run-1",
+      idempotencyKey: "external-task",
+      visibility: "run",
+      priority: 1,
+      delivery: "next-step",
+      payload: {
+        type: "task.request",
+        taskId: "external-task",
+        goal: baseGoal,
+        inputRefs: [],
+        budget: baseBudget,
+      },
+    });
+    clock.advance(1_001);
+
+    await expect(expiring.dispatch({
+      taskId: "task-2",
+      goal: baseGoal,
+      budget: baseBudget,
+    })).resolves.toMatchObject({ status: "queued" });
+  });
+
+  it.each([0, 65])("rejects an invalid outstanding task bound (%s)", (maxOutstandingTasks) => {
+    expect(() => new TaskDispatcher({
+      inbox: new A2AInbox(),
+      runId: "run-1",
+      maxOutstandingTasks,
+    })).toThrow(/maxOutstandingTasks/);
   });
 });
