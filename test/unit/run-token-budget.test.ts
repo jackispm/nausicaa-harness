@@ -78,6 +78,29 @@ describe("RunTokenBudget", () => {
     expect(budget.snapshot().usedTokens).toBe(30);
   });
 
+  it("reconciles live reservations and already recovered terminal usage once", () => {
+    const live = new RunTokenBudget(100);
+    live.reserve("fukai:live", 40);
+    expect(live.reconcile("fukai:live", 25, { alreadyAccounted: true })).toMatchObject({
+      reservedTokens: 40,
+      actualTokens: 25,
+    });
+    expect(live.snapshot().usedTokens).toBe(25);
+
+    const recovered = new RunTokenBudget(100, 25);
+    expect(recovered.reconcile("fukai:recovered", 25, {
+      alreadyAccounted: true,
+    })).toMatchObject({
+      reservedTokens: 0,
+      actualTokens: 25,
+    });
+    expect(recovered.snapshot().usedTokens).toBe(25);
+    expect(recovered.reconcile("fukai:recovered", 25)).toMatchObject({
+      actualTokens: 25,
+    });
+    expect(recovered.snapshot().usedTokens).toBe(25);
+  });
+
   it("rejects invalid values and unknown settlements without mutation", () => {
     expect(() => new RunTokenBudget(0)).toThrow(/maxTokens/);
     expect(() => new RunTokenBudget(10, -1)).toThrow(/usedTokens/);

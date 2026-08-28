@@ -40,6 +40,7 @@ export interface ModelResponse {
 
 export interface ModelCapabilities {
   imageInput: boolean;
+  contextWindowTokens?: number;
 }
 
 export type ModelStreamEvent =

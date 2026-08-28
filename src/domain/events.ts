@@ -17,6 +17,12 @@ import type {
   TurnId,
   Visibility,
 } from "./types.js";
+import type {
+  ContextCompactionBudget,
+  ContextCompactionGeneration,
+  ContextManifest,
+  ContextSourceRef,
+} from "./context.js";
 
 export type InputDelivery = "new-turn" | "steering" | "follow-up";
 export type UserMessageKind = "initial" | "steering";
@@ -99,6 +105,10 @@ export interface EventPayloadMap {
     truncations?: ContextTruncation[];
     /** Time spent building the model context, in milliseconds. */
     contextBuildMs?: number;
+    /** Deterministic request estimate used by admission and pressure gates. */
+    estimatedInputTokens?: number;
+    /** Redacted six-slot context contract used to build this request. */
+    contextManifest?: ContextManifest;
   };
   "model.completed": {
     model: string;
@@ -198,6 +208,88 @@ export interface EventPayloadMap {
     stateRefs: ArtifactRef[];
     stateHash: string;
     policyVersion: string;
+  };
+  /** One opt-in Main pre-request pressure decision; never emitted while disabled. */
+  "fukai.compaction.pressure": {
+    trigger: "main-pre-step";
+    model: string;
+    contextWindowTokens: number | null;
+    currentTokens: number;
+    thresholdTokens: number | null;
+    minimumRetainedRawTokens: number | null;
+    selectedRawTokens: number;
+    retainedRawTokens: number;
+    predictedGainTokens: number;
+    decision: "compact" | "skip";
+    reason:
+      | "pressure-threshold-reached"
+      | "below-threshold"
+      | "no-compactable-prefix"
+      | "insufficient-predicted-gain"
+      | "context-window-unknown"
+      | "source-window-unavailable";
+  };
+  /** A physical provider attempt was durably admitted before model IO. */
+  "fukai.compaction.requested": {
+    compactionId: string;
+    attemptId: string;
+    attempt: number;
+    /** Stale capsule this deterministic request intends to repair. */
+    repairFromCompactionId?: string;
+    cursor: string;
+    upperWatermark: number;
+    goalVersion: number;
+    policyVersion: string;
+    sourceRefs: ContextSourceRef[];
+    deferredConversationRefs?: ArtifactRef[];
+    generation?: ContextCompactionGeneration;
+    budget: ContextCompactionBudget;
+  };
+  /** The provider returned a persisted summary selection. */
+  "fukai.compaction.completed": {
+    compactionId: string;
+    attemptId: string;
+    attempt: number;
+    elapsedMs: number;
+    usage: TokenUsage | null;
+    summaryRef: ArtifactRef;
+    summaryHash: string;
+    estimatedTokens: number;
+    generationSpecHash?: string;
+  };
+  /** The provider attempt terminated without a usable selection. */
+  "fukai.compaction.failed": {
+    compactionId: string;
+    attemptId: string;
+    attempt: number;
+    status: "failed" | "timed-out" | "cancelled";
+    elapsedMs: number;
+    usage: TokenUsage | null;
+  };
+  /** Durable record for a structured Fukai summary stored out-of-line. */
+  "fukai.compaction.committed": {
+    compactionId: string;
+    attemptId: string | null;
+    summaryRef: ArtifactRef;
+    sourceRefs: ContextSourceRef[];
+    deferredConversationRefs?: ArtifactRef[];
+    generation?: ContextCompactionGeneration;
+    /** Explicit repair lineage when an unusable latest capsule is replaced. */
+    resetFromCompactionId?: string;
+    cursor: string;
+    upperWatermark: number;
+    goalVersion: number;
+    policyVersion: string;
+    summaryHash: string;
+    estimatedTokens: number;
+  };
+  /** A preflight admission or capsule verification failure forced raw fallback. */
+  "fukai.compaction.fallback": {
+    compactionId: string;
+    attemptId: string | null;
+    attempt: number | null;
+    reason: "budget-exhausted" | "stale" | "verification-failed";
+    phase: "preflight" | "commit" | "read-back";
   };
 }
 

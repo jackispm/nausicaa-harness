@@ -19,6 +19,7 @@ import {
 import type {
   ArtifactRef,
   ConversationMessage,
+  FukaiCompactionPolicy,
   Goal,
   LaneStatus,
   RunPolicy,
@@ -63,7 +64,18 @@ import {
   resolvePendingToolOperation,
 } from "./recovery.js";
 import { persistedErrorText } from "./redaction.js";
-import { resolveRunPolicy } from "./run-policy.js";
+import {
+  normalizeFukaiCompactionPolicy,
+  resolveRunPolicy,
+} from "./run-policy.js";
+import {
+  createRuntimeFukaiCompaction,
+  deriveRuntimePolicyVersion,
+  instantiateRuntimeFukaiCompaction,
+  prepareRuntimeFukaiCompaction,
+  runtimeFukaiCompactionBudget,
+  type RuntimeFukaiCompactionFactory,
+} from "./fukai-compaction-runtime.js";
 import { RunTokenBudget } from "./run-token-budget.js";
 import { recoverRunTokenUsage } from "./run-token-budget-recovery.js";
 import { TetoScheduler } from "./teto-scheduler.js";
@@ -172,6 +184,8 @@ export interface SessionControllerOptions {
   workerModel?: string;
   /** Opt-in bounded Worker lane; omitted or false preserves Main-only behavior. */
   workerEnabled?: boolean;
+  /** Explicit Fukai capability settings; omitted keeps the legacy disabled path. */
+  fukaiCompaction?: FukaiCompactionPolicy;
   policy?: Partial<RunPolicy>;
   maxOutputTokens?: number;
   allowWrite?: boolean;
@@ -186,6 +200,8 @@ export interface SessionControllerDeps {
   tools?: readonly AgentTool[];
   /** Optional bounded read-only tools for Worker; defaults to the workspace set. */
   workerTools?: readonly AgentTool[];
+  /** Test/plugin seam for the opt-in activation-scoped compaction adapter. */
+  createCompactionRuntime?: RuntimeFukaiCompactionFactory;
   clock?: Clock;
   createRunId?: () => string;
 }
@@ -265,6 +281,9 @@ export class SessionController {
     this.requestedWorkerEnabled = options.workerEnabled ?? options.policy?.workerEnabled;
     this.policy = resolveRunPolicy({
       ...options.policy,
+      ...(options.fukaiCompaction === undefined
+        ? {}
+        : { fukaiCompaction: options.fukaiCompaction }),
       ...(options.workerEnabled === undefined
         ? {}
         : { workerEnabled: options.workerEnabled }),
@@ -1006,6 +1025,10 @@ export class SessionController {
       ) {
         throw new SessionProtocolError("Cannot change workerEnabled while resuming a Run");
       }
+      validateRequestedFukaiPolicy(
+        this.policy.fukaiCompaction,
+        projection.run.policy.fukaiCompaction,
+      );
       attached = {
         runId,
         ledger,
@@ -1159,11 +1182,6 @@ export class SessionController {
         `turn:${turn.turnId}:running:${startStep}`,
         turn.turnId,
       );
-      const remaining = attached.tokenBudget.availableTokens();
-      if (remaining === 0) {
-        await this.failRunBudget(turn.turnId);
-        return;
-      }
       const model = this.deps.mainModel ?? createOpenRouterModelPort();
       const inbox = attached.worker?.inbox ?? new A2AInbox({
         sink: attached.sink,
@@ -1205,6 +1223,51 @@ export class SessionController {
           store: attached.store,
         }));
       }
+      let latestEvents = await attached.ledger.read({ runId: attached.runId });
+      const recoveredMain = projectMainExecutionRecovery(latestEvents);
+      const turnStarted = events.find((event): event is Extract<AnyEvent, {
+        type: "turn.started";
+      }> => event.type === "turn.started" && event.payload.turnId === turn.turnId);
+      if (turnStarted === undefined) {
+        throw new SessionProtocolError(`Turn ${turn.turnId} is missing turn.started`);
+      }
+      const preTurnConversationRefs = projectMainExecutionRecovery(
+        events.filter((event) => event.globalOffset < turnStarted.globalOffset),
+      ).conversationRefs;
+      const compactionRuntime = instantiateRuntimeFukaiCompaction(
+        attached.policy,
+        this.deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
+        {
+          ledger: attached.sink,
+          store: attached.store,
+          modelPort: model,
+          model: this.model,
+          tokenBudget: attached.tokenBudget,
+          clock: this.clock,
+          policy: attached.policy,
+        },
+      );
+      const policyVersion = deriveRuntimePolicyVersion(attached.policy);
+      if (compactionRuntime !== undefined) {
+        await prepareRuntimeFukaiCompaction(compactionRuntime, {
+          runId: attached.runId,
+          laneId: "main",
+          goal: attached.goal,
+          policyVersion,
+          upperWatermark: Math.max(0, turnStarted.globalOffset - 1),
+          conversationRefs: preTurnConversationRefs,
+          budget: runtimeFukaiCompactionBudget(attached.policy),
+          signal: turn.controller.signal,
+        });
+        latestEvents = await attached.ledger.read({ runId: attached.runId });
+      }
+      const remaining = attached.tokenBudget.availableTokens();
+      if (remaining === 0) {
+        await scheduler?.stop();
+        scheduler = undefined;
+        await this.failRunBudget(turn.turnId);
+        return;
+      }
       const loop = new MainLoop({
         model,
         resolveModel: () => this.model,
@@ -1239,10 +1302,20 @@ export class SessionController {
                 attached.worker?.scheduler.enqueue(context);
               },
             }),
+        ...(compactionRuntime === undefined
+          ? {}
+          : {
+              selectCompaction: compactionRuntime.select.bind(compactionRuntime),
+              ...(compactionRuntime.compactIfNeeded === undefined
+                ? {}
+                : {
+                    compactForPressure: compactionRuntime.compactIfNeeded.bind(
+                      compactionRuntime,
+                    ),
+                  }),
+            }),
         onStreamEvent: (event) => this.publish({ kind: "stream", event }),
       });
-      const latestEvents = await attached.ledger.read({ runId: attached.runId });
-      const recoveredMain = projectMainExecutionRecovery(latestEvents);
       const result = await loop.run({
         runId: attached.runId,
         turnId: turn.turnId,
@@ -1251,7 +1324,10 @@ export class SessionController {
         model: this.model,
         workspace: this.workspace,
         policy: { ...attached.policy, maxModelTokens: remaining },
+        policyVersion,
         conversationRefs: recoveredMain.conversationRefs,
+        pressureEligibleConversationCount:
+          recoveredMain.pressureEligibleConversationCount,
         upperWatermark: latestEvents.at(-1)?.globalOffset ?? 0,
         startStep: highestTurnStep(latestEvents, turn.turnId) + 1,
         maxOutputTokens: this.maxOutputTokens,
@@ -1710,7 +1786,7 @@ function emptyWorkerTaskSummary(): WorkerTaskSummary {
   };
 }
 
-class SessionEventSink {
+class SessionEventSink implements Ledger {
   private active = true;
   private events: AnyEvent[];
   private lastOffset: number;
@@ -1754,6 +1830,22 @@ class SessionEventSink {
       this.onEvent({ kind: "event", event: event as AnyEvent });
     }
     return event;
+  }
+
+  read(options?: Parameters<Ledger["read"]>[0]): ReturnType<Ledger["read"]> {
+    return this.ledger.read(options);
+  }
+
+  watermark(): Promise<number> {
+    return this.ledger.watermark();
+  }
+
+  flush(): Promise<void> {
+    return this.ledger.flush();
+  }
+
+  close(): Promise<void> {
+    return this.ledger.close();
   }
 }
 
@@ -1998,6 +2090,15 @@ function validateOptions(options: SessionControllerOptions): void {
   if (options.workerEnabled !== undefined && typeof options.workerEnabled !== "boolean") {
     throw new SessionProtocolError("workerEnabled must be a boolean");
   }
+  if (options.fukaiCompaction !== undefined) {
+    try {
+      normalizeFukaiCompactionPolicy(options.fukaiCompaction);
+    } catch (error: unknown) {
+      throw new SessionProtocolError(
+        error instanceof Error ? error.message : "Invalid fukaiCompaction policy",
+      );
+    }
+  }
   if (options.runId !== undefined) validateRunId(options.runId);
   if (
     options.maxOutputTokens !== undefined
@@ -2012,6 +2113,32 @@ function validateOptions(options: SessionControllerOptions): void {
     );
   }
 }
+
+const validateRequestedFukaiPolicy = (
+  requested: FukaiCompactionPolicy | undefined,
+  recorded: FukaiCompactionPolicy | undefined,
+): void => {
+  if (requested === undefined || recorded === undefined) {
+    if (requested?.enabled === true && recorded === undefined) {
+      throw new SessionProtocolError(
+        "Cannot enable Fukai compaction while resuming a Run without a recorded policy",
+      );
+    }
+    return;
+  }
+  if (!sameFukaiCompactionPolicy(normalizeFukaiCompactionPolicy(requested), recorded)) {
+    throw new SessionProtocolError("Cannot change fukaiCompaction while resuming a Run");
+  }
+};
+
+const sameFukaiCompactionPolicy = (
+  left: FukaiCompactionPolicy,
+  right: FukaiCompactionPolicy,
+): boolean => left.enabled === right.enabled
+  && left.provider === right.provider
+  && left.maxInputTokens === right.maxInputTokens
+  && left.maxOutputTokens === right.maxOutputTokens
+  && left.maxWallClockMs === right.maxWallClockMs;
 
 function validateSubmit(request: SessionSubmitRequest): void {
   if (request.inputId.length === 0 || request.inputId.includes("\0")) {

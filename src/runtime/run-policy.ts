@@ -1,5 +1,14 @@
-import type { RunPolicy } from "../domain/types.js";
-import { mainStepAllowance } from "../domain/types.js";
+import type { FukaiCompactionPolicy, RunPolicy } from "../domain/types.js";
+import {
+  DEFAULT_FUKAI_COMPACTION_MINIMUM_GAIN_TOKENS,
+  DEFAULT_FUKAI_COMPACTION_RETAIN_RATIO,
+  DEFAULT_FUKAI_COMPACTION_THRESHOLD_RATIO,
+  mainStepAllowance,
+} from "../domain/types.js";
+
+const MAX_FUKAI_COMPACTION_INPUT_TOKENS = 16 * 1024 * 1024;
+const MAX_FUKAI_COMPACTION_OUTPUT_TOKENS = 16 * 1024 * 1024;
+const MAX_FUKAI_COMPACTION_WALL_CLOCK_MS = 5 * 60 * 1_000;
 
 export const DEFAULT_RUN_POLICY: RunPolicy = {
   maxMainStepsPerActivation: 24,
@@ -25,6 +34,9 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
     ...(input.tetoAdviceDelivery === undefined
       ? {}
       : { tetoAdviceDelivery: input.tetoAdviceDelivery }),
+    ...(input.fukaiCompaction === undefined
+      ? {}
+      : { fukaiCompaction: normalizeFukaiCompactionPolicy(input.fukaiCompaction) }),
   };
   if (!Number.isSafeInteger(allowance) || allowance < 1) {
     throw new RangeError("maxMainStepsPerActivation must be a positive integer");
@@ -60,4 +72,64 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
     throw new RangeError("tetoAdviceDelivery must be live or shadow");
   }
   return policy;
+};
+
+/** Validate and clone the durable Fukai policy at a runtime boundary. */
+export const normalizeFukaiCompactionPolicy = (
+  value: FukaiCompactionPolicy,
+): FukaiCompactionPolicy => {
+  if (value === null || typeof value !== "object") {
+    throw new TypeError("fukaiCompaction must be an object");
+  }
+  if (typeof value.enabled !== "boolean") {
+    throw new TypeError("fukaiCompaction.enabled must be a boolean");
+  }
+  if (value.provider !== "none" && value.provider !== "pi-ai") {
+    throw new TypeError("fukaiCompaction.provider must be none or pi-ai");
+  }
+  if (value.enabled && value.provider === "none") {
+    throw new TypeError("enabled Fukai compaction requires the pi-ai provider");
+  }
+  for (const [name, candidate, maximum] of [
+    ["maxInputTokens", value.maxInputTokens, MAX_FUKAI_COMPACTION_INPUT_TOKENS],
+    ["maxOutputTokens", value.maxOutputTokens, MAX_FUKAI_COMPACTION_OUTPUT_TOKENS],
+    ["maxWallClockMs", value.maxWallClockMs, MAX_FUKAI_COMPACTION_WALL_CLOCK_MS],
+  ] as const) {
+    if (!Number.isSafeInteger(candidate) || candidate < 1) {
+      throw new TypeError(`fukaiCompaction.${name} must be a positive integer`);
+    }
+    if (candidate > maximum) {
+      throw new RangeError(`fukaiCompaction.${name} must be at most ${maximum}`);
+    }
+  }
+  const thresholdRatio = value.thresholdRatio
+    ?? DEFAULT_FUKAI_COMPACTION_THRESHOLD_RATIO;
+  const retainRatio = value.retainRatio ?? DEFAULT_FUKAI_COMPACTION_RETAIN_RATIO;
+  for (const [name, candidate] of [
+    ["thresholdRatio", thresholdRatio],
+    ["retainRatio", retainRatio],
+  ] as const) {
+    if (!Number.isFinite(candidate) || candidate <= 0 || candidate >= 1) {
+      throw new RangeError(`fukaiCompaction.${name} must be between zero and one`);
+    }
+  }
+  if (retainRatio >= thresholdRatio) {
+    throw new RangeError("fukaiCompaction.retainRatio must be less than thresholdRatio");
+  }
+  const minimumGainTokens = value.minimumGainTokens
+    ?? DEFAULT_FUKAI_COMPACTION_MINIMUM_GAIN_TOKENS;
+  if (!Number.isSafeInteger(minimumGainTokens) || minimumGainTokens < 1) {
+    throw new TypeError("fukaiCompaction.minimumGainTokens must be a positive integer");
+  }
+  if (minimumGainTokens > MAX_FUKAI_COMPACTION_INPUT_TOKENS) {
+    throw new RangeError(
+      `fukaiCompaction.minimumGainTokens must be at most ${MAX_FUKAI_COMPACTION_INPUT_TOKENS}`,
+    );
+  }
+  return {
+    ...structuredClone(value),
+    thresholdRatio,
+    retainRatio,
+    minimumGainTokens,
+  };
 };

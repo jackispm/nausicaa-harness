@@ -118,7 +118,10 @@ export class ReflectionScheduler {
   async beforeMainStep(
     _context?: Pick<MainBeforeStepContext, "step">,
   ): Promise<readonly MainBoundaryMessage[]> {
-    await this.drain();
+    // Reflection is an observer lane. A slow provider must not hold Main at a
+    // boundary; completed notes are picked up on the next boundary instead.
+    // The queue itself remains serialized and every rejection is still caught
+    // by enqueue(), so skipping a drain here cannot create an unhandled tail.
     const pending = this.pendingReflections[0];
     if (pending === undefined) return [];
     const messageId = `${this.runId}:reflection:${pending.mainCallIndex}`;

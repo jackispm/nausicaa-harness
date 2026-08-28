@@ -6,8 +6,16 @@ import type {
   EventType,
 } from "../../src/domain/events.js";
 import type { TokenUsage } from "../../src/domain/types.js";
+import {
+  deriveContextCompactionAttemptId,
+  deriveContextCompactionId,
+  FUKAI_COMPACTION_MEDIA_TYPE,
+} from "../../src/domain/context.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
-import { projectRunMetrics } from "../../src/observability/index.js";
+import {
+  projectRunMetrics,
+  type FukaiCompactionProviderObservation,
+} from "../../src/observability/index.js";
 
 const mainUsage: TokenUsage = {
   input: 100,
@@ -114,6 +122,16 @@ describe("projectRunMetrics", () => {
       checkpoints: 1,
       unknownOperations: 1,
       cacheReadRatio: 80 / 210,
+      fukaiCompaction: {
+        runId: "run-1",
+        eventCount: 13,
+        observationCount: 0,
+        total: {
+          providerCalls: 0,
+          committedCompactions: 0,
+          context: { knownRequests: 0, unknownRequests: 2 },
+        },
+      },
     });
     expect(metrics.advice).toEqual({
       total: 1,
@@ -292,6 +310,111 @@ describe("projectRunMetrics", () => {
       prefixChanges: 0,
       stablePrefixRate: 1,
     });
+  });
+
+  it("includes optional metered Fukai observations without changing Ledger projection", async () => {
+    const ledger = new MemoryLedger();
+    await append(ledger, "run.created", {
+      goal: { version: 1, statement: "Inspect", successCriteria: [], hardConstraints: [] },
+      workspace: "/workspace",
+      policy: {
+        maxMainSteps: 20,
+        maxModelTokens: 20_000,
+        tetoEnabled: true,
+        tetoMaxOutputTokens: 200,
+        tetoTokenRatio: 0.1,
+      },
+    }, "main", "2026-01-01T00:00:00.000Z");
+    const observation: FukaiCompactionProviderObservation = {
+      attemptId: "fukai-attempt-1",
+      runId: "run-1",
+      laneId: "main",
+      status: "completed",
+      budget: { maxInputTokens: 100, maxOutputTokens: 50, maxWallClockMs: 1_000 },
+      elapsedMs: 12,
+      estimatedOutputTokens: 7,
+      summaryBytes: 32,
+    };
+
+    const metrics = projectRunMetrics(await ledger.read(), "run-1", [observation]);
+
+    expect(metrics.fukaiCompaction.observationCount).toBe(1);
+    expect(metrics.fukaiCompaction.total).toMatchObject({
+      providerCalls: 1,
+      providerStatus: { completed: 1 },
+      usage: { knownCalls: 0, unknownCalls: 1 },
+      selectedOutputTokens: 7,
+      selectedSummaryBytes: 32,
+    });
+  });
+
+  it("includes durable Fukai provider metrics without transient observations", async () => {
+    const ledger = new MemoryLedger();
+    const sourceRef = ref("source");
+    const summaryRef = {
+      ...ref("summary"),
+      mediaType: FUKAI_COMPACTION_MEDIA_TYPE,
+    };
+    const compactionBudget = {
+      maxInputTokens: 100,
+      maxOutputTokens: 50,
+      maxWallClockMs: 1_000,
+    };
+    const sourceRefs = [{ kind: "artifact" as const, ref: sourceRef }];
+    const compactionId = deriveContextCompactionId({
+      runId: "run-1",
+      laneId: "main",
+      cursor: "offset:1",
+      upperWatermark: 1,
+      goalVersion: 1,
+      policyVersion: "policy-v1",
+      sourceRefs,
+      budget: compactionBudget,
+    });
+    const attemptId = deriveContextCompactionAttemptId(compactionId, 1);
+    await append(ledger, "fukai.compaction.requested", {
+      compactionId,
+      attemptId,
+      attempt: 1,
+      cursor: "offset:1",
+      upperWatermark: 1,
+      goalVersion: 1,
+      policyVersion: "policy-v1",
+      sourceRefs,
+      budget: compactionBudget,
+    }, "main", "2026-01-01T00:00:00.000Z");
+    await append(ledger, "fukai.compaction.completed", {
+      compactionId,
+      attemptId,
+      attempt: 1,
+      elapsedMs: 18,
+      usage: tetoUsage,
+      summaryRef,
+      summaryHash: summaryRef.contentHash,
+      estimatedTokens: 5,
+    }, "main", "2026-01-01T00:00:00.018Z");
+    await append(ledger, "fukai.compaction.committed", {
+      compactionId,
+      attemptId,
+      summaryRef,
+      sourceRefs,
+      cursor: "offset:1",
+      upperWatermark: 1,
+      goalVersion: 1,
+      policyVersion: "policy-v1",
+      summaryHash: summaryRef.contentHash,
+      estimatedTokens: 5,
+    }, "main", "2026-01-01T00:00:00.020Z");
+
+    expect(projectRunMetrics(await ledger.read(), "run-1").fukaiCompaction.total)
+      .toMatchObject({
+        providerCalls: 1,
+        providerStatus: { completed: 1, failed: 0, timedOut: 0, cancelled: 0 },
+        providerLatency: { count: 1, totalMs: 18, p50Ms: 18, p95Ms: 18 },
+        usage: { knownCalls: 1, unknownCalls: 0, total: tetoUsage },
+        committedCompactions: 1,
+        committedOutputTokens: 5,
+      });
   });
 });
 

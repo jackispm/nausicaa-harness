@@ -13,6 +13,7 @@ import type {
 import { JsonlLedger } from "../../src/ledger/index.js";
 import { ScriptedModel, type ScriptedModelStep } from "../../src/model/index.js";
 import { executeRun } from "../../src/runtime/index.js";
+import type { RuntimeFukaiCompactionFactory } from "../../src/runtime/fukai-compaction-runtime.js";
 
 const roots: string[] = [];
 
@@ -23,6 +24,385 @@ afterEach(async () => {
 });
 
 describe("executeRun", () => {
+  it("does not construct the compaction runtime when the recorded policy is disabled", async () => {
+    const root = await temporaryRoot();
+    let factoryCalls = 0;
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect the workspace",
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([response("done")]),
+      createRunId: () => "disabled-fukai-runtime",
+      createCompactionRuntime: () => {
+        factoryCalls += 1;
+        throw new Error("disabled factory must not run");
+      },
+    });
+
+    expect(result.completed).toBe(true);
+    expect(factoryCalls).toBe(0);
+  });
+
+  it("prepares Fukai once per activation and reads it at every Main boundary", async () => {
+    const root = await temporaryRoot();
+    let factoryCalls = 0;
+    let prepareCalls = 0;
+    let selectCalls = 0;
+    const policyVersions = new Set<string>();
+    const factory: RuntimeFukaiCompactionFactory = () => {
+      factoryCalls += 1;
+      return {
+        async prepare(request) {
+          prepareCalls += 1;
+          policyVersions.add(request.policyVersion);
+          expect(request.conversationRefs).toEqual([]);
+        },
+        async select(request) {
+          selectCalls += 1;
+          policyVersions.add(request.policyVersion);
+          return undefined;
+        },
+      };
+    };
+    const model = new ScriptedModel([{
+      ...response("inspect"),
+      stopReason: "toolUse",
+      toolCalls: [{ id: "fukai-noop", name: "noop", arguments: {} }],
+    }, response("done")]);
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect the workspace",
+      fukaiCompaction: enabledFukaiPolicy(),
+      policy: {
+        maxMainStepsPerActivation: 2,
+        maxModelTokens: 20_000,
+        tetoEnabled: false,
+      },
+    }, {
+      mainModel: model,
+      tools: [noopTool],
+      createRunId: () => "activation-fukai-runtime",
+      createCompactionRuntime: factory,
+    });
+
+    expect(result.completed).toBe(true);
+    expect(model.callCount).toBe(2);
+    expect({ factoryCalls, prepareCalls, selectCalls }).toEqual({
+      factoryCalls: 1,
+      prepareCalls: 1,
+      selectCalls: 2,
+    });
+    expect([...policyVersions]).toHaveLength(1);
+    expect([...policyVersions][0]).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  it("propagates activation cancellation before Main reaches the provider", async () => {
+    const root = await temporaryRoot();
+    const controller = new AbortController();
+    const cancelled = new Error("cancel compaction preparation");
+    const model = new ScriptedModel([response("must not run")]);
+
+    await expect(executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect the workspace",
+      fukaiCompaction: enabledFukaiPolicy(),
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
+      signal: controller.signal,
+    }, {
+      mainModel: model,
+      createRunId: () => "cancelled-fukai-runtime",
+      createCompactionRuntime: () => ({
+        async prepare() {
+          controller.abort(cancelled);
+          throw cancelled;
+        },
+        async select() {
+          return undefined;
+        },
+      }),
+    })).rejects.toBe(cancelled);
+    expect(model.callCount).toBe(0);
+  });
+
+  it("keeps bounded raw context when compaction preparation and reads fail", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([(request) => {
+      expect(request.messages.map((message) => message.content))
+        .toContain("Keep this raw input");
+      return response("done");
+    }]);
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Keep this raw input",
+      fukaiCompaction: enabledFukaiPolicy(),
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
+    }, {
+      mainModel: model,
+      createRunId: () => "failed-fukai-runtime",
+      createCompactionRuntime: () => ({
+        async prepare() {
+          throw new Error("compaction provider unavailable");
+        },
+        async select() {
+          throw new Error("compaction read unavailable");
+        },
+      }),
+    });
+
+    expect(result.completed).toBe(true);
+    expect(model.callCount).toBe(1);
+  });
+
+  it("repairs optional compaction before a recovered zero-budget Run is blocked", async () => {
+    const root = await temporaryRoot();
+    const dataDir = join(root, "state");
+    const first = await executeRun({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      message: "Use the entire bounded budget",
+      fukaiCompaction: enabledFukaiPolicy(),
+      maxOutputTokens: 5,
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 500, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([{
+        content: "continue later",
+        stopReason: "toolUse",
+        toolCalls: [{ id: "budget-noop", name: "noop", arguments: {} }],
+        usage: { input: 495, output: 5, cacheRead: 0, cacheWrite: 0 },
+      }]),
+      tools: [noopTool],
+      createRunId: () => "zero-budget-fukai-repair",
+    });
+    expect(first.completed).toBe(false);
+
+    let prepareCalls = 0;
+    const main = new ScriptedModel([response("must not run")]);
+    const resumed = await executeRun({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      resumeRunId: first.runId,
+    }, {
+      mainModel: main,
+      tools: [noopTool],
+      createCompactionRuntime: () => ({
+        async prepare() {
+          prepareCalls += 1;
+        },
+        async select() {
+          return undefined;
+        },
+      }),
+    });
+
+    expect(prepareCalls).toBe(1);
+    expect(main.callCount).toBe(0);
+    expect(resumed).toMatchObject({
+      completed: false,
+      blocker: "run-budget-or-step-limit",
+    });
+  });
+
+  it("reuses a committed compaction after Main crashes before its boundary commits", async () => {
+    const root = await temporaryRoot();
+    const dataDir = join(root, "state");
+    const first = await executeRun({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      message: "Inspect once, then resume",
+      fukaiCompaction: {
+        ...enabledFukaiPolicy(),
+        maxInputTokens: 32_000,
+      },
+      policy: { maxMainStepsPerActivation: 3, maxModelTokens: 100_000, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([
+        {
+          ...response("x".repeat(5_000)),
+          stopReason: "toolUse",
+          toolCalls: [{ id: "restart-noop-1", name: "noop", arguments: {} }],
+        },
+        {
+          ...response("history observed; continue after activation"),
+          stopReason: "toolUse",
+          toolCalls: [{ id: "restart-noop-2", name: "noop", arguments: {} }],
+        },
+        {
+          ...response("latest eligible group remains raw"),
+          stopReason: "toolUse",
+          toolCalls: [{ id: "restart-noop-3", name: "noop", arguments: {} }],
+        },
+      ]),
+      tools: [noopTool],
+      createRunId: () => "restart-fukai-runtime",
+    });
+    expect(first.completed).toBe(false);
+    expect(first.steps).toBe(3);
+
+    let compactionCalls = 0;
+    const observedCompactionEvents: string[] = [];
+    const crashingModel: ModelPort = {
+      capabilities: () => ({ imageInput: false, contextWindowTokens: 10 }),
+      async complete(request) {
+        if (request.sessionId.startsWith("fukai-compaction:")) {
+          compactionCalls += 1;
+          return response(JSON.stringify({
+            decisions: ["Resume the existing inspection"],
+            openQuestions: ["Finish the answer"],
+            verifiedResults: ["The first bounded step completed"],
+          }), 100, 20);
+        }
+        throw new Error("simulated Main crash");
+      },
+    };
+    await expect(executeRun({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      resumeRunId: first.runId,
+      message: "Continue from the prior inspection",
+    }, {
+      mainModel: crashingModel,
+      tools: [noopTool],
+      onEvent: (event) => {
+        if (event.type.startsWith("fukai.compaction.") || event.type === "budget.charged") {
+          observedCompactionEvents.push(event.type);
+        }
+      },
+    })).rejects.toThrow("simulated Main crash");
+    expect(compactionCalls).toBe(1);
+    expect(observedCompactionEvents).toEqual([
+      "fukai.compaction.pressure",
+      "fukai.compaction.requested",
+      "fukai.compaction.completed",
+      "budget.charged",
+      "fukai.compaction.committed",
+    ]);
+
+    const resumedModel = new ScriptedModel([response("done after restart")]);
+    const resumed = await executeRun({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      resumeRunId: first.runId,
+    }, {
+      mainModel: resumedModel,
+      tools: [noopTool],
+    });
+
+    expect(resumed).toMatchObject({ completed: true, finalText: "done after restart" });
+    expect(resumedModel.callCount).toBe(1);
+    expect(resumedModel.requests[0]?.messages.some((message) => (
+      message.content.includes("Historical compaction capsule")
+    ))).toBe(true);
+    const ledger = await JsonlLedger.open(join(resumed.stateDir, "ledger.jsonl"));
+    const events = await ledger.read({ runId: resumed.runId });
+    expect(events.filter((event) => event.type === "fukai.compaction.requested"))
+      .toHaveLength(1);
+    expect(events.filter((event) => event.type === "fukai.compaction.committed"))
+      .toHaveLength(1);
+    await ledger.close();
+  });
+
+  it("persists explicit Fukai settings without invoking a provider", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([response("Grounded answer")]);
+    const fukaiCompaction = {
+      enabled: true,
+      provider: "pi-ai" as const,
+      maxInputTokens: 12_000,
+      maxOutputTokens: 2_048,
+      maxWallClockMs: 30_000,
+      thresholdRatio: 0.8,
+      retainRatio: 0.16,
+      minimumGainTokens: 1,
+    };
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect the workspace",
+      fukaiCompaction,
+      policy: { maxMainSteps: 1, tetoEnabled: false },
+    }, {
+      mainModel: model,
+      createRunId: () => "run-fukai-config",
+    });
+
+    expect(result.completed).toBe(true);
+    expect(model.callCount).toBe(1);
+    const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
+    const events = await ledger.read({ runId: result.runId });
+    const created = events.find((event) => event.type === "run.created");
+    expect(created?.type).toBe("run.created");
+    if (created?.type !== "run.created") throw new Error("Missing run.created");
+    expect(created.payload.policy.fukaiCompaction).toEqual(fukaiCompaction);
+    const requested = events.find((event) => event.type === "model.requested");
+    expect(requested?.type).toBe("model.requested");
+    if (requested?.type !== "model.requested") throw new Error("Missing model.requested");
+    expect(requested.payload.contextManifest?.slots.compaction.status).toBe("none");
+    await ledger.close();
+  });
+
+  it("rejects changing a persisted Fukai policy while resuming", async () => {
+    const root = await temporaryRoot();
+    const state = join(root, "state");
+    const disabled = {
+      enabled: false,
+      provider: "none" as const,
+      maxInputTokens: 32_000,
+      maxOutputTokens: 4_096,
+      maxWallClockMs: 60_000,
+    };
+    const first = await executeRun({
+      workspace: root,
+      dataDir: state,
+      model: "scripted",
+      message: "Continue later",
+      fukaiCompaction: disabled,
+      policy: { maxMainSteps: 1, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([{
+        ...response("partial"),
+        stopReason: "toolUse",
+        toolCalls: [{ id: "resume-fukai-tool", name: "noop", arguments: {} }],
+      }]),
+      tools: [noopTool],
+      createRunId: () => "run-fukai-resume",
+    });
+    expect(first.completed).toBe(false);
+
+    await expect(executeRun({
+      workspace: root,
+      dataDir: state,
+      model: "scripted",
+      resumeRunId: first.runId,
+      fukaiCompaction: {
+        ...disabled,
+        enabled: true,
+        provider: "pi-ai",
+      },
+    }, {
+      mainModel: new ScriptedModel([response("should not run")]),
+      tools: [noopTool],
+    })).rejects.toThrow("Cannot change fukaiCompaction while resuming a Run");
+  });
+
   it("composes a complete Main-only Run on the file-backed runtime", async () => {
     const root = await temporaryRoot();
     const model = new ScriptedModel([response("Grounded answer")]);
@@ -152,6 +532,70 @@ describe("executeRun", () => {
       && event.payload.status === "cancelled",
     )).toBe(true);
     await ledger.close();
+  });
+
+  it("returns Main's answer without waiting for a slow reflection tail", async () => {
+    const root = await temporaryRoot();
+    const mainResponses: ScriptedModelStep[] = [
+      {
+        ...response("Step 1", 1_000, 200),
+        stopReason: "toolUse",
+        toolCalls: [{ id: "slow-reflection-call-1", name: "noop", arguments: {} }],
+      },
+      {
+        ...response("Step 2", 1_000, 200),
+        stopReason: "toolUse",
+        toolCalls: [{ id: "slow-reflection-call-2", name: "noop", arguments: {} }],
+      },
+      async () => {
+        // The first Main boundary queues Reflection. Waiting for this marker
+        // makes the test cover an in-flight observer, rather than a queue that
+        // happened not to start before Main completed.
+        await reflectionStarted;
+        return response("Done", 1_000, 200);
+      },
+    ];
+    let markReflectionStarted: (() => void) | undefined;
+    const reflectionStarted = new Promise<void>((resolve) => {
+      markReflectionStarted = resolve;
+    });
+    let releaseReflection: ((value: ModelResponse) => void) | undefined;
+    const slowReflection: ModelPort = {
+      complete: async () => new Promise<ModelResponse>((resolve) => {
+        markReflectionStarted?.();
+        releaseReflection = resolve;
+      }),
+    };
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "main-scripted",
+      reflectionModel: "reflection-scripted",
+      auxiliaryMode: "reflection",
+      message: "Complete three bounded decisions",
+      policy: { maxMainSteps: 3, maxModelTokens: 50_000 },
+    }, {
+      mainModel: new ScriptedModel(mainResponses),
+      reflectionModel: slowReflection,
+      tools: [noopTool],
+      createRunId: () => "run-slow-reflection",
+    });
+
+    expect(result).toMatchObject({ completed: true, finalText: "Done" });
+    const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
+    const events = await ledger.read({ runId: result.runId });
+    expect(events.some((event) => (
+      event.type === "lane.status"
+      && event.laneId === "reflection"
+      && event.payload.status === "cancelled"
+    ))).toBe(true);
+    await ledger.close();
+
+    // Let the deliberately uncooperative provider settle after Main has
+    // returned. Its late completion must not append to the closed Ledger.
+    releaseReflection?.(response('{"action":"silent"}', 20, 5));
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
   });
 
   it("closes the Run before an observer that ignores cancellation resolves", async () => {
@@ -737,6 +1181,17 @@ const response = (content: string, input = 20, output = 5): ModelResponse => ({
   toolCalls: [],
   stopReason: "stop",
   usage: { input, output, cacheRead: 0, cacheWrite: 0 },
+});
+
+const enabledFukaiPolicy = () => ({
+  enabled: true,
+  provider: "pi-ai" as const,
+  maxInputTokens: 2_000,
+  maxOutputTokens: 500,
+  maxWallClockMs: 30_000,
+  thresholdRatio: 0.8,
+  retainRatio: 0.16,
+  minimumGainTokens: 1,
 });
 
 const image = (

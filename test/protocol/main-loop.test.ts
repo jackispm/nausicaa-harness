@@ -9,10 +9,16 @@ import type {
   ModelPort,
   ModelResponse,
 } from "../../src/domain/ports.js";
+import type { Goal } from "../../src/domain/types.js";
+import { FUKAI_COMPACTION_MEDIA_TYPE } from "../../src/domain/context.js";
 import {
   ContentStoreFukaiSource,
   FukaiContextProvider,
 } from "../../src/fukai/index.js";
+import type {
+  FukaiCompactionSelection,
+  MainContextProvider,
+} from "../../src/fukai/types.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import {
@@ -32,6 +38,515 @@ afterEach(async () => {
 });
 
 describe("MainLoop", () => {
+  it("wires an explicit Fukai capsule selector without changing the default loop", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const model = new ScriptedModel([{
+      content: "inspect",
+      toolCalls: [{ id: "compaction-noop", name: "noop", arguments: {} }],
+      stopReason: "toolUse",
+      usage: tokenUsage(10, 5),
+    }, {
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const summary = {
+      schemaVersion: 1 as const,
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      decisions: ["Keep the answer concise"],
+      verifiedResults: ["The request is bounded"],
+      openQuestions: [],
+      sourceRefs: [{ kind: "event" as const, eventId: "source-event", contentHash: "sha256:source" }],
+    };
+    const summaryRef = await store.put(JSON.stringify(summary), FUKAI_COMPACTION_MEDIA_TYPE);
+    let selectorCalls = 0;
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [{
+        definition: {
+          name: "noop",
+          description: "Return a deterministic result",
+          parameters: { type: "object", additionalProperties: false },
+        },
+        async execute() {
+          return { content: "ok", isError: false };
+        },
+      }],
+      selectCompaction: async (context) => {
+        selectorCalls += 1;
+        expect(context.upperWatermark).toBeGreaterThan(0);
+        if (selectorCalls === 2) {
+          throw new Error("transient compaction read failure");
+        }
+        return {
+          capsule: {
+            schemaVersion: 1,
+            compactionId: `fukai-compaction:sha256:${"a".repeat(64)}`,
+            status: "ready",
+            summaryRef,
+            sourceRefs: summary.sourceRefs,
+            summaryHash: summaryRef.contentHash,
+            cursor: "offset:0",
+            upperWatermark: context.upperWatermark,
+            goalVersion: 1,
+            policyVersion: "1",
+            estimatedTokens: 24,
+          },
+          summary,
+        };
+      },
+    });
+
+    await loop.run({
+      runId: "main-compaction-selector",
+      goal: summary.goal,
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      policyVersion: "1",
+      initialMessage: "Go",
+    });
+
+    expect(selectorCalls).toBe(2);
+    expect(model.requests[0]?.messages.some((message) => (
+      message.content.includes("Historical compaction capsule")
+    ))).toBe(true);
+    expect(model.requests[1]?.messages.some((message) => (
+      message.content.includes("Historical compaction capsule")
+    ))).toBe(false);
+    const requested = (await ledger.read({ runId: "main-compaction-selector" }))
+      .filter((event) => event.type === "model.requested");
+    expect(requested.map((event) => event.payload.contextManifest?.slots.compaction.status))
+      .toEqual(["ready", "none"]);
+    expect(new Set(requested.map((event) => event.payload.prefixHash)).size).toBe(1);
+  });
+
+  it("falls back to bounded raw context when a selected capsule exceeds the context budget", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const model = new ScriptedModel([{
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const goal = { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] };
+    const summary = {
+      schemaVersion: 1 as const,
+      goal,
+      decisions: ["x".repeat(4_000)],
+      verifiedResults: [],
+      openQuestions: [],
+      sourceRefs: [{ kind: "event" as const, eventId: "source-event", contentHash: "sha256:source" }],
+    };
+    const summaryRef = await store.put(JSON.stringify(summary), FUKAI_COMPACTION_MEDIA_TYPE);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+      selectCompaction: async (context) => ({
+        capsule: {
+          schemaVersion: 1,
+          compactionId: `fukai-compaction:sha256:${"b".repeat(64)}`,
+          status: "ready",
+          summaryRef,
+          sourceRefs: summary.sourceRefs,
+          summaryHash: summaryRef.contentHash,
+          cursor: "offset:0",
+          upperWatermark: context.upperWatermark,
+          goalVersion: goal.version,
+          policyVersion: "1",
+          estimatedTokens: 1_100,
+        },
+        summary,
+      }),
+    });
+
+    await expect(loop.run({
+      runId: "main-compaction-context-fallback",
+      goal,
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      policyVersion: "1",
+      systemPrompt: "Main",
+      contextBudget: { maxInputTokens: 256 },
+      initialMessage: "Go",
+    })).resolves.toMatchObject({ completed: true });
+
+    expect(model.requests).toHaveLength(1);
+    expect(model.requests[0]?.messages.some((message) => (
+      message.content.includes("Historical compaction capsule")
+    ))).toBe(false);
+    const requested = (await ledger.read({ runId: "main-compaction-context-fallback" }))
+      .filter((event) => event.type === "model.requested");
+    expect(requested[0]?.payload.contextManifest?.slots.compaction.status).toBe("none");
+  });
+
+  it("checks compaction pressure at every Main request boundary without adding provider calls", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const model = new ScriptedModel([{
+      content: "inspect both",
+      toolCalls: [
+        { id: "pressure-tool-a", name: "noop", arguments: {} },
+        { id: "pressure-tool-b", name: "noop", arguments: {} },
+      ],
+      stopReason: "toolUse",
+      usage: tokenUsage(10, 5),
+    }, {
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const pressureChecks: Array<{
+      model: string;
+      upperWatermark: number;
+      conversationCount: number;
+      estimatedInputTokens: number;
+    }> = [];
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [{
+        definition: {
+          name: "noop",
+          description: "Return a deterministic result",
+          parameters: { type: "object", additionalProperties: false },
+        },
+        async execute() {
+          return { content: "ok", isError: false };
+        },
+      }],
+      compactForPressure: async (context) => {
+        pressureChecks.push({
+          model: context.model,
+          upperWatermark: context.upperWatermark,
+          conversationCount: context.conversationRefs.length,
+          estimatedInputTokens: context.estimatedInputTokens,
+        });
+        return undefined;
+      },
+      beforeStep: async ({ step }) => [{
+        kind: "runtime-notice",
+        source: "test",
+        content: `boundary ${step}`,
+        messageId: `pressure-boundary-${step}`,
+      }],
+    });
+
+    await expect(loop.run({
+      runId: "main-pressure-boundaries",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      initialMessage: "Go",
+    })).resolves.toMatchObject({ completed: true, steps: 2 });
+
+    expect(model.requests).toHaveLength(2);
+    expect(pressureChecks).toHaveLength(2);
+    expect(pressureChecks[0]).toMatchObject({ model: "demo", conversationCount: 0 });
+    expect(pressureChecks[1]).toMatchObject({ model: "demo", conversationCount: 2 });
+    expect(pressureChecks[1]!.upperWatermark).toBeGreaterThan(
+      pressureChecks[0]!.upperWatermark,
+    );
+    expect(pressureChecks.every((check) => check.estimatedInputTokens > 0)).toBe(true);
+    expect((await ledger.read({ runId: "main-pressure-boundaries" }))
+      .filter((event) => event.type === "model.requested")).toHaveLength(2);
+  });
+
+  it("protects the admitted Main request budget from optional compaction failure", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const runTokenBudget = new RunTokenBudget(1_000);
+    const model = new ScriptedModel([{
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    let compactionUsage = 0;
+    let mainReservedDuringCompaction = 0;
+    const loop = new MainLoop({
+      model,
+      runTokenBudget,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+      compactForPressure: async () => {
+        const beforeCompaction = runTokenBudget.snapshot();
+        mainReservedDuringCompaction = beforeCompaction.reservedTokens;
+        compactionUsage = beforeCompaction.availableTokens;
+        expect(beforeCompaction.reservations).toEqual([
+          expect.objectContaining({
+            id: "main-pressure-budget-guard:lane:main:legacy:step:1:provider:attempt:1",
+          }),
+        ]);
+        expect(mainReservedDuringCompaction).toBeGreaterThan(0);
+        expect(compactionUsage).toBeGreaterThan(0);
+        expect(runTokenBudget.reserve("test:optional-compaction", compactionUsage))
+          .toBeDefined();
+        runTokenBudget.settle("test:optional-compaction", compactionUsage);
+        throw new Error("optional compaction failed after provider usage");
+      },
+    });
+
+    await expect(loop.run({
+      runId: "main-pressure-budget-guard",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      maxOutputTokens: 20,
+    })).resolves.toMatchObject({ completed: true, finalText: "done" });
+
+    expect(model.callCount).toBe(1);
+    expect(mainReservedDuringCompaction).toBeGreaterThan(0);
+    expect(compactionUsage).toBeGreaterThan(0);
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: compactionUsage + 15,
+      reservedTokens: 0,
+    });
+  });
+
+  it("constrains Main output when pressure compaction grows within its reservation", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const runTokenBudget = new RunTokenBudget(400);
+    const model = new ScriptedModel([{
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const goal: Goal = {
+      version: 1,
+      statement: "Answer",
+      successCriteria: [],
+      hardConstraints: [],
+    };
+    const loop = new MainLoop({
+      model,
+      runTokenBudget,
+      contextProvider: pressureSizedContextProvider(store, 100, 160),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+      compactForPressure: (context) => pressureCompactionSelection(
+        store,
+        goal,
+        context.policyVersion,
+        context.upperWatermark,
+        "c",
+      ),
+    });
+
+    await expect(loop.run({
+      runId: "main-pressure-larger-view",
+      goal,
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      maxOutputTokens: 100,
+    })).resolves.toMatchObject({ completed: true, finalText: "done" });
+
+    expect(model.requests).toHaveLength(1);
+    expect(model.requests[0]?.maxOutputTokens).toBe(40);
+    expect(model.requests[0]?.messages.some((message) => (
+      message.content.includes("Historical compaction capsule")
+    ))).toBe(true);
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 15,
+      reservedTokens: 0,
+      settlements: [expect.objectContaining({ reservedTokens: 200 })],
+    });
+    const requested = (await ledger.read({ runId: "main-pressure-larger-view" }))
+      .find((event) => event.type === "model.requested");
+    expect(requested?.payload).toMatchObject({
+      estimatedInputTokens: 160,
+      contextManifest: { slots: { compaction: { status: "ready" } } },
+    });
+  });
+
+  it("retains the admitted view when pressure compaction outgrows Main's reservation", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const runTokenBudget = new RunTokenBudget(400);
+    const model = new ScriptedModel([{
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const goal: Goal = {
+      version: 1,
+      statement: "Answer",
+      successCriteria: [],
+      hardConstraints: [],
+    };
+    const loop = new MainLoop({
+      model,
+      runTokenBudget,
+      contextProvider: pressureSizedContextProvider(store, 100, 220),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+      compactForPressure: (context) => pressureCompactionSelection(
+        store,
+        goal,
+        context.policyVersion,
+        context.upperWatermark,
+        "d",
+      ),
+    });
+
+    await expect(loop.run({
+      runId: "main-pressure-view-rejected",
+      goal,
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      maxOutputTokens: 100,
+    })).resolves.toMatchObject({ completed: true, finalText: "done" });
+
+    expect(model.requests).toHaveLength(1);
+    expect(model.requests[0]?.maxOutputTokens).toBe(100);
+    expect(model.requests[0]?.messages.some((message) => (
+      message.content.includes("Historical compaction capsule")
+    ))).toBe(false);
+    const requested = (await ledger.read({ runId: "main-pressure-view-rejected" }))
+      .find((event) => event.type === "model.requested");
+    expect(requested?.payload).toMatchObject({
+      estimatedInputTokens: 100,
+      contextManifest: { slots: { compaction: { status: "none" } } },
+    });
+  });
+
+  it("releases Main's reservation when pressure compaction is aborted", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const runTokenBudget = new RunTokenBudget(400);
+    const controller = new AbortController();
+    const model = new ScriptedModel([{
+      content: "must not run",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(1, 1),
+    }]);
+    let reservedBeforeAbort = 0;
+    const loop = new MainLoop({
+      model,
+      runTokenBudget,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+      compactForPressure: async () => {
+        reservedBeforeAbort = runTokenBudget.snapshot().reservedTokens;
+        const cancellation = new Error("pressure compaction cancelled");
+        controller.abort(cancellation);
+        throw cancellation;
+      },
+    });
+
+    await expect(loop.run({
+      runId: "main-pressure-aborted",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      maxOutputTokens: 20,
+      signal: controller.signal,
+    })).rejects.toThrow("pressure compaction cancelled");
+
+    expect(reservedBeforeAbort).toBeGreaterThan(0);
+    expect(model.callCount).toBe(0);
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 0,
+      reservedTokens: 0,
+      availableTokens: 400,
+      settlements: [],
+    });
+    expect((await ledger.read({ runId: "main-pressure-aborted" })).some((event) => (
+      event.type === "model.requested"
+    ))).toBe(false);
+  });
+
+  it("freezes one model selector for pressure and provider IO at each boundary", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const model = new ScriptedModel([{
+      content: "inspect",
+      toolCalls: [{ id: "selector-noop", name: "noop", arguments: {} }],
+      stopReason: "toolUse",
+      usage: tokenUsage(10, 5),
+    }, {
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    let selectedModel = "model-b";
+    let resolverCalls = 0;
+    const pressureModels: string[] = [];
+    const loop = new MainLoop({
+      model,
+      resolveModel: () => {
+        resolverCalls += 1;
+        return selectedModel;
+      },
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [noopToolForMainTest],
+      compactForPressure: async (context) => {
+        pressureModels.push(context.model);
+        selectedModel = "model-c";
+        return undefined;
+      },
+    });
+
+    await loop.run({
+      runId: "main-pressure-model-freeze",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "model-a",
+      workspace,
+      policy: policy(2),
+      initialMessage: "Go",
+    });
+
+    expect(resolverCalls).toBe(2);
+    expect(pressureModels).toEqual(["model-b", "model-c"]);
+    expect(model.requests.map((request) => request.model)).toEqual(["model-b", "model-c"]);
+    expect((await ledger.read({ runId: "main-pressure-model-freeze" }))
+      .filter((event) => event.type === "model.requested")
+      .map((event) => event.payload.model)).toEqual(["model-b", "model-c"]);
+  });
+
   it("admits Main with a shared Run budget, narrows output, and settles actual usage", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
@@ -149,6 +664,43 @@ describe("MainLoop", () => {
       availableTokens: 400,
       settlements: [],
     });
+  });
+
+  it("charges provider-reported usage when a Main request fails", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const runTokenBudget = new RunTokenBudget(400);
+    const failure = Object.assign(new Error("provider returned an error response"), {
+      providerUsage: tokenUsage(9, 3),
+    });
+    const loop = new MainLoop({
+      model: new ScriptedModel([failure]),
+      runTokenBudget,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+    });
+
+    await expect(loop.run({
+      runId: "main-budget-metered-failure",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    })).rejects.toThrow("provider returned an error response");
+
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 12,
+      reservedTokens: 0,
+      availableTokens: 388,
+    });
+    const events = await ledger.read({ runId: "main-budget-metered-failure" });
+    expect(events.filter((event) => event.type === "budget.charged"))
+      .toEqual([expect.objectContaining({ payload: { laneId: "main", usage: tokenUsage(9, 3) } })]);
+    expect(events.some((event) => event.type === "model.failed")).toBe(true);
   });
 
   it("reconciles partial deltas with the committed assistant message", async () => {
@@ -720,6 +1272,13 @@ describe("MainLoop", () => {
       maxInputTokens: 4_000,
       maxConversationMessages: 3,
     };
+    const activationPolicy = {
+      maxMainStepsPerActivation: 1,
+      maxModelTokens: 10_000,
+      tetoEnabled: false,
+      tetoMaxOutputTokens: 200,
+      tetoTokenRatio: 0.1,
+    };
 
     const interrupted = await loop.run({
       runId: "cache-evidence-run",
@@ -728,7 +1287,7 @@ describe("MainLoop", () => {
       goal,
       model: "vision-demo",
       workspace,
-      policy: policy(1),
+      policy: activationPolicy,
       initialImages: [image],
       contextBudget,
     });
@@ -741,7 +1300,7 @@ describe("MainLoop", () => {
       goal,
       model: "vision-demo",
       workspace,
-      policy: policy(2),
+      policy: activationPolicy,
       startStep: 2,
       upperWatermark: await ledger.watermark(),
       conversationRefs: interrupted.conversationRefs,
@@ -756,7 +1315,7 @@ describe("MainLoop", () => {
       goal,
       model: "vision-demo",
       workspace,
-      policy: policy(1),
+      policy: activationPolicy,
       initialMessage: "What changed?",
       upperWatermark: await ledger.watermark(),
       conversationRefs: resumed.conversationRefs,
@@ -965,6 +1524,17 @@ describe("MainLoop", () => {
   });
 });
 
+const noopToolForMainTest: AgentTool = {
+  definition: {
+    name: "noop",
+    description: "Return a deterministic result",
+    parameters: { type: "object", additionalProperties: false },
+  },
+  async execute() {
+    return { content: "ok", isError: false };
+  },
+};
+
 function policy(maxMainSteps: number) {
   return {
     maxMainSteps,
@@ -989,4 +1559,65 @@ async function temporaryDirectory(): Promise<string> {
   const directory = await mkdtemp(path.join(tmpdir(), "nausicaa-main-"));
   temporaryDirectories.push(directory);
   return directory;
+}
+
+function pressureSizedContextProvider(
+  store: MemoryContentAddressedStore,
+  rawTokens: number,
+  compactedTokens: number,
+): MainContextProvider {
+  const provider = new FukaiContextProvider(new ContentStoreFukaiSource(store));
+  return {
+    async build(request) {
+      const view = await provider.build(request);
+      return {
+        ...view,
+        usage: {
+          ...view.usage,
+          estimatedInputTokens: request.compaction === undefined
+            ? rawTokens
+            : compactedTokens,
+        },
+      };
+    },
+  };
+}
+
+async function pressureCompactionSelection(
+  store: MemoryContentAddressedStore,
+  goal: Goal,
+  policyVersion: string,
+  upperWatermark: number,
+  digestCharacter: string,
+): Promise<FukaiCompactionSelection> {
+  const sourceRefs = [{
+    kind: "event" as const,
+    eventId: `pressure-source-${digestCharacter}`,
+    contentHash: `sha256:${digestCharacter.repeat(64)}`,
+  }];
+  const summary = {
+    schemaVersion: 1 as const,
+    goal,
+    decisions: ["Use the pressure capsule"],
+    verifiedResults: [],
+    openQuestions: [],
+    sourceRefs,
+  };
+  const summaryRef = await store.put(JSON.stringify(summary), FUKAI_COMPACTION_MEDIA_TYPE);
+  return {
+    capsule: {
+      schemaVersion: 1,
+      compactionId: `fukai-compaction:sha256:${digestCharacter.repeat(64)}`,
+      status: "ready",
+      summaryRef,
+      sourceRefs,
+      summaryHash: summaryRef.contentHash,
+      cursor: "offset:0",
+      upperWatermark,
+      goalVersion: goal.version,
+      policyVersion,
+      estimatedTokens: 24,
+    },
+    summary,
+  };
 }

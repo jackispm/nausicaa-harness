@@ -20,12 +20,19 @@ import type {
   TokenUsage,
 } from "../../src/domain/types.js";
 import {
+  deriveContextCompactionAttemptId,
+  deriveContextCompactionId,
+  FUKAI_COMPACTION_MEDIA_TYPE,
+} from "../../src/domain/context.js";
+import {
   computeEventContentHash,
   JsonlLedger,
   LedgerCorruptionError,
   MemoryLedger,
 } from "../../src/ledger/index.js";
 import { validateEventPayload } from "../../src/ledger/validation.js";
+import { compactionIntegrityReasons } from "../../src/fukai/index.js";
+import { createArtifactRef } from "../../src/store/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -42,6 +49,14 @@ const artifact: ArtifactRef = {
   mediaType: "application/json",
   byteLength: 12,
 };
+const compactionSummaryRef: ArtifactRef = {
+  ...artifact,
+  id: "compaction-summary-1",
+  mediaType: FUKAI_COMPACTION_MEDIA_TYPE,
+};
+const compactionId = `fukai-compaction:sha256:${"c".repeat(64)}`;
+const resetFromCompactionId = `fukai-compaction:sha256:${"d".repeat(64)}`;
+const compactionAttemptId = `${compactionId}:attempt:1`;
 const tokenUsage: TokenUsage = {
   input: 10,
   output: 2,
@@ -242,6 +257,67 @@ const validPayloads = {
     stateHash: "sha256:state",
     policyVersion: "policy-v1",
   },
+  "fukai.compaction.pressure": {
+    trigger: "main-pre-step",
+    model: "openrouter:model-1",
+    contextWindowTokens: 1_000,
+    currentTokens: 800,
+    thresholdTokens: 800,
+    minimumRetainedRawTokens: 200,
+    selectedRawTokens: 600,
+    retainedRawTokens: 300,
+    predictedGainTokens: 500,
+    decision: "compact",
+    reason: "pressure-threshold-reached",
+  },
+  "fukai.compaction.requested": {
+    compactionId,
+    attemptId: compactionAttemptId,
+    attempt: 1,
+    cursor: "offset:3",
+    upperWatermark: 4,
+    goalVersion: 1,
+    policyVersion: "policy-v1",
+    sourceRefs: [{ kind: "artifact", ref: artifact }],
+    budget: { maxInputTokens: 100, maxOutputTokens: 20, maxWallClockMs: 1_000 },
+  },
+  "fukai.compaction.completed": {
+    compactionId,
+    attemptId: compactionAttemptId,
+    attempt: 1,
+    elapsedMs: 25,
+    usage: tokenUsage,
+    summaryRef: compactionSummaryRef,
+    summaryHash: compactionSummaryRef.contentHash,
+    estimatedTokens: 120,
+  },
+  "fukai.compaction.failed": {
+    compactionId,
+    attemptId: compactionAttemptId,
+    attempt: 1,
+    status: "failed",
+    elapsedMs: 25,
+    usage: null,
+  },
+  "fukai.compaction.committed": {
+    compactionId,
+    attemptId: compactionAttemptId,
+    summaryRef: compactionSummaryRef,
+    sourceRefs: [{ kind: "artifact", ref: artifact }],
+    cursor: "offset:3",
+    upperWatermark: 4,
+    goalVersion: 1,
+    policyVersion: "policy-v1",
+    summaryHash: compactionSummaryRef.contentHash,
+    estimatedTokens: 120,
+  },
+  "fukai.compaction.fallback": {
+    compactionId,
+    attemptId: compactionAttemptId,
+    attempt: 1,
+    reason: "verification-failed",
+    phase: "commit",
+  },
 } satisfies EventPayloadMap;
 
 const invalidPayloads = {
@@ -362,6 +438,38 @@ const invalidPayloads = {
     stateHash: "hash",
     policyVersion: "policy",
   },
+  "fukai.compaction.pressure": {
+    ...validPayloads["fukai.compaction.pressure"],
+    decision: "skip",
+  },
+  "fukai.compaction.requested": {
+    ...validPayloads["fukai.compaction.requested"],
+    attemptId: `${compactionId}:attempt:2`,
+  },
+  "fukai.compaction.completed": {
+    ...validPayloads["fukai.compaction.completed"],
+    elapsedMs: -1,
+  },
+  "fukai.compaction.failed": {
+    ...validPayloads["fukai.compaction.failed"],
+    status: "interrupted",
+  },
+  "fukai.compaction.committed": {
+    compactionId,
+    attemptId: compactionAttemptId,
+    summaryRef: compactionSummaryRef,
+    sourceRefs: [],
+    cursor: "offset:2",
+    upperWatermark: 1,
+    goalVersion: 1,
+    policyVersion: "policy",
+    summaryHash: "wrong-hash",
+    estimatedTokens: 10,
+  },
+  "fukai.compaction.fallback": {
+    ...validPayloads["fukai.compaction.fallback"],
+    attempt: null,
+  },
 } satisfies Record<EventType, unknown>;
 
 describe("event payload validation", () => {
@@ -397,6 +505,69 @@ describe("event payload validation", () => {
       reflectionRef: artifact,
       usage: tokenUsage,
     })).not.toThrow();
+    expect(() => validateEventPayload("fukai.compaction.fallback", {
+      compactionId,
+      attemptId: null,
+      attempt: null,
+      reason: "budget-exhausted",
+      phase: "preflight",
+    })).not.toThrow();
+  });
+
+  it("binds budget admission fallback to attempt-less preflight", () => {
+    expect(() => validateEventPayload("fukai.compaction.fallback", {
+      ...validPayloads["fukai.compaction.fallback"],
+      reason: "budget-exhausted",
+    })).toThrow(/attemptId/);
+    expect(() => validateEventPayload("fukai.compaction.fallback", {
+      compactionId,
+      attemptId: null,
+      attempt: null,
+      reason: "budget-exhausted",
+      phase: "commit",
+    })).toThrow(/phase/);
+  });
+
+  it("accepts a canonical compaction reset provenance ID", () => {
+    expect(() => validateEventPayload("fukai.compaction.committed", {
+      ...validPayloads["fukai.compaction.committed"],
+      resetFromCompactionId,
+    })).not.toThrow();
+  });
+
+  it.each([
+    ["the committed compaction itself", compactionId],
+    ["a non-canonical uppercase digest", `fukai-compaction:sha256:${"D".repeat(64)}`],
+    ["an invalid identity", "compaction-reset-1"],
+  ])("rejects resetFromCompactionId pointing to %s", (_case, resetId) => {
+    expect(() => validateEventPayload("fukai.compaction.committed", {
+      ...validPayloads["fukai.compaction.committed"],
+      resetFromCompactionId: resetId,
+    })).toThrow(/resetFromCompactionId/);
+  });
+
+  it("rejects and quarantines a reset that also retains a compaction summary base", () => {
+    const projectionSummaryRef = createArtifactRef(
+      Buffer.from("projection reset summary"),
+      FUKAI_COMPACTION_MEDIA_TYPE,
+    );
+    const payload = {
+      ...validPayloads["fukai.compaction.committed"],
+      resetFromCompactionId,
+      summaryRef: projectionSummaryRef,
+      summaryHash: projectionSummaryRef.contentHash,
+      sourceRefs: [{ kind: "artifact" as const, ref: projectionSummaryRef }],
+    };
+
+    expect(() => validateEventPayload("fukai.compaction.committed", payload))
+      .toThrow(/repair reset without a compaction summary base/);
+
+    // Projection still quarantines malformed historical records that bypass validation.
+    const event = {
+      type: "fukai.compaction.committed",
+      payload,
+    } as unknown as Extract<AnyEvent, { type: "fukai.compaction.committed" }>;
+    expect(compactionIntegrityReasons(event)).toContain("reset-invalid");
   });
 
   it("rejects malformed core data for every event type", () => {
@@ -441,6 +612,101 @@ describe("event payload validation", () => {
 
     await expect(ledger.append(command)).rejects.toBeInstanceOf(LedgerCorruptionError);
     await expect(ledger.watermark()).resolves.toBe(0);
+  });
+
+  it("binds a compaction request identity to its Run and lane envelope", async () => {
+    const identity = {
+      runId: "run-1",
+      laneId: "main",
+      cursor: "offset:3",
+      upperWatermark: 4,
+      goalVersion: 1,
+      policyVersion: "policy-v1",
+      sourceRefs: [{ kind: "artifact" as const, ref: artifact }],
+      budget: { maxInputTokens: 100, maxOutputTokens: 20, maxWallClockMs: 1_000 },
+    };
+    const derivedId = deriveContextCompactionId(identity);
+    const payload: EventPayloadMap["fukai.compaction.requested"] = {
+      compactionId: derivedId,
+      attemptId: deriveContextCompactionAttemptId(derivedId, 1),
+      attempt: 1,
+      cursor: identity.cursor,
+      upperWatermark: identity.upperWatermark,
+      goalVersion: identity.goalVersion,
+      policyVersion: identity.policyVersion,
+      sourceRefs: identity.sourceRefs,
+      budget: identity.budget,
+    };
+    const append = (runId: string) => ({
+      runId,
+      laneId: identity.laneId,
+      type: "fukai.compaction.requested" as const,
+      payload,
+      correlationId: "test:fukai:identity",
+      idempotencyKey: `test:fukai:identity:${runId}`,
+    });
+
+    await expect(new MemoryLedger().append(append("run-1"))).resolves.toMatchObject({
+      payload: { compactionId: derivedId },
+    });
+    await expect(new MemoryLedger().append(append("run-2")))
+      .rejects.toBeInstanceOf(LedgerCorruptionError);
+  });
+
+  it("binds stale repair intent into the requested compaction identity", async () => {
+    const identity = {
+      runId: "run-1",
+      laneId: "main",
+      cursor: "offset:3",
+      upperWatermark: 4,
+      goalVersion: 1,
+      policyVersion: "policy-v1",
+      sourceRefs: [{ kind: "artifact" as const, ref: artifact }],
+      budget: { maxInputTokens: 100, maxOutputTokens: 20, maxWallClockMs: 1_000 },
+    };
+    const ordinaryId = deriveContextCompactionId(identity);
+    const repairId = deriveContextCompactionId({
+      ...identity,
+      repairFromCompactionId: ordinaryId,
+    });
+    const payload: EventPayloadMap["fukai.compaction.requested"] = {
+      compactionId: repairId,
+      attemptId: deriveContextCompactionAttemptId(repairId, 1),
+      attempt: 1,
+      repairFromCompactionId: ordinaryId,
+      cursor: identity.cursor,
+      upperWatermark: identity.upperWatermark,
+      goalVersion: identity.goalVersion,
+      policyVersion: identity.policyVersion,
+      sourceRefs: identity.sourceRefs,
+      budget: identity.budget,
+    };
+    const append = (overrides: Partial<typeof payload> = {}) => ({
+      runId: identity.runId,
+      laneId: identity.laneId,
+      type: "fukai.compaction.requested" as const,
+      payload: { ...payload, ...overrides },
+      correlationId: "test:fukai:repair-identity",
+      idempotencyKey: `test:fukai:repair-identity:${JSON.stringify(overrides)}`,
+    });
+
+    expect(repairId).not.toBe(ordinaryId);
+    await expect(new MemoryLedger().append(append())).resolves.toMatchObject({
+      payload: { compactionId: repairId, repairFromCompactionId: ordinaryId },
+    });
+    await expect(new MemoryLedger().append(append({
+      repairFromCompactionId: resetFromCompactionId,
+    }))).rejects.toBeInstanceOf(LedgerCorruptionError);
+  });
+
+  it.each([
+    ["the requested compaction itself", compactionId],
+    ["a non-canonical ID", "stale-compaction"],
+  ])("rejects repairFromCompactionId pointing to %s", (_case, repairId) => {
+    expect(() => validateEventPayload("fukai.compaction.requested", {
+      ...validPayloads["fukai.compaction.requested"],
+      repairFromCompactionId: repairId,
+    })).toThrow(/repairFromCompactionId/);
   });
 
   it("rejects malformed optional telemetry fields", () => {

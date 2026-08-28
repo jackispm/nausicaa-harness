@@ -16,6 +16,7 @@ import type {
 } from "../domain/events.js";
 import type {
   ConversationMessage,
+  FukaiCompactionPolicy,
   Goal,
   RunPolicy,
   TokenUsage,
@@ -31,6 +32,7 @@ import {
   ContentStoreFukaiSource,
   FukaiContextProvider,
 } from "../fukai/index.js";
+import type { FukaiCompactionSelection } from "../fukai/types.js";
 import { JsonlLedger, type Ledger } from "../ledger/index.js";
 import { createOpenRouterModelPort } from "../model/index.js";
 import {
@@ -56,7 +58,18 @@ import {
   resolvePendingToolOperation,
   type RunRecoveryState,
 } from "./recovery.js";
-import { resolveRunPolicy } from "./run-policy.js";
+import {
+  normalizeFukaiCompactionPolicy,
+  resolveRunPolicy,
+} from "./run-policy.js";
+import {
+  createRuntimeFukaiCompaction,
+  deriveRuntimePolicyVersion,
+  instantiateRuntimeFukaiCompaction,
+  prepareRuntimeFukaiCompaction,
+  runtimeFukaiCompactionBudget,
+  type RuntimeFukaiCompactionFactory,
+} from "./fukai-compaction-runtime.js";
 import { RunTokenBudget } from "./run-token-budget.js";
 import { recoverRunTokenUsage } from "./run-token-budget-recovery.js";
 import { TetoScheduler } from "./teto-scheduler.js";
@@ -81,6 +94,8 @@ export interface RunExecutionRequest {
   auxiliaryMode?: AuxiliaryMode;
   /** Opt-in bounded Worker lane; omitted or false preserves Main-only behavior. */
   workerEnabled?: boolean;
+  /** Explicit Fukai capability settings; omitted keeps the legacy disabled path. */
+  fukaiCompaction?: FukaiCompactionPolicy;
   adviceDelivery?: TetoAdviceDelivery;
   message?: string;
   images?: UserImage[];
@@ -102,6 +117,17 @@ export interface RunExecutionDeps {
   tools?: readonly AgentTool[];
   /** Optional bounded read-only tools for Worker; defaults to the workspace set. */
   workerTools?: readonly AgentTool[];
+  /** Optional explicit selector for a previously committed Fukai capsule. */
+  selectCompaction?: (context: {
+    runId: string;
+    laneId: string;
+    goal: Goal;
+    policyVersion: string;
+    upperWatermark: number;
+    signal?: AbortSignal;
+  }) => Promise<FukaiCompactionSelection | undefined>;
+  /** Test/plugin seam for the opt-in activation-scoped compaction adapter. */
+  createCompactionRuntime?: RuntimeFukaiCompactionFactory;
   clock?: Clock;
   createRunId?: () => string;
   onEvent?: (event: AnyEvent) => void;
@@ -147,6 +173,9 @@ export const executeRun = async (
     const recovered = request.resumeRunId === undefined
       ? undefined
       : await recoverRun(ledger, runId);
+    if (recovered !== undefined) {
+      validateRequestedFukaiPolicy(request.fukaiCompaction, recovered.policy.fukaiCompaction);
+    }
     if (recovered?.completedAnswerRef !== undefined) {
       return {
         runId,
@@ -212,6 +241,40 @@ export const executeRun = async (
       policy.maxModelTokens,
       totalTokens(recoveredUsage),
     );
+    const policyVersion = deriveRuntimePolicyVersion(policy);
+    const compactionEnabled = policy.fukaiCompaction?.enabled === true
+      && policy.fukaiCompaction.provider === "pi-ai";
+    const compactionModel = compactionEnabled
+      ? deps.mainModel ?? createOpenRouterModelPort()
+      : undefined;
+    const compactionRuntime = compactionModel === undefined
+      ? undefined
+      : instantiateRuntimeFukaiCompaction(
+          policy,
+          deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
+          {
+            ledger: sink,
+            store,
+            modelPort: compactionModel,
+            model: request.model,
+            tokenBudget: runTokenBudget,
+            clock,
+            policy,
+          },
+        );
+    if (compactionRuntime !== undefined) {
+      await prepareRuntimeFukaiCompaction(compactionRuntime, {
+        runId,
+        laneId: "main",
+        goal: setup.goal,
+        policyVersion,
+        upperWatermark: setup.compactionUpperWatermark,
+        conversationRefs: setup.conversationRefs,
+        budget: runtimeFukaiCompactionBudget(policy),
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+      });
+    }
+    rethrowIfAborted(request.signal);
     const remainingModelTokens = runTokenBudget.availableTokens();
     const legacyStepLimitExhausted = "maxMainSteps" in policy
       && setup.startStep > mainStepAllowance(policy);
@@ -239,7 +302,17 @@ export const executeRun = async (
       };
     }
 
-    const mainModel = deps.mainModel ?? createOpenRouterModelPort();
+    const mainModel = compactionModel ?? deps.mainModel ?? createOpenRouterModelPort();
+    const mainUpperWatermark = compactionRuntime === undefined
+      ? setup.upperWatermark
+      : await ledger.watermark();
+    const selectCompaction = deps.selectCompaction
+      ?? (compactionRuntime === undefined
+        ? undefined
+        : compactionRuntime.select.bind(compactionRuntime));
+    const compactForPressure = deps.selectCompaction === undefined
+      ? compactionRuntime?.compactIfNeeded?.bind(compactionRuntime)
+      : undefined;
     const inbox = new A2AInbox({
       sink,
       events: setup.events,
@@ -348,6 +421,8 @@ export const executeRun = async (
       ...(outputContinuationMessageId === undefined
         && scheduler === undefined
         && workerScheduler === undefined
+        && selectCompaction === undefined
+        && compactForPressure === undefined
         ? {}
         : {
             beforeStep: async ({ step }) => {
@@ -371,6 +446,7 @@ export const executeRun = async (
               ];
             },
             ...(scheduler === undefined && workerScheduler === undefined
+              && selectCompaction === undefined
               ? {}
               : {
                   afterStep: (context) => {
@@ -378,6 +454,12 @@ export const executeRun = async (
                     workerScheduler?.enqueue(context);
                   },
                 }),
+            ...(selectCompaction === undefined
+              ? {}
+              : { selectCompaction }),
+            ...(compactForPressure === undefined
+              ? {}
+              : { compactForPressure }),
           }),
     });
 
@@ -388,6 +470,7 @@ export const executeRun = async (
         model: request.model,
         workspace: setup.workspace,
         policy: { ...policy, maxModelTokens: remainingModelTokens },
+        policyVersion,
         ...(request.message === undefined && (request.images?.length ?? 0) === 0
           ? {}
           : { initialMessage: request.message ?? "" }),
@@ -395,8 +478,9 @@ export const executeRun = async (
           ? {}
           : { initialImages: structuredClone(request.images) }),
         startStep: setup.startStep,
-        upperWatermark: setup.upperWatermark,
+        upperWatermark: mainUpperWatermark,
         conversationRefs: setup.conversationRefs,
+        pressureEligibleConversationCount: setup.pressureEligibleConversationCount,
         maxOutputTokens: request.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
@@ -515,7 +599,9 @@ interface RunSetup {
   workspace: string;
   startStep: number;
   upperWatermark: number;
+  compactionUpperWatermark: number;
   conversationRefs: RunRecoveryState["conversationRefs"];
+  pressureEligibleConversationCount: number;
   events: AnyEvent[];
 }
 
@@ -547,6 +633,9 @@ const createNewRun = async (
       ? {}
       : { tetoAdviceDelivery: request.adviceDelivery }),
     ...(workerEnabled === undefined ? {} : { workerEnabled }),
+    ...(request.fukaiCompaction === undefined
+      ? {}
+      : { fukaiCompaction: request.fukaiCompaction }),
     ...(auxiliaryMode === "teto"
       ? { tetoEnabled: true }
       : auxiliaryMode === "reflection" || auxiliaryMode === "none"
@@ -621,7 +710,9 @@ const createNewRun = async (
     workspace,
     startStep: 1,
     upperWatermark: await sink.ledger.watermark(),
+    compactionUpperWatermark: await sink.ledger.watermark(),
     conversationRefs: [],
+    pressureEligibleConversationCount: 0,
     events,
   };
 };
@@ -656,12 +747,17 @@ const resumeExistingRun = async (
     workspace: recovered.workspace,
     startStep: recovered.startStep,
     upperWatermark: await sink.ledger.watermark(),
+    compactionUpperWatermark: recovered.conversationRefs.reduce(
+      (highest, conversationRef) => Math.max(highest, conversationRef.sequence),
+      0,
+    ),
     conversationRefs: recovered.conversationRefs,
+    pressureEligibleConversationCount: recovered.pressureEligibleConversationCount,
     events: await sink.ledger.read({ runId: recovered.runId }),
   };
 };
 
-class ObservableEventSink {
+class ObservableEventSink implements Ledger {
   readonly ledger: Ledger;
   readonly #onEvent: RunExecutionDeps["onEvent"];
   readonly #seen = new Set<string>();
@@ -684,6 +780,22 @@ class ObservableEventSink {
       }
     }
     return event;
+  }
+
+  read(options?: Parameters<Ledger["read"]>[0]): ReturnType<Ledger["read"]> {
+    return this.ledger.read(options);
+  }
+
+  watermark(): Promise<number> {
+    return this.ledger.watermark();
+  }
+
+  flush(): Promise<void> {
+    return this.ledger.flush();
+  }
+
+  close(): Promise<void> {
+    return this.ledger.close();
   }
 }
 
@@ -737,6 +849,9 @@ const validateRequest = (request: RunExecutionRequest): void => {
   if (request.workerEnabled !== undefined && typeof request.workerEnabled !== "boolean") {
     throw new Error("workerEnabled must be a boolean");
   }
+  if (request.fukaiCompaction !== undefined) {
+    normalizeFukaiCompactionPolicy(request.fukaiCompaction);
+  }
   if (
     request.auxiliaryMode !== undefined
     && request.auxiliaryMode !== "none"
@@ -779,6 +894,46 @@ const validateRequest = (request: RunExecutionRequest): void => {
     );
   }
 };
+
+/**
+ * A resumed Run keeps the policy it was created with. An omitted policy is
+ * treated as the legacy disabled state so old Runs remain attachable.
+ */
+const validateRequestedFukaiPolicy = (
+  requested: FukaiCompactionPolicy | undefined,
+  recorded: FukaiCompactionPolicy | undefined,
+): void => {
+  if (requested === undefined || recorded === undefined) {
+    if (
+      requested !== undefined
+      && recorded === undefined
+      && normalizeFukaiCompactionPolicy(requested).enabled
+    ) {
+      throw new Error("Cannot enable Fukai compaction while resuming a Run without a recorded policy");
+    }
+    return;
+  }
+  const normalized = normalizeFukaiCompactionPolicy(requested);
+  if (!sameFukaiCompactionPolicy(normalized, recorded)) {
+    throw new Error("Cannot change fukaiCompaction while resuming a Run");
+  }
+};
+
+const sameFukaiCompactionPolicy = (
+  left: FukaiCompactionPolicy,
+  right: FukaiCompactionPolicy,
+): boolean => left.enabled === right.enabled
+  && left.provider === right.provider
+  && left.maxInputTokens === right.maxInputTokens
+  && left.maxOutputTokens === right.maxOutputTokens
+  && left.maxWallClockMs === right.maxWallClockMs;
+
+function rethrowIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted", "AbortError");
+}
 
 const validateRunId = (runId: string): void => {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(runId)) {

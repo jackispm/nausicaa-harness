@@ -4,13 +4,14 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { AgentTool, ModelResponse, UserImage } from "../../src/domain/index.js";
+import type { AgentTool, ModelPort, ModelResponse, UserImage } from "../../src/domain/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import { JsonlLedger } from "../../src/ledger/index.js";
 import {
   SessionController,
   type SessionRuntimeEvent,
 } from "../../src/runtime/index.js";
+import type { RuntimeFukaiCompactionFactory } from "../../src/runtime/fukai-compaction-runtime.js";
 import { FileContentAddressedStore } from "../../src/store/index.js";
 
 const roots: string[] = [];
@@ -22,6 +23,198 @@ afterEach(async () => {
 });
 
 describe("SessionController", () => {
+  it("does not construct an interactive compaction runtime while disabled", async () => {
+    const root = await temporaryRoot();
+    let factoryCalls = 0;
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 10_000, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([response("done")]),
+      createRunId: () => "disabled-session-fukai",
+      createCompactionRuntime: () => {
+        factoryCalls += 1;
+        throw new Error("disabled factory must not run");
+      },
+    });
+
+    await session.submit({ inputId: "disabled-input", text: "Inspect" });
+    await session.waitForIdle();
+    expect(factoryCalls).toBe(0);
+    await session.close();
+  });
+
+  it("prepares Fukai once per Turn and excludes the current Turn input", async () => {
+    const root = await temporaryRoot();
+    const sourceCounts: number[] = [];
+    const policyVersions = new Set<string>();
+    let factoryCalls = 0;
+    let selectCalls = 0;
+    const factory: RuntimeFukaiCompactionFactory = () => {
+      factoryCalls += 1;
+      let prepared = false;
+      return {
+        async prepare(request) {
+          expect(prepared).toBe(false);
+          prepared = true;
+          sourceCounts.push(request.conversationRefs.length);
+          policyVersions.add(request.policyVersion);
+        },
+        async select(request) {
+          expect(prepared).toBe(true);
+          selectCalls += 1;
+          policyVersions.add(request.policyVersion);
+          return undefined;
+        },
+      };
+    };
+    const model = new ScriptedModel([
+      response("first answer"),
+      {
+        ...response("inspect once more"),
+        stopReason: "toolUse",
+        toolCalls: [{ id: "session-fukai-noop", name: "noop", arguments: {} }],
+      },
+      response("second answer"),
+    ]);
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      fukaiCompaction: enabledFukaiPolicy(),
+      policy: {
+        maxMainStepsPerActivation: 2,
+        maxModelTokens: 20_000,
+        tetoEnabled: false,
+      },
+    }, {
+      mainModel: model,
+      tools: [noopTool],
+      createRunId: () => "two-turn-fukai-runtime",
+      createCompactionRuntime: factory,
+    });
+
+    await session.submit({ inputId: "fukai-turn-1", text: "First task" });
+    await session.waitForIdle();
+    await session.submit({ inputId: "fukai-turn-2", text: "Second task" });
+    await session.waitForIdle();
+
+    expect(factoryCalls).toBe(2);
+    expect(sourceCounts).toEqual([0, 2]);
+    expect(selectCalls).toBe(3);
+    expect([...policyVersions]).toHaveLength(1);
+    expect([...policyVersions][0]).toMatch(/^sha256:[0-9a-f]{64}$/);
+    await session.close();
+  });
+
+  it("publishes compaction lifecycle events and includes their usage in snapshots", async () => {
+    const root = await temporaryRoot();
+    const mainResponses = [
+      response("x".repeat(5_000)),
+      response("second answer"),
+      response("third answer"),
+    ];
+    const model: ModelPort = {
+      capabilities: () => ({ imageInput: false, contextWindowTokens: 10 }),
+      async complete(request) {
+        if (request.sessionId.startsWith("fukai-compaction:")) {
+          return response(JSON.stringify({
+            decisions: ["Keep the first answer as established context"],
+            verifiedResults: ["The first Turn completed"],
+            openQuestions: [],
+          }));
+        }
+        const next = mainResponses.shift();
+        if (next === undefined) throw new Error("Unexpected Main request");
+        return next;
+      },
+    };
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      fukaiCompaction: {
+        ...enabledFukaiPolicy(),
+        maxInputTokens: 12_000,
+      },
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
+    }, {
+      mainModel: model,
+      createRunId: () => "session-fukai-live-events",
+    });
+    const observed: SessionRuntimeEvent[] = [];
+    session.subscribe((event) => observed.push(event));
+
+    await session.submit({ inputId: "live-fukai-1", text: "First task" });
+    await session.waitForIdle();
+    await session.submit({ inputId: "live-fukai-2", text: "Second task" });
+    await session.waitForIdle();
+    await session.submit({ inputId: "live-fukai-3", text: "Third task" });
+    await session.waitForIdle();
+
+    const types = durableEvents(observed).map((event) => event.type);
+    expect(types).toContain("fukai.compaction.requested");
+    expect(types).toContain("fukai.compaction.completed");
+    expect(types).toContain("fukai.compaction.committed");
+    expect(session.snapshot().usage).toMatchObject({ input: 40, output: 8 });
+    await session.close();
+  });
+
+  it("persists explicit Fukai settings in an interactive Run", async () => {
+    const root = await temporaryRoot();
+    const fukaiCompaction = {
+      enabled: true,
+      provider: "pi-ai" as const,
+      maxInputTokens: 12_000,
+      maxOutputTokens: 2_048,
+      maxWallClockMs: 30_000,
+      thresholdRatio: 0.8,
+      retainRatio: 0.16,
+      minimumGainTokens: 1,
+    };
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      fukaiCompaction,
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 10_000, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([response("done")]),
+      createRunId: () => "session-fukai-config",
+    });
+
+    await session.submit({ inputId: "fukai-input", text: "Inspect the workspace" });
+    await session.waitForIdle();
+    await session.close();
+
+    const ledger = await JsonlLedger.open(join(
+      root,
+      "state",
+      "runs",
+      "session-fukai-config",
+      "ledger.jsonl",
+    ));
+    const events = await ledger.read({ runId: "session-fukai-config" });
+    const created = events.find((event) => event.type === "run.created");
+    expect(created?.type).toBe("run.created");
+    if (created?.type !== "run.created") throw new Error("Missing run.created");
+    expect(created.payload.policy.fukaiCompaction).toEqual(fukaiCompaction);
+    await ledger.close();
+
+    const reopened = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      runId: "session-fukai-config",
+      fukaiCompaction,
+    }, {
+      mainModel: new ScriptedModel([]),
+    });
+    await reopened.close();
+  });
+
   it("runs two Turns in one persistent Run with shared conversation context", async () => {
     const root = await temporaryRoot();
     const model = new ScriptedModel([response("first answer"), response("second answer")]);
@@ -1330,6 +1523,19 @@ function response(content: string): ModelResponse {
     toolCalls: [],
     stopReason: "stop",
     usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 },
+  };
+}
+
+function enabledFukaiPolicy() {
+  return {
+    enabled: true,
+    provider: "pi-ai" as const,
+    maxInputTokens: 2_000,
+    maxOutputTokens: 500,
+    maxWallClockMs: 30_000,
+    thresholdRatio: 0.8,
+    retainRatio: 0.16,
+    minimumGainTokens: 1,
   };
 }
 

@@ -1,5 +1,6 @@
 export * from "./advice-tool.js";
 export * from "./main-loop.js";
+export * from "./fukai-compaction-runtime.js";
 export * from "./recovery.js";
 export * from "./run-policy.js";
 export * from "./run-runtime.js";

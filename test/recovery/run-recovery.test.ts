@@ -72,6 +72,113 @@ describe("Run recovery", () => {
     await expect(recoverRun(ledger, "run-1")).resolves.toMatchObject({ startStep: 2 });
   });
 
+  it("protects steering admitted after the latest successful Main request", async () => {
+    const ledger = new MemoryLedger();
+    await append(ledger, "run.created", {
+      goal: { version: 1, statement: "Inspect", successCriteria: [], hardConstraints: [] },
+      workspace: "/workspace",
+      policy,
+    }, "created");
+    await append(ledger, "user.message", { messageRef: ref("initial") }, "initial");
+    await append(ledger, "step.started", { step: 1 }, "step-1-started");
+    const requested = await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "model.requested",
+      payload: {
+        model: "scripted",
+        requestHash: "sha256:request",
+        contextWatermark: 2,
+      },
+      correlationId: "correlation-1",
+      idempotencyKey: "run-1:turn:turn-1:step:1:model:requested",
+    });
+    await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "model.completed",
+      payload: {
+        model: "scripted",
+        responseRef: ref("answer"),
+        stopReason: "toolUse",
+        usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
+      },
+      causationId: requested.eventId,
+      correlationId: "correlation-1",
+      idempotencyKey: "run-1:turn:turn-1:step:1:model:completed",
+    });
+    await append(ledger, "assistant.message", {
+      messageRef: ref("answer"),
+    }, "run-1:turn:turn-1:step:1:assistant");
+    await append(ledger, "step.completed", {
+      step: 1,
+      hasToolCalls: true,
+    }, "step-1-completed");
+
+    for (const [sequence, inputId] of ["steering-1", "steering-2"].entries()) {
+      const admitted = await ledger.append({
+        runId: "run-1",
+        turnId: "turn-1",
+        laneId: "main",
+        type: "input.admitted",
+        payload: {
+          inputId,
+          messageRef: ref(inputId),
+          delivery: "steering",
+          targetTurnId: "turn-1",
+          sequence: sequence + 2,
+        },
+        correlationId: "turn:turn-1",
+        idempotencyKey: `${inputId}:admitted`,
+      });
+      const delivered = await ledger.append({
+        runId: "run-1",
+        turnId: "turn-1",
+        laneId: "main",
+        type: "input.delivered",
+        payload: {
+          inputId,
+          turnId: "turn-1",
+          boundary: "safe-step:2",
+        },
+        causationId: admitted.eventId,
+        correlationId: "turn:turn-1",
+        idempotencyKey: `${inputId}:delivered`,
+      });
+      await ledger.append({
+        runId: "run-1",
+        turnId: "turn-1",
+        laneId: "main",
+        type: "user.message",
+        payload: {
+          inputId,
+          messageRef: ref(inputId),
+          kind: "steering",
+        },
+        causationId: delivered.eventId,
+        correlationId: "turn:turn-1",
+        idempotencyKey: `${inputId}:user-message`,
+      });
+    }
+
+    const recovered = await recoverRun(ledger, "run-1");
+
+    expect(recovered.conversationRefs.map((item) => item.ref.id)).toEqual([
+      "initial",
+      "answer",
+      "steering-1",
+      "steering-2",
+    ]);
+    expect(recovered.pressureEligibleConversationCount).toBe(1);
+    expect(recovered.conversationRefs
+      .slice(recovered.pressureEligibleConversationCount)
+      .map((item) => item.ref.id)).toEqual([
+        "answer",
+        "steering-1",
+        "steering-2",
+      ]);
+  });
+
   it("refuses to resume a tool operation whose side-effect outcome is unknown", async () => {
     const ledger = new MemoryLedger();
     await append(ledger, "run.created", {

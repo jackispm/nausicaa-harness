@@ -171,15 +171,17 @@ describe("RetryingModelPort", () => {
     },
   );
 
-  it("preserves the delegate's optional stream and image capability surface", () => {
+  it("preserves the delegate's optional stream and capability surface", () => {
+    const capabilities = { imageInput: true, contextWindowTokens: 128_000 };
     const completionOnly: ModelPort = {
-      capabilities: () => ({ imageInput: true }),
+      capabilities: () => capabilities,
       complete: async () => response,
     };
     const withoutStream = retrying(completionOnly);
     const withStream = retrying(new StreamSequence([[{ type: "done", response }]]));
 
-    expect(withoutStream.capabilities("vision")).toEqual({ imageInput: true });
+    expect(withoutStream.capabilities("vision")).toBe(capabilities);
+    expect(withStream.capabilities("text")).toEqual({ imageInput: false });
     expect(withoutStream.stream).toBeUndefined();
     expect(withStream.stream).toBeTypeOf("function");
   });

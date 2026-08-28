@@ -26,6 +26,7 @@ export interface RunRecoveryState {
   startStep: number;
   upperWatermark: number;
   conversationRefs: FukaiConversationRef[];
+  pressureEligibleConversationCount: number;
   priorUsage: TokenUsage;
   completedAnswerRef?: ArtifactRef;
   events: AnyEvent[];
@@ -33,6 +34,7 @@ export interface RunRecoveryState {
 
 export interface MainExecutionRecoveryProjection {
   conversationRefs: FukaiConversationRef[];
+  pressureEligibleConversationCount: number;
   usage: TokenUsage;
 }
 
@@ -111,6 +113,7 @@ export const recoverRun = async (
     startStep: highestStep(events) + 1,
     upperWatermark: projection.run.lastOffset,
     conversationRefs: main.conversationRefs,
+    pressureEligibleConversationCount: main.pressureEligibleConversationCount,
     priorUsage: main.usage,
     ...(completedAnswerRef === undefined ? {} : { completedAnswerRef }),
     events,
@@ -343,7 +346,11 @@ const recoverConversationRefs = (events: readonly AnyEvent[]): FukaiConversation
           !candidate.consumed && candidate.ref.id === event.payload.messageRef.id,
         );
         if (pending !== undefined) pending.consumed = true;
-        add(event.payload.messageRef, event.globalOffset, `event:${event.eventId}`);
+        add(
+          event.payload.messageRef,
+          event.globalOffset,
+          mainStepConversationGroup(event.idempotencyKey) ?? `event:${event.eventId}`,
+        );
         break;
       }
       case "model.completed":
@@ -358,7 +365,12 @@ const recoverConversationRefs = (events: readonly AnyEvent[]): FukaiConversation
         break;
       case "tool.succeeded":
       case "tool.failed":
-        add(event.payload.resultRef, event.globalOffset, `operation:${event.payload.operationId}`);
+        add(
+          event.payload.resultRef,
+          event.globalOffset,
+          mainStepConversationGroup(event.idempotencyKey)
+            ?? `operation:${event.payload.operationId}`,
+        );
         break;
       default:
         break;
@@ -366,11 +378,24 @@ const recoverConversationRefs = (events: readonly AnyEvent[]): FukaiConversation
   }
   for (const pending of pendingModelMessages) {
     if (!pending.consumed) {
-      add(pending.ref, pending.offset, `event:${pending.eventId}`);
+      const event = events.find((candidate) => candidate.eventId === pending.eventId);
+      add(
+        pending.ref,
+        pending.offset,
+        event === undefined
+          ? `event:${pending.eventId}`
+          : mainStepConversationGroup(event.idempotencyKey) ?? `event:${pending.eventId}`,
+      );
     }
   }
   return refs.sort((left, right) => left.sequence - right.sequence);
 };
+
+function mainStepConversationGroup(idempotencyKey: string): string | undefined {
+  return /^(.*:step:\d+):(?:assistant|model:completed|tool:)/.exec(
+    idempotencyKey,
+  )?.[1];
+}
 
 /**
  * Rebuild Main's committed context and token usage from durable facts. A
@@ -385,11 +410,47 @@ export const projectMainExecutionRecovery = (
       ? addUsage(usage, event.payload.usage)
       : usage
   ), emptyUsage());
+  const conversationRefs = recoverConversationRefs(events);
   return {
-    conversationRefs: recoverConversationRefs(events),
+    conversationRefs,
+    pressureEligibleConversationCount: recoverPressureEligibleConversationCount(
+      events,
+      conversationRefs,
+    ),
     usage: recoverMainUsage(events, chargedUsage),
   };
 };
+
+function recoverPressureEligibleConversationCount(
+  events: readonly AnyEvent[],
+  conversationRefs: readonly FukaiConversationRef[],
+): number {
+  const completed = [...events].reverse().find((event): event is Extract<
+    AnyEvent,
+    { type: "model.completed" }
+  > => event.type === "model.completed" && event.laneId === "main");
+  if (completed?.causationId === undefined) return 0;
+  const requested = events.find((event) => (
+    event.type === "model.requested"
+    && event.laneId === "main"
+    && event.eventId === completed.causationId
+  ));
+  if (requested === undefined) return 0;
+
+  let count = conversationRefs.findIndex(
+    (conversationRef) => conversationRef.sequence >= requested.globalOffset,
+  );
+  if (count < 0) count = conversationRefs.length;
+  while (
+    count > 0
+    && count < conversationRefs.length
+    && conversationRefs[count - 1]?.groupId !== undefined
+    && conversationRefs[count - 1]?.groupId === conversationRefs[count]?.groupId
+  ) {
+    count -= 1;
+  }
+  return count;
+}
 
 const emptyUsage = (): TokenUsage => ({
   input: 0,

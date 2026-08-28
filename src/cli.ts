@@ -76,8 +76,17 @@ const main = async (): Promise<number> => {
       ...(options.dataDir === undefined ? {} : { dataDir: options.dataDir }),
       ...(options.allowWrite === undefined ? {} : { allowWrite: options.allowWrite }),
       ...(options.allowShell === undefined ? {} : { allowShell: options.allowShell }),
+      ...(options.fukaiCompaction === undefined
+        ? {}
+        : { fukaiCompaction: options.fukaiCompaction }),
     };
     const resolvedSettings = resolveSettings(workspace, settings, overrides);
+    // Keep resume semantics explicit: when neither the settings file nor the
+    // CLI mentions Fukai, omit the field so a persisted Run policy wins.
+    const fukaiCompaction = settings.fukaiCompaction === undefined
+      && options.fukaiCompaction === undefined
+      ? undefined
+      : resolvedSettings.fukaiCompaction;
     resolvedDataDir = resolvedSettings.dataDir;
     resolvedModel = resolvedSettings.model;
     resolvedMaxOutputTokens = resolvedSettings.maxOutputTokens;
@@ -97,6 +106,7 @@ const main = async (): Promise<number> => {
         dataDir: resolvedSettings.dataDir,
         model: resolvedSettings.model,
         tetoModel: resolvedSettings.tetoModel,
+        ...(fukaiCompaction === undefined ? {} : { fukaiCompaction }),
         ...(options.workerEnabled === undefined
           ? {}
           : { workerEnabled: options.workerEnabled }),
@@ -138,6 +148,7 @@ const main = async (): Promise<number> => {
         dataDir: resolvedSettings.dataDir,
         model: resolvedSettings.model,
         tetoModel: resolvedSettings.tetoModel,
+        ...(fukaiCompaction === undefined ? {} : { fukaiCompaction }),
         ...(options.workerEnabled === undefined
           ? {}
           : { workerEnabled: options.workerEnabled }),

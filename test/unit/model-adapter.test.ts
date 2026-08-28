@@ -118,6 +118,36 @@ describe("ScriptedModel", () => {
 });
 
 describe("PiAiModelPort", () => {
+  it("reports a validated pi-ai context window capability", () => {
+    const faux = fauxProvider({
+      provider: "openrouter",
+      models: [{ id: "vision", input: ["text", "image"], contextWindow: 128_000 }],
+    });
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+
+    expect(adapter.capabilities("openrouter:vision")).toEqual({
+      imageInput: true,
+      contextWindowTokens: 128_000,
+    });
+  });
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "omits an invalid pi-ai context window capability: %s",
+    (contextWindow) => {
+      const faux = fauxProvider({
+        provider: "openrouter",
+        models: [{ id: "demo", input: ["text"], contextWindow }],
+      });
+      const models = createModels();
+      models.setProvider(faux.provider);
+      const adapter = new PiAiModelPort({ models });
+
+      expect(adapter.capabilities("openrouter:demo")).toEqual({ imageInput: false });
+    },
+  );
+
   it("preserves pi-ai session cache affinity across repeated requests", async () => {
     const faux = fauxProvider({
       provider: "openrouter",
@@ -428,6 +458,14 @@ describe("PiAiModelPort", () => {
   it("exposes only structured status and category for a provider response", async () => {
     const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
     const response = fauxAssistantMessage("", { stopReason: "error" });
+    response.usage = {
+      input: 7,
+      output: 3,
+      cacheRead: 2,
+      cacheWrite: 1,
+      totalTokens: 13,
+      cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 },
+    };
     response.errorMessage = "HTTP 429 Bearer sk-provider-secret https://example.test/private";
     faux.setResponses([response]);
     const models = createModels();
@@ -441,6 +479,13 @@ describe("PiAiModelPort", () => {
       category: "rate-limit",
       status: 429,
       retryable: true,
+      providerUsage: {
+        input: expect.any(Number),
+        output: expect.any(Number),
+        cacheRead: expect.any(Number),
+        cacheWrite: expect.any(Number),
+        costUsd: expect.any(Number),
+      },
     });
     expect((error as Error).message).not.toContain("sk-provider-secret");
     expect((error as Error).message).not.toContain("example.test");

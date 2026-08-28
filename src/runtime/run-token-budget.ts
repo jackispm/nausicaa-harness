@@ -99,6 +99,35 @@ export class RunTokenBudget {
     return { ...settlement };
   }
 
+  /** Reconcile a durable terminal with either a live reservation or recovered usage. */
+  reconcile(
+    id: string,
+    usage: TokenUsage | number,
+    options: { alreadyAccounted?: boolean } = {},
+  ): RunTokenSettlement {
+    reservationId(id);
+    if (this.reservations.has(id)) return this.settle(id, usage);
+    const actualTokens = usageTokens(usage);
+    const settled = this.settlements.get(id);
+    if (settled !== undefined) {
+      if (settled.actualTokens !== actualTokens) {
+        throw new Error(`Token settlement ${id} was reused with different usage`);
+      }
+      return { ...settled };
+    }
+    if (options.alreadyAccounted !== true) {
+      this.usedTokens = safeAdd(this.usedTokens, actualTokens, "used token total");
+    }
+    const settlement: RunTokenSettlement = {
+      id,
+      reservedTokens: 0,
+      actualTokens,
+      overrunTokens: actualTokens,
+    };
+    this.settlements.set(id, settlement);
+    return { ...settlement };
+  }
+
   cancel(id: string): void {
     reservationId(id);
     const reserved = this.reservations.get(id);

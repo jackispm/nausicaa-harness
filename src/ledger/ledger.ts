@@ -12,6 +12,7 @@ import type { EventId, RunId } from "../domain/types.js";
 import { cloneJson, sha256, stableJson } from "./hash.js";
 import {
   eventTypes,
+  validateCompactionRequestEnvelope,
   validateEventPayload,
   validateMessageRun,
 } from "./validation.js";
@@ -149,6 +150,12 @@ export function validateEvent(event: unknown): asserts event is AnyEvent {
 
   try {
     validateEventPayload(candidate.type, candidate.payload);
+    validateCompactionRequestEnvelope(
+      candidate.type,
+      candidate.payload,
+      candidate.runId,
+      candidate.laneId,
+    );
     const payloadTurnId = "turnId" in candidate.payload
       ? candidate.payload.turnId
       : undefined;

@@ -36,6 +36,7 @@ import {
 import type {
   FukaiArtifactSelection,
   FukaiBudget,
+  FukaiCompactionSelection,
   FukaiConversationRef,
   MainContextProvider,
 } from "../fukai/types.js";
@@ -44,6 +45,7 @@ import {
   persistedErrorText,
   redactSensitiveText,
 } from "./redaction.js";
+import { deriveRuntimePolicyVersion } from "./fukai-compaction-runtime.js";
 import type { RunTokenBudget } from "./run-token-budget.js";
 
 const DEFAULT_SYSTEM_PROMPT = `You are Main, the primary execution lane.
@@ -102,6 +104,22 @@ export interface MainAfterStepContext extends MainNavigationContext {
   boundaryMessageIds: readonly string[];
 }
 
+export interface MainCompactionSelectionContext {
+  runId: RunId;
+  laneId: LaneId;
+  goal: Goal;
+  policyVersion: string;
+  upperWatermark: number;
+  signal?: AbortSignal;
+}
+
+export interface MainCompactionPressureContext extends MainCompactionSelectionContext {
+  /** Model selector frozen for the provider request at this boundary. */
+  model: string;
+  conversationRefs: readonly FukaiConversationRef[];
+  estimatedInputTokens: number;
+}
+
 export interface MainLoopDeps {
   model: ModelPort;
   /** Read once at each provider boundary; an in-flight request keeps its selector. */
@@ -123,6 +141,14 @@ export interface MainLoopDeps {
   ) => void | NavigationDelta;
   /** Synchronously enqueue auxiliary work; never execute a model in this hook. */
   afterStep?: (context: MainAfterStepContext) => void;
+  /** Optional, explicit selection of an already-admitted Fukai capsule. */
+  selectCompaction?: (
+    context: MainCompactionSelectionContext,
+  ) => Promise<FukaiCompactionSelection | undefined>;
+  /** DeepSeek-style pre-request pressure gate; absent means no automatic compaction. */
+  compactForPressure?: (
+    context: MainCompactionPressureContext,
+  ) => Promise<FukaiCompactionSelection | undefined>;
   onStreamEvent?: (event: MainStreamEvent) => void;
 }
 
@@ -179,6 +205,8 @@ export interface MainLoopInput {
   maxOutputTokens?: number;
   contextBudget?: Partial<FukaiBudget>;
   conversationRefs?: readonly FukaiConversationRef[];
+  /** Strict incoming prefix already included in a successful Main request. */
+  pressureEligibleConversationCount?: number;
   artifactSelections?: readonly FukaiArtifactSelection[];
   correlationId?: string;
   /** Legacy one-shot completes the Run; interactive execution completes only its Turn. */
@@ -217,6 +245,8 @@ export class MainLoop {
   private readonly beforeStep: MainLoopDeps["beforeStep"];
   private readonly navigationHook: MainLoopDeps["navigationHook"];
   private readonly afterStep: MainLoopDeps["afterStep"];
+  private readonly selectCompaction: MainLoopDeps["selectCompaction"];
+  private readonly compactForPressure: MainLoopDeps["compactForPressure"];
   private readonly onStreamEvent: MainLoopDeps["onStreamEvent"];
   private readonly streamSequences = new Map<string, number>();
   private readonly modelCallAttempts = new Map<string, number>();
@@ -235,6 +265,8 @@ export class MainLoop {
     this.beforeStep = deps.beforeStep;
     this.navigationHook = deps.navigationHook;
     this.afterStep = deps.afterStep;
+    this.selectCompaction = deps.selectCompaction;
+    this.compactForPressure = deps.compactForPressure;
     this.onStreamEvent = deps.onStreamEvent;
   }
 
@@ -254,6 +286,7 @@ export class MainLoop {
       loop: "main",
     })}`;
     const startStep = input.startStep ?? 1;
+    const policyVersion = input.policyVersion ?? deriveRuntimePolicyVersion(input.policy);
     const allowance = mainStepAllowance(input.policy);
     const finalStep = "maxMainStepsPerActivation" in input.policy
       ? startStep + allowance - 1
@@ -262,6 +295,9 @@ export class MainLoop {
     const contextBudget = resolveContextBudget(input);
     const conversationRefs = [...(input.conversationRefs ?? [])]
       .map((ref) => structuredClone(ref));
+    // Only refs included in an earlier Main request may be summarized. New
+    // user/boundary input and unseen tool results remain raw for their first read.
+    let pressureEligibleConversationCount = input.pressureEligibleConversationCount ?? 0;
     const artifactSelections = [...(input.artifactSelections ?? [])]
       .map((selection) => structuredClone(selection));
     let sequence = conversationRefs.reduce(
@@ -333,9 +369,26 @@ export class MainLoop {
             groupId: `${input.runId}:boundary:${boundary.messageId}`,
           });
         }
+        const requestConversationCount = conversationRefs.length;
 
         const contextStartedAt = this.monotonicNow();
-        const view = await this.contextProvider.build({
+        let compaction: FukaiCompactionSelection | undefined;
+        if (this.selectCompaction !== undefined) {
+          try {
+            compaction = await this.selectCompaction({
+              runId: input.runId,
+              laneId,
+              goal: input.goal,
+              policyVersion,
+              upperWatermark: stepWatermark.globalOffset,
+              ...(input.signal === undefined ? {} : { signal: input.signal }),
+            });
+          } catch {
+            throwIfAborted(input.signal);
+            compaction = undefined;
+          }
+        }
+        const contextRequest = {
           runId: input.runId,
           laneId,
           laneKind: "main",
@@ -348,12 +401,25 @@ export class MainLoop {
           artifactSelections,
           tools: this.tools.map((tool) => tool.definition),
           upperWatermark: stepWatermark.globalOffset,
-          policyVersion: input.policyVersion ?? "1",
+          policyVersion,
           budget: contextBudget,
           ...(input.signal === undefined ? {} : { signal: input.signal }),
-        });
-        const contextBuildMs = elapsedMilliseconds(contextStartedAt, this.monotonicNow());
-
+        } as const;
+        let view: Awaited<ReturnType<MainContextProvider["build"]>>;
+        try {
+          view = await this.contextProvider.build({
+            ...contextRequest,
+            ...(compaction === undefined ? {} : { compaction }),
+          });
+        } catch (error: unknown) {
+          throwIfAborted(input.signal);
+          if (compaction === undefined) throw error;
+          view = await this.contextProvider.build(contextRequest);
+          compaction = undefined;
+        }
+        // Freeze the selector before any optional compaction IO. A concurrent
+        // model change applies at this boundary or the next one, never midway.
+        const requestModel = this.resolveModel?.() ?? input.model;
         const remainingTokens = Math.max(
           1,
           input.policy.maxModelTokens - chargedTokens(usage),
@@ -362,6 +428,8 @@ export class MainLoop {
           input.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS,
           remainingTokens,
         );
+        const reservationId = this.nextModelReservationId(input, laneId, step);
+        let reservedMainTokens: number | undefined;
         if (this.runTokenBudget !== undefined) {
           const availableOutputTokens = this.runTokenBudget.availableTokens()
             - view.usage.estimatedInputTokens;
@@ -371,25 +439,70 @@ export class MainLoop {
             );
           }
           maxOutputTokens = Math.min(maxOutputTokens, availableOutputTokens);
-        }
-        // Freeze the selector for this request. A Session may update its Main
-        // selection concurrently, but that update only affects the next call.
-        const requestModel = this.resolveModel?.() ?? input.model;
-        const requestHash = hashStable({
-          context: view.cacheKey,
-          model: requestModel,
-          maxOutputTokens,
-          sessionId,
-        });
-        const reservationId = this.nextModelReservationId(input, laneId, step);
-        if (this.runTokenBudget !== undefined) {
           const reservedTokens = view.usage.estimatedInputTokens + maxOutputTokens;
           if (this.runTokenBudget.reserve(reservationId, reservedTokens) === undefined) {
             throw new MainRunTokenBudgetExhaustedError(
               `Run model token budget exhausted before Main step ${step}`,
             );
           }
+          reservedMainTokens = reservedTokens;
         }
+        if (this.compactForPressure !== undefined) {
+          try {
+            const pressured = await this.compactForPressure({
+              runId: input.runId,
+              laneId,
+              goal: input.goal,
+              policyVersion,
+              upperWatermark: stepWatermark.globalOffset,
+              model: requestModel,
+              conversationRefs: conversationRefs.slice(
+                0,
+                pressureEligibleConversationCount,
+              ),
+              estimatedInputTokens: view.usage.estimatedInputTokens,
+              ...(input.signal === undefined ? {} : { signal: input.signal }),
+            });
+            if (
+              pressured !== undefined
+              && pressured.capsule.compactionId !== compaction?.capsule.compactionId
+            ) {
+              const candidateView = await this.contextProvider.build({
+                ...contextRequest,
+                compaction: pressured,
+              });
+              const candidateOutputHeadroom = reservedMainTokens === undefined
+                ? undefined
+                : reservedMainTokens - candidateView.usage.estimatedInputTokens;
+              if (
+                candidateOutputHeadroom === undefined
+                || candidateOutputHeadroom >= 1
+              ) {
+                view = candidateView;
+                compaction = pressured;
+                if (candidateOutputHeadroom !== undefined) {
+                  maxOutputTokens = Math.min(
+                    maxOutputTokens,
+                    candidateOutputHeadroom,
+                  );
+                }
+              }
+            }
+          } catch {
+            if (input.signal?.aborted === true) {
+              this.runTokenBudget?.cancel(reservationId);
+            }
+            throwIfAborted(input.signal);
+            // Optional compaction never displaces the bounded raw/current view.
+          }
+        }
+        const contextBuildMs = elapsedMilliseconds(contextStartedAt, this.monotonicNow());
+        const requestHash = hashStable({
+          context: view.cacheKey,
+          model: requestModel,
+          maxOutputTokens,
+          sessionId,
+        });
         let requestEvent: { eventId: string; globalOffset: number } | undefined;
         let response: ModelResponse;
         const modelStartedAt = this.monotonicNow();
@@ -405,6 +518,8 @@ export class MainLoop {
               dependencyRefs: [...view.dependencyRefs],
               truncations: structuredClone(view.truncations),
               contextBuildMs,
+              estimatedInputTokens: view.usage.estimatedInputTokens,
+              contextManifest: structuredClone(view.manifest),
             },
             idempotencyKey: `${eventPrefix}:step:${step}:model:requested`,
           });
@@ -426,9 +541,26 @@ export class MainLoop {
             requestEvent.eventId,
           );
         } catch (error: unknown) {
-          this.runTokenBudget?.cancel(reservationId);
           if (requestEvent === undefined) {
+            this.runTokenBudget?.cancel(reservationId);
             throw error;
+          }
+          const failureUsage = providerUsageFromError(error);
+          if (failureUsage === undefined) {
+            this.runTokenBudget?.cancel(reservationId);
+          } else {
+            try {
+              await this.emit(input, laneId, correlationId, eventState, {
+                type: "budget.charged",
+                payload: { laneId, usage: failureUsage },
+                idempotencyKey: `${eventPrefix}:step:${step}:budget`,
+                causationId: requestEvent.eventId,
+              });
+              this.runTokenBudget?.settle(reservationId, failureUsage);
+            } catch (budgetError: unknown) {
+              this.runTokenBudget?.settle(reservationId, failureUsage);
+              throw budgetError;
+            }
           }
           const cancelled = input.signal?.aborted === true;
           if (cancelled) {
@@ -517,6 +649,7 @@ export class MainLoop {
           idempotencyKey: `${eventPrefix}:step:${step}:assistant`,
           causationId: requestEvent.eventId,
         });
+        pressureEligibleConversationCount = requestConversationCount;
         this.publishStream({
           type: "stream.end",
           input,
@@ -1098,6 +1231,26 @@ function validateInput(input: MainLoopInput): void {
   if ((input.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS) > MAX_MAIN_OUTPUT_TOKENS) {
     throw new Error(`maxOutputTokens must not exceed ${MAX_MAIN_OUTPUT_TOKENS}`);
   }
+  const pressureEligibleConversationCount = input.pressureEligibleConversationCount ?? 0;
+  if (
+    !Number.isSafeInteger(pressureEligibleConversationCount)
+    || pressureEligibleConversationCount < 0
+    || pressureEligibleConversationCount > (input.conversationRefs?.length ?? 0)
+  ) {
+    throw new Error(
+      "pressureEligibleConversationCount must be a valid incoming conversation prefix",
+    );
+  }
+  const previousEligible = input.conversationRefs?.[pressureEligibleConversationCount - 1];
+  const firstProtected = input.conversationRefs?.[pressureEligibleConversationCount];
+  if (
+    previousEligible !== undefined
+    && firstProtected !== undefined
+    && previousEligible.groupId !== undefined
+    && previousEligible.groupId === firstProtected.groupId
+  ) {
+    throw new Error("pressureEligibleConversationCount must not split a conversation group");
+  }
 }
 
 function indexTools(tools: readonly AgentTool[]): ReadonlyMap<string, AgentTool> {
@@ -1140,6 +1293,31 @@ function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
 
 function chargedTokens(usage: TokenUsage): number {
   return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+function providerUsageFromError(error: unknown): TokenUsage | undefined {
+  if (error === null || typeof error !== "object" || !("providerUsage" in error)) {
+    return undefined;
+  }
+  const usage = error.providerUsage;
+  if (usage === null || typeof usage !== "object") return undefined;
+  const candidate = usage as Partial<TokenUsage>;
+  for (const name of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+    if (!Number.isFinite(candidate[name]) || (candidate[name] as number) < 0) return undefined;
+  }
+  if (
+    candidate.costUsd !== undefined
+    && (!Number.isFinite(candidate.costUsd) || candidate.costUsd < 0)
+  ) {
+    return undefined;
+  }
+  return {
+    input: candidate.input!,
+    output: candidate.output!,
+    cacheRead: candidate.cacheRead!,
+    cacheWrite: candidate.cacheWrite!,
+    ...(candidate.costUsd === undefined ? {} : { costUsd: candidate.costUsd }),
+  };
 }
 
 function defaultMonotonicNow(): number {

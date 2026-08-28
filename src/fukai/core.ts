@@ -6,9 +6,15 @@ import type {
   EventPayloadMap,
   EventType,
 } from "../domain/events.js";
+import {
+  FUKAI_COMPACTION_MEDIA_TYPE,
+  type ContextCompactionGeneration,
+  type ContextCompactionSummary,
+  type ContextSourceRef,
+} from "../domain/context.js";
 import type { Clock } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
-import type { ArtifactRef, LaneId, RunId } from "../domain/types.js";
+import type { ArtifactRef, Goal, LaneId, RunId } from "../domain/types.js";
 import { assertArtifactRef } from "../store/store.js";
 import { cloneJson, sha256, stableJson } from "../ledger/hash.js";
 import {
@@ -17,6 +23,9 @@ import {
 } from "../ledger/index.js";
 import type {
   FukaiArtifactRead,
+  FukaiCompactionCommitRequest,
+  FukaiCompactionReadRequest,
+  FukaiCompactionView,
   FukaiReadOptions,
   FukaiSource,
 } from "./types.js";
@@ -35,9 +44,11 @@ const MAX_QUERY_EVENTS = 100_000;
 const MAX_QUERY_BYTES = 64 * 1024 * 1024;
 const MAX_QUERY_TOKENS = 16 * 1024 * 1024;
 const MAX_QUERY_WALL_CLOCK_MS = 5 * 60 * 1_000;
+const MAX_COMPACTION_SUMMARY_BYTES = 4 * 1024 * 1024;
 
 /** Checkpoint monotonicity belongs to the durable Ledger, not a Core instance. */
 const checkpointLocksByLedger = new WeakMap<Ledger, Map<string, Promise<void>>>();
+const compactionLocksByLedger = new WeakMap<Ledger, Map<string, Promise<void>>>();
 
 export type FukaiQueryStatus =
   | "ok"
@@ -707,6 +718,486 @@ export class FukaiCore {
     });
   }
 
+  async readCompaction(
+    request: FukaiCompactionReadRequest,
+  ): Promise<FukaiCompactionView> {
+    validateCompactionReadRequest(request);
+    throwIfAborted(request.signal);
+    const events = await readLedgerBounded(this.ledger, { runId: request.runId });
+    const currentWatermark = events.at(-1)?.globalOffset ?? 0;
+    const projection = projectFukai(events, request.runId, request.laneId);
+    const compaction = projection.latestCompaction;
+    if (compaction === undefined) {
+      const reasons = projection.invalidCompactions.flatMap(({ compaction: invalid, reasons }) => (
+        reasons.map((reason) => `compaction-fallback:${invalid.eventId}:${reason}`)
+      ));
+      return {
+        status: reasons.length > 0 ? "stale" : "not-found",
+        reasons,
+        dependenciesVerified: reasons.length === 0,
+      };
+    }
+
+    const reasons: string[] = projection.invalidCompactions
+      .filter(({ compaction: invalid }) => invalid.globalOffset > compaction.globalOffset)
+      .flatMap(({ compaction: invalid, reasons: invalidReasons }) => (
+        invalidReasons.map((reason) => `compaction-fallback:${invalid.eventId}:${reason}`)
+      ));
+    const payload = compaction.payload;
+    if (payload.upperWatermark > currentWatermark) {
+      reasons.push(`compaction-future-watermark:${payload.upperWatermark}:${currentWatermark}`);
+    }
+    if (payload.goalVersion !== request.goalVersion) {
+      reasons.push("goal-version-changed");
+    }
+    if (payload.policyVersion !== request.policyVersion) {
+      reasons.push("policy-version-changed");
+    }
+    const dependencies = await this.verifyCompactionDependencies(
+      compaction,
+      events,
+      request.signal,
+    );
+    reasons.push(...dependencies.reasons);
+    let summary: ContextCompactionSummary | undefined;
+    try {
+      summary = await this.readCompactionSummary(
+        payload.summaryRef,
+        request.signal,
+      );
+    } catch (error: unknown) {
+      reasons.push(`summary-invalid:${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (summary !== undefined && !sameJson(
+      canonicalContextSourceRefs(summary.sourceRefs),
+      canonicalContextSourceRefs(payload.sourceRefs),
+    )) {
+      reasons.push("summary-source-refs-changed");
+    }
+    if (summary !== undefined && summary.goal.version !== payload.goalVersion) {
+      reasons.push("summary-goal-version-changed");
+    }
+    if (summary !== undefined && !sameJson(
+      summary.deferredConversationRefs ?? [],
+      payload.deferredConversationRefs ?? [],
+    )) {
+      reasons.push("summary-deferred-conversation-refs-changed");
+    }
+    if (summary !== undefined && !sameJson(
+      summary.generation ?? null,
+      payload.generation ?? null,
+    )) {
+      reasons.push("summary-generation-changed");
+    }
+    return {
+      status: reasons.length === 0 ? "ready" : "stale",
+      reasons,
+      dependenciesVerified: dependencies.verified,
+      compactionId: payload.compactionId,
+      ...(summary === undefined ? {} : {
+        selection: {
+          capsule: {
+            schemaVersion: 1,
+            compactionId: payload.compactionId,
+            status: reasons.length === 0 ? "ready" : "stale",
+            summaryRef: cloneJson(payload.summaryRef),
+            sourceRefs: cloneJson(payload.sourceRefs),
+            ...(payload.deferredConversationRefs === undefined
+              ? {}
+              : {
+                  deferredConversationRefs: payload.deferredConversationRefs.map(cloneJson),
+                }),
+            ...(payload.generation === undefined
+              ? {}
+              : { generation: cloneJson(payload.generation) }),
+            summaryHash: payload.summaryHash,
+            cursor: payload.cursor,
+            upperWatermark: payload.upperWatermark,
+            goalVersion: payload.goalVersion,
+            policyVersion: payload.policyVersion,
+            estimatedTokens: payload.estimatedTokens,
+          },
+          summary,
+        },
+      }),
+      event: cloneJson(compaction),
+    };
+  }
+
+  /** Rehydrate a provider result recorded by a completed lifecycle event. */
+  async readCompactionSelection(
+    capsule: import("../domain/context.js").ContextCompactionCapsule,
+    signal?: AbortSignal,
+  ): Promise<import("./types.js").FukaiCompactionSelection> {
+    throwIfAborted(signal);
+    if (capsule.schemaVersion !== 1 || capsule.status !== "ready") {
+      throw new FukaiCoreError("Fukai compaction recovery requires a ready schema-v1 capsule");
+    }
+    validateBoundedIdentity(capsule.compactionId, "compactionId", MAX_QUERY_ID_LENGTH);
+    if (!/^fukai-compaction:sha256:[0-9a-f]{64}$/.test(capsule.compactionId)) {
+      throw new FukaiCoreError("Fukai compaction recovery ID is invalid");
+    }
+    validateWatermark(capsule.upperWatermark);
+    const cursorOffset = decodeCursor(capsule.cursor);
+    if (capsule.cursor !== encodeCursor(cursorOffset)) {
+      throw new FukaiCoreError("Fukai compaction recovery cursor is not canonical");
+    }
+    if (cursorOffset > capsule.upperWatermark) {
+      throw new FukaiCoreError("Fukai compaction recovery cursor exceeds its watermark");
+    }
+    validateIdentity(capsule.policyVersion, "policyVersion");
+    if (!Number.isSafeInteger(capsule.goalVersion) || capsule.goalVersion < 1) {
+      throw new FukaiCoreError("Fukai compaction recovery goalVersion must be positive");
+    }
+    if (!Number.isSafeInteger(capsule.estimatedTokens) || capsule.estimatedTokens < 0) {
+      throw new FukaiCoreError("Fukai compaction recovery estimatedTokens must be non-negative");
+    }
+    assertArtifactRef(capsule.summaryRef);
+    if (capsule.summaryHash !== capsule.summaryRef.contentHash) {
+      throw new FukaiCoreError("Fukai compaction recovery summary hash mismatch");
+    }
+    validateContextSourceRefs(capsule.sourceRefs);
+    validateDeferredConversationRefs(
+      capsule.deferredConversationRefs,
+      capsule.sourceRefs,
+    );
+    validateCompactionGeneration(capsule.generation);
+    const summary = await this.readCompactionSummary(capsule.summaryRef, signal);
+    if (!sameJson(
+      canonicalContextSourceRefs(summary.sourceRefs),
+      canonicalContextSourceRefs(capsule.sourceRefs),
+    )) {
+      throw new FukaiCoreError("Fukai compaction recovery source refs changed");
+    }
+    if (summary.goal.version !== capsule.goalVersion) {
+      throw new FukaiCoreError("Fukai compaction recovery Goal version changed");
+    }
+    if (!sameJson(
+      summary.deferredConversationRefs ?? [],
+      capsule.deferredConversationRefs ?? [],
+    )) {
+      throw new FukaiCoreError("Fukai compaction recovery deferred refs changed");
+    }
+    if (!sameJson(summary.generation ?? null, capsule.generation ?? null)) {
+      throw new FukaiCoreError("Fukai compaction recovery generation changed");
+    }
+    return {
+      capsule: cloneJson(capsule),
+      summary,
+    };
+  }
+
+  async commitCompaction(
+    request: FukaiCompactionCommitRequest,
+  ): Promise<EventEnvelope<"fukai.compaction.committed">> {
+    validateCompactionCommitRequest(request);
+    throwIfAborted(request.signal);
+    return this.withCompactionLock(request.runId, request.laneId, request.signal, () => (
+      this.commitCompactionInternal(request)
+    ));
+  }
+
+  private async commitCompactionInternal(
+    request: FukaiCompactionCommitRequest,
+  ): Promise<EventEnvelope<"fukai.compaction.committed">> {
+    throwIfAborted(request.signal);
+    const { capsule, summary } = request.selection;
+    const cursorOffset = decodeCursor(capsule.cursor);
+    const currentWatermark = await this.ledger.watermark();
+    if (capsule.upperWatermark > currentWatermark) {
+      throw new FukaiStaleError(
+        `Compaction watermark ${capsule.upperWatermark} is ahead of Ledger ${currentWatermark}`,
+      );
+    }
+    if (capsule.goalVersion !== request.goal.version) {
+      throw new FukaiStaleError("Compaction goal version does not match the current Goal");
+    }
+    if (capsule.policyVersion !== request.policyVersion) {
+      throw new FukaiStaleError("Compaction policy version does not match the current Policy");
+    }
+
+    const events = await readLedgerBounded(this.ledger, { runId: request.runId });
+    const projection = projectFukai(events, request.runId, request.laneId);
+    const previous = projection.latestCompaction;
+    if (previous !== undefined) {
+      const previousCursor = decodeCursor(previous.payload.cursor);
+      if (
+        cursorOffset < previousCursor
+        || capsule.upperWatermark < previous.payload.upperWatermark
+      ) {
+        throw new FukaiStaleError("Fukai compaction cursor and watermark must be monotonic");
+      }
+    }
+    const lineagePrevious = previous?.payload.compactionId === request.compactionId
+      ? projectFukai(
+          events.filter((event) => event.eventId !== previous.eventId),
+          request.runId,
+          request.laneId,
+        ).latestCompaction
+      : previous;
+    let resetFromCompactionId: string | undefined;
+    const hasSummaryBase = capsule.sourceRefs.some((source) => (
+      source.kind === "artifact"
+      && source.ref.mediaType === FUKAI_COMPACTION_MEDIA_TYPE
+    ));
+    if (
+      lineagePrevious !== undefined
+      && !hasSummaryBase
+      && lineagePrevious.payload.goalVersion === capsule.goalVersion
+      && lineagePrevious.payload.policyVersion === capsule.policyVersion
+    ) {
+      const previousView = await this.readCompaction({
+        runId: request.runId,
+        laneId: request.laneId,
+        goalVersion: lineagePrevious.payload.goalVersion,
+        policyVersion: lineagePrevious.payload.policyVersion,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+      });
+      if (
+        previousView.status !== "ready"
+        || previousView.compactionId !== lineagePrevious.payload.compactionId
+      ) {
+        resetFromCompactionId = lineagePrevious.payload.compactionId;
+      }
+    }
+    if (
+      request.repairFromCompactionId !== undefined
+      && request.repairFromCompactionId !== resetFromCompactionId
+    ) {
+      throw new FukaiStaleError(
+        "Fukai compaction repair source changed before commit",
+      );
+    }
+    const lineageReasons = compactionLineageReasons(
+      capsule.sourceRefs,
+      capsule.deferredConversationRefs ?? [],
+      lineagePrevious,
+      {
+        goalVersion: capsule.goalVersion,
+        policyVersion: capsule.policyVersion,
+        cursorOffset,
+        upperWatermark: capsule.upperWatermark,
+      },
+      resetFromCompactionId,
+    );
+    if (lineageReasons.length > 0) {
+      throw new FukaiStaleError(lineageReasons.join("; "));
+    }
+    const dependencies = await this.verifyContextSourceRefs(
+      capsule.sourceRefs,
+      events,
+      request.laneId,
+      capsule.upperWatermark,
+      {
+        goalVersion: capsule.goalVersion,
+        policyVersion: capsule.policyVersion,
+      },
+      request.signal,
+    );
+    if (dependencies.reasons.length > 0) {
+      throw new FukaiStaleError(dependencies.reasons.join("; "));
+    }
+    const deferredDependencies = await this.verifyContextSourceRefs(
+      (capsule.deferredConversationRefs ?? []).map((ref) => ({
+        kind: "conversation" as const,
+        ref,
+      })),
+      events,
+      request.laneId,
+      capsule.upperWatermark,
+      {
+        goalVersion: capsule.goalVersion,
+        policyVersion: capsule.policyVersion,
+      },
+      request.signal,
+    );
+    if (deferredDependencies.reasons.length > 0) {
+      throw new FukaiStaleError(deferredDependencies.reasons.join("; "));
+    }
+    await this.assertCompactionSummary(
+      capsule.summaryRef,
+      summary,
+      request.signal,
+    );
+    return this.ledger.append({
+      runId: request.runId,
+      laneId: request.laneId,
+      type: "fukai.compaction.committed",
+      payload: {
+        compactionId: request.compactionId,
+        attemptId: request.attemptId ?? null,
+        summaryRef: cloneJson(capsule.summaryRef),
+        sourceRefs: canonicalContextSourceRefs(capsule.sourceRefs),
+        ...(capsule.deferredConversationRefs === undefined
+          ? {}
+          : {
+              deferredConversationRefs: capsule.deferredConversationRefs.map(cloneJson),
+            }),
+        ...(capsule.generation === undefined
+          ? {}
+          : { generation: cloneJson(capsule.generation) }),
+        ...(resetFromCompactionId === undefined
+          ? {}
+          : { resetFromCompactionId }),
+        cursor: encodeCursor(cursorOffset),
+        upperWatermark: capsule.upperWatermark,
+        goalVersion: capsule.goalVersion,
+        policyVersion: capsule.policyVersion,
+        summaryHash: capsule.summaryHash,
+        estimatedTokens: capsule.estimatedTokens,
+      },
+      ...(request.causationId === undefined ? {} : { causationId: request.causationId }),
+      correlationId: `fukai:compaction:${request.runId}:${request.laneId}`,
+      idempotencyKey: `fukai:compaction:${request.laneId}:${request.compactionId}`,
+      visibility: "lane",
+      occurredAt: this.clock.now().toISOString(),
+    });
+  }
+
+  private async verifyCompactionDependencies(
+    compaction: EventEnvelope<"fukai.compaction.committed">,
+    events: readonly AnyEvent[],
+    signal: AbortSignal | undefined,
+  ): Promise<{ verified: boolean; reasons: string[] }> {
+    const prior = projectFukai(
+      events.filter((event) => event.globalOffset < compaction.globalOffset),
+      compaction.runId,
+      compaction.laneId,
+    ).latestCompaction;
+    const reasons = compactionLineageReasons(
+      compaction.payload.sourceRefs,
+      compaction.payload.deferredConversationRefs ?? [],
+      prior,
+      {
+        goalVersion: compaction.payload.goalVersion,
+        policyVersion: compaction.payload.policyVersion,
+        cursorOffset: decodeCursor(compaction.payload.cursor),
+        upperWatermark: compaction.payload.upperWatermark,
+      },
+      compaction.payload.resetFromCompactionId,
+    );
+    const dependencies = await this.verifyContextSourceRefs(
+      compaction.payload.sourceRefs,
+      events,
+      compaction.laneId,
+      compaction.payload.upperWatermark,
+      {
+        goalVersion: compaction.payload.goalVersion,
+        policyVersion: compaction.payload.policyVersion,
+      },
+      signal,
+      compaction.eventId,
+    );
+    reasons.push(...dependencies.reasons);
+    const deferredDependencies = await this.verifyContextSourceRefs(
+      (compaction.payload.deferredConversationRefs ?? []).map((ref) => ({
+        kind: "conversation" as const,
+        ref,
+      })),
+      events,
+      compaction.laneId,
+      compaction.payload.upperWatermark,
+      {
+        goalVersion: compaction.payload.goalVersion,
+        policyVersion: compaction.payload.policyVersion,
+      },
+      signal,
+      compaction.eventId,
+    );
+    reasons.push(...deferredDependencies.reasons);
+    return { verified: reasons.length === 0, reasons };
+  }
+
+  private async verifyContextSourceRefs(
+    sourceRefs: readonly ContextSourceRef[],
+    events: readonly AnyEvent[],
+    laneId: LaneId,
+    upperWatermark: number,
+    expected: { goalVersion: number; policyVersion: string },
+    signal: AbortSignal | undefined,
+    excludeEventId?: string,
+  ): Promise<{ verified: boolean; reasons: string[] }> {
+    const reasons: string[] = [];
+    for (const source of sourceRefs) {
+      throwIfAborted(signal);
+      if (source.kind === "event") {
+        const found = events.some((event) => (
+          event.eventId === source.eventId
+          && event.contentHash === source.contentHash
+          && event.eventId !== excludeEventId
+          && event.globalOffset <= upperWatermark
+          && canReadEvent(event, laneId)
+        ));
+        if (!found) reasons.push(`missing-source-event:${source.eventId}`);
+        continue;
+      }
+      const isCompactionBase = source.kind === "artifact"
+        && source.ref.mediaType === FUKAI_COMPACTION_MEDIA_TYPE;
+      const found = events.some((event) => (
+        event.eventId !== excludeEventId
+        && event.globalOffset <= upperWatermark
+        && canReadEvent(event, laneId)
+        && (isCompactionBase
+          ? event.type === "fukai.compaction.committed"
+            && sameArtifactRef(event.payload.summaryRef, source.ref)
+            && event.payload.goalVersion === expected.goalVersion
+            && event.payload.policyVersion === expected.policyVersion
+          : eventAuthorizesContextSource(event, source))
+      ));
+      if (!found) {
+        reasons.push(`missing-source-ref:${source.ref.id}`);
+        continue;
+      }
+      if (!await this.source.hasArtifact(source.ref, signalOptions(signal))) {
+        reasons.push(`missing-source-artifact:${source.ref.id}`);
+      }
+    }
+    return { verified: reasons.length === 0, reasons };
+  }
+
+  private async readCompactionSummary(
+    ref: ArtifactRef,
+    signal: AbortSignal | undefined,
+  ): Promise<ContextCompactionSummary> {
+    assertArtifactRef(ref);
+    if (ref.mediaType !== FUKAI_COMPACTION_MEDIA_TYPE) {
+      throw new FukaiCoreError("Fukai compaction summary has an invalid media type");
+    }
+    if (ref.byteLength > MAX_COMPACTION_SUMMARY_BYTES) {
+      throw new FukaiCoreError("Fukai compaction summary exceeds the byte limit");
+    }
+    const read = await this.source.readArtifact(
+      ref,
+      { offset: 0, length: ref.byteLength },
+      signalOptions(signal),
+    );
+    if (read === undefined || read.byteLength !== ref.byteLength) {
+      throw new FukaiCoreError("Fukai compaction summary is missing or truncated");
+    }
+    if (read.contentHash !== ref.contentHash || sha256(Buffer.from(read.content, "utf8")) !== ref.contentHash) {
+      throw new FukaiCoreError("Fukai compaction summary hash mismatch");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(read.content);
+    } catch {
+      throw new FukaiCoreError("Fukai compaction summary is not valid JSON");
+    }
+    validateCompactionSummary(parsed);
+    return cloneJson(parsed) as ContextCompactionSummary;
+  }
+
+  private async assertCompactionSummary(
+    ref: ArtifactRef,
+    expected: ContextCompactionSummary,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const actual = await this.readCompactionSummary(ref, signal);
+    if (!sameJson(actual, expected)) {
+      throw new FukaiCoreError("Fukai compaction summary does not match the persisted artifact");
+    }
+  }
+
   private async withQueryLock<T>(
     runId: RunId,
     queryId: string,
@@ -726,6 +1217,20 @@ export class FukaiCore {
     if (tails === undefined) {
       tails = new Map<string, Promise<void>>();
       checkpointLocksByLedger.set(this.ledger, tails);
+    }
+    return withKeyedLock(tails, `${runId}\0${laneId}`, signal, operation);
+  }
+
+  private async withCompactionLock<T>(
+    runId: RunId,
+    laneId: LaneId,
+    signal: AbortSignal | undefined,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    let tails = compactionLocksByLedger.get(this.ledger);
+    if (tails === undefined) {
+      tails = new Map<string, Promise<void>>();
+      compactionLocksByLedger.set(this.ledger, tails);
     }
     return withKeyedLock(tails, `${runId}\0${laneId}`, signal, operation);
   }
@@ -965,6 +1470,212 @@ function validateCheckpointRequest(request: FukaiCheckpointRequest): void {
   if (request.stateHash !== undefined) {
     validateIdentity(request.stateHash, "stateHash");
   }
+}
+
+function validateCompactionReadRequest(request: FukaiCompactionReadRequest): void {
+  validateIdentity(request.runId, "runId");
+  validateIdentity(request.laneId, "laneId");
+  if (!Number.isSafeInteger(request.goalVersion) || request.goalVersion < 1) {
+    throw new FukaiCoreError("Fukai compaction goalVersion must be a positive integer");
+  }
+  validateIdentity(request.policyVersion, "policyVersion");
+}
+
+function validateCompactionCommitRequest(request: FukaiCompactionCommitRequest): void {
+  validateIdentity(request.runId, "runId");
+  validateIdentity(request.laneId, "laneId");
+  validateBoundedIdentity(request.compactionId, "compactionId", MAX_QUERY_ID_LENGTH);
+  if (request.repairFromCompactionId !== undefined) {
+    validateBoundedIdentity(
+      request.repairFromCompactionId,
+      "repairFromCompactionId",
+      MAX_QUERY_ID_LENGTH,
+    );
+    if (
+      !/^fukai-compaction:sha256:[0-9a-f]{64}$/.test(request.repairFromCompactionId)
+      || request.repairFromCompactionId === request.compactionId
+    ) {
+      throw new FukaiCoreError("Fukai compaction repair source ID is invalid");
+    }
+  }
+  validateGoal(request.goal);
+  validateIdentity(request.policyVersion, "policyVersion");
+  const { capsule, summary } = request.selection;
+  if (capsule.schemaVersion !== 1 || capsule.status !== "ready") {
+    throw new FukaiCoreError("Fukai compaction capsule must be a ready schema-v1 capsule");
+  }
+  if (capsule.compactionId !== request.compactionId) {
+    throw new FukaiCoreError("Fukai compaction capsule ID does not match commit ID");
+  }
+  validateWatermark(capsule.upperWatermark);
+  const cursorOffset = decodeCursor(capsule.cursor);
+  if (capsule.cursor !== encodeCursor(cursorOffset)) {
+    throw new FukaiCoreError("Fukai compaction cursor must be canonical");
+  }
+  if (cursorOffset > capsule.upperWatermark) {
+    throw new FukaiStaleError("Fukai compaction cursor cannot exceed its watermark");
+  }
+  if (capsule.goalVersion !== request.goal.version) {
+    throw new FukaiStaleError("Fukai compaction goalVersion does not match Goal");
+  }
+  if (capsule.policyVersion !== request.policyVersion) {
+    throw new FukaiStaleError("Fukai compaction policyVersion does not match Policy");
+  }
+  assertArtifactRef(capsule.summaryRef);
+  if (capsule.summaryRef.mediaType !== FUKAI_COMPACTION_MEDIA_TYPE) {
+    throw new FukaiCoreError("Fukai compaction summaryRef has an invalid media type");
+  }
+  if (capsule.summaryHash !== capsule.summaryRef.contentHash) {
+    throw new FukaiCoreError("Fukai compaction summaryHash must match summaryRef.contentHash");
+  }
+  if (!Number.isSafeInteger(capsule.estimatedTokens) || capsule.estimatedTokens < 0) {
+    throw new FukaiCoreError("Fukai compaction estimatedTokens must be non-negative");
+  }
+  validateContextSourceRefs(capsule.sourceRefs);
+  validateDeferredConversationRefs(
+    capsule.deferredConversationRefs,
+    capsule.sourceRefs,
+  );
+  validateCompactionGeneration(capsule.generation);
+  validateCompactionSummary(summary);
+  if (!sameJson(canonicalContextSourceRefs(capsule.sourceRefs), canonicalContextSourceRefs(summary.sourceRefs))) {
+    throw new FukaiCoreError("Fukai compaction capsule and summary source refs differ");
+  }
+  if (!sameJson(summary.goal, request.goal)) {
+    throw new FukaiCoreError("Fukai compaction summary goal does not match Goal");
+  }
+  if (!sameJson(
+    summary.deferredConversationRefs ?? [],
+    capsule.deferredConversationRefs ?? [],
+  )) {
+    throw new FukaiCoreError(
+      "Fukai compaction capsule and summary deferred conversation refs differ",
+    );
+  }
+  if (!sameJson(summary.generation ?? null, capsule.generation ?? null)) {
+    throw new FukaiCoreError("Fukai compaction capsule and summary generation differ");
+  }
+}
+
+function validateGoal(goal: Goal): void {
+  if (!Number.isSafeInteger(goal.version) || goal.version < 1) {
+    throw new FukaiCoreError("Fukai compaction Goal version must be positive");
+  }
+  if (typeof goal.statement !== "string" || goal.statement.length === 0) {
+    throw new FukaiCoreError("Fukai compaction Goal statement must be non-empty");
+  }
+  if (!Array.isArray(goal.successCriteria) || !Array.isArray(goal.hardConstraints)) {
+    throw new FukaiCoreError("Fukai compaction Goal criteria must be arrays");
+  }
+  for (const item of [...goal.successCriteria, ...goal.hardConstraints]) {
+    if (typeof item !== "string" || item.length === 0) {
+      throw new FukaiCoreError("Fukai compaction Goal criteria must be non-empty strings");
+    }
+  }
+}
+
+function validateContextSourceRefs(sourceRefs: readonly ContextSourceRef[]): void {
+  if (!Array.isArray(sourceRefs) || sourceRefs.length === 0) {
+    throw new FukaiCoreError("Fukai compaction sourceRefs must contain at least one ref");
+  }
+  if (sourceRefs.length > MAX_STATE_REFS) {
+    throw new FukaiCoreError(`Fukai compaction sourceRefs exceeds ${MAX_STATE_REFS}`);
+  }
+  const identities = new Set<string>();
+  for (const source of sourceRefs) {
+    if (source.kind === "event") {
+      validateBoundedIdentity(source.eventId, "compaction source eventId", MAX_FILTER_ITEM_LENGTH);
+      validateBoundedIdentity(source.contentHash, "compaction source contentHash", MAX_FILTER_ITEM_LENGTH);
+    } else if (source.kind === "artifact" || source.kind === "conversation") {
+      assertArtifactRef(source.ref);
+    } else {
+      throw new FukaiCoreError("Fukai compaction sourceRef kind is invalid");
+    }
+    const identity = stableJson(source);
+    if (identities.has(identity)) {
+      throw new FukaiCoreError("Fukai compaction sourceRefs must be unique");
+    }
+    identities.add(identity);
+  }
+}
+
+function validateDeferredConversationRefs(
+  refs: readonly ArtifactRef[] | undefined,
+  sourceRefs: readonly ContextSourceRef[],
+): void {
+  if (refs === undefined) return;
+  if (!Array.isArray(refs) || refs.length > MAX_STATE_REFS) {
+    throw new FukaiCoreError(
+      `Fukai deferred conversation refs must contain at most ${MAX_STATE_REFS} refs`,
+    );
+  }
+  const summarized = new Set(sourceRefs.flatMap((source) => (
+    source.kind === "conversation" ? [stableJson(source.ref)] : []
+  )));
+  const seen = new Set<string>();
+  for (const ref of refs) {
+    assertArtifactRef(ref);
+    const identity = stableJson(ref);
+    if (seen.has(identity) || summarized.has(identity)) {
+      throw new FukaiCoreError(
+        "Fukai deferred conversation refs must be unique and outside source refs",
+      );
+    }
+    seen.add(identity);
+  }
+}
+
+function validateCompactionGeneration(
+  generation: ContextCompactionGeneration | undefined,
+): void {
+  if (generation === undefined) return;
+  validateBoundedIdentity(
+    generation.provider,
+    "generation provider",
+    MAX_FILTER_ITEM_LENGTH,
+  );
+  validateBoundedIdentity(generation.model, "generation model", MAX_FILTER_ITEM_LENGTH);
+  validateBoundedIdentity(
+    generation.summarizerVersion,
+    "generation summarizerVersion",
+    MAX_FILTER_ITEM_LENGTH,
+  );
+  if (!/^sha256:[0-9a-f]{64}$/.test(generation.promptHash)) {
+    throw new FukaiCoreError("Fukai compaction generation promptHash is invalid");
+  }
+}
+
+function validateCompactionSummary(value: unknown): asserts value is ContextCompactionSummary {
+  if (!isRecord(value) || value.schemaVersion !== 1) {
+    throw new FukaiCoreError("Fukai compaction summary schema is unsupported");
+  }
+  validateGoal(value.goal as Goal);
+  for (const name of ["decisions", "verifiedResults", "openQuestions"] as const) {
+    const entries = value[name];
+    if (!Array.isArray(entries) || entries.some((entry) => typeof entry !== "string")) {
+      throw new FukaiCoreError(`Fukai compaction summary ${name} must be string arrays`);
+    }
+  }
+  validateContextSourceRefs(value.sourceRefs as ContextSourceRef[]);
+  validateDeferredConversationRefs(
+    value.deferredConversationRefs as ArtifactRef[] | undefined,
+    value.sourceRefs as ContextSourceRef[],
+  );
+  validateCompactionGeneration(
+    value.generation as ContextCompactionGeneration | undefined,
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function canonicalContextSourceRefs(refs: readonly ContextSourceRef[]): ContextSourceRef[] {
+  return refs.map((ref) => cloneJson(ref));
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return stableJson(left) === stableJson(right);
 }
 
 function validateBudget(budget: FukaiQueryBudget): void {
@@ -1214,6 +1925,115 @@ function payloadReferencesArtifact(value: unknown, ref: ArtifactRef): boolean {
     }
   }
   return false;
+}
+
+function eventAuthorizesContextSource(
+  event: AnyEvent,
+  source: Exclude<ContextSourceRef, { kind: "event" }>,
+): boolean {
+  // Lifecycle records describe a candidate compaction. They cannot bootstrap
+  // provenance for the refs they are attempting to summarize.
+  if (event.type.startsWith("fukai.compaction.")) return false;
+  if (source.kind === "artifact") {
+    return payloadReferencesArtifact(event.payload, source.ref);
+  }
+  switch (event.type) {
+    case "input.admitted":
+    case "user.message":
+    case "assistant.message":
+      return sameArtifactRef(event.payload.messageRef, source.ref);
+    case "model.completed":
+      return sameArtifactRef(event.payload.responseRef, source.ref);
+    case "tool.succeeded":
+    case "tool.failed":
+      return sameArtifactRef(event.payload.resultRef, source.ref);
+    case "run.completed":
+    case "turn.completed":
+      return event.payload.answerRef !== undefined
+        && sameArtifactRef(event.payload.answerRef, source.ref);
+    default:
+      return false;
+  }
+}
+
+function compactionLineageReasons(
+  sourceRefs: readonly ContextSourceRef[],
+  deferredConversationRefs: readonly ArtifactRef[],
+  previous: EventEnvelope<"fukai.compaction.committed"> | undefined,
+  expected: {
+    goalVersion: number;
+    policyVersion: string;
+    cursorOffset: number;
+    upperWatermark: number;
+  },
+  resetFromCompactionId?: string,
+): string[] {
+  const bases = sourceRefs.filter((source): source is Exclude<
+    ContextSourceRef,
+    { kind: "event" }
+  > => source.kind === "artifact" && source.ref.mediaType === FUKAI_COMPACTION_MEDIA_TYPE);
+  if (bases.length === 0) {
+    if (resetFromCompactionId !== undefined) {
+      return previous?.payload.compactionId === resetFromCompactionId
+        ? []
+        : ["compaction-reset-not-latest"];
+    }
+    if (
+      previous !== undefined
+      && previous.payload.goalVersion === expected.goalVersion
+      && previous.payload.policyVersion === expected.policyVersion
+    ) {
+      return ["missing-compaction-base"];
+    }
+    return [];
+  }
+  if (resetFromCompactionId !== undefined) {
+    return ["compaction-reset-has-base"];
+  }
+  if (bases.length > 1) return ["multiple-compaction-bases"];
+  if (previous === undefined) return ["missing-compaction-base"];
+  const reasons: string[] = [];
+  if (!sameArtifactRef(previous.payload.summaryRef, bases[0]!.ref)) {
+    reasons.push("compaction-base-not-latest");
+  }
+  if (previous.payload.goalVersion !== expected.goalVersion) {
+    reasons.push("compaction-base-goal-version-changed");
+  }
+  if (previous.payload.policyVersion !== expected.policyVersion) {
+    reasons.push("compaction-base-policy-version-changed");
+  }
+  const retainedDeferred = new Set(deferredConversationRefs.map((ref) => stableJson(ref)));
+  const newlySummarized = new Set(sourceRefs.flatMap((source) => (
+    source.kind === "conversation" ? [stableJson(source.ref)] : []
+  )));
+  const resolvedDeferred = (previous.payload.deferredConversationRefs ?? []).some((ref) => {
+    const identity = stableJson(ref);
+    return newlySummarized.has(identity) && !retainedDeferred.has(identity);
+  });
+  const previousCursor = decodeCursor(previous.payload.cursor);
+  if (
+    previousCursor > expected.cursorOffset
+    || (previousCursor === expected.cursorOffset && !resolvedDeferred)
+  ) {
+    reasons.push("compaction-base-cursor-not-advanced");
+  }
+  if (previous.payload.upperWatermark > expected.upperWatermark) {
+    reasons.push("compaction-base-watermark-regressed");
+  }
+  for (const ref of previous.payload.deferredConversationRefs ?? []) {
+    const identity = stableJson(ref);
+    if (!retainedDeferred.has(identity) && !newlySummarized.has(identity)) {
+      reasons.push(`compaction-base-deferred-ref-dropped:${ref.id}`);
+    }
+  }
+  return reasons;
+}
+
+function sameArtifactRef(left: ArtifactRef, right: ArtifactRef): boolean {
+  return left.id === right.id
+    && left.contentHash === right.contentHash
+    && left.mediaType === right.mediaType
+    && left.byteLength === right.byteLength;
 }
 
 /**

@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import type { AppendEvent, EventType } from "../../src/domain/events.js";
+import type { AppendEvent, EventEnvelope, EventType } from "../../src/domain/events.js";
+import { FUKAI_COMPACTION_MEDIA_TYPE } from "../../src/domain/context.js";
 import type { ArtifactRef, Goal, RunPolicy } from "../../src/domain/types.js";
 import {
   FukaiCore,
   FukaiStaleError,
+  compactionIntegrityReasons,
   projectFukai,
   ContentStoreFukaiSource,
 } from "../../src/fukai/index.js";
@@ -30,6 +32,10 @@ const policy: RunPolicy = {
   tetoMaxOutputTokens: 200,
   tetoTokenRatio: 0.1,
 };
+
+const compactionId = `fukai-compaction:sha256:${"c".repeat(64)}`;
+const staleCompactionId = `fukai-compaction:sha256:${"d".repeat(64)}`;
+const rollForwardCompactionId = `fukai-compaction:sha256:${"f".repeat(64)}`;
 
 describe("FukaiCore", () => {
   it("queries a fixed watermark with stable cursors and records a bounded audit", async () => {
@@ -570,6 +576,712 @@ describe("FukaiCore", () => {
     const reverse = projectFukai([...events].reverse(), "run-1", "main");
     expect(reverse).toEqual(forward);
     expect(forward.latestCheckpoint?.payload.stateRefs).toHaveLength(1);
+  });
+
+  it("commits and restores a verified compaction capsule", async () => {
+    const ledger = new MemoryLedger();
+    const store = new MemoryContentAddressedStore();
+    const core = new FukaiCore(ledger, new ContentStoreFukaiSource(store));
+    await ledger.append(command("run.created", { goal, workspace: "/workspace", policy }));
+    const source = await store.put("verified source", "text/plain");
+    await ledger.append(command("assistant.message", { messageRef: source }));
+    const upperWatermark = await ledger.watermark();
+    const summaryBody = {
+      schemaVersion: 1 as const,
+      goal,
+      decisions: ["Use the existing workspace"],
+      verifiedResults: ["The source was read"],
+      openQuestions: ["What remains to inspect?"],
+      sourceRefs: [{ kind: "artifact" as const, ref: source }],
+    };
+    const summaryRef = await store.put(
+      JSON.stringify(summaryBody),
+      FUKAI_COMPACTION_MEDIA_TYPE,
+    );
+    const request = {
+      runId: "run-1",
+      laneId: "main",
+      compactionId,
+      goal,
+      policyVersion: "policy-v1",
+      selection: {
+        capsule: {
+          schemaVersion: 1 as const,
+          compactionId,
+          status: "ready" as const,
+          summaryRef,
+          sourceRefs: summaryBody.sourceRefs,
+          summaryHash: summaryRef.contentHash,
+          cursor: `offset:${upperWatermark}`,
+          upperWatermark,
+          goalVersion: goal.version,
+          policyVersion: "policy-v1",
+          estimatedTokens: 42,
+        },
+        summary: summaryBody,
+      },
+    };
+    const committed = await core.commitCompaction(request);
+    expect(committed.payload.compactionId).toBe(compactionId);
+    expect(projectFukai(await ledger.read(), "run-1", "main").latestCompaction).toEqual(committed);
+
+    await expect(core.readCompaction({
+      runId: "run-1",
+      laneId: "main",
+      goalVersion: goal.version,
+      policyVersion: "policy-v1",
+    })).resolves.toMatchObject({
+      status: "ready",
+      reasons: [],
+      compactionId,
+      selection: { summary: summaryBody },
+    });
+    await expect(core.commitCompaction(request)).resolves.toEqual(committed);
+  });
+
+  it("rejects a roll-forward base from an older Goal version", async () => {
+    const ledger = new MemoryLedger();
+    const store = new MemoryContentAddressedStore();
+    const core = new FukaiCore(ledger, new ContentStoreFukaiSource(store));
+    await ledger.append(command("run.created", { goal, workspace: "/workspace", policy }));
+    const original = await store.put("original evidence", "text/plain");
+    await ledger.append(command("assistant.message", { messageRef: original }));
+    const originalWatermark = await ledger.watermark();
+    const originalSources = [{ kind: "conversation" as const, ref: original }];
+    const originalSummary = {
+      schemaVersion: 1 as const,
+      goal,
+      decisions: ["Keep the original decision"],
+      verifiedResults: [],
+      openQuestions: [],
+      sourceRefs: originalSources,
+    };
+    const originalSummaryRef = await store.put(
+      JSON.stringify(originalSummary),
+      FUKAI_COMPACTION_MEDIA_TYPE,
+    );
+    await core.commitCompaction({
+      runId: "run-1",
+      laneId: "main",
+      compactionId,
+      goal,
+      policyVersion: "policy-v1",
+      selection: {
+        capsule: {
+          schemaVersion: 1,
+          compactionId,
+          status: "ready",
+          summaryRef: originalSummaryRef,
+          sourceRefs: originalSources,
+          summaryHash: originalSummaryRef.contentHash,
+          cursor: `offset:${originalWatermark}`,
+          upperWatermark: originalWatermark,
+          goalVersion: goal.version,
+          policyVersion: "policy-v1",
+          estimatedTokens: 12,
+        },
+        summary: originalSummary,
+      },
+    });
+
+    const revisedGoal = { ...goal, version: 2, statement: "Inspect a different workspace" };
+    await ledger.append(command("goal.revised", { goal: revisedGoal }));
+    const newEvidence = await store.put("new evidence", "text/plain");
+    await ledger.append(command("assistant.message", { messageRef: newEvidence }));
+    const revisedWatermark = await ledger.watermark();
+    const revisedSources = [
+      { kind: "artifact" as const, ref: originalSummaryRef },
+      { kind: "conversation" as const, ref: newEvidence },
+    ];
+    const revisedSummary = {
+      schemaVersion: 1 as const,
+      goal: revisedGoal,
+      decisions: [],
+      verifiedResults: ["New evidence exists"],
+      openQuestions: [],
+      sourceRefs: revisedSources,
+    };
+    const revisedSummaryRef = await store.put(
+      JSON.stringify(revisedSummary),
+      FUKAI_COMPACTION_MEDIA_TYPE,
+    );
+
+    await expect(core.commitCompaction({
+      runId: "run-1",
+      laneId: "main",
+      compactionId: rollForwardCompactionId,
+      goal: revisedGoal,
+      policyVersion: "policy-v1",
+      selection: {
+        capsule: {
+          schemaVersion: 1,
+          compactionId: rollForwardCompactionId,
+          status: "ready",
+          summaryRef: revisedSummaryRef,
+          sourceRefs: revisedSources,
+          summaryHash: revisedSummaryRef.contentHash,
+          cursor: `offset:${revisedWatermark}`,
+          upperWatermark: revisedWatermark,
+          goalVersion: revisedGoal.version,
+          policyVersion: "policy-v1",
+          estimatedTokens: 12,
+        },
+        summary: revisedSummary,
+      },
+    })).rejects.toThrow("compaction-base-goal-version-changed");
+  });
+
+  it("requires the latest summary base for same-Goal lineage but permits a revised-Goal reset", async () => {
+    const ledger = new MemoryLedger();
+    const store = new MemoryContentAddressedStore();
+    const core = new FukaiCore(ledger, new ContentStoreFukaiSource(store));
+    await ledger.append(command("run.created", { goal, workspace: "/workspace", policy }));
+    const deferred = await store.put("deferred oldest message", "text/plain");
+    const original = await store.put("summarized original message", "text/plain");
+    await ledger.append(command("user.message", { messageRef: deferred }));
+    await ledger.append(command("assistant.message", { messageRef: original }));
+    const firstWatermark = await ledger.watermark();
+    const selectionFor = async (options: {
+      id: string;
+      currentGoal: Goal;
+      source: ArtifactRef;
+      cursor: number;
+      deferredRefs?: ArtifactRef[];
+    }) => {
+      const sourceRefs = [{ kind: "conversation" as const, ref: options.source }];
+      const summary = {
+        schemaVersion: 1 as const,
+        goal: options.currentGoal,
+        decisions: [],
+        verifiedResults: [],
+        openQuestions: [],
+        sourceRefs,
+        ...(options.deferredRefs === undefined
+          ? {}
+          : { deferredConversationRefs: options.deferredRefs }),
+      };
+      const summaryRef = await store.put(
+        JSON.stringify(summary),
+        FUKAI_COMPACTION_MEDIA_TYPE,
+      );
+      return {
+        capsule: {
+          schemaVersion: 1 as const,
+          compactionId: options.id,
+          status: "ready" as const,
+          summaryRef,
+          sourceRefs,
+          ...(options.deferredRefs === undefined
+            ? {}
+            : { deferredConversationRefs: options.deferredRefs }),
+          summaryHash: summaryRef.contentHash,
+          cursor: `offset:${options.cursor}`,
+          upperWatermark: options.cursor,
+          goalVersion: options.currentGoal.version,
+          policyVersion: "policy-v1",
+          estimatedTokens: 12,
+        },
+        summary,
+      };
+    };
+    const firstSelection = await selectionFor({
+      id: compactionId,
+      currentGoal: goal,
+      source: original,
+      cursor: firstWatermark,
+      deferredRefs: [deferred],
+    });
+    await core.commitCompaction({
+      runId: "run-1",
+      laneId: "main",
+      compactionId,
+      goal,
+      policyVersion: "policy-v1",
+      selection: firstSelection,
+    });
+
+    const sameGoalEvidence = await store.put("same Goal evidence", "text/plain");
+    await ledger.append(command("assistant.message", { messageRef: sameGoalEvidence }));
+    const sameGoalWatermark = await ledger.watermark();
+    const standalone = await selectionFor({
+      id: staleCompactionId,
+      currentGoal: goal,
+      source: sameGoalEvidence,
+      cursor: sameGoalWatermark,
+    });
+
+    await expect(core.commitCompaction({
+      runId: "run-1",
+      laneId: "main",
+      compactionId: staleCompactionId,
+      goal,
+      policyVersion: "policy-v1",
+      selection: standalone,
+    })).rejects.toThrow("missing-compaction-base");
+    expect((await ledger.read()).filter(
+      (event) => event.type === "fukai.compaction.committed",
+    )).toHaveLength(1);
+    await expect(core.readCompaction({
+      runId: "run-1",
+      laneId: "main",
+      goalVersion: goal.version,
+      policyVersion: "policy-v1",
+    })).resolves.toMatchObject({
+      status: "ready",
+      selection: { capsule: { deferredConversationRefs: [deferred] } },
+    });
+
+    const revisedGoal = { ...goal, version: 2, statement: "Inspect the revised workspace" };
+    await ledger.append(command("goal.revised", { goal: revisedGoal }));
+    const revisedEvidence = await store.put("revised Goal evidence", "text/plain");
+    await ledger.append(command("assistant.message", { messageRef: revisedEvidence }));
+    const revisedWatermark = await ledger.watermark();
+    const reset = await selectionFor({
+      id: rollForwardCompactionId,
+      currentGoal: revisedGoal,
+      source: revisedEvidence,
+      cursor: revisedWatermark,
+    });
+
+    await expect(core.commitCompaction({
+      runId: "run-1",
+      laneId: "main",
+      compactionId: rollForwardCompactionId,
+      goal: revisedGoal,
+      policyVersion: "policy-v1",
+      selection: reset,
+    })).resolves.toMatchObject({
+      type: "fukai.compaction.committed",
+      payload: { goalVersion: 2, sourceRefs: reset.capsule.sourceRefs },
+    });
+  });
+
+  it("repairs a stale same-Goal capsule only after its summary disappears", async () => {
+    const ledger = new MemoryLedger();
+    const store = new MemoryContentAddressedStore();
+    const delegate = new ContentStoreFukaiSource(store);
+    const missing = new Set<string>();
+    const source: FukaiSource = {
+      hasArtifact: (ref, options) => missing.has(ref.contentHash)
+        ? Promise.resolve(false)
+        : delegate.hasArtifact(ref, options),
+      readConversation: (ref, options) => delegate.readConversation(ref, options),
+      readArtifact: (ref, range, options) => missing.has(ref.contentHash)
+        ? Promise.resolve(undefined)
+        : delegate.readArtifact(ref, range, options),
+    };
+    const core = new FukaiCore(ledger, source);
+    await ledger.append(command("run.created", { goal, workspace: "/workspace", policy }));
+
+    const originalEvidence = await store.put("original evidence", "text/plain");
+    await ledger.append(command("assistant.message", { messageRef: originalEvidence }));
+    const originalWatermark = await ledger.watermark();
+    const originalSources = [{ kind: "conversation" as const, ref: originalEvidence }];
+    const originalSummary = {
+      schemaVersion: 1 as const,
+      goal,
+      decisions: ["Keep the original evidence"],
+      verifiedResults: [],
+      openQuestions: [],
+      sourceRefs: originalSources,
+    };
+    const originalSummaryRef = await store.put(
+      JSON.stringify(originalSummary),
+      FUKAI_COMPACTION_MEDIA_TYPE,
+    );
+    await core.commitCompaction({
+      runId: "run-1",
+      laneId: "main",
+      compactionId,
+      goal,
+      policyVersion: "policy-v1",
+      selection: {
+        capsule: {
+          schemaVersion: 1,
+          compactionId,
+          status: "ready",
+          summaryRef: originalSummaryRef,
+          sourceRefs: originalSources,
+          summaryHash: originalSummaryRef.contentHash,
+          cursor: `offset:${originalWatermark}`,
+          upperWatermark: originalWatermark,
+          goalVersion: goal.version,
+          policyVersion: "policy-v1",
+          estimatedTokens: 12,
+        },
+        summary: originalSummary,
+      },
+    });
+
+    const repairEvidence = await store.put("standalone repair evidence", "text/plain");
+    await ledger.append(command("assistant.message", { messageRef: repairEvidence }));
+    const repairWatermark = await ledger.watermark();
+    const repairSources = [{ kind: "conversation" as const, ref: repairEvidence }];
+    const repairSummary = {
+      schemaVersion: 1 as const,
+      goal,
+      decisions: ["Rebuild from available evidence"],
+      verifiedResults: [],
+      openQuestions: [],
+      sourceRefs: repairSources,
+    };
+    const repairSummaryRef = await store.put(
+      JSON.stringify(repairSummary),
+      FUKAI_COMPACTION_MEDIA_TYPE,
+    );
+    const repairRequest = {
+      runId: "run-1",
+      laneId: "main" as const,
+      compactionId: staleCompactionId,
+      goal,
+      policyVersion: "policy-v1",
+      selection: {
+        capsule: {
+          schemaVersion: 1 as const,
+          compactionId: staleCompactionId,
+          status: "ready" as const,
+          summaryRef: repairSummaryRef,
+          sourceRefs: repairSources,
+          summaryHash: repairSummaryRef.contentHash,
+          cursor: `offset:${repairWatermark}`,
+          upperWatermark: repairWatermark,
+          goalVersion: goal.version,
+          policyVersion: "policy-v1",
+          estimatedTokens: 12,
+        },
+        summary: repairSummary,
+      },
+    };
+
+    await expect(core.commitCompaction(repairRequest)).rejects.toThrow(
+      "missing-compaction-base",
+    );
+
+    missing.add(originalSummaryRef.contentHash);
+    await expect(core.readCompaction({
+      runId: "run-1",
+      laneId: "main",
+      goalVersion: goal.version,
+      policyVersion: "policy-v1",
+    })).resolves.toMatchObject({
+      status: "stale",
+      compactionId,
+      reasons: expect.arrayContaining([expect.stringContaining("summary-invalid")]),
+    });
+
+    await expect(core.commitCompaction({
+      ...repairRequest,
+      repairFromCompactionId: rollForwardCompactionId,
+    })).rejects.toThrow("repair source changed before commit");
+    await expect(core.commitCompaction({
+      ...repairRequest,
+      repairFromCompactionId: "invalid-repair-id",
+    })).rejects.toThrow("repair source ID is invalid");
+    await expect(core.commitCompaction({
+      ...repairRequest,
+      repairFromCompactionId: compactionId,
+    })).resolves.toMatchObject({
+      type: "fukai.compaction.committed",
+      payload: {
+        compactionId: staleCompactionId,
+        resetFromCompactionId: compactionId,
+        sourceRefs: repairSources,
+      },
+    });
+    await expect(core.readCompaction({
+      runId: "run-1",
+      laneId: "main",
+      goalVersion: goal.version,
+      policyVersion: "policy-v1",
+    })).resolves.toMatchObject({
+      status: "ready",
+      reasons: [],
+      compactionId: staleCompactionId,
+      selection: { summary: repairSummary },
+    });
+
+    const rollForwardEvidence = await store.put("post-repair evidence", "text/plain");
+    await ledger.append(command("assistant.message", { messageRef: rollForwardEvidence }));
+    const rollForwardWatermark = await ledger.watermark();
+    const rollForwardSources = [
+      { kind: "artifact" as const, ref: repairSummaryRef },
+      { kind: "conversation" as const, ref: rollForwardEvidence },
+    ];
+    const rollForwardSummary = {
+      schemaVersion: 1 as const,
+      goal,
+      decisions: ["Continue from the repaired capsule"],
+      verifiedResults: ["Post-repair evidence is retained"],
+      openQuestions: [],
+      sourceRefs: rollForwardSources,
+    };
+    const rollForwardSummaryRef = await store.put(
+      JSON.stringify(rollForwardSummary),
+      FUKAI_COMPACTION_MEDIA_TYPE,
+    );
+    await expect(core.commitCompaction({
+      runId: "run-1",
+      laneId: "main",
+      compactionId: rollForwardCompactionId,
+      goal,
+      policyVersion: "policy-v1",
+      selection: {
+        capsule: {
+          schemaVersion: 1,
+          compactionId: rollForwardCompactionId,
+          status: "ready",
+          summaryRef: rollForwardSummaryRef,
+          sourceRefs: rollForwardSources,
+          summaryHash: rollForwardSummaryRef.contentHash,
+          cursor: `offset:${rollForwardWatermark}`,
+          upperWatermark: rollForwardWatermark,
+          goalVersion: goal.version,
+          policyVersion: "policy-v1",
+          estimatedTokens: 14,
+        },
+        summary: rollForwardSummary,
+      },
+    })).resolves.toMatchObject({
+      payload: { compactionId: rollForwardCompactionId },
+    });
+    await expect(core.readCompaction({
+      runId: "run-1",
+      laneId: "main",
+      goalVersion: goal.version,
+      policyVersion: "policy-v1",
+    })).resolves.toMatchObject({
+      status: "ready",
+      reasons: [],
+      compactionId: rollForwardCompactionId,
+    });
+
+    const forgedCompactionId = `fukai-compaction:sha256:${"e".repeat(64)}`;
+    const forgedEvidence = await store.put("forged reset evidence", "text/plain");
+    await ledger.append(command("assistant.message", { messageRef: forgedEvidence }));
+    const forgedWatermark = await ledger.watermark();
+    const forgedSources = [{ kind: "conversation" as const, ref: forgedEvidence }];
+    const forgedSummary = {
+      schemaVersion: 1 as const,
+      goal,
+      decisions: ["Trust a reset with the wrong parent"],
+      verifiedResults: [],
+      openQuestions: [],
+      sourceRefs: forgedSources,
+    };
+    const forgedSummaryRef = await store.put(
+      JSON.stringify(forgedSummary),
+      FUKAI_COMPACTION_MEDIA_TYPE,
+    );
+    await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "fukai.compaction.committed",
+      payload: {
+        compactionId: forgedCompactionId,
+        attemptId: null,
+        summaryRef: forgedSummaryRef,
+        sourceRefs: forgedSources,
+        resetFromCompactionId: staleCompactionId,
+        cursor: `offset:${forgedWatermark}`,
+        upperWatermark: forgedWatermark,
+        goalVersion: goal.version,
+        policyVersion: "policy-v1",
+        summaryHash: forgedSummaryRef.contentHash,
+        estimatedTokens: 12,
+      },
+      correlationId: "test:forged-compaction-reset",
+      idempotencyKey: "test:forged-compaction-reset",
+      visibility: "lane",
+    });
+    await expect(core.readCompaction({
+      runId: "run-1",
+      laneId: "main",
+      goalVersion: goal.version,
+      policyVersion: "policy-v1",
+    })).resolves.toMatchObject({
+      status: "stale",
+      compactionId: rollForwardCompactionId,
+      reasons: expect.arrayContaining([expect.stringContaining(":reset-invalid")]),
+    });
+
+    const taintedCompactionId = `fukai-compaction:sha256:${"b".repeat(64)}`;
+    const taintedEvidence = await store.put("tainted roll-forward evidence", "text/plain");
+    await ledger.append(command("assistant.message", { messageRef: taintedEvidence }));
+    const taintedWatermark = await ledger.watermark();
+    const taintedSources = [
+      { kind: "artifact" as const, ref: forgedSummaryRef },
+      { kind: "conversation" as const, ref: taintedEvidence },
+    ];
+    const taintedSummary = {
+      schemaVersion: 1 as const,
+      goal,
+      decisions: ["Continue from the forged reset"],
+      verifiedResults: [],
+      openQuestions: [],
+      sourceRefs: taintedSources,
+    };
+    const taintedSummaryRef = await store.put(
+      JSON.stringify(taintedSummary),
+      FUKAI_COMPACTION_MEDIA_TYPE,
+    );
+    const taintedRequest = {
+      runId: "run-1",
+      laneId: "main" as const,
+      compactionId: taintedCompactionId,
+      goal,
+      policyVersion: "policy-v1",
+      selection: {
+        capsule: {
+          schemaVersion: 1 as const,
+          compactionId: taintedCompactionId,
+          status: "ready" as const,
+          summaryRef: taintedSummaryRef,
+          sourceRefs: taintedSources,
+          summaryHash: taintedSummaryRef.contentHash,
+          cursor: `offset:${taintedWatermark}`,
+          upperWatermark: taintedWatermark,
+          goalVersion: goal.version,
+          policyVersion: "policy-v1",
+          estimatedTokens: 12,
+        },
+        summary: taintedSummary,
+      },
+    };
+    await expect(core.commitCompaction(taintedRequest)).rejects.toThrow(
+      "compaction-base-not-latest",
+    );
+
+    await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "fukai.compaction.committed",
+      payload: {
+        compactionId: taintedCompactionId,
+        attemptId: null,
+        summaryRef: taintedSummaryRef,
+        sourceRefs: taintedSources,
+        cursor: `offset:${taintedWatermark}`,
+        upperWatermark: taintedWatermark,
+        goalVersion: goal.version,
+        policyVersion: "policy-v1",
+        summaryHash: taintedSummaryRef.contentHash,
+        estimatedTokens: 12,
+      },
+      correlationId: "test:tainted-compaction-roll-forward",
+      idempotencyKey: "test:tainted-compaction-roll-forward",
+      visibility: "lane",
+    });
+    await expect(core.readCompaction({
+      runId: "run-1",
+      laneId: "main",
+      goalVersion: goal.version,
+      policyVersion: "policy-v1",
+    })).resolves.toMatchObject({
+      status: "stale",
+      compactionId: rollForwardCompactionId,
+      reasons: expect.arrayContaining([
+        expect.stringContaining(":reset-invalid"),
+        expect.stringContaining(":lineage-invalid"),
+      ]),
+    });
+  });
+
+  it("quarantines a malformed compaction source entry without throwing", () => {
+    const digest = `sha256:${"a".repeat(64)}`;
+    const malformed = {
+      eventId: "event-malformed-compaction",
+      runId: "run-1",
+      laneId: "main",
+      globalOffset: 1,
+      laneSeq: 1,
+      type: "fukai.compaction.committed",
+      schemaVersion: 1,
+      occurredAt: "2026-01-01T00:00:00.000Z",
+      correlationId: "test:malformed-compaction",
+      idempotencyKey: "test:malformed-compaction",
+      visibility: "lane",
+      contentHash: digest,
+      payload: {
+        compactionId,
+        attemptId: null,
+        summaryRef: {
+          id: digest,
+          contentHash: digest,
+          mediaType: FUKAI_COMPACTION_MEDIA_TYPE,
+          byteLength: 10,
+        },
+        sourceRefs: [null],
+        cursor: "offset:1",
+        upperWatermark: 1,
+        goalVersion: 1,
+        policyVersion: "policy-v1",
+        summaryHash: digest,
+        estimatedTokens: 10,
+      },
+    } as unknown as EventEnvelope<"fukai.compaction.committed">;
+
+    expect(() => compactionIntegrityReasons(malformed)).not.toThrow();
+    expect(compactionIntegrityReasons(malformed)).toContain("source-refs-invalid");
+    const projection = projectFukai([malformed], "run-1", "main");
+    expect(projection.latestCompaction).toBeUndefined();
+    expect(projection.invalidCompactions).toEqual([{
+        compaction: malformed,
+        reasons: expect.arrayContaining(["source-refs-invalid"]),
+    }]);
+  });
+
+  it("marks a projected compaction stale when its goal or source is no longer usable", async () => {
+    const ledger = new MemoryLedger();
+    const store = new MemoryContentAddressedStore();
+    const core = new FukaiCore(ledger, new ContentStoreFukaiSource(store));
+    await ledger.append(command("run.created", { goal, workspace: "/workspace", policy }));
+    const source = await store.put("verified source", "text/plain");
+    await ledger.append(command("assistant.message", { messageRef: source }));
+    const upperWatermark = await ledger.watermark();
+    const summaryBody = {
+      schemaVersion: 1 as const,
+      goal,
+      decisions: ["Keep the goal"],
+      verifiedResults: ["Source exists"],
+      openQuestions: [],
+      sourceRefs: [{ kind: "artifact" as const, ref: source }],
+    };
+    const summaryRef = await store.put(JSON.stringify(summaryBody), FUKAI_COMPACTION_MEDIA_TYPE);
+    await core.commitCompaction({
+      runId: "run-1",
+      laneId: "main",
+      compactionId: staleCompactionId,
+      goal,
+      policyVersion: "policy-v1",
+      selection: {
+        capsule: {
+          schemaVersion: 1,
+          compactionId: staleCompactionId,
+          status: "ready",
+          summaryRef,
+          sourceRefs: summaryBody.sourceRefs,
+          summaryHash: summaryRef.contentHash,
+          cursor: `offset:${upperWatermark}`,
+          upperWatermark,
+          goalVersion: 1,
+          policyVersion: "policy-v1",
+          estimatedTokens: 12,
+        },
+        summary: summaryBody,
+      },
+    });
+    await ledger.append(command("goal.revised", {
+      goal: { ...goal, version: 2, statement: "A new goal" },
+    }));
+    await expect(core.readCompaction({
+      runId: "run-1",
+      laneId: "main",
+      goalVersion: 2,
+      policyVersion: "policy-v1",
+    })).resolves.toMatchObject({
+      status: "stale",
+      reasons: expect.arrayContaining(["goal-version-changed"]),
+    });
   });
 
   it("serializes checkpoint monotonicity across FukaiCore instances sharing one Ledger", async () => {

@@ -66,6 +66,47 @@ describe("recoverRunTokenUsage", () => {
     });
   });
 
+  it("pairs Fukai terminal usage with its charge and closes an uncharged failure window", () => {
+    const compaction = `fukai:compaction:main:fukai-compaction:sha256:${"a".repeat(64)}`;
+    const events = [
+      compactionTerminal("fukai.compaction.completed", `${compaction}:attempt:1`, chargedMain, 1),
+      charged("main", `${compaction}:attempt:1`, chargedMain, 2),
+      compactionTerminal("fukai.compaction.failed", `${compaction}:attempt:2`, unchargedWorker, 3),
+    ];
+
+    expect(recoverRunTokenUsage(events, "run-1")).toEqual({
+      input: 17,
+      output: 6,
+      cacheRead: 2,
+      cacheWrite: 2,
+      costUsd: 0.03,
+    });
+  });
+
+  it("recovers the reserved maximum when successful Fukai usage was not persisted", () => {
+    const compaction = `fukai:compaction:main:fukai-compaction:sha256:${"a".repeat(64)}`;
+    const budget = { maxInputTokens: 100, maxOutputTokens: 20, maxWallClockMs: 1_000 };
+    const events = [
+      compactionRequested(`${compaction}:attempt:3`, 3, budget, 1),
+      compactionTerminal(
+        "fukai.compaction.completed",
+        `${compaction}:attempt:3`,
+        null,
+        2,
+        3,
+      ),
+      compactionRequested(`${compaction}:attempt:4`, 4, budget, 3),
+      compactionTerminal("fukai.compaction.failed", `${compaction}:attempt:4`, null, 4, 4),
+    ];
+
+    expect(recoverRunTokenUsage(events.toReversed(), "run-1")).toEqual({
+      input: 100,
+      output: 20,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
+  });
+
   it("is deterministic under replay, reordering, and duplicate terminal forms", () => {
     const first = completed("hybrid", "hybrid:9", chargedMain, 1);
     const replay = {
@@ -151,6 +192,62 @@ function charged(
     laneId,
     usage: chargedUsage,
   }, `${prefix}:budget`, offset);
+}
+
+function compactionTerminal(
+  type: "fukai.compaction.completed" | "fukai.compaction.failed",
+  prefix: string,
+  terminalUsage: TokenUsage | null,
+  offset: number,
+  attempt = offset === 1 ? 1 : 2,
+): Extract<AnyEvent, { type: typeof type }> {
+  const compactionId = `fukai-compaction:sha256:${"a".repeat(64)}`;
+  const attemptId = `${compactionId}:attempt:${attempt}`;
+  if (type === "fukai.compaction.completed") {
+    const summary = ref(`compaction-summary-${offset}`);
+    return event(type, "main", {
+      compactionId,
+      attemptId,
+      attempt,
+      elapsedMs: 10,
+      usage: terminalUsage,
+      summaryRef: summary,
+      summaryHash: summary.contentHash,
+      estimatedTokens: terminalUsage?.output ?? 0,
+    }, `${prefix}:terminal`, offset) as Extract<AnyEvent, { type: typeof type }>;
+  }
+  return event(type, "main", {
+    compactionId,
+    attemptId,
+    attempt,
+    status: "failed",
+    elapsedMs: 10,
+    usage: terminalUsage,
+  }, `${prefix}:terminal`, offset) as Extract<AnyEvent, { type: typeof type }>;
+}
+
+function compactionRequested(
+  prefix: string,
+  attempt: number,
+  budget: {
+    maxInputTokens: number;
+    maxOutputTokens: number;
+    maxWallClockMs: number;
+  },
+  offset: number,
+): Extract<AnyEvent, { type: "fukai.compaction.requested" }> {
+  const compactionId = `fukai-compaction:sha256:${"a".repeat(64)}`;
+  return event("fukai.compaction.requested", "main", {
+    compactionId,
+    attemptId: `${compactionId}:attempt:${attempt}`,
+    attempt,
+    cursor: `offset:${offset}`,
+    upperWatermark: offset,
+    goalVersion: 1,
+    policyVersion: "policy-v1",
+    sourceRefs: [],
+    budget,
+  }, `${prefix}:requested`, offset);
 }
 
 function event<K extends EventType>(

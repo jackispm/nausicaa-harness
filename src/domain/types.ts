@@ -93,6 +93,30 @@ export interface NavigationDelta {
   openQuestions: string[];
 }
 
+/**
+ * Durable, explicit Fukai compaction capability settings.
+ *
+ * This is a policy value rather than a provider implementation. Keeping it
+ * on the Run policy makes resume behavior deterministic without coupling the
+ * domain to a particular model or transport.
+ */
+export interface FukaiCompactionPolicy {
+  enabled: boolean;
+  provider: "none" | "pi-ai";
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  maxWallClockMs: number;
+  /** Schema-v1 logs may omit cadence fields; new Runs always persist them. */
+  thresholdRatio?: number;
+  retainRatio?: number;
+  minimumGainTokens?: number;
+}
+
+/** DeepSeek-style pressure defaults, made durable on every newly created Run. */
+export const DEFAULT_FUKAI_COMPACTION_THRESHOLD_RATIO = 0.8;
+export const DEFAULT_FUKAI_COMPACTION_RETAIN_RATIO = 0.16;
+export const DEFAULT_FUKAI_COMPACTION_MINIMUM_GAIN_TOKENS = 1;
+
 export interface ObservationFrame {
   mission: {
     goalVersion: number;
@@ -224,6 +248,8 @@ interface RunPolicyBase {
   auxiliaryMode?: AuxiliaryMode;
   /** Shadow records generated Advice without publishing it to Main's Inbox. */
   tetoAdviceDelivery?: "live" | "shadow";
+  /** Optional, explicit Fukai compaction capability; absent means disabled. */
+  fukaiCompaction?: FukaiCompactionPolicy;
 }
 
 /** New runs use an activation allowance; maxMainSteps is replay-only legacy data. */

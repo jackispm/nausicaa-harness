@@ -60,7 +60,12 @@ export class PiAiModelPort implements ModelPort {
     if (model === undefined) {
       throw new Error(`Unknown model: ${selector.provider}:${selector.model}`);
     }
-    return { imageInput: model.input.includes("image") };
+    return {
+      imageInput: model.input.includes("image"),
+      ...(isPositiveInteger(model.contextWindow)
+        ? { contextWindowTokens: model.contextWindow }
+        : {}),
+    };
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
@@ -179,6 +184,10 @@ export class PiAiModelPort implements ModelPort {
       };
     }
   }
+}
+
+function isPositiveInteger(value: number): boolean {
+  return Number.isInteger(value) && value > 0;
 }
 
 export function createOpenRouterModelPort(
@@ -424,12 +433,23 @@ function providerFailure(
   const status = evidence.status ?? statusFromText(text);
   const category = failureCategory(source, text, status, evidence, stopReason);
   const retryable = isRetryable(category, status, evidence.retryDirective);
+  const providerUsage = providerUsageFromFailure(source);
   return new ProviderModelError({
     category,
     retryable,
     ...(status === undefined ? {} : { status }),
     ...(evidence.retryAfterMs === undefined ? {} : { retryAfterMs: evidence.retryAfterMs }),
+    ...(providerUsage === undefined ? {} : { providerUsage }),
   });
+}
+
+function providerUsageFromFailure(source: unknown): TokenUsage | undefined {
+  if (!isAssistantMessage(source)) return undefined;
+  try {
+    return toDomainUsage(source);
+  } catch {
+    return undefined;
+  }
 }
 
 function failureCategory(

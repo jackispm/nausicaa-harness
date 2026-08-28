@@ -66,6 +66,15 @@ describe("parseCliArgs", () => {
           "openrouter:openai/gpt-5-mini",
           "--main-only",
           "--worker",
+          "--fukai-compaction",
+          "--fukai-provider",
+          "pi-ai",
+          "--fukai-max-input-tokens",
+          "12000",
+          "--fukai-max-output-tokens",
+          "2048",
+          "--fukai-max-wall-clock-ms",
+          "30000",
           "--allow-write",
           "--allow-shell",
           "--resume",
@@ -84,6 +93,13 @@ describe("parseCliArgs", () => {
       model: "openrouter:openai/gpt-5-mini",
       tetoEnabled: false,
       workerEnabled: true,
+      fukaiCompaction: {
+        enabled: true,
+        provider: "pi-ai",
+        maxInputTokens: 12_000,
+        maxOutputTokens: 2_048,
+        maxWallClockMs: 30_000,
+      },
       allowWrite: true,
       allowShell: true,
       resume: "run-7",
@@ -112,6 +128,19 @@ describe("parseCliArgs", () => {
     expect(options.allowWrite).toBeUndefined();
   });
 
+  it("parses explicit Fukai disablement without enabling a provider", () => {
+    expect(parseCliArgs(["--no-fukai-compaction", "task"], "/work"))
+      .toMatchObject({
+        fukaiCompaction: { enabled: false },
+        message: "task",
+      });
+    expect(parseCliArgs(["--fukai-provider", "none", "task"], "/work"))
+      .toMatchObject({
+        fukaiCompaction: { provider: "none" },
+        message: "task",
+      });
+  });
+
   it("rejects malformed or unknown options", () => {
     expect(() => parseCliArgs(["--mode", "rpc"], "/work")).toThrow(
       CliUsageError,
@@ -131,6 +160,12 @@ describe("parseCliArgs", () => {
     );
     expect(() => parseCliArgs(["--resolve-operation", "op-1"], "/work")).toThrow(
       /requires --resume/,
+    );
+    expect(() => parseCliArgs(["--fukai-provider", "other"], "/work")).toThrow(
+      /fukai-provider.*none or pi-ai/i,
+    );
+    expect(() => parseCliArgs(["--fukai-max-output-tokens", "0"], "/work")).toThrow(
+      /fukai-max-output-tokens.*positive integer/i,
     );
   });
 
@@ -165,6 +200,8 @@ describe("parseCliArgs", () => {
     expect(usage).toContain("--mode <interactive|print|json>");
     expect(usage).toContain("--continue");
     expect(usage).toContain("--max-output-tokens");
+    expect(usage).toContain("--fukai-compaction");
+    expect(usage).toContain("--fukai-provider <none|pi-ai>");
     expect(usage).toMatch(/--allow-shell.*high privilege.*read\/write outside the workspace/i);
   });
 });

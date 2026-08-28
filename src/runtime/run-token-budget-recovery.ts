@@ -1,11 +1,21 @@
 import type { AnyEvent, RunId, TokenUsage } from "../domain/index.js";
 
 type UsageTerminal = Extract<AnyEvent, {
-  type: "model.completed" | "teto.observed" | "reflection.observed";
+  type:
+    | "model.completed"
+    | "teto.observed"
+    | "reflection.observed"
+    | "fukai.compaction.completed"
+    | "fukai.compaction.failed";
+}>;
+
+type CompactionRequested = Extract<AnyEvent, {
+  type: "fukai.compaction.requested";
 }>;
 
 const MODEL_COMPLETED_SUFFIX = ":model:completed";
 const OBSERVED_SUFFIX = ":observed";
+const COMPACTION_TERMINAL_SUFFIX = ":terminal";
 const BUDGET_SUFFIX = ":budget";
 
 /**
@@ -18,25 +28,31 @@ export function recoverRunTokenUsage(
 ): TokenUsage {
   const ordered = uniqueRunEvents(events, runId);
   const chargedCalls = new Set<string>();
+  const compactionRequests = new Map<string, CompactionRequested>();
   let usage = emptyUsage();
 
   for (const event of ordered) {
+    if (event.type === "fukai.compaction.requested") {
+      compactionRequests.set(compactionAttemptKey(event), event);
+    }
     if (event.type !== "budget.charged") continue;
     usage = addUsage(usage, event.payload.usage);
     const call = chargedCallKey(event);
     if (call !== undefined) chargedCalls.add(call);
   }
 
-  const unchargedTerminals = new Map<string, UsageTerminal>();
+  const unchargedTerminals = new Map<string, TokenUsage>();
   for (const event of ordered) {
     if (!isUsageTerminal(event)) continue;
+    const recoveredUsage = terminalUsage(event, compactionRequests);
+    if (recoveredUsage === null) continue;
     const call = terminalCallKey(event);
     if (chargedCalls.has(call) || unchargedTerminals.has(call)) continue;
-    unchargedTerminals.set(call, event);
+    unchargedTerminals.set(call, recoveredUsage);
   }
 
-  for (const terminal of unchargedTerminals.values()) {
-    usage = addUsage(usage, terminal.payload.usage);
+  for (const terminalUsage of unchargedTerminals.values()) {
+    usage = addUsage(usage, terminalUsage);
   }
   return usage;
 }
@@ -64,15 +80,48 @@ function compareEvents(left: AnyEvent, right: AnyEvent): number {
 function isUsageTerminal(event: AnyEvent): event is UsageTerminal {
   return event.type === "model.completed"
     || event.type === "teto.observed"
-    || event.type === "reflection.observed";
+    || event.type === "reflection.observed"
+    || event.type === "fukai.compaction.completed"
+    || event.type === "fukai.compaction.failed";
 }
 
 function terminalCallKey(event: UsageTerminal): string {
   const suffix = event.type === "model.completed"
     ? MODEL_COMPLETED_SUFFIX
-    : OBSERVED_SUFFIX;
+    : event.type === "fukai.compaction.completed" || event.type === "fukai.compaction.failed"
+      ? COMPACTION_TERMINAL_SUFFIX
+      : OBSERVED_SUFFIX;
   const prefix = stripSuffix(event.idempotencyKey, suffix);
   return callKey(event.runId, event.laneId, prefix ?? event.idempotencyKey);
+}
+
+function terminalUsage(
+  event: UsageTerminal,
+  compactionRequests: ReadonlyMap<string, CompactionRequested>,
+): TokenUsage | null {
+  if (event.payload.usage !== null) return event.payload.usage;
+  if (event.type !== "fukai.compaction.completed") return null;
+
+  const requested = compactionRequests.get(compactionAttemptKey(event));
+  return requested === undefined
+    ? null
+    : {
+        input: requested.payload.budget.maxInputTokens,
+        output: requested.payload.budget.maxOutputTokens,
+        cacheRead: 0,
+        cacheWrite: 0,
+      };
+}
+
+function compactionAttemptKey(
+  event: CompactionRequested | Extract<AnyEvent, { type: "fukai.compaction.completed" }>,
+): string {
+  return [
+    event.runId,
+    event.laneId,
+    event.payload.compactionId,
+    event.payload.attemptId,
+  ].join("\0");
 }
 
 function chargedCallKey(

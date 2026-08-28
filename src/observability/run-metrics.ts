@@ -4,6 +4,11 @@ import type {
   LaneId,
   TokenUsage,
 } from "../domain/types.js";
+import {
+  projectFukaiCompactionMetrics,
+  type FukaiCompactionMetrics,
+  type FukaiCompactionProviderObservation,
+} from "./fukai-compaction-metrics.js";
 
 export interface LatencyStats {
   count: number;
@@ -68,6 +73,8 @@ export interface RunMetrics {
   unknownOperations: number;
   checkpoints: number;
   cacheReadRatio: number;
+  /** Ledger-replayable Fukai commits and request-time selection evidence. */
+  fukaiCompaction: FukaiCompactionMetrics;
 }
 
 interface MutableLaneMetrics {
@@ -144,6 +151,7 @@ const emptyLatency = (): LatencyStats => ({
 export function projectRunMetrics(
   events: readonly AnyEvent[],
   runId: string,
+  fukaiObservations: readonly FukaiCompactionProviderObservation[] = [],
 ): RunMetrics {
   const lanes = new Map<LaneId, MutableLaneMetrics>();
   const adviceById = new Map<string, LaneId>();
@@ -317,6 +325,7 @@ export function projectRunMetrics(
       .filter((operationId) => !terminalOperations.has(operationId)).length,
     checkpoints,
     cacheReadRatio: cacheTokens === 0 ? 0 : total.usage.cacheRead / cacheTokens,
+    fukaiCompaction: projectFukaiCompactionMetrics(ordered, runId, fukaiObservations),
   };
 }
 

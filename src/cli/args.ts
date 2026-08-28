@@ -1,4 +1,8 @@
 import { MAX_MAIN_OUTPUT_TOKENS } from "../domain/types.js";
+import type {
+  FukaiCompactionProviderCapability,
+  FukaiCompactionSettings,
+} from "../config/settings.js";
 
 export type OutputMode = "interactive" | "print" | "json";
 
@@ -20,6 +24,8 @@ export interface CliOptions {
   maxOutputTokens?: number;
   allowShell?: boolean;
   allowWrite?: boolean;
+  /** Explicit Fukai compaction declaration; parsing it never runs a provider. */
+  fukaiCompaction?: FukaiCompactionSettings;
   fileArgs: string[];
   message?: string;
 }
@@ -30,6 +36,30 @@ const readValue = (args: string[], index: number, flag: string): string => {
   const value = args[index + 1];
   if (value === undefined || value.startsWith("-")) {
     throw new CliUsageError(`${flag} requires a value`);
+  }
+  return value;
+};
+
+const readPositiveInteger = (
+  args: string[],
+  index: number,
+  flag: string,
+): number => {
+  const value = Number(readValue(args, index, flag));
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new CliUsageError(`${flag} must be a positive integer`);
+  }
+  return value;
+};
+
+const readFukaiProvider = (
+  args: string[],
+  index: number,
+  flag: string,
+): FukaiCompactionProviderCapability => {
+  const value = readValue(args, index, flag);
+  if (value !== "none" && value !== "pi-ai") {
+    throw new CliUsageError(`${flag} must be none or pi-ai`);
   }
   return value;
 };
@@ -100,6 +130,46 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
         break;
       case "--worker":
         options.workerEnabled = true;
+        break;
+      case "--fukai-compaction":
+        options.fukaiCompaction = {
+          ...(options.fukaiCompaction ?? {}),
+          enabled: true,
+        };
+        break;
+      case "--no-fukai-compaction":
+        options.fukaiCompaction = {
+          ...(options.fukaiCompaction ?? {}),
+          enabled: false,
+        };
+        break;
+      case "--fukai-provider":
+        options.fukaiCompaction = {
+          ...(options.fukaiCompaction ?? {}),
+          provider: readFukaiProvider(args, index, argument),
+        };
+        index += 1;
+        break;
+      case "--fukai-max-input-tokens":
+        options.fukaiCompaction = {
+          ...(options.fukaiCompaction ?? {}),
+          maxInputTokens: readPositiveInteger(args, index, argument),
+        };
+        index += 1;
+        break;
+      case "--fukai-max-output-tokens":
+        options.fukaiCompaction = {
+          ...(options.fukaiCompaction ?? {}),
+          maxOutputTokens: readPositiveInteger(args, index, argument),
+        };
+        index += 1;
+        break;
+      case "--fukai-max-wall-clock-ms":
+        options.fukaiCompaction = {
+          ...(options.fukaiCompaction ?? {}),
+          maxWallClockMs: readPositiveInteger(args, index, argument),
+        };
+        index += 1;
         break;
       case "--allow-write":
         options.allowWrite = true;
@@ -186,6 +256,16 @@ Options:
   --resolve-operation <id> Resolve one unknown tool operation as failed (requires --resume)
   --main-only             Disable the Teto lane for this run
   --worker                Enable the bounded Worker sub-agent lane
+  --fukai-compaction      Enable activation-scoped Fukai compaction (defaults to pi-ai)
+  --no-fukai-compaction   Disable Fukai compaction for this run
+  --fukai-provider <none|pi-ai>
+                          Select the Fukai provider capability; does not invoke it
+  --fukai-max-input-tokens <number>
+                          Fukai compaction input budget
+  --fukai-max-output-tokens <number>
+                          Fukai compaction output budget
+  --fukai-max-wall-clock-ms <number>
+                          Fukai compaction wall-clock budget
   --allow-write           Allow workspace file writes for this run
   --allow-shell           Explicit high privilege: shell may read/write outside the workspace
   --workspace <path>      Bound tools to this workspace
