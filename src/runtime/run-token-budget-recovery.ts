@@ -13,6 +13,12 @@ type CompactionRequested = Extract<AnyEvent, {
   type: "fukai.compaction.requested";
 }>;
 
+/** Usage recovered for one execution lane, including an uncharged crash window. */
+export interface RecoveredLaneUsage {
+  laneId: string;
+  usage: TokenUsage;
+}
+
 const MODEL_COMPLETED_SUFFIX = ":model:completed";
 const OBSERVED_SUFFIX = ":observed";
 const COMPACTION_TERMINAL_SUFFIX = ":terminal";
@@ -26,35 +32,60 @@ export function recoverRunTokenUsage(
   events: readonly AnyEvent[],
   runId: RunId,
 ): TokenUsage {
+  return recoverRunTokenUsageByLane(events, runId).reduce(
+    (total, lane) => addUsage(total, lane.usage),
+    emptyUsage(),
+  );
+}
+
+/**
+ * Rebuild usage while retaining lane ownership. The pairing and crash-window
+ * rules intentionally mirror recoverRunTokenUsage(), so callers cannot make a
+ * different accounting decision merely by asking for a breakdown.
+ */
+export function recoverRunTokenUsageByLane(
+  events: readonly AnyEvent[],
+  runId: RunId,
+): RecoveredLaneUsage[] {
   const ordered = uniqueRunEvents(events, runId);
   const chargedCalls = new Set<string>();
   const compactionRequests = new Map<string, CompactionRequested>();
-  let usage = emptyUsage();
+  const usageByLane = new Map<string, TokenUsage>();
 
   for (const event of ordered) {
     if (event.type === "fukai.compaction.requested") {
       compactionRequests.set(compactionAttemptKey(event), event);
     }
     if (event.type !== "budget.charged") continue;
-    usage = addUsage(usage, event.payload.usage);
+    addLaneUsage(usageByLane, event.payload.laneId, event.payload.usage);
     const call = chargedCallKey(event);
     if (call !== undefined) chargedCalls.add(call);
   }
 
-  const unchargedTerminals = new Map<string, TokenUsage>();
+  const unchargedTerminals = new Map<string, RecoveredLaneUsage>();
   for (const event of ordered) {
     if (!isUsageTerminal(event)) continue;
     const recoveredUsage = terminalUsage(event, compactionRequests);
     if (recoveredUsage === null) continue;
     const call = terminalCallKey(event);
     if (chargedCalls.has(call) || unchargedTerminals.has(call)) continue;
-    unchargedTerminals.set(call, recoveredUsage);
+    unchargedTerminals.set(call, { laneId: event.laneId, usage: recoveredUsage });
   }
 
-  for (const terminalUsage of unchargedTerminals.values()) {
-    usage = addUsage(usage, terminalUsage);
+  for (const terminal of unchargedTerminals.values()) {
+    addLaneUsage(usageByLane, terminal.laneId, terminal.usage);
   }
-  return usage;
+  return [...usageByLane.entries()]
+    .map(([laneId, usage]) => ({ laneId, usage }))
+    .sort((left, right) => left.laneId.localeCompare(right.laneId));
+}
+
+function addLaneUsage(
+  usageByLane: Map<string, TokenUsage>,
+  laneId: string,
+  usage: TokenUsage,
+): void {
+  usageByLane.set(laneId, addUsage(usageByLane.get(laneId) ?? emptyUsage(), usage));
 }
 
 /** Ledger retries replay the original key. Earliest durable fact wins. */

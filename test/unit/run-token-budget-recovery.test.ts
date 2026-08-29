@@ -6,7 +6,10 @@ import type {
   EventType,
   TokenUsage,
 } from "../../src/domain/index.js";
-import { recoverRunTokenUsage } from "../../src/runtime/index.js";
+import {
+  recoverRunTokenUsage,
+  recoverRunTokenUsageByLane,
+} from "../../src/runtime/index.js";
 
 const chargedMain = usage(10, 4, 2, 1, 0.01);
 const chargedTeto = usage(3, 1, 1, 0);
@@ -37,6 +40,12 @@ describe("recoverRunTokenUsage", () => {
       cacheWrite: 2,
       costUsd: 0.03,
     });
+    expect(recoverRunTokenUsageByLane(events, "run-1")).toEqual([
+      { laneId: "main", usage: chargedMain },
+      { laneId: "reflection", usage: unchargedReflection },
+      { laneId: "teto", usage: chargedTeto },
+      { laneId: "worker", usage: unchargedWorker },
+    ]);
   });
 
   it("pairs every current terminal and budget idempotency convention", () => {

@@ -84,7 +84,11 @@ import {
   type RuntimeFukaiCompactionFactory,
 } from "./fukai-compaction-runtime.js";
 import { RunTokenBudget } from "./run-token-budget.js";
-import { recoverRunTokenUsage } from "./run-token-budget-recovery.js";
+import {
+  recoverRunTokenUsage,
+  recoverRunTokenUsageByLane,
+  type RecoveredLaneUsage,
+} from "./run-token-budget-recovery.js";
 import { TetoScheduler } from "./teto-scheduler.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
 import { TaskDispatcher } from "./task-dispatcher.js";
@@ -195,6 +199,20 @@ export interface SessionSnapshot {
   /** Cumulative provider usage for the Run; shown in detailed status, not the context tray. */
   usage: TokenUsage;
   blocker?: string;
+}
+
+/** Read-only accounting projection used by local context/status surfaces. */
+export interface SessionContextOverview {
+  model: string;
+  currentContext: {
+    tokens: number | null;
+    contextWindowTokens: number | null;
+    percent: number | null;
+  };
+  /** Cumulative billable usage across every lane in the attached Run. */
+  usage: TokenUsage;
+  /** Per-lane own usage; rows sum to usage without parent/child duplication. */
+  lanes: RecoveredLaneUsage[];
 }
 
 export type WorkspaceRunStatus =
@@ -598,6 +616,35 @@ export class SessionController {
       mainContextWindowTokens: this.selectedModelContextWindowTokens() ?? null,
       usage,
       ...(blocker === undefined ? {} : { blocker }),
+    };
+  }
+
+  /** Project current context capacity separately from cumulative Run spend. */
+  contextOverview(): SessionContextOverview {
+    this.assertOpen();
+    const snapshot = this.snapshot();
+    const events = this.attached?.sink.cachedEvents ?? [];
+    const recovered = this.attached === undefined
+      ? []
+      : recoverRunTokenUsageByLane(events, this.attached.runId);
+    const lanes = ensureVisibleLanes(
+      recovered,
+      snapshot.tetoEnabled,
+      snapshot.workerEnabled,
+    );
+    const tokens = snapshot.mainContextTokens;
+    const contextWindowTokens = snapshot.mainContextWindowTokens;
+    return {
+      model: snapshot.model,
+      currentContext: {
+        tokens,
+        contextWindowTokens,
+        percent: tokens === null || contextWindowTokens === null
+          ? null
+          : (tokens / contextWindowTokens) * 100,
+      },
+      usage: structuredClone(snapshot.usage),
+      lanes,
     };
   }
 
@@ -2296,6 +2343,37 @@ function latestResumableTurn(
 
 function totalTokens(usage: TokenUsage): number {
   return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+function ensureVisibleLanes(
+  recovered: readonly RecoveredLaneUsage[],
+  tetoEnabled: boolean,
+  workerEnabled: boolean,
+): RecoveredLaneUsage[] {
+  const byLane = new Map(recovered.map((lane) => [
+    lane.laneId,
+    { laneId: lane.laneId, usage: structuredClone(lane.usage) },
+  ]));
+  const ensure = (laneId: string): void => {
+    if (byLane.has(laneId)) return;
+    byLane.set(laneId, {
+      laneId,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+  };
+  ensure("main");
+  if (tetoEnabled) ensure("teto");
+  if (workerEnabled) ensure("worker");
+  const priority = new Map([
+    ["main", 0],
+    ["teto", 1],
+    ["reflection", 2],
+    ["worker", 3],
+  ]);
+  return [...byLane.values()].sort((left, right) => (
+    (priority.get(left.laneId) ?? 4) - (priority.get(right.laneId) ?? 4)
+      || left.laneId.localeCompare(right.laneId)
+  ));
 }
 
 function latestMainContextTokens(

@@ -11,6 +11,7 @@ import {
   AdviceBlock,
   AssistantMessageBlock,
   BrandSplashHeader,
+  ContextUsageBlock,
   NoticeBlock,
   QueuePreview,
   SessionTray,
@@ -22,7 +23,10 @@ import {
   setNausicaaColorScheme,
   terminalSafeText,
 } from "../../src/cli/tui-components.js";
-import type { SessionSnapshot } from "../../src/runtime/index.js";
+import type {
+  SessionContextOverview,
+  SessionSnapshot,
+} from "../../src/runtime/index.js";
 
 const snapshot: SessionSnapshot = {
   workspace: "/work/a-very-long-project-name",
@@ -176,6 +180,62 @@ describe("TUI components", () => {
       permissionProfile: "workspace",
     })).render(100).join("\n"));
     expect(plan).toContain("plan · workspace");
+  });
+
+  it("separates one-decimal current context from cumulative lane usage", () => {
+    const overview: SessionContextOverview = {
+      model: "openrouter:deepseek/deepseek-v4-pro-0813",
+      currentContext: {
+        tokens: 4_600,
+        contextWindowTokens: 1_048_576,
+        percent: (4_600 / 1_048_576) * 100,
+      },
+      usage: {
+        input: 5_000,
+        output: 100,
+        cacheRead: 4_000,
+        cacheWrite: 10,
+        costUsd: 0.1234,
+      },
+      lanes: [
+        {
+          laneId: "main",
+          usage: {
+            input: 3_000,
+            output: 100,
+            cacheRead: 1_000,
+            cacheWrite: 10,
+            costUsd: 0.1,
+          },
+        },
+        {
+          laneId: "teto",
+          usage: {
+            input: 2_000,
+            output: 0,
+            cacheRead: 3_000,
+            cacheWrite: 0,
+            costUsd: 0.0234,
+          },
+        },
+      ],
+    };
+
+    for (const width of [1, 20, 60, 120]) {
+      const lines = new ContextUsageBlock(overview).render(width);
+      for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+    }
+    const rendered = stripTerminalSequences(
+      new ContextUsageBlock(overview).render(60).join("\n"),
+    );
+    expect(rendered).toContain("Current context:");
+    expect(rendered).toContain("0.4% (4.6k/1.0m)");
+    expect(rendered).toContain("Cumulative usage");
+    expect(rendered).toContain("main");
+    expect(rendered).toContain("teto");
+    expect(rendered).toContain("Input: 5,000");
+    expect(rendered).toContain("Total: 9,110");
+    expect(rendered).toContain("Cost: $0.1234");
   });
 
   it("hides an empty Worker summary and names every durable lifecycle", () => {

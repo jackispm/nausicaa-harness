@@ -60,6 +60,7 @@ import {
   AdviceBlock,
   AssistantMessageBlock,
   BrandSplashHeader,
+  ContextUsageBlock,
   getNausicaaColorScheme,
   nausicaaEditorTheme,
   nausicaaMarkdownTheme,
@@ -207,6 +208,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider([
     { name: "help", description: "Show commands" },
     { name: "status", description: "Show session state" },
+    { name: "context", description: "Show context capacity and cumulative lane usage" },
+    { name: "usage", description: "Alias for /context" },
     {
       name: "model",
       description: "Switch the Main model",
@@ -1162,7 +1165,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "/help":
           appendBlock(new Markdown([
             "### Commands",
-            "`/status` session details  ·  `/goal [statement]` show or revise Goal",
+            "`/status` session details  ·  `/context` context and cumulative usage",
+            "`/usage` alias for `/context`  ·  `/goal [statement]` show or revise Goal",
             "`/session [run-id]` switch saved Run  ·  `/new` new Run",
             "`/permissions [profile]` capability boundary  ·  `/plan [prompt]` enter Plan mode",
             "`/mode [default|plan]` collaboration mode  ·  `/model [selector]` switch Main model",
@@ -1178,6 +1182,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           break;
         case "/status":
           writeStatus(options.session.snapshot());
+          break;
+        case "/context":
+        case "/usage":
+          if (argument.length > 0) throw new Error("Usage: /context");
+          appendBlock(new ContextUsageBlock(options.session.contextOverview()));
           break;
         case "/model": {
           if (argument.length === 0) {

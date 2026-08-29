@@ -1002,6 +1002,53 @@ describe("interactive TUI", () => {
     }
   });
 
+  it.each(["/context", "/usage"])(
+    "renders %s locally without model or Ledger mutation",
+    async (command) => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-context-"));
+    const terminal = new MemoryTerminal(60, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const model = new ScriptedModel([]);
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: model,
+        createRunId: () => "interactive-context-run",
+      });
+      const events: SessionRuntimeEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type(command);
+      terminal.send("\r");
+      await waitForOutput(terminal, "Cumulative usage");
+      expect(terminal.output).toContain("Current context:");
+      expect(terminal.output).toContain("not measured yet");
+      expect(model.callCount).toBe(0);
+      expect(events.filter((event) => event.kind === "event")).toHaveLength(0);
+
+      if (command === "/context") {
+        terminal.type("/context extra");
+        terminal.send("\r");
+        await waitForOutput(terminal, "Usage: /context");
+        expect(model.callCount).toBe(0);
+        expect(events.filter((event) => event.kind === "event")).toHaveLength(0);
+      }
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each([44, 100])(
     "completes command arguments and preserves a multiline Goal at %i columns",
     async (columns) => {

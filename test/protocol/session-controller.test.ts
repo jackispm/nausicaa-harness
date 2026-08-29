@@ -493,11 +493,33 @@ describe("SessionController", () => {
       mainContextTokens: requested.payload.estimatedInputTokens,
       mainContextWindowTokens: 128_000,
     });
+    const overview = session.contextOverview();
+    expect(overview.currentContext).toEqual({
+      tokens: requested.payload.estimatedInputTokens,
+      contextWindowTokens: 128_000,
+      percent: (requested.payload.estimatedInputTokens! / 128_000) * 100,
+    });
+    expect(overview.usage).toEqual({
+      input: 10,
+      output: 2,
+      cacheRead: 0,
+      cacheWrite: 0,
+    });
+    expect(overview.lanes).toEqual([{
+      laneId: "main",
+      usage: overview.usage,
+    }]);
+    expect(overview.currentContext.tokens).not.toBe(overview.usage.input);
     await session.selectModel("openrouter:other");
     expect(session.snapshot()).toMatchObject({
       model: "openrouter:other",
       mainContextTokens: null,
       mainContextWindowTokens: 128_000,
+    });
+    expect(session.contextOverview().currentContext).toEqual({
+      tokens: null,
+      contextWindowTokens: 128_000,
+      percent: null,
     });
     await session.close();
   });

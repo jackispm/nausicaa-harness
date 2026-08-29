@@ -15,6 +15,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 import type {
+  SessionContextOverview,
   SessionSnapshot,
   WorkerTaskSummary,
 } from "../runtime/index.js";
@@ -301,6 +302,105 @@ export class SessionTray implements Component {
   }
 
   invalidate(): void {}
+}
+
+/** Prime-aligned detail view: current Main capacity is not cumulative spend. */
+export class ContextUsageBlock implements Component {
+  constructor(private readonly overview: SessionContextOverview) {}
+
+  render(width: number): string[] {
+    const safeWidth = Math.max(1, width);
+    const lines = [
+      palette.strong("Context"),
+      "",
+      `${palette.dim("Model:")} ${palette.muted(terminalSafeText(this.overview.model))}`,
+      formatCurrentContext(this.overview.currentContext, safeWidth),
+      "",
+      palette.strong("Cumulative usage"),
+      "",
+      ...formatLaneUsageTable(this.overview, safeWidth),
+      "",
+      `${palette.dim("Input:")} ${formatExactTokens(this.overview.usage.input)}`,
+      `${palette.dim("Output:")} ${formatExactTokens(this.overview.usage.output)}`,
+      `${palette.dim("Cache read:")} ${formatExactTokens(this.overview.usage.cacheRead)}`,
+      `${palette.dim("Cache write:")} ${formatExactTokens(this.overview.usage.cacheWrite)}`,
+      `${palette.dim("Total:")} ${formatExactTokens(spentTokens(this.overview.usage))}`,
+      ...(this.overview.usage.costUsd === undefined
+        ? []
+        : [`${palette.dim("Cost:")} $${this.overview.usage.costUsd.toFixed(4)}`]),
+    ];
+    return fitLines(lines, safeWidth);
+  }
+
+  invalidate(): void {}
+}
+
+function formatCurrentContext(
+  context: SessionContextOverview["currentContext"],
+  width: number,
+): string {
+  if (context.tokens === null) {
+    return `${palette.dim("Current context:")} ${palette.muted("not measured yet")}`;
+  }
+  if (context.contextWindowTokens === null || context.percent === null) {
+    return `${palette.dim("Current context:")} ${formatExactTokens(context.tokens)} / ${palette.muted("unknown")}`;
+  }
+  const percent = `${context.percent.toFixed(1)}%`;
+  const detail = `${formatTokens(context.tokens)}/${formatTokens(context.contextWindowTokens)}`;
+  const filled = Math.max(0, Math.min(10, Math.round(context.percent / 10)));
+  const bar = palette.accent("▓".repeat(filled)) + palette.dim("░".repeat(10 - filled));
+  const value = width >= 48
+    ? `${bar} ${percent} ${palette.dim(`(${detail})`)}`
+    : `${percent} ${palette.dim(`(${detail})`)}`;
+  return `${palette.dim("Current context:")} ${value}`;
+}
+
+function formatLaneUsageTable(
+  overview: SessionContextOverview,
+  width: number,
+): string[] {
+  if (width < 42) {
+    return overview.lanes.map((lane) => {
+      const cost = lane.usage.costUsd === undefined ? "" : ` · $${lane.usage.costUsd.toFixed(2)}`;
+      return `${terminalSafeText(lane.laneId)} · ${formatTokens(spentTokens(lane.usage))} tokens${cost}`;
+    });
+  }
+  const tokenCells = overview.lanes.map((lane) => formatTokens(spentTokens(lane.usage)));
+  const costCells = overview.lanes.map((lane) => (
+    lane.usage.costUsd === undefined ? "-" : `$${lane.usage.costUsd.toFixed(2)}`
+  ));
+  const tokenWidth = Math.max("tokens".length, ...tokenCells.map((value) => value.length));
+  const costWidth = Math.max("cost".length, ...costCells.map((value) => value.length));
+  const laneWidth = Math.max(8, Math.min(
+    24,
+    width - tokenWidth - costWidth - 8,
+  ));
+  const lines = [palette.dim(
+    `  ${padVisibleEnd("lane", laneWidth)}  ${padVisibleStart("tokens", tokenWidth)}  ${padVisibleStart("cost", costWidth)}`,
+  )];
+  for (const [index, lane] of overview.lanes.entries()) {
+    const label = truncateToWidth(terminalSafeText(lane.laneId), laneWidth, "...");
+    lines.push(
+      `  ${padVisibleEnd(label, laneWidth)}  ${padVisibleStart(tokenCells[index] ?? "0", tokenWidth)}  ${palette.dim(padVisibleStart(costCells[index] ?? "-", costWidth))}`,
+    );
+  }
+  return lines;
+}
+
+function spentTokens(usage: SessionContextOverview["usage"]): number {
+  return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+function formatExactTokens(tokens: number): string {
+  return tokens.toLocaleString("en-US");
+}
+
+function padVisibleEnd(value: string, width: number): string {
+  return `${value}${" ".repeat(Math.max(0, width - visibleWidth(value)))}`;
+}
+
+function padVisibleStart(value: string, width: number): string {
+  return `${" ".repeat(Math.max(0, width - visibleWidth(value)))}${value}`;
 }
 
 function permissionLabel(profile: SessionSnapshot["permissionProfile"]): string {
