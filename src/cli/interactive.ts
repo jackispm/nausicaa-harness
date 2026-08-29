@@ -40,9 +40,13 @@ import {
   imageMarkerIds,
 } from "./image-markers.js";
 import {
+  collaborationModeOptions,
   modelSelectorOptions,
   normalizeModelSelector,
+  parseCollaborationMode,
+  parsePermissionProfile,
   parseThemeChoice,
+  permissionProfileOptions,
   themeSelectorOptions,
   type ThemeChoice,
 } from "./selectors.js";
@@ -199,6 +203,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     { name: "help", description: "Show commands" },
     { name: "status", description: "Show session state" },
     { name: "model", description: "Switch the Main model" },
+    { name: "permissions", description: "Change the tool capability boundary" },
+    { name: "mode", description: "Switch between Default and Plan" },
+    { name: "plan", description: "Enter Plan mode, optionally with a prompt" },
     { name: "theme", description: "Select the TUI color scheme" },
     { name: "goal", description: "Show or revise the Run Goal" },
     { name: "new", description: "Start a new Run" },
@@ -817,7 +824,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       `- **Workspace:** \`${snapshot.workspace}\``,
       `- **Model:** \`${snapshot.model}\``,
       `- **Run / Turn:** \`${snapshot.runId ?? "new"}\` / \`${snapshot.turnId ?? "idle"}\``,
-      `- **State:** ${snapshot.status}; Teto ${snapshot.tetoEnabled ? "on" : "off"}; ${snapshot.allowWrite ? "write enabled" : "file writes off"}; ${snapshot.allowShell ? "shell enabled" : "shell off"}; ${snapshot.allowNetwork ? "network enabled" : "network off"}`,
+      `- **State:** ${snapshot.status}; ${snapshot.collaborationMode} mode; Teto ${snapshot.tetoEnabled ? "on" : "off"}`,
+      `- **Permissions:** ${snapshot.permissionProfile}; ${snapshot.allowWrite ? "write enabled" : "file writes off"}; ${snapshot.allowShell ? "shell enabled" : "shell off"}; ${snapshot.allowNetwork ? "network enabled" : "network off"}`,
       `- **Queue / Tokens:** ${snapshot.pendingInputs} pending; ${usage.input + usage.output} used; ${usage.cacheRead} cache-read`,
       ...(snapshot.blocker === undefined ? [] : [`- **Blocked:** ${snapshot.blocker}`]),
     ].join("\n");
@@ -903,6 +911,82 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
   };
 
+  const applyPermissionProfile = async (value: string): Promise<void> => {
+    try {
+      const profile = parsePermissionProfile(value);
+      const result = await options.session.selectPermissionProfile(profile);
+      if (!result.changed) {
+        appendNotice(`Permissions already use ${result.profile}.`, "info");
+        return;
+      }
+      appendNotice(
+        result.activeTurnUnaffected
+          ? `Permissions set to ${result.profile}. The active Turn keeps ${result.previousProfile}; the next Turn uses the new boundary.`
+          : `Permissions set to ${result.profile}. Future tool calls use the new boundary.`,
+        "success",
+      );
+    } catch (error: unknown) {
+      appendNotice(
+        `Permissions were not changed: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    }
+  };
+
+  const showPermissionSelector = (): void => {
+    const current = options.session.snapshot().permissionProfile;
+    const selector = new SelectorOverlay({
+      title: "Permissions",
+      subtitle: "Choose the capability boundary for future tool calls.",
+      options: permissionProfileOptions(current),
+      current,
+      onSelect: (value) => {
+        closeSelector(false);
+        void applyPermissionProfile(value);
+      },
+      onCancel: () => closeSelector(true),
+    });
+    mountSelector(selector);
+  };
+
+  const applyCollaborationMode = async (value: string): Promise<void> => {
+    try {
+      const mode = parseCollaborationMode(value);
+      const result = await options.session.selectCollaborationMode(mode);
+      if (!result.changed) {
+        appendNotice(`Already using ${result.mode} mode.`, "info");
+        return;
+      }
+      appendNotice(
+        result.activeTurnUnaffected
+          ? `${capitalize(result.mode)} mode selected. The active Turn keeps ${result.previousMode}; the next Turn uses the new mode.`
+          : `${capitalize(result.mode)} mode selected.`,
+        "success",
+      );
+    } catch (error: unknown) {
+      appendNotice(
+        `Mode was not changed: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    }
+  };
+
+  const showCollaborationModeSelector = (): void => {
+    const current = options.session.snapshot().collaborationMode;
+    const selector = new SelectorOverlay({
+      title: "Mode",
+      subtitle: "Default can act; Plan investigates read-only and proposes the work.",
+      options: collaborationModeOptions(current),
+      current,
+      onSelect: (value) => {
+        closeSelector(false);
+        void applyCollaborationMode(value);
+      },
+      onCancel: () => closeSelector(true),
+    });
+    mountSelector(selector);
+  };
+
   const applyThemeChoice = (choice: ThemeChoice): void => {
     themePreference = choice;
     // `auto` follows the last detected terminal scheme; explicit choices take
@@ -948,7 +1032,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     mountSelector(selector, restorePreview);
   };
 
-  const handleCommand = async (commandLine: string): Promise<void> => {
+  const handleCommand = async (
+    commandLine: string,
+    commandImages?: readonly UserImage[],
+  ): Promise<void> => {
     const [command, ...args] = commandLine.split(/\s+/);
     try {
       switch (command) {
@@ -956,7 +1043,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           appendBlock(new Markdown([
             "### Commands",
             "`/status` session details  ·  `/goal [statement]` show or revise Goal",
-            "`/model [selector]` show or switch Main model  ·  `/theme [auto|light|dark]` change colors",
+            "`/permissions [profile]` capability boundary  ·  `/plan [prompt]` enter Plan mode",
+            "`/mode [default|plan]` collaboration mode  ·  `/model [selector]` switch Main model",
+            "`/theme [auto|light|dark]` change colors",
             "`/new` new Run  ·  `/resume` resume",
             "`/cancel` cancel active Turn  ·  `/resolve <operation-id>` resolve recovery",
             "`/copy` copy the last assistant answer",
@@ -975,6 +1064,41 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           }
           const selected = normalizeModelSelector(args.join(" "));
           await applyModelSelection(selected);
+          break;
+        }
+        case "/permissions": {
+          if (args.length === 0) {
+            showPermissionSelector();
+            break;
+          }
+          await applyPermissionProfile(args.join(" "));
+          break;
+        }
+        case "/mode": {
+          if (args.length === 0) {
+            showCollaborationModeSelector();
+            break;
+          }
+          await applyCollaborationMode(args.join(" "));
+          break;
+        }
+        case "/plan": {
+          const status = options.session.snapshot().status;
+          if (status === "running" || status === "cancelling") {
+            throw new Error("/plan is unavailable while Main is working");
+          }
+          await applyCollaborationMode("plan");
+          const prompt = args.join(" ").trim();
+          if (prompt.length > 0) {
+            await options.session.submit({
+              inputId: createInputId(),
+              text: prompt,
+              ...(commandImages === undefined || commandImages.length === 0
+                ? {}
+                : { images: structuredClone([...commandImages]) }),
+              delivery: "new-turn",
+            });
+          }
           break;
         }
         case "/theme": {
@@ -1063,7 +1187,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const { value } = submission;
     if (value.startsWith("/")) {
       addPromptToHistory(value);
-      await handleCommand(value);
+      await handleCommand(value, submission.images);
       return;
     }
     const inputId = createInputId();
@@ -1316,6 +1440,10 @@ function unknownToolDetail(operationId: string): string {
 
 function oneLine(value: string): string {
   return value.replace(/\s+/g, " ").trim().slice(0, 160);
+}
+
+function capitalize(value: string): string {
+  return value.length === 0 ? value : `${value[0]!.toLocaleUpperCase()}${value.slice(1)}`;
 }
 
 function createInputId(): string {

@@ -143,6 +143,35 @@ export interface SessionModelSelectionResult {
   activeRequestUnaffected: boolean;
 }
 
+export type SessionPermissionProfile =
+  | "read-only"
+  | "workspace"
+  | "full-access"
+  | "custom";
+
+export type SelectableSessionPermissionProfile = Exclude<
+  SessionPermissionProfile,
+  "custom"
+>;
+
+export type SessionCollaborationMode = "default" | "plan";
+
+export interface SessionPermissionSelectionResult {
+  profile: SelectableSessionPermissionProfile;
+  previousProfile: SessionPermissionProfile;
+  changed: boolean;
+  /** An active Main loop keeps the catalog captured at its Turn boundary. */
+  activeTurnUnaffected: boolean;
+}
+
+export interface SessionCollaborationModeSelectionResult {
+  mode: SessionCollaborationMode;
+  previousMode: SessionCollaborationMode;
+  changed: boolean;
+  /** An active Main loop keeps the mode captured at its Turn boundary. */
+  activeTurnUnaffected: boolean;
+}
+
 export interface SessionSnapshot {
   workspace: string;
   runId?: string;
@@ -152,6 +181,8 @@ export interface SessionSnapshot {
   model: string;
   tetoEnabled: boolean;
   workerEnabled: boolean;
+  permissionProfile: SessionPermissionProfile;
+  collaborationMode: SessionCollaborationMode;
   allowWrite: boolean;
   allowShell: boolean;
   allowNetwork: boolean;
@@ -206,6 +237,8 @@ export interface SessionControllerOptions {
   allowShell?: boolean;
   /** Explicitly enable network-backed workspace tools for Main. */
   allowNetwork?: boolean;
+  /** Initial collaboration behavior; interactive users may change it later. */
+  collaborationMode?: SessionCollaborationMode;
   /** Optional root directory for per-Run durable process-job metadata. */
   processJobRegistryDir?: string;
   runId?: string;
@@ -271,9 +304,6 @@ export class SessionController {
   readonly tetoModel: string;
   readonly workerModel: string;
   readonly maxOutputTokens: number;
-  readonly allowWrite: boolean;
-  readonly allowShell: boolean;
-  readonly allowNetwork: boolean;
   readonly processJobRegistryDir: string | undefined;
 
   private readonly deps: SessionControllerDeps;
@@ -281,6 +311,10 @@ export class SessionController {
   private readonly policy: RunPolicy;
   private readonly requestedWorkerEnabled: boolean | undefined;
   private selectedMainModel: string;
+  private writeAllowed: boolean;
+  private shellAllowed: boolean;
+  private networkAllowed: boolean;
+  private selectedCollaborationMode: SessionCollaborationMode;
   private readonly listeners = new Set<(event: SessionRuntimeEvent) => void>();
   private readonly contextWindowByModel = new Map<string, number | null>();
   private workerTaskSummaryCache: {
@@ -308,9 +342,10 @@ export class SessionController {
     this.tetoModel = normalizeModelSelector(options.tetoModel ?? options.model);
     this.workerModel = normalizeModelSelector(options.workerModel ?? options.model);
     this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS;
-    this.allowWrite = options.allowWrite === true;
-    this.allowShell = options.allowShell === true;
-    this.allowNetwork = options.allowNetwork === true;
+    this.writeAllowed = options.allowWrite === true;
+    this.shellAllowed = options.allowShell === true;
+    this.networkAllowed = options.allowNetwork === true;
+    this.selectedCollaborationMode = options.collaborationMode ?? "default";
     this.processJobRegistryDir = options.processJobRegistryDir === undefined
       ? undefined
       : resolve(options.processJobRegistryDir);
@@ -350,6 +385,30 @@ export class SessionController {
 
   get model(): string {
     return this.selectedMainModel;
+  }
+
+  get allowWrite(): boolean {
+    return this.writeAllowed;
+  }
+
+  get allowShell(): boolean {
+    return this.shellAllowed;
+  }
+
+  get allowNetwork(): boolean {
+    return this.networkAllowed;
+  }
+
+  get permissionProfile(): SessionPermissionProfile {
+    return permissionProfileForCapabilities({
+      allowWrite: this.writeAllowed,
+      allowShell: this.shellAllowed,
+      allowNetwork: this.networkAllowed,
+    });
+  }
+
+  get collaborationMode(): SessionCollaborationMode {
+    return this.selectedCollaborationMode;
   }
 
   modelCapabilities(): SessionModelCapabilities {
@@ -424,6 +483,73 @@ export class SessionController {
     });
   }
 
+  /**
+   * Change which first-party capabilities Main receives on its next Turn.
+   * Workspace deliberately excludes Bash because Nausicaa does not yet own an
+   * OS-level workspace sandbox; Full Access makes that host-level boundary
+   * explicit instead of hiding it behind a misleading label.
+   */
+  async selectPermissionProfile(
+    profile: SelectableSessionPermissionProfile,
+  ): Promise<SessionPermissionSelectionResult> {
+    return this.runAdmission(async () => {
+      this.assertOpen();
+      const normalized = normalizePermissionProfile(profile);
+      const previousProfile = this.permissionProfile;
+      const activeTurnUnaffected = this.active !== undefined;
+      const next = capabilitiesForPermissionProfile(normalized);
+      const changed = this.writeAllowed !== next.allowWrite
+        || this.shellAllowed !== next.allowShell
+        || this.networkAllowed !== next.allowNetwork;
+      if (!changed) {
+        return {
+          profile: normalized,
+          previousProfile,
+          changed: false,
+          activeTurnUnaffected,
+        };
+      }
+      this.writeAllowed = next.allowWrite;
+      this.shellAllowed = next.allowShell;
+      this.networkAllowed = next.allowNetwork;
+      this.publishState();
+      return {
+        profile: normalized,
+        previousProfile,
+        changed: true,
+        activeTurnUnaffected,
+      };
+    });
+  }
+
+  /** Select Default or Plan behavior for the next Turn boundary. */
+  async selectCollaborationMode(
+    mode: SessionCollaborationMode,
+  ): Promise<SessionCollaborationModeSelectionResult> {
+    return this.runAdmission(async () => {
+      this.assertOpen();
+      const normalized = normalizeCollaborationMode(mode);
+      const previousMode = this.selectedCollaborationMode;
+      const activeTurnUnaffected = this.active !== undefined;
+      if (normalized === previousMode) {
+        return {
+          mode: normalized,
+          previousMode,
+          changed: false,
+          activeTurnUnaffected,
+        };
+      }
+      this.selectedCollaborationMode = normalized;
+      this.publishState();
+      return {
+        mode: normalized,
+        previousMode,
+        changed: true,
+        activeTurnUnaffected,
+      };
+    });
+  }
+
   snapshot(): SessionSnapshot {
     const events = this.attached?.sink.cachedEvents ?? [];
     const usage = this.attached === undefined
@@ -441,6 +567,8 @@ export class SessionController {
       tetoEnabled: this.attached?.policy.tetoEnabled ?? this.policy.tetoEnabled,
       workerEnabled: this.attached?.policy.workerEnabled === true
         || (this.attached === undefined && this.policy.workerEnabled === true),
+      permissionProfile: this.permissionProfile,
+      collaborationMode: this.collaborationMode,
       allowWrite: this.allowWrite,
       allowShell: this.allowShell,
       allowNetwork: this.allowNetwork,
@@ -1241,6 +1369,12 @@ export class SessionController {
 
   private async runTurn(turn: ActiveTurn): Promise<void> {
     const attached = this.requireAttached();
+    const turnCapabilities = {
+      allowWrite: this.allowWrite,
+      allowShell: this.allowShell,
+      allowNetwork: this.allowNetwork,
+    } as const;
+    const turnCollaborationMode = this.collaborationMode;
     let scheduler: TetoScheduler | undefined;
     try {
       const events = await attached.ledger.read({ runId: attached.runId });
@@ -1269,13 +1403,20 @@ export class SessionController {
         events,
         clock: this.clock,
       });
+      if (
+        this.deps.tools === undefined
+        && turnCapabilities.allowShell
+        && attached.processJobs === undefined
+      ) {
+        attached.processJobs = await this.createProcessJobManager(attached.runId);
+      }
       const tools = [...(this.deps.tools ?? createWorkspaceTools({
-        allowWrite: this.allowWrite,
-        allowShell: this.allowShell,
-        allowProcessJobs: this.allowShell,
+        allowWrite: turnCapabilities.allowWrite,
+        allowShell: turnCapabilities.allowShell,
+        allowProcessJobs: turnCapabilities.allowShell,
         ...(attached.processJobs === undefined ? {} : { processJobManager: attached.processJobs }),
         allowImages: shouldAdvertiseImageTools(model, this.model),
-        allowNetwork: this.allowNetwork,
+        allowNetwork: turnCapabilities.allowNetwork,
         ...(this.deps.webFetchProvider === undefined
           ? {}
           : { webFetchProvider: this.deps.webFetchProvider }),
@@ -1425,6 +1566,7 @@ export class SessionController {
         upperWatermark: latestEvents.at(-1)?.globalOffset ?? 0,
         startStep: highestTurnStep(latestEvents, turn.turnId) + 1,
         maxOutputTokens: this.maxOutputTokens,
+        collaborationMode: turnCollaborationMode,
         completeRun: false,
         signal: turn.controller.signal,
       });
@@ -2211,6 +2353,54 @@ async function readTurnObjective(
   return text.trim().length === 0 ? "Analyze the attached image(s)" : text;
 }
 
+function capabilitiesForPermissionProfile(
+  profile: SelectableSessionPermissionProfile,
+): { allowWrite: boolean; allowShell: boolean; allowNetwork: boolean } {
+  switch (profile) {
+    case "read-only":
+      return { allowWrite: false, allowShell: false, allowNetwork: false };
+    case "workspace":
+      return { allowWrite: true, allowShell: false, allowNetwork: false };
+    case "full-access":
+      return { allowWrite: true, allowShell: true, allowNetwork: true };
+  }
+}
+
+function permissionProfileForCapabilities(capabilities: {
+  allowWrite: boolean;
+  allowShell: boolean;
+  allowNetwork: boolean;
+}): SessionPermissionProfile {
+  if (!capabilities.allowWrite && !capabilities.allowShell && !capabilities.allowNetwork) {
+    return "read-only";
+  }
+  if (capabilities.allowWrite && !capabilities.allowShell && !capabilities.allowNetwork) {
+    return "workspace";
+  }
+  if (capabilities.allowWrite && capabilities.allowShell && capabilities.allowNetwork) {
+    return "full-access";
+  }
+  return "custom";
+}
+
+function normalizePermissionProfile(
+  profile: SelectableSessionPermissionProfile,
+): SelectableSessionPermissionProfile {
+  if (profile !== "read-only" && profile !== "workspace" && profile !== "full-access") {
+    throw new SessionProtocolError(
+      "permission profile must be read-only, workspace, or full-access",
+    );
+  }
+  return profile;
+}
+
+function normalizeCollaborationMode(mode: SessionCollaborationMode): SessionCollaborationMode {
+  if (mode !== "default" && mode !== "plan") {
+    throw new SessionProtocolError("collaboration mode must be default or plan");
+  }
+  return mode;
+}
+
 function validateOptions(options: SessionControllerOptions): void {
   if (options.workspace.length === 0 || options.dataDir.length === 0 || options.model.length === 0) {
     throw new SessionProtocolError("workspace, dataDir, and model are required");
@@ -2231,6 +2421,9 @@ function validateOptions(options: SessionControllerOptions): void {
   }
   if (options.workerEnabled !== undefined && typeof options.workerEnabled !== "boolean") {
     throw new SessionProtocolError("workerEnabled must be a boolean");
+  }
+  if (options.collaborationMode !== undefined) {
+    normalizeCollaborationMode(options.collaborationMode);
   }
   if (
     options.processJobRegistryDir !== undefined

@@ -278,8 +278,12 @@ export class SessionTray implements Component {
     if (snapshot.workerEnabled) lanes.push("Worker");
     const topology = `${lanes.join(" + ")}/${state}`;
     const transientStatus = this.readTransientStatus();
+    const controls = [
+      snapshot.collaborationMode === "plan" ? "plan" : undefined,
+      permissionLabel(snapshot.permissionProfile),
+    ].filter((value): value is string => value !== undefined).join(" · ");
     const left = transientStatus === undefined
-      ? ` ← ${topology}   ${shortModel(snapshot.model)}`
+      ? ` ← ${topology}   ${shortModel(snapshot.model)}   ${controls}`
       : ` ← ${terminalSafeText(transientStatus)}`;
     const contextPercent = snapshot.mainContextTokens === null
       || snapshot.mainContextWindowTokens === null
@@ -292,6 +296,15 @@ export class SessionTray implements Component {
   }
 
   invalidate(): void {}
+}
+
+function permissionLabel(profile: SessionSnapshot["permissionProfile"]): string {
+  switch (profile) {
+    case "read-only": return "read only";
+    case "workspace": return "workspace";
+    case "full-access": return "full access";
+    case "custom": return "custom permissions";
+  }
 }
 
 /** A quiet, durable summary of Worker tasks in the attached Run. */

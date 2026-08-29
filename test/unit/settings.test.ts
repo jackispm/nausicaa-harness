@@ -134,7 +134,7 @@ describe("settings", () => {
       maxOutputTokens: 8_192,
       dataDir: "/work/.nausicaa",
       allowShell: false,
-      allowWrite: false,
+      allowWrite: true,
       allowNetwork: false,
       fukaiCompaction: {
         enabled: false,
@@ -237,19 +237,19 @@ describe("settings", () => {
     )).toThrow(/maxOutputTokens.*1.*1000000/i);
   });
 
-  it("keeps writes disabled by default and supports explicit overrides", () => {
+  it("enables workspace writes by default and supports explicit overrides", () => {
     expect(resolveSettings(
       "/work",
       { model: "openrouter:base" },
       {},
-      {},
-    ).allowWrite).toBe(false);
-    expect(resolveSettings(
-      "/work",
-      { model: "openrouter:base" },
-      { allowWrite: true },
       {},
     ).allowWrite).toBe(true);
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base" },
+      { allowWrite: false },
+      {},
+    ).allowWrite).toBe(false);
   });
 
   it("keeps shell access disabled by default and independent from writes", () => {

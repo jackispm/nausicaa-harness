@@ -8,14 +8,29 @@ import {
 } from "../../src/cli/tool-renderers.js";
 
 describe("tool presentation registry", () => {
-  it("covers every built-in coding tool and falls back for unknown tools", () => {
+  it("covers every first-party Mowe tool and falls back for unknown tools", () => {
     expect(Object.keys(TOOL_PRESENTATION_RENDERERS).sort()).toEqual([
       "bash",
+      "delegate_task",
+      "directory_create",
       "edit",
+      "file_info",
       "find",
       "grep",
       "list_files",
+      "path_copy",
+      "path_delete",
+      "path_move",
+      "process_kill",
+      "process_list",
+      "process_output",
+      "process_start",
+      "process_status",
       "read_file",
+      "read_image",
+      "respond_to_advice",
+      "web_fetch",
+      "web_search",
       "write_file",
     ]);
 
@@ -201,6 +216,226 @@ describe("tool presentation registry", () => {
     });
     expect(write.summary).toBe("src/new.ts · 10 B written");
     expect(text(write.expanded)).not.toContain("export {}");
+  });
+
+  it("renders file metadata, images, and path mutations without result JSON", () => {
+    const info = renderToolPresentation({
+      name: "file_info",
+      arguments: { path: "bin/run" },
+      result: {
+        path: "bin/run",
+        type: "file",
+        byteLength: 2_048,
+        mode: 0o755,
+        executable: true,
+        modifiedAt: "2026-08-30T00:00:00.000Z",
+        createdAt: "2026-08-29T00:00:00.000Z",
+        hash: "sha256:abc",
+      },
+      status: "succeeded",
+      width: 100,
+    });
+    expect(info.summary).toBe("bin/run · file · 2.0 KB");
+    expect(text(info.expanded)).toContain("Mode 0755 · executable");
+    expect(text(info.expanded)).toContain("sha256:abc");
+    expect(text(info.expanded)).not.toContain('"modifiedAt"');
+
+    const image = renderToolPresentation({
+      name: "read_image",
+      arguments: { path: "screen.png" },
+      result: { path: "screen.png", mimeType: "image/png", byteLength: 4_096 },
+      status: "succeeded",
+      width: 80,
+    });
+    expect(image.summary).toBe("screen.png · image/png · 4.0 KB");
+    expect(text(image.expanded)).toBe("Image attached to model context");
+
+    const created = renderToolPresentation({
+      name: "directory_create",
+      arguments: { path: "fixtures/new", parents: true },
+      result: { path: "fixtures/new", created: true, parents: true },
+      status: "succeeded",
+      width: 80,
+    });
+    expect(created.summary).toBe("fixtures/new · created");
+    expect(text(created.expanded)).toBe("Parent creation enabled");
+
+    const copied = renderToolPresentation({
+      name: "path_copy",
+      arguments: { from: "a.txt", to: "b.txt" },
+      result: { from: "a.txt", to: "b.txt", type: "file", bytes: 12 },
+      status: "succeeded",
+      width: 80,
+    });
+    expect(copied.summary).toBe("a.txt -> b.txt · copied · file · 12 B");
+
+    const moved = renderToolPresentation({
+      name: "path_move",
+      arguments: { from: "old", to: "new" },
+      result: { from: "old", to: "new", type: "directory" },
+      status: "succeeded",
+      width: 80,
+    });
+    expect(moved.summary).toBe("old -> new · moved · directory");
+
+    const deleted = renderToolPresentation({
+      name: "path_delete",
+      arguments: { path: "old", recursive: true },
+      result: { path: "old", type: "directory", deleted: true, recursive: true },
+      status: "succeeded",
+      width: 80,
+    });
+    expect(deleted.summary).toBe("old · directory deleted recursively");
+  });
+
+  it("renders web fetches and searches as bounded content and citeable sources", () => {
+    const fetched = renderToolPresentation({
+      name: "web_fetch",
+      arguments: { url: "https://example.test/docs" },
+      result: {
+        url: "https://example.test/docs",
+        statusCode: 200,
+        contentType: "text/plain",
+        body: { kind: "text", content: "first\nsecond\nthird\nfourth" },
+        truncated: true,
+      },
+      status: "succeeded",
+      width: 100,
+    });
+    expect(fetched.summary).toContain("HTTP 200 · text");
+    expect(fetched.summary).toContain("more");
+    expect(text(fetched.collapsed)).toContain("... 2 more lines");
+    expect(text(fetched.expanded)).toContain("fourth");
+    expect(text(fetched.expanded)).not.toContain('"body"');
+
+    const searched = renderToolPresentation({
+      name: "web_search",
+      arguments: { queries: ["Nausicaa runtime", "Nausicaa Mowe"] },
+      result: {
+        sources: [
+          { url: "https://example.test/a", title: "Architecture", snippet: "Runtime notes" },
+          { url: "https://example.test/b", title: "Tools" },
+        ],
+        truncated: false,
+      },
+      status: "succeeded",
+      width: 100,
+    });
+    expect(searched.summary).toBe("2 searches · 2 sources");
+    expect(text(searched.collapsed)).toContain("Architecture · https://example.test/a");
+    expect(text(searched.expanded)).toContain("Runtime notes");
+    expect(text(searched.expanded)).not.toContain('"sources"');
+
+    const failed = renderToolPresentation({
+      name: "web_fetch",
+      arguments: { url: "http://127.0.0.1" },
+      result: { error: { code: "WEB_URL_BLOCKED", message: "URL is private" } },
+      status: "failed",
+      width: 80,
+    });
+    expect(failed.summary).toBe("WEB_URL_BLOCKED: URL is private");
+    expect(text(failed.collapsed)).toBe("WEB_URL_BLOCKED: URL is private");
+  });
+
+  it("renders background process lifecycle and output without snapshot JSON", () => {
+    const snapshot = {
+      id: "job-123",
+      pid: 42,
+      state: "running",
+      exitCode: null,
+      signal: null,
+      startedAt: "2026-08-30T00:00:00.000Z",
+      endedAt: null,
+      stdout: { content: "", totalLines: 3, totalBytes: 30, outputLines: 3, outputBytes: 30, truncated: false },
+      stderr: { content: "", totalLines: 0, totalBytes: 0, outputLines: 0, outputBytes: 0, truncated: false },
+    };
+    const started = renderToolPresentation({
+      name: "process_start",
+      arguments: { command: "npm run dev" },
+      result: snapshot,
+      status: "succeeded",
+      width: 100,
+    });
+    expect(started.summary).toBe("$ npm run dev · running");
+    expect(text(started.collapsed)).toBe("job-123 · pid 42");
+    expect(text(started.expanded)).toContain("stdout · 3 lines · 30 B");
+    expect(text(started.expanded)).not.toContain('"startedAt"');
+
+    for (const name of ["process_status", "process_kill"] as const) {
+      const rendered = renderToolPresentation({
+        name,
+        arguments: { jobId: "job-123" },
+        result: { ...snapshot, state: name === "process_kill" ? "killed" : "running" },
+        status: "succeeded",
+        width: 100,
+      });
+      expect(rendered.summary).toContain(`job-123 · ${name === "process_kill" ? "killed" : "running"}`);
+    }
+
+    const output = renderToolPresentation({
+      name: "process_output",
+      arguments: { jobId: "job-123", stream: "both" },
+      result: {
+        jobId: "job-123",
+        state: "running",
+        stream: "both",
+        stdout: { content: "ready\nserving", truncated: false },
+        stderr: { content: "warning", truncated: true, outputBytes: 7, totalBytes: 70 },
+      },
+      status: "succeeded",
+      width: 80,
+    });
+    expect(output.summary).toBe("job-123 · running · both");
+    expect(text(output.expanded)).toContain("ready\nserving");
+    expect(text(output.expanded)).toContain("stderr truncated · showing 7 B of 70 B");
+    expect(text(output.expanded)).not.toContain('"stdout"');
+
+    const list = renderToolPresentation({
+      name: "process_list",
+      result: JSON.stringify([
+        { snapshot, status: "attached", persisted: true },
+        { snapshot: { ...snapshot, id: "job-456", pid: null, state: "succeeded" }, status: "terminal", persisted: true },
+      ]),
+      status: "succeeded",
+      width: 100,
+    });
+    expect(list.summary).toBe("2 process jobs");
+    expect(text(list.expanded)).toContain("job-123 · running · pid 42 · attached");
+    expect(text(list.expanded)).toContain("job-456 · succeeded · terminal");
+    expect(text(list.expanded)).not.toContain('"snapshot"');
+  });
+
+  it("renders Worker delegation and Teto acknowledgement as collaboration events", () => {
+    const delegated = renderToolPresentation({
+      name: "delegate_task",
+      arguments: {
+        statement: "Inspect the storage boundary",
+        successCriteria: ["Identify the owner"],
+        hardConstraints: ["Read only"],
+        input: "bounded source",
+        maxModelTokens: 2_000,
+        maxWallClockMs: 30_000,
+      },
+      result: { status: "queued", taskId: "task-storage", messageId: "message-1" },
+      status: "succeeded",
+      width: 100,
+    });
+    expect(delegated.summary).toBe("Inspect the storage boundary · queued");
+    expect(text(delegated.collapsed)).toBe("task-storage");
+    expect(text(delegated.expanded)).toContain("success  Identify the owner");
+    expect(text(delegated.expanded)).toContain("limit    Read only");
+    expect(text(delegated.expanded)).toContain("2000 tokens · 30.0s");
+    expect(text(delegated.expanded)).not.toContain("bounded source");
+
+    const advice = renderToolPresentation({
+      name: "respond_to_advice",
+      arguments: { adviceId: "advice-1", disposition: "accept", reason: "It closes the gap" },
+      result: { adviceId: "advice-1", disposition: "accept", status: "acknowledged" },
+      status: "succeeded",
+      width: 80,
+    });
+    expect(advice.summary).toBe("accept advice-1 · acknowledged");
+    expect(text(advice.expanded)).toBe("It closes the gap");
   });
 
   it("distinguishes a partial read line from an empty file", () => {

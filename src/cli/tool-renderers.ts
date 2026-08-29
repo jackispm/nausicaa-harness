@@ -68,8 +68,23 @@ export const TOOL_PRESENTATION_RENDERERS: Readonly<Record<string, ToolPresentati
     list_files: renderListFiles,
     grep: renderGrep,
     find: renderFind,
+    file_info: renderFileInfo,
+    read_image: renderReadImage,
     write_file: renderWriteFile,
     edit: renderEdit,
+    directory_create: renderDirectoryCreate,
+    path_copy: renderPathCopy,
+    path_move: renderPathMove,
+    path_delete: renderPathDelete,
+    web_fetch: renderWebFetch,
+    web_search: renderWebSearch,
+    process_start: renderProcessStart,
+    process_status: renderProcessStatus,
+    process_output: renderProcessOutput,
+    process_kill: renderProcessKill,
+    process_list: renderProcessList,
+    delegate_task: renderDelegateTask,
+    respond_to_advice: renderAdviceResponse,
   });
 
 export function renderToolPresentation(input: ToolPresentationInput): ToolPresentation {
@@ -295,6 +310,54 @@ function renderFind(context: ToolRenderContext): ToolPresentation {
   };
 }
 
+function renderFileInfo(context: ToolRenderContext): ToolPresentation {
+  const argumentPath = stringValue(context.arguments?.path) ?? "...";
+  const failure = resultFailure(context, argumentPath);
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, argumentPath);
+
+  const path = stringValue(context.result.path) ?? argumentPath;
+  const type = stringValue(context.result.type) ?? "path";
+  const bytes = integer(context.result.byteLength);
+  const mode = integer(context.result.mode);
+  const executable = context.result.executable === true;
+  const details = [type, bytes === undefined ? undefined : formatBytes(bytes)]
+    .filter((value): value is string => value !== undefined)
+    .join(" · ");
+  const rows: ToolPresentationLine[] = [];
+  if (mode !== undefined) {
+    rows.push(line(`Mode 0${mode.toString(8).padStart(3, "0")}${executable ? " · executable" : ""}`, "muted"));
+  }
+  const modified = stringValue(context.result.modifiedAt);
+  const created = stringValue(context.result.createdAt);
+  if (modified !== undefined) rows.push(line(`Modified ${modified}`, "muted"));
+  if (created !== undefined) rows.push(line(`Created ${created}`, "muted"));
+  const hash = stringValue(context.result.hash);
+  if (hash !== undefined) rows.push(...wrapRows(hash, context.width, "output"));
+  return {
+    summary: `${path}${details.length === 0 ? "" : ` · ${details}`}`,
+    collapsed: [],
+    expanded: rows,
+  };
+}
+
+function renderReadImage(context: ToolRenderContext): ToolPresentation {
+  const argumentPath = stringValue(context.arguments?.path) ?? "...";
+  const failure = resultFailure(context, argumentPath);
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, argumentPath);
+
+  const path = stringValue(context.result.path) ?? argumentPath;
+  const mimeType = stringValue(context.result.mimeType) ?? "image";
+  const bytes = integer(context.result.byteLength);
+  const detail = `${mimeType}${bytes === undefined ? "" : ` · ${formatBytes(bytes)}`}`;
+  return {
+    summary: `${path} · ${detail}`,
+    collapsed: [],
+    expanded: [line("Image attached to model context", "muted")],
+  };
+}
+
 function renderWriteFile(context: ToolRenderContext): ToolPresentation {
   const argumentPath = stringValue(context.arguments?.path) ?? "...";
   const failure = resultFailure(context, argumentPath);
@@ -335,6 +398,288 @@ function renderEdit(context: ToolRenderContext): ToolPresentation {
   };
 }
 
+function renderDirectoryCreate(context: ToolRenderContext): ToolPresentation {
+  const argumentPath = stringValue(context.arguments?.path) ?? "...";
+  const failure = resultFailure(context, argumentPath);
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, argumentPath);
+
+  const path = stringValue(context.result.path) ?? argumentPath;
+  const created = context.result.created === true;
+  const parents = context.result.parents === true;
+  return {
+    summary: `${path} · ${created ? "created" : "already exists"}`,
+    collapsed: [],
+    expanded: [line(parents ? "Parent creation enabled" : "Parent creation disabled", "muted")],
+  };
+}
+
+function renderPathCopy(context: ToolRenderContext): ToolPresentation {
+  return renderPathTransfer(context, "copied");
+}
+
+function renderPathMove(context: ToolRenderContext): ToolPresentation {
+  return renderPathTransfer(context, "moved");
+}
+
+function renderPathTransfer(
+  context: ToolRenderContext,
+  action: "copied" | "moved",
+): ToolPresentation {
+  const fromArgument = stringValue(context.arguments?.from) ?? "...";
+  const toArgument = stringValue(context.arguments?.to) ?? "...";
+  const callSummary = `${fromArgument} -> ${toArgument}`;
+  const failure = resultFailure(context, callSummary);
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, callSummary);
+
+  const from = stringValue(context.result.from) ?? fromArgument;
+  const to = stringValue(context.result.to) ?? toArgument;
+  const type = stringValue(context.result.type);
+  const bytes = integer(context.result.bytes);
+  const detail = [action, type, bytes === undefined ? undefined : formatBytes(bytes)]
+    .filter((value): value is string => value !== undefined)
+    .join(" · ");
+  return {
+    summary: `${from} -> ${to} · ${detail}`,
+    collapsed: [],
+    expanded: [],
+  };
+}
+
+function renderPathDelete(context: ToolRenderContext): ToolPresentation {
+  const argumentPath = stringValue(context.arguments?.path) ?? "...";
+  const failure = resultFailure(context, argumentPath);
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, argumentPath);
+
+  const path = stringValue(context.result.path) ?? argumentPath;
+  const type = stringValue(context.result.type) ?? "path";
+  const recursive = context.result.recursive === true;
+  return {
+    summary: `${path} · ${type} deleted${recursive ? " recursively" : ""}`,
+    collapsed: [],
+    expanded: [],
+  };
+}
+
+function renderWebFetch(context: ToolRenderContext): ToolPresentation {
+  const argumentUrl = stringValue(context.arguments?.url) ?? "...";
+  const failure = resultFailure(context, argumentUrl);
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, argumentUrl);
+
+  const url = stringValue(context.result.url) ?? argumentUrl;
+  const statusCode = integer(context.result.statusCode);
+  const contentType = stringValue(context.result.contentType);
+  const body = isRecord(context.result.body) ? context.result.body : undefined;
+  const kind = stringValue(body?.kind);
+  const content = stringValue(body?.content) ?? "";
+  const rows = content.length === 0
+    ? [line("(empty response)", "muted")]
+    : wrapRows(content, context.width, "output");
+  if (statusCode !== undefined && statusCode >= 400) {
+    rows.push(line(`HTTP ${statusCode}`, "warning"));
+  }
+  if (context.result.truncated === true) rows.push(line("... response truncated", "warning"));
+  const metadata = [
+    statusCode === undefined ? undefined : `HTTP ${statusCode}`,
+    kind ?? contentType,
+    content.length === 0 ? undefined : formatBytes(Buffer.byteLength(content, "utf8")),
+    context.result.truncated === true ? "more" : undefined,
+  ].filter((value): value is string => value !== undefined).join(" · ");
+  return {
+    summary: `${url}${metadata.length === 0 ? "" : ` · ${metadata}`}`,
+    collapsed: headPreview(rows, 3),
+    expanded: boundedRows(rows),
+  };
+}
+
+function renderWebSearch(context: ToolRenderContext): ToolPresentation {
+  const queries = stringArray(context.arguments?.queries);
+  const querySummary = queries.length === 0
+    ? "web search"
+    : queries.length === 1
+      ? oneLine(queries[0] ?? "")
+      : `${queries.length} searches`;
+  const failure = resultFailure(context, querySummary);
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, querySummary);
+
+  const sources = Array.isArray(context.result.sources)
+    ? context.result.sources.filter(isRecord)
+    : [];
+  const expanded: ToolPresentationLine[] = [];
+  const content = stringValue(context.result.content);
+  if (content !== undefined && content.length > 0) {
+    expanded.push(...wrapRows(content, context.width, "output"));
+  }
+  const collapsed: ToolPresentationLine[] = [];
+  for (const [index, source] of sources.entries()) {
+    const url = stringValue(source.url) ?? "unknown source";
+    const title = stringValue(source.title) ?? url;
+    collapsed.push(...wrapPrefixed(`${index + 1}. `, `${title} · ${url}`, context.width, "output"));
+    expanded.push(...wrapPrefixed(`${index + 1}. `, title, context.width, "output"));
+    if (title !== url) expanded.push(...wrapRows(url, context.width, "muted"));
+    const snippet = stringValue(source.snippet);
+    if (snippet !== undefined) expanded.push(...wrapRows(snippet, context.width, "context"));
+    const publishedAt = stringValue(source.publishedAt);
+    if (publishedAt !== undefined) expanded.push(line(`Published ${publishedAt}`, "muted"));
+  }
+  if (sources.length === 0 && expanded.length === 0) expanded.push(line("No sources", "muted"));
+  if (context.result.truncated === true) {
+    collapsed.push(line("... more sources", "warning"));
+    expanded.push(line("... more sources", "warning"));
+  }
+  return {
+    summary: `${querySummary} · ${sources.length} source${sources.length === 1 ? "" : "s"}${context.result.truncated === true ? " · more" : ""}`,
+    collapsed: headPreview(collapsed, 3),
+    expanded: boundedRows(expanded),
+  };
+}
+
+function renderProcessStart(context: ToolRenderContext): ToolPresentation {
+  const command = stringValue(context.arguments?.command) ?? "...";
+  const failure = resultFailure(context, `$ ${oneLine(command)}`);
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, `$ ${oneLine(command)}`);
+  return renderProcessSnapshot(context, `$ ${oneLine(command)}`, true);
+}
+
+function renderProcessStatus(context: ToolRenderContext): ToolPresentation {
+  return renderProcessSnapshot(context, stringValue(context.arguments?.jobId) ?? "process", false);
+}
+
+function renderProcessKill(context: ToolRenderContext): ToolPresentation {
+  return renderProcessSnapshot(context, stringValue(context.arguments?.jobId) ?? "process", false);
+}
+
+function renderProcessSnapshot(
+  context: ToolRenderContext,
+  callSummary: string,
+  preserveCallSummary: boolean,
+): ToolPresentation {
+  const failure = resultFailure(context, callSummary);
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, callSummary);
+
+  const id = stringValue(context.result.id) ?? stringValue(context.arguments?.jobId) ?? "process";
+  const state = stringValue(context.result.state) ?? context.status;
+  const pid = nullableNumber(context.result.pid);
+  const exitCode = nullableNumber(context.result.exitCode);
+  const signal = stringValue(context.result.signal);
+  const rows: ToolPresentationLine[] = [
+    line(`${id}${pid === undefined || pid === null ? "" : ` · pid ${pid}`}`, "muted"),
+  ];
+  if (exitCode !== undefined && exitCode !== null) rows.push(line(`Exit code ${exitCode}`, exitCode === 0 ? "muted" : "error"));
+  if (signal !== undefined) rows.push(line(`Signal ${signal}`, "warning"));
+  const startedAt = stringValue(context.result.startedAt);
+  const endedAt = stringValue(context.result.endedAt);
+  if (startedAt !== undefined) rows.push(line(`Started ${startedAt}`, "muted"));
+  if (endedAt !== undefined) rows.push(line(`Ended ${endedAt}`, "muted"));
+  appendProcessOutputCounters(rows, "stdout", context.result.stdout);
+  appendProcessOutputCounters(rows, "stderr", context.result.stderr);
+  return {
+    summary: `${preserveCallSummary ? callSummary : id} · ${state}`,
+    collapsed: rows.slice(0, 1),
+    expanded: rows,
+  };
+}
+
+function renderProcessOutput(context: ToolRenderContext): ToolPresentation {
+  const argumentId = stringValue(context.arguments?.jobId) ?? "process";
+  const failure = resultFailure(context, argumentId);
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, argumentId);
+
+  const id = stringValue(context.result.jobId) ?? argumentId;
+  const state = stringValue(context.result.state) ?? "unknown";
+  const stream = stringValue(context.result.stream) ?? "both";
+  const rows: ToolPresentationLine[] = [];
+  appendProcessOutput(rows, context.result.stdout, "output", context.width);
+  appendProcessOutput(rows, context.result.stderr, "error", context.width);
+  if (rows.length === 0) rows.push(line("(no output)", "muted"));
+  return {
+    summary: `${id} · ${state} · ${stream}`,
+    collapsed: tailPreview(rows, BASH_PREVIEW_LINES),
+    expanded: boundedTailRows(rows),
+  };
+}
+
+function renderProcessList(context: ToolRenderContext): ToolPresentation {
+  const failure = resultFailure(context, "process jobs");
+  if (failure !== undefined) return failure;
+  const entries = parseArray(context.rawResult).filter(isRecord);
+  if (entries.length === 0 && context.rawResult.length === 0) {
+    return { summary: "process jobs", collapsed: [], expanded: [] };
+  }
+  const rows: ToolPresentationLine[] = [];
+  for (const entry of entries) {
+    const snapshot = isRecord(entry.snapshot) ? entry.snapshot : entry;
+    const id = stringValue(snapshot.id) ?? "unknown-job";
+    const state = stringValue(snapshot.state) ?? "unknown";
+    const pid = nullableNumber(snapshot.pid);
+    const registryStatus = stringValue(entry.status);
+    rows.push(...wrapRows(
+      `${id} · ${state}${pid === undefined || pid === null ? "" : ` · pid ${pid}`}${registryStatus === undefined ? "" : ` · ${registryStatus}`}`,
+      context.width,
+      state === "failed" || state === "output_limited" ? "error" : "output",
+    ));
+  }
+  if (rows.length === 0) rows.push(line("No process jobs", "muted"));
+  return {
+    summary: `${entries.length} process job${entries.length === 1 ? "" : "s"}`,
+    collapsed: headPreview(rows, 5),
+    expanded: boundedRows(rows),
+  };
+}
+
+function renderDelegateTask(context: ToolRenderContext): ToolPresentation {
+  const statement = stringValue(context.arguments?.statement) ?? "Worker task";
+  const failure = resultFailure(context, oneLine(statement));
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, oneLine(statement));
+
+  const taskId = stringValue(context.result.taskId) ?? stringValue(context.arguments?.taskId);
+  const status = stringValue(context.result.status) ?? "queued";
+  const rows: ToolPresentationLine[] = [];
+  if (taskId !== undefined) rows.push(line(`${taskId} · ${status}`, "muted"));
+  const successCriteria = stringArray(context.arguments?.successCriteria);
+  for (const criterion of successCriteria) rows.push(...wrapPrefixed("success  ", criterion, context.width, "context"));
+  const hardConstraints = stringArray(context.arguments?.hardConstraints);
+  for (const constraint of hardConstraints) rows.push(...wrapPrefixed("limit    ", constraint, context.width, "warning"));
+  const input = stringValue(context.arguments?.input);
+  if (input !== undefined) rows.push(line(`Input ${formatBytes(Buffer.byteLength(input, "utf8"))}`, "muted"));
+  const maxModelTokens = integer(context.arguments?.maxModelTokens);
+  const maxWallClockMs = integer(context.arguments?.maxWallClockMs);
+  if (maxModelTokens !== undefined || maxWallClockMs !== undefined) {
+    rows.push(line([
+      maxModelTokens === undefined ? undefined : `${maxModelTokens} tokens`,
+      maxWallClockMs === undefined ? undefined : formatDuration(maxWallClockMs),
+    ].filter((value): value is string => value !== undefined).join(" · "), "muted"));
+  }
+  return {
+    summary: `${oneLine(statement)} · ${status}`,
+    collapsed: taskId === undefined ? [] : [line(taskId, "muted")],
+    expanded: rows,
+  };
+}
+
+function renderAdviceResponse(context: ToolRenderContext): ToolPresentation {
+  const adviceId = stringValue(context.arguments?.adviceId) ?? "advice";
+  const disposition = stringValue(context.arguments?.disposition) ?? "respond";
+  const failure = resultFailure(context, `${disposition} ${adviceId}`);
+  if (failure !== undefined) return failure;
+  const status = stringValue(context.result?.status);
+  const reason = stringValue(context.arguments?.reason);
+  const rows = reason === undefined ? [] : wrapRows(reason, context.width, "context");
+  return {
+    summary: `${disposition} ${adviceId}${status === undefined ? "" : ` · ${status}`}`,
+    collapsed: [],
+    expanded: rows,
+  };
+}
+
 function renderFallback(context: ToolRenderContext): ToolPresentation {
   const path = stringValue(context.arguments?.path);
   const summary = path ?? "custom tool";
@@ -358,7 +703,7 @@ function resultFailure(
   context: ToolRenderContext,
   fallbackSummary: string,
 ): ToolPresentation | undefined {
-  const error = stringValue(context.result?.error);
+  const error = toolErrorMessage(context.result?.error);
   if (error === undefined && context.status !== "failed") return undefined;
   const message = (error ?? context.rawResult) || "Tool failed";
   const rows = wrapRows(message, context.width, "error");
@@ -367,6 +712,52 @@ function resultFailure(
     collapsed: rows,
     expanded: rows,
   };
+}
+
+function toolErrorMessage(value: unknown): string | undefined {
+  const direct = stringValue(value);
+  if (direct !== undefined) return direct;
+  if (!isRecord(value)) return undefined;
+  const message = stringValue(value.message);
+  const code = stringValue(value.code);
+  if (message === undefined) return code;
+  return code === undefined ? message : `${code}: ${message}`;
+}
+
+function appendProcessOutputCounters(
+  rows: ToolPresentationLine[],
+  label: "stdout" | "stderr",
+  value: unknown,
+): void {
+  if (!isRecord(value)) return;
+  const totalLines = integer(value.totalLines);
+  const totalBytes = integer(value.totalBytes);
+  if ((totalLines ?? 0) === 0 && (totalBytes ?? 0) === 0) return;
+  rows.push(line(
+    `${label} · ${totalLines ?? 0} lines · ${formatBytes(totalBytes ?? 0)}${value.truncated === true ? " · truncated" : ""}`,
+    value.truncated === true ? "warning" : "muted",
+  ));
+}
+
+function appendProcessOutput(
+  rows: ToolPresentationLine[],
+  value: unknown,
+  tone: "output" | "error",
+  width: number,
+): void {
+  if (!isRecord(value)) return;
+  const content = stringValue(value.content) ?? "";
+  if (content.length > 0) rows.push(...wrapRows(content, width, tone, "tail"));
+  if (value.truncated === true) {
+    const outputBytes = integer(value.outputBytes);
+    const totalBytes = integer(value.totalBytes);
+    rows.push(line(
+      outputBytes !== undefined && totalBytes !== undefined
+        ? `${tone === "error" ? "stderr" : "stdout"} truncated · showing ${formatBytes(outputBytes)} of ${formatBytes(totalBytes)}`
+        : `${tone === "error" ? "stderr" : "stdout"} truncated`,
+      "warning",
+    ));
+  }
 }
 
 function rawOrEmpty(context: ToolRenderContext, summary: string): ToolPresentation {
@@ -455,6 +846,14 @@ function tailPreview(rows: readonly ToolPresentationLine[], maximum: number): To
   ];
 }
 
+function headPreview(rows: readonly ToolPresentationLine[], maximum: number): ToolPresentationLine[] {
+  if (rows.length <= maximum) return [...rows];
+  return [
+    ...rows.slice(0, maximum),
+    line(`... ${rows.length - maximum} more lines`, "muted"),
+  ];
+}
+
 function boundedRows(rows: readonly ToolPresentationLine[]): ToolPresentationLine[] {
   if (rows.length <= MAX_EXPANDED_LINES) return [...rows];
   const sourceClipped = rows.at(-1)?.text === HEAD_SOURCE_CLIPPED;
@@ -539,6 +938,16 @@ function parseRecord(value: string | Record<string, unknown> | undefined): Recor
   }
 }
 
+function parseArray(value: string): unknown[] {
+  if (value.length === 0) return [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 function serialize(value: string | Record<string, unknown> | undefined): string {
   if (value === undefined) return "";
   return safeText(typeof value === "string" ? value : JSON.stringify(value));
@@ -585,6 +994,12 @@ function integer(value: unknown): number | undefined {
   return Number.isSafeInteger(value) ? value as number : undefined;
 }
 
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string").map(safeText)
+    : [];
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -593,4 +1008,9 @@ function formatBytes(bytes: number): string {
   if (bytes < 1_024) return `${bytes} B`;
   if (bytes < 1_024 * 1_024) return `${(bytes / 1_024).toFixed(1)} KB`;
   return `${(bytes / (1_024 * 1_024)).toFixed(1)} MB`;
+}
+
+function formatDuration(milliseconds: number): string {
+  if (milliseconds < 1_000) return `${milliseconds}ms`;
+  return `${(milliseconds / 1_000).toFixed(1)}s`;
 }

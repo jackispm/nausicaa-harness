@@ -1013,7 +1013,7 @@ describe("interactive TUI", () => {
         model: "scripted-main",
         tetoModel: "scripted-teto",
         policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
-      }, { mainModel: new ScriptedModel([]) });
+      }, { mainModel: new ScriptedModel([response("PLAN_ANSWER")]) });
       const running = runInteractive({
         session,
         terminal,
@@ -1056,6 +1056,35 @@ describe("interactive TUI", () => {
       terminal.type("/status");
       terminal.send("\r");
       await waitForOutput(terminal, "Queue / Tokens");
+
+      terminal.type("/permissions");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Choose the capability boundary");
+      terminal.send("\x1b[B");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Permissions set to workspace");
+      expect(session.snapshot()).toMatchObject({
+        permissionProfile: "workspace",
+        allowWrite: true,
+        allowShell: false,
+        allowNetwork: false,
+      });
+
+      terminal.type("/mode");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Default can act; Plan investigates");
+      terminal.send("\x1b[B");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Plan mode selected");
+      expect(session.snapshot().collaborationMode).toBe("plan");
+
+      terminal.type("/mode default");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Default mode selected");
+      terminal.type("/plan Propose a focused migration");
+      terminal.send("\r");
+      await waitForOutput(terminal, "PLAN_ANSWER");
+      expect(session.snapshot().collaborationMode).toBe("plan");
 
       terminal.type("/exit");
       terminal.send("\r");

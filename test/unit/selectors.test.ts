@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  collaborationModeOptions,
   filterSelectorOptions,
   modelSelectorOptions,
   normalizeModelSelector,
+  parseCollaborationMode,
+  parsePermissionProfile,
   parseThemeChoice,
+  permissionProfileOptions,
   themeSelectorOptions,
 } from "../../src/cli/selectors.js";
 
@@ -37,6 +41,24 @@ describe("Prime-style CLI selectors", () => {
     expect(parseThemeChoice("auto")).toBe("auto");
     expect(themeSelectorOptions("light")).toHaveLength(3);
     expect(() => parseThemeChoice("solarized")).toThrow(/auto, light, or dark/);
+  });
+
+  it("provides Codex-style permission profiles without conflating Plan mode", () => {
+    expect(permissionProfileOptions("workspace").map((option) => option.value)).toEqual([
+      "read-only",
+      "workspace",
+      "full-access",
+    ]);
+    expect(permissionProfileOptions("workspace")[1]?.description).toContain("current");
+    expect(parsePermissionProfile(" FULL-ACCESS ")).toBe("full-access");
+    expect(() => parsePermissionProfile("plan")).toThrow(/read-only.*workspace.*full-access/);
+
+    expect(collaborationModeOptions("plan").map((option) => option.value)).toEqual([
+      "default",
+      "plan",
+    ]);
+    expect(parseCollaborationMode(" PLAN ")).toBe("plan");
+    expect(() => parseCollaborationMode("workspace")).toThrow(/default or plan/);
   });
 
   it("rejects unsafe or ambiguous model selectors", () => {

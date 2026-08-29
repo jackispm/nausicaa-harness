@@ -30,6 +30,8 @@ const snapshot: SessionSnapshot = {
   model: "openrouter:openai/gpt-5-mini",
   tetoEnabled: true,
   workerEnabled: false,
+  permissionProfile: "read-only",
+  collaborationMode: "default",
   allowWrite: false,
   allowShell: false,
   allowNetwork: false,
@@ -101,6 +103,7 @@ describe("TUI components", () => {
   it("shows current Main context capacity instead of cumulative usage or cache ratio", () => {
     const tray = stripTerminalSequences(new SessionTray(() => snapshot).render(100).join("\n"));
     expect(tray).toContain("7.0k (1%)");
+    expect(tray).toContain("read only");
     expect(tray).not.toContain("150");
     expect(tray).not.toContain("40%");
 
@@ -123,6 +126,13 @@ describe("TUI components", () => {
       mainContextWindowTokens: 100_000,
     })).render(100).join("\n"));
     expect(overflow).toContain("130.0k (130%)");
+
+    const plan = stripTerminalSequences(new SessionTray(() => ({
+      ...snapshot,
+      collaborationMode: "plan",
+      permissionProfile: "workspace",
+    })).render(100).join("\n"));
+    expect(plan).toContain("plan · workspace");
   });
 
   it("hides an empty Worker summary and names every durable lifecycle", () => {

@@ -60,8 +60,8 @@ nausicaa -p "查看这个项目如何安装"
 nausicaa --resume <run-id>
 nausicaa --continue
 
-# 需要修改工作区时显式打开写入
-nausicaa --allow-write --model openrouter:openai/gpt-5-mini "修复这个项目"
+# 默认可以读取和修改当前工作区；Shell 与网络仍保持关闭
+nausicaa --model openrouter:openai/gpt-5-mini "修复这个项目"
 
 # 需要执行命令时单独开启高权限 Shell；它不要求也不等同于 --allow-write
 nausicaa --allow-shell "运行测试并分析失败原因"
@@ -69,7 +69,9 @@ nausicaa --allow-shell "运行测试并分析失败原因"
 
 `@image` 用于启动消息，可重复指定；交互中按 `Ctrl+V`（Windows 为 `Alt+V`）可从剪贴板插入 Prime 风格的 `[image #N]` 标记。提交时只附带仍出现在文本中的标记，删除标记会移除附件，当前进程内通过撤销或历史恢复标记后仍可重新附带。模型必须在 `pi-ai` 模型目录中声明 `image` 输入能力；文本模型会在发起 provider 请求前给出错误。路径必须相对当前工作区，且不能穿过符号链接、硬链接、受保护目录或 `..`；支持 PNG、JPEG、GIF、WebP，按文件内容而非扩展名识别。每次最多 4 张、单张最多 3 MiB、总计最多 10 MiB，当前不会自动缩放。图片内容随 Run 持久化并可恢复；Teto 不会因此读取额外的完整主线内容。
 
-也可设置 `NAUSICAA_MODEL`，省略每次调用的 `--model`。交互会话中，`/goal` 查看当前 Run 的长期目标，`/goal <statement>` 修订它，`/copy` 将最后一条 assistant 回答复制到系统剪贴板；普通消息仍是各自 Turn 的当前任务。运行状态默认写入工作区的 `.nausicaa/`；使用 `nausicaa --resume <run-id>` 从已提交边界继续。若恢复时发现结果未知的工具操作，CLI 会打印 operation ID 和显式结算命令；确认其应按失败处理后再执行该命令，运行时不会自动重放副作用。
+也可设置 `NAUSICAA_MODEL`，省略每次调用的 `--model`。交互会话默认使用 `workspace` 权限：可读写当前工作区，但不开放宿主 Shell 或网络。`/permissions` 可在 `read-only`、`workspace`、`full-access` 三档之间切换；`full-access` 等同于明确开放工作区写入、宿主 Shell、网络和后台进程，因此边界会直接显示在底部状态栏。`/plan [prompt]` 进入只读 Plan 模式，`/mode` 可在 Default 与 Plan 间切换。
+
+`/goal` 查看当前 Run 的长期目标，`/goal <statement>` 修订它，`/copy` 将最后一条 assistant 回答复制到系统剪贴板；普通消息仍是各自 Turn 的当前任务。运行状态默认写入工作区的 `.nausicaa/`；使用 `nausicaa --resume <run-id>` 从已提交边界继续。若恢复时发现结果未知的工具操作，CLI 会打印 operation ID 和显式结算命令；确认其应按失败处理后再执行该命令，运行时不会自动重放副作用。
 
 `npm run dev -- <参数>` 通过 `tsx` 直接运行 TypeScript 源码，是开发调试入口，不是产品交互模型。构建后的产品入口是 `nausicaa`；`npm start -- <参数>` 直接运行 `dist/cli.js`。因此别人项目看起来是“进入 CLI”，是因为它们发布了一个 bin；本项目也通过 `package.json` 的 `bin.nausicaa` 提供同样的入口。
 

@@ -381,6 +381,97 @@ describe("SessionController", () => {
     await session.close();
   });
 
+  it("switches future Turns between read-only, workspace, and full-access capabilities", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([
+      response("workspace"),
+      response("full"),
+      response("read only"),
+    ]);
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
+    }, {
+      mainModel: model,
+      createRunId: () => "permission-profile-run",
+    });
+
+    expect(session.snapshot()).toMatchObject({
+      permissionProfile: "read-only",
+      collaborationMode: "default",
+    });
+    await expect(session.selectPermissionProfile("workspace")).resolves.toMatchObject({
+      previousProfile: "read-only",
+      profile: "workspace",
+      changed: true,
+    });
+    await session.submit({ inputId: "workspace-input", text: "Edit the workspace" });
+    await session.waitForIdle();
+    const workspaceTools = model.requests[0]?.tools.map((tool) => tool.name) ?? [];
+    expect(workspaceTools).toContain("write_file");
+    expect(workspaceTools).toContain("edit");
+    expect(workspaceTools).not.toContain("bash");
+    expect(workspaceTools).not.toContain("web_fetch");
+
+    await session.selectPermissionProfile("full-access");
+    await session.submit({ inputId: "full-input", text: "Use full capabilities" });
+    await session.waitForIdle();
+    const fullTools = model.requests[1]?.tools.map((tool) => tool.name) ?? [];
+    expect(fullTools).toContain("bash");
+    expect(fullTools).toContain("web_fetch");
+    expect(fullTools).toContain("process_start");
+
+    await session.selectPermissionProfile("read-only");
+    await session.submit({ inputId: "read-input", text: "Only inspect" });
+    await session.waitForIdle();
+    const readTools = model.requests[2]?.tools.map((tool) => tool.name) ?? [];
+    expect(readTools).toContain("read_file");
+    expect(readTools).not.toContain("write_file");
+    expect(readTools).not.toContain("bash");
+    expect(readTools).not.toContain("web_fetch");
+    await session.close();
+  });
+
+  it("makes Plan mode a read-only runtime boundary rather than a visual label", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([response("plan"), response("implementation")]);
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      allowWrite: true,
+      allowShell: true,
+      allowNetwork: true,
+      collaborationMode: "plan",
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
+    }, {
+      mainModel: model,
+      createRunId: () => "plan-mode-run",
+    });
+
+    await session.submit({ inputId: "plan-input", text: "Plan the change" });
+    await session.waitForIdle();
+    expect(model.requests[0]?.systemPrompt).toContain("Plan mode is active");
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).toContain("read_file");
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).not.toContain("write_file");
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).not.toContain("bash");
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).not.toContain("web_fetch");
+
+    await expect(session.selectCollaborationMode("default")).resolves.toMatchObject({
+      previousMode: "plan",
+      mode: "default",
+      changed: true,
+    });
+    await session.submit({ inputId: "default-input", text: "Implement it" });
+    await session.waitForIdle();
+    expect(model.requests[1]?.systemPrompt).not.toContain("Plan mode is active");
+    expect(model.requests[1]?.tools.map((tool) => tool.name)).toContain("write_file");
+    expect(model.requests[1]?.tools.map((tool) => tool.name)).toContain("bash");
+    await session.close();
+  });
+
   it("runs an opt-in Worker lane and delivers its result at a later Main boundary", async () => {
     const root = await temporaryRoot();
     let markWorkerStarted: (() => void) | undefined;

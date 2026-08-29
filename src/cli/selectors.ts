@@ -1,6 +1,11 @@
 import { fuzzyFilter } from "@earendil-works/pi-tui";
 
 import { normalizeModelSelector as normalizeRuntimeModelSelector } from "../model/index.js";
+import type {
+  SelectableSessionPermissionProfile,
+  SessionCollaborationMode,
+  SessionPermissionProfile,
+} from "../runtime/index.js";
 
 /** Small helpers for Prime-style command selectors. */
 
@@ -11,6 +16,69 @@ export interface SelectorOption {
 }
 
 export type ThemeChoice = "auto" | "light" | "dark";
+
+export function permissionProfileOptions(
+  current: SessionPermissionProfile,
+): SelectorOption[] {
+  return [
+    {
+      value: "read-only",
+      label: "Read Only",
+      description: "Inspect workspace files; no writes, shell, or network",
+    },
+    {
+      value: "workspace",
+      label: "Workspace",
+      description: "Read and edit files inside the workspace; no shell or network",
+    },
+    {
+      value: "full-access",
+      label: "Full Access",
+      description: "Workspace writes, host-level shell, network, and background jobs",
+    },
+  ].map((option) => ({
+    ...option,
+    ...(option.value === current ? { description: `${option.description} (current)` } : {}),
+  }));
+}
+
+export function parsePermissionProfile(
+  value: string,
+): SelectableSessionPermissionProfile {
+  const profile = value.trim().toLocaleLowerCase();
+  if (profile !== "read-only" && profile !== "workspace" && profile !== "full-access") {
+    throw new Error("/permissions expects read-only, workspace, or full-access");
+  }
+  return profile;
+}
+
+export function collaborationModeOptions(
+  current: SessionCollaborationMode,
+): SelectorOption[] {
+  return [
+    {
+      value: "default",
+      label: "Default",
+      description: "Investigate, edit, and verify within the selected permissions",
+    },
+    {
+      value: "plan",
+      label: "Plan",
+      description: "Read-only investigation followed by an implementation-ready plan",
+    },
+  ].map((option) => ({
+    ...option,
+    ...(option.value === current ? { description: `${option.description} (current)` } : {}),
+  }));
+}
+
+export function parseCollaborationMode(value: string): SessionCollaborationMode {
+  const mode = value.trim().toLocaleLowerCase();
+  if (mode !== "default" && mode !== "plan") {
+    throw new Error("/mode expects default or plan");
+  }
+  return mode;
+}
 
 /**
  * Reuse pi-tui's token-aware fuzzy matcher so model search behaves like the

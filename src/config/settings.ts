@@ -150,7 +150,9 @@ export const resolveSettings = (
     ),
     dataDir: isAbsolute(dataDir) ? resolve(dataDir) : resolve(workspace, dataDir),
     allowShell: merged.allowShell ?? false,
-    allowWrite: merged.allowWrite ?? false,
+    // Match the mature coding-agent baseline: edits inside the workspace are
+    // available by default, while unsandboxed shell and network stay off.
+    allowWrite: merged.allowWrite ?? true,
     allowNetwork: merged.allowNetwork ?? false,
     fukaiCompaction,
   };
