@@ -16,6 +16,7 @@ export * from "./file-execution-lease.js";
 export * from "./daemon-host.js";
 export * from "./daemon-control.js";
 export * from "./daemon-wake-adapter.js";
+export * from "./daemon-wake-sources.js";
 export * from "./daemon-runtime.js";
 export * from "./worker-task-executor.js";
 export * from "./worker-lane-scheduler.js";
