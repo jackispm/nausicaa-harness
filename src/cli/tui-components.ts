@@ -262,7 +262,7 @@ export class BrandSplashHeader implements Component {
   invalidate(): void {}
 }
 
-/** Fixed dock tray: lane topology on the left, context/cache signal on the right. */
+/** Fixed dock tray: lane topology on the left, Main context capacity on the right. */
 export class SessionTray implements Component {
   constructor(
     private readonly readSnapshot: () => SessionSnapshot,
@@ -281,10 +281,13 @@ export class SessionTray implements Component {
     const left = transientStatus === undefined
       ? ` ← ${topology}   ${shortModel(snapshot.model)}`
       : ` ← ${terminalSafeText(transientStatus)}`;
-    const consumed = snapshot.usage.input + snapshot.usage.output;
-    const cacheBase = snapshot.usage.input + snapshot.usage.cacheRead;
-    const cachePercent = cacheBase === 0 ? 0 : Math.round((snapshot.usage.cacheRead / cacheBase) * 100);
-    const right = `${formatTokens(consumed)} (${cachePercent}%) `;
+    const contextPercent = snapshot.mainContextTokens === null
+      || snapshot.mainContextWindowTokens === null
+      ? undefined
+      : Math.round((snapshot.mainContextTokens / snapshot.mainContextWindowTokens) * 100);
+    const right = snapshot.mainContextTokens === null
+      ? ""
+      : `${formatTokens(snapshot.mainContextTokens)} (${contextPercent === undefined ? "?" : `${contextPercent}%`}) `;
     return [alignLine(palette.muted(left), palette.dim(right), safeWidth)];
   }
 

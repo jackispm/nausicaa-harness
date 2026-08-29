@@ -335,6 +335,52 @@ describe("SessionController", () => {
     await session.close();
   });
 
+  it("projects the latest durable Main context estimate against the model window", async () => {
+    const root = await temporaryRoot();
+    const model: ModelPort = {
+      capabilities: () => ({ imageInput: false, contextWindowTokens: 128_000 }),
+      async complete() {
+        return response("context measured");
+      },
+    };
+    const events: SessionRuntimeEvent[] = [];
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "openrouter:metered",
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 10_000, tetoEnabled: false },
+    }, {
+      mainModel: model,
+      createRunId: () => "context-meter-run",
+    });
+    session.subscribe((event) => events.push(event));
+
+    expect(session.snapshot()).toMatchObject({
+      mainContextTokens: null,
+      mainContextWindowTokens: 128_000,
+    });
+    await session.submit({ inputId: "context-meter-input", text: "Measure this request" });
+    await session.waitForIdle();
+
+    const requested = durableEvents(events).findLast((event) => (
+      event.type === "model.requested" && event.laneId === "main"
+    ));
+    expect(requested?.type).toBe("model.requested");
+    if (requested?.type !== "model.requested") throw new Error("Missing Main request");
+    expect(requested.payload.estimatedInputTokens).toBeGreaterThan(0);
+    expect(session.snapshot()).toMatchObject({
+      mainContextTokens: requested.payload.estimatedInputTokens,
+      mainContextWindowTokens: 128_000,
+    });
+    await session.selectModel("openrouter:other");
+    expect(session.snapshot()).toMatchObject({
+      model: "openrouter:other",
+      mainContextTokens: null,
+      mainContextWindowTokens: 128_000,
+    });
+    await session.close();
+  });
+
   it("runs an opt-in Worker lane and delivers its result at a later Main boundary", async () => {
     const root = await temporaryRoot();
     let markWorkerStarted: (() => void) | undefined;

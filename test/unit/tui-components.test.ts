@@ -35,6 +35,8 @@ const snapshot: SessionSnapshot = {
   allowNetwork: false,
   pendingInputs: 2,
   lastCommittedStep: 3,
+  mainContextTokens: 7_000,
+  mainContextWindowTokens: 1_000_000,
   usage: { input: 120, output: 30, cacheRead: 80, cacheWrite: 0 },
 };
 
@@ -94,6 +96,33 @@ describe("TUI components", () => {
     const workerSnapshot = { ...snapshot, workerEnabled: true };
     const tray = stripTerminalSequences(new SessionTray(() => workerSnapshot).render(100).join("\n"));
     expect(tray).toContain("main + Teto + Worker/running");
+  });
+
+  it("shows current Main context capacity instead of cumulative usage or cache ratio", () => {
+    const tray = stripTerminalSequences(new SessionTray(() => snapshot).render(100).join("\n"));
+    expect(tray).toContain("7.0k (1%)");
+    expect(tray).not.toContain("150");
+    expect(tray).not.toContain("40%");
+
+    const unknown = stripTerminalSequences(new SessionTray(() => ({
+      ...snapshot,
+      mainContextTokens: 4_600,
+      mainContextWindowTokens: null,
+    })).render(100).join("\n"));
+    expect(unknown).toContain("4.6k (?)");
+
+    const noRequest = stripTerminalSequences(new SessionTray(() => ({
+      ...snapshot,
+      mainContextTokens: null,
+    })).render(100).join("\n"));
+    expect(noRequest).not.toContain("?");
+
+    const overflow = stripTerminalSequences(new SessionTray(() => ({
+      ...snapshot,
+      mainContextTokens: 130_000,
+      mainContextWindowTokens: 100_000,
+    })).render(100).join("\n"));
+    expect(overflow).toContain("130.0k (130%)");
   });
 
   it("hides an empty Worker summary and names every durable lifecycle", () => {

@@ -44,6 +44,39 @@ afterEach(async () => {
 });
 
 describe("MainLoop", () => {
+  it("keeps visible output in the latest user language without routine tool narration", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const model = new ScriptedModel([{
+      content: "完成",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: [],
+    });
+
+    await loop.run({
+      runId: "main-language-continuity",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "查看最新提交",
+    });
+
+    const prompt = model.requests[0]?.systemPrompt ?? "";
+    expect(prompt).toContain("Match all user-visible progress and final answers");
+    expect(prompt).toContain("language of the latest user message");
+    expect(prompt).toContain("tool output and context language do not change it");
+    expect(prompt).toContain("Skip routine pre-tool narration");
+  });
+
   it("rejects malformed tool arguments before recording a tool operation", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();

@@ -157,6 +157,11 @@ export interface SessionSnapshot {
   allowNetwork: boolean;
   pendingInputs: number;
   lastCommittedStep: number;
+  /** Latest durable Fukai input estimate for the selected Main model, or null before its next request. */
+  mainContextTokens: number | null;
+  /** Selected Main model's advertised context window, or null when unknown. */
+  mainContextWindowTokens: number | null;
+  /** Cumulative provider usage for the Run; shown in detailed status, not the context tray. */
   usage: TokenUsage;
   blocker?: string;
 }
@@ -277,6 +282,7 @@ export class SessionController {
   private readonly requestedWorkerEnabled: boolean | undefined;
   private selectedMainModel: string;
   private readonly listeners = new Set<(event: SessionRuntimeEvent) => void>();
+  private readonly contextWindowByModel = new Map<string, number | null>();
   private workerTaskSummaryCache: {
     runId: string;
     lastOffset: number;
@@ -442,9 +448,30 @@ export class SessionController {
       lastCommittedStep: this.active === undefined
         ? 0
         : highestTurnStep(events, this.active.turnId),
+      mainContextTokens: latestMainContextTokens(events, this.model),
+      mainContextWindowTokens: this.selectedModelContextWindowTokens() ?? null,
       usage,
       ...(blocker === undefined ? {} : { blocker }),
     };
+  }
+
+  private selectedModelContextWindowTokens(): number | undefined {
+    const cached = this.contextWindowByModel.get(this.model);
+    if (cached !== undefined) return cached ?? undefined;
+    try {
+      const value = (
+        this.deps.mainModel ?? createOpenRouterModelPort()
+      ).capabilities?.(this.model)?.contextWindowTokens;
+      const normalized = Number.isSafeInteger(value) && (value ?? 0) > 0
+        ? value
+        : undefined;
+      this.contextWindowByModel.set(this.model, normalized ?? null);
+      return normalized;
+    } catch {
+      // Context capacity is advisory; unknown custom models keep working.
+      this.contextWindowByModel.set(this.model, null);
+      return undefined;
+    }
   }
 
   /** Project the durable Worker lifecycle without giving the TUI its own task state. */
@@ -2089,6 +2116,24 @@ function latestResumableTurn(
 
 function totalTokens(usage: TokenUsage): number {
   return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+function latestMainContextTokens(
+  events: readonly AnyEvent[],
+  selectedModel: string,
+): number | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.laneId !== "main") continue;
+    // A model selection invalidates the previous tokenizer-specific estimate
+    // until Fukai constructs the first request for that selection.
+    if (event.type === "model.selected") return null;
+    if (event.type !== "model.requested") continue;
+    if (event.payload.model !== selectedModel) return null;
+    const tokens = event.payload.estimatedInputTokens;
+    return Number.isSafeInteger(tokens) && (tokens ?? -1) >= 0 ? tokens ?? null : null;
+  }
+  return null;
 }
 
 function pendingToolRequests(
