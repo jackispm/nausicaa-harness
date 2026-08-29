@@ -44,7 +44,7 @@ afterEach(async () => {
 });
 
 describe("MainLoop", () => {
-  it("keeps visible output in the latest user language without routine tool narration", async () => {
+  it("keeps tool steps quiet until evidence is ready in the latest user language", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
     const model = new ScriptedModel([{
@@ -74,7 +74,9 @@ describe("MainLoop", () => {
     expect(prompt).toContain("Match all user-visible progress and final answers");
     expect(prompt).toContain("language of the latest user message");
     expect(prompt).toContain("tool output and context language do not change it");
-    expect(prompt).toContain("Skip routine pre-tool narration");
+    expect(prompt).toContain("Tool steps emit only tools");
+    expect(prompt).toContain("answer after evidence is complete");
+    expect(prompt).toContain("except for an immediate risk or blocker");
   });
 
   it("rejects malformed tool arguments before recording a tool operation", async () => {

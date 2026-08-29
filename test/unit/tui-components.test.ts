@@ -1,4 +1,6 @@
 import {
+  type Terminal,
+  TuiAltScreen,
   stripTerminalSequences,
   visibleWidth,
 } from "@earendil-works/pi-tui";
@@ -94,6 +96,46 @@ describe("TUI components", () => {
     expect(activity).toContain("step 3");
   });
 
+  it("marks user and final assistant messages as semantic terminal prompts", () => {
+    const start = "\x1b]133;A\x07";
+    const end = "\x1b]133;B\x07";
+    const final = "\x1b]133;C\x07";
+    const user = new UserMessageBlock("hello").render(80);
+    const assistant = new AssistantMessageBlock("done").render(80);
+
+    for (const lines of [user, assistant]) {
+      expect(lines[0]).toContain(start);
+      expect(lines.at(-1)).toContain(end + final);
+      expect(stripTerminalSequences(lines.join("\n"))).not.toContain("133;");
+      for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+    }
+
+    const toolStep = new AssistantMessageBlock("I will inspect the files.", true).render(80);
+    expect(toolStep.join("\n")).not.toContain("\x1b]133;");
+
+    const empty = new AssistantMessageBlock().render(80);
+    expect(empty).toEqual([]);
+  });
+
+  it("lets pi-tui jump between Nausicaa semantic prompts", async () => {
+    const terminal = new NavigationTerminal(40, 5);
+    const tui = new TuiAltScreen(terminal);
+    for (let index = 1; index <= 4; index += 1) {
+      tui.addChild(new UserMessageBlock(`prompt ${index}\n\ndetail ${index}`));
+    }
+
+    tui.start();
+    await nextRender();
+    const bottom = tui.viewportTop;
+    expect(bottom).toBeGreaterThan(0);
+
+    terminal.send("\x1b[1;6A");
+    await nextRender();
+    expect(tui.viewportTop).toBeLessThan(bottom);
+
+    tui.stop();
+  });
+
   it("shows the opt-in Worker lane in the topology tray", () => {
     const workerSnapshot = { ...snapshot, workerEnabled: true };
     const tray = stripTerminalSequences(new SessionTray(() => workerSnapshot).render(100).join("\n"));
@@ -102,7 +144,7 @@ describe("TUI components", () => {
 
   it("shows current Main context capacity instead of cumulative usage or cache ratio", () => {
     const tray = stripTerminalSequences(new SessionTray(() => snapshot).render(100).join("\n"));
-    expect(tray).toContain("7.0k (1%)");
+    expect(tray).toContain("7.0k/1.0m (1%)");
     expect(tray).toContain("read only");
     expect(tray).not.toContain("150");
     expect(tray).not.toContain("40%");
@@ -112,7 +154,8 @@ describe("TUI components", () => {
       mainContextTokens: 4_600,
       mainContextWindowTokens: null,
     })).render(100).join("\n"));
-    expect(unknown).toContain("4.6k (?)");
+    expect(unknown).toContain("4.6k/?");
+    expect(unknown).not.toContain("%");
 
     const noRequest = stripTerminalSequences(new SessionTray(() => ({
       ...snapshot,
@@ -125,7 +168,7 @@ describe("TUI components", () => {
       mainContextTokens: 130_000,
       mainContextWindowTokens: 100_000,
     })).render(100).join("\n"));
-    expect(overflow).toContain("130.0k (130%)");
+    expect(overflow).toContain("130.0k/100.0k (130%)");
 
     const plan = stripTerminalSequences(new SessionTray(() => ({
       ...snapshot,
@@ -332,3 +375,28 @@ describe("TUI components", () => {
     expect(rendered).not.toContain("\x07");
   });
 });
+
+class NavigationTerminal implements Terminal {
+  kittyProtocolActive = false;
+  private input?: (data: string) => void;
+
+  constructor(readonly columns: number, readonly rows: number) {}
+
+  start(onInput: (data: string) => void): void { this.input = onInput; }
+  stop(): void { this.input = undefined; }
+  send(data: string): void { this.input?.(data); }
+  async drainInput(): Promise<void> {}
+  write(): void {}
+  moveBy(): void {}
+  hideCursor(): void {}
+  showCursor(): void {}
+  clearLine(): void {}
+  clearFromCursor(): void {}
+  clearScreen(): void {}
+  setTitle(): void {}
+  setProgress(): void {}
+}
+
+async function nextRender(): Promise<void> {
+  await new Promise<void>((resolve) => { setTimeout(resolve, 10); });
+}

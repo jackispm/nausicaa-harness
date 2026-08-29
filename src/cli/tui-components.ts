@@ -24,6 +24,9 @@ import {
 } from "./tool-renderers.js";
 
 const ESC = "\x1b[";
+const OSC133_ZONE_START = "\x1b]133;A\x07";
+const OSC133_ZONE_END = "\x1b]133;B\x07";
+const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 
 type ColorScheme = "light" | "dark";
 
@@ -291,7 +294,9 @@ export class SessionTray implements Component {
       : Math.round((snapshot.mainContextTokens / snapshot.mainContextWindowTokens) * 100);
     const right = snapshot.mainContextTokens === null
       ? ""
-      : `${formatTokens(snapshot.mainContextTokens)} (${contextPercent === undefined ? "?" : `${contextPercent}%`}) `;
+      : snapshot.mainContextWindowTokens === null
+        ? `${formatTokens(snapshot.mainContextTokens)}/? `
+        : `${formatTokens(snapshot.mainContextTokens)}/${formatTokens(snapshot.mainContextWindowTokens)} (${contextPercent}%) `;
     return [alignLine(palette.muted(left), palette.dim(right), safeWidth)];
   }
 
@@ -387,6 +392,11 @@ export class UserMessageBlock extends Container {
     }
     this.addChild(box);
   }
+
+  override render(width: number): string[] {
+    const lines = super.render(width);
+    return markSemanticPrompt(lines);
+  }
 }
 
 function shortImageType(mediaType: string): string {
@@ -435,9 +445,11 @@ export class AssistantMessageBlock implements Component {
   private readonly thinking = new ThinkingRow();
   private readonly markdown: Markdown;
   private text = "";
+  private hasToolCalls: boolean;
 
-  constructor(text = "") {
+  constructor(text = "", hasToolCalls = false) {
     this.markdown = new Markdown("", 1, 0, nausicaaMarkdownTheme);
+    this.hasToolCalls = hasToolCalls;
     this.setText(text);
   }
 
@@ -452,6 +464,8 @@ export class AssistantMessageBlock implements Component {
     this.thinking.invalidate();
   }
 
+  setHasToolCalls(hasToolCalls: boolean): void { this.hasToolCalls = hasToolCalls; }
+
   toggleThinking(): void { this.thinking.toggle(); }
   setThinkingExpanded(expanded: boolean): void { this.thinking.setExpanded(expanded); }
   getText(): string { return this.text; }
@@ -462,17 +476,27 @@ export class AssistantMessageBlock implements Component {
   render(width: number): string[] {
     const thinking = this.thinking.render(width);
     const answer = this.text.length === 0 ? [] : this.markdown.render(width);
-    return fitLines([
+    const lines = fitLines([
       ...thinking,
       ...(thinking.length > 0 && answer.length > 0 ? [""] : []),
       ...answer,
     ], width);
+    return this.hasToolCalls ? lines : markSemanticPrompt(lines);
   }
 
   invalidate(): void {
     this.thinking.invalidate();
     this.markdown.invalidate();
   }
+}
+
+function markSemanticPrompt(lines: string[]): string[] {
+  if (lines.length === 0) return lines;
+  const marked = [...lines];
+  marked[0] = OSC133_ZONE_START + marked[0];
+  const last = marked.length - 1;
+  marked[last] = OSC133_ZONE_END + OSC133_ZONE_FINAL + marked[last];
+  return marked;
 }
 
 export type ToolStatus = "running" | "succeeded" | "failed" | "unknown" | "archived";

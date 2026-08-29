@@ -540,6 +540,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       if (block !== undefined && committed.role === "assistant") {
         finalText = committed.content;
         block.setText(committed.content);
+        block.setHasToolCalls(committed.toolCalls.length > 0);
       }
     } catch {
       if (closed || generation !== transcriptGeneration) return;
@@ -588,7 +589,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       const key = assistantKey(ref.id, message.content);
       if (renderedAssistants.has(key)) return;
       renderedAssistants.add(key);
-      appendAssistant(new AssistantMessageBlock(message.content));
+      appendAssistant(new AssistantMessageBlock(message.content, message.toolCalls.length > 0));
     } catch {
       if (closed || generation !== transcriptGeneration) return;
       appendNotice("Assistant message could not be rendered; the Ledger still contains the event.", "error");
@@ -1089,6 +1090,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             "`/copy` copy the last assistant answer",
             "`/exit` close session  ·  `Alt+Enter` queue follow-up",
             `\`${pasteImageLabel}\` paste image  ·  \`Ctrl+T\` thinking  ·  \`Ctrl+O\` tool output`,
+            "`Ctrl+Up/Down` jump between prompts  ·  `Ctrl+Shift+F` search transcript",
             "`Ctrl+C` cancel/clear",
           ].join("\n\n"), 1, 0, nausicaaMarkdownTheme));
           break;
