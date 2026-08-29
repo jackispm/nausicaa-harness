@@ -4,6 +4,7 @@ import {
   deriveContextCompactionAttemptId,
   deriveContextCompactionId,
   FUKAI_COMPACTION_MEDIA_TYPE,
+  PROJECT_INSTRUCTIONS_MEDIA_TYPE,
 } from "../domain/context.js";
 import type {
   ContextManifest,
@@ -14,6 +15,7 @@ import {
   MAX_TASK_MODEL_TOKENS,
   MAX_TASK_WALL_CLOCK_MS,
 } from "../domain/types.js";
+import { sha256, stableJson } from "./hash.js";
 import type {
   A2AMessage,
   Advice,
@@ -486,6 +488,83 @@ function contextCompactionSlotManifest(value: unknown, path: string): void {
   string(item.policyVersion, `${path}.policyVersion`, false);
 }
 
+function contextProjectInstructionsManifest(value: unknown, path: string): void {
+  const item = payloadObject(value, path, [
+    "schemaVersion",
+    "state",
+    "itemCount",
+    "totalBytes",
+    "sourceHash",
+    "contentHash",
+    "sources",
+  ]);
+  if (item.schemaVersion !== 1) {
+    invalid(`${path}.schemaVersion`, "the supported value 1");
+  }
+  oneOf(item.state, `${path}.state`, ["empty", "present"] as const);
+  integer(item.itemCount, `${path}.itemCount`);
+  integer(item.totalBytes, `${path}.totalBytes`);
+  for (const field of ["sourceHash", "contentHash"] as const) {
+    string(item[field], `${path}.${field}`, false);
+    if (!/^sha256:[0-9a-f]{64}$/.test(item[field] as string)) {
+      invalid(`${path}.${field}`, "a sha256:<lowercase digest> identity");
+    }
+  }
+  if (!Array.isArray(item.sources)) {
+    invalid(`${path}.sources`, "an array");
+  }
+  const sources = item.sources.map((value, index) => {
+    const source = payloadObject(value, `${path}.sources[${index}]`, [
+      "pathHash",
+      "contentHash",
+      "byteLength",
+    ]);
+    for (const field of ["pathHash", "contentHash"] as const) {
+      string(source[field], `${path}.sources[${index}].${field}`, false);
+      if (!/^sha256:[0-9a-f]{64}$/.test(source[field] as string)) {
+        invalid(
+          `${path}.sources[${index}].${field}`,
+          "a sha256:<lowercase digest> identity",
+        );
+      }
+    }
+    integer(source.byteLength, `${path}.sources[${index}].byteLength`);
+    return {
+      pathHash: source.pathHash as string,
+      contentHash: source.contentHash as string,
+      byteLength: source.byteLength as number,
+    };
+  });
+  if (item.itemCount !== sources.length) {
+    invalid(`${path}.itemCount`, "equal to the source count");
+  }
+  if (item.totalBytes !== sources.reduce((sum, source) => sum + source.byteLength, 0)) {
+    invalid(`${path}.totalBytes`, "equal to the source byte total");
+  }
+  if (item.sourceHash !== sha256(stableJson(sources.map((source) => source.pathHash)))) {
+    invalid(`${path}.sourceHash`, "match the ordered source identities");
+  }
+  if (item.contentHash !== sha256(stableJson(sources.map((source) => ({
+    contentHash: source.contentHash,
+    byteLength: source.byteLength,
+  }))))) {
+    invalid(`${path}.contentHash`, "match the ordered content identities");
+  }
+  if (item.state === "empty") {
+    if (sources.length !== 0 || item.bundleRef !== undefined) {
+      invalid(path, "empty without sources or a bundle ref");
+    }
+    return;
+  }
+  if (sources.length === 0 || item.bundleRef === undefined) {
+    invalid(path, "present with sources and a bundle ref");
+  }
+  artifactRef(item.bundleRef, `${path}.bundleRef`);
+  if ((item.bundleRef as ArtifactRef).mediaType !== PROJECT_INSTRUCTIONS_MEDIA_TYPE) {
+    invalid(`${path}.bundleRef.mediaType`, PROJECT_INSTRUCTIONS_MEDIA_TYPE);
+  }
+}
+
 function contextManifest(value: unknown, path: string): void {
   const item = payloadObject(value, path, [
     "schemaVersion",
@@ -512,6 +591,12 @@ function contextManifest(value: unknown, path: string): void {
     } else {
       contextSlotManifest(slots[name], `${path}.slots.${name}`);
     }
+  }
+  if (item.projectInstructions !== undefined) {
+    contextProjectInstructionsManifest(
+      item.projectInstructions,
+      `${path}.projectInstructions`,
+    );
   }
   string(item.prefixHash, `${path}.prefixHash`, false);
   string(item.dynamicHash, `${path}.dynamicHash`, false);

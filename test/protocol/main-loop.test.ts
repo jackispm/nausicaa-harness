@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -44,6 +44,78 @@ afterEach(async () => {
 });
 
 describe("MainLoop", () => {
+  it("reloads trusted project instructions at every request and records CAS identity", async () => {
+    const workspace = await temporaryDirectory();
+    const instructionPath = path.join(workspace, "AGENTS.md");
+    await writeFile(instructionPath, "Use the first project rule.\n");
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const model = new ScriptedModel([
+      {
+        content: "refresh instructions",
+        toolCalls: [{ id: "refresh", name: "refresh_instructions", arguments: {} }],
+        stopReason: "toolUse",
+        usage: tokenUsage(10, 5),
+      },
+      {
+        content: "done",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(10, 5),
+      },
+    ]);
+    const refreshInstructions: AgentTool = {
+      definition: {
+        name: "refresh_instructions",
+        description: "Replace the project instruction fixture",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      async execute() {
+        await writeFile(instructionPath, "Use the second project rule.\n");
+        return { content: "updated", isError: false };
+      },
+    };
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [refreshInstructions],
+    });
+
+    await loop.run({
+      runId: "main-project-instructions",
+      goal: { version: 1, statement: "Follow project rules", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      initialMessage: "Go",
+    });
+
+    expect(model.requests).toHaveLength(2);
+    expect(model.requests[0]?.systemPrompt).toContain("Trusted project instructions");
+    expect(model.requests[0]?.systemPrompt).toContain("Use the first project rule.");
+    expect(model.requests[1]?.systemPrompt).toContain("Use the second project rule.");
+    expect(model.requests[1]?.systemPrompt).not.toContain("Use the first project rule.");
+
+    const requested = (await ledger.read({ runId: "main-project-instructions" }))
+      .filter((event) => event.type === "model.requested");
+    const first = requested[0]?.payload.contextManifest?.projectInstructions;
+    const second = requested[1]?.payload.contextManifest?.projectInstructions;
+    expect(first?.state).toBe("present");
+    expect(first?.sourceHash).toBe(second?.sourceHash);
+    expect(first?.contentHash).not.toBe(second?.contentHash);
+    expect(first?.bundleRef?.contentHash).not.toBe(second?.bundleRef?.contentHash);
+    expect(requested[0]?.payload.prefixHash).not.toBe(requested[1]?.payload.prefixHash);
+    expect(JSON.stringify(first)).not.toContain("Use the first project rule.");
+    if (first?.bundleRef === undefined) throw new Error("Missing project instruction bundle");
+    const bundle = Buffer.from(await store.get(first.bundleRef)).toString("utf8");
+    expect(bundle).toContain("Use the first project rule.");
+    expect(requested[0]?.payload.dependencyRefs).toContain(
+      `${first.bundleRef.id}@${first.bundleRef.contentHash}`,
+    );
+  });
+
   it("keeps tool steps quiet until evidence is ready in the latest user language", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();

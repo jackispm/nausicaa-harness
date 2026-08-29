@@ -6,6 +6,10 @@ import type { ArtifactRef, Goal, LaneId, RunId } from "./types.js";
 export const FUKAI_COMPACTION_MEDIA_TYPE =
   "application/vnd.nausicaa.fukai-compaction+json" as const;
 
+/** Store object containing the exact trusted project-instruction request input. */
+export const PROJECT_INSTRUCTIONS_MEDIA_TYPE =
+  "application/vnd.nausicaa.project-instructions+json" as const;
+
 export const CONTEXT_MANIFEST_SCHEMA_VERSION = 1 as const;
 export const CONTEXT_COMPACTION_SCHEMA_VERSION = 1 as const;
 
@@ -176,6 +180,28 @@ export interface ContextCompactionSlotManifest extends ContextSlotManifest {
   policyVersion?: string;
 }
 
+/** Redacted identity of one trusted project instruction source. */
+export interface ContextProjectInstructionSource {
+  pathHash: string;
+  contentHash: string;
+  byteLength: number;
+}
+
+/**
+ * Durable request fact for the trusted project prefix. Markdown bodies stay
+ * in the content-addressed Store and are not copied into the Ledger event.
+ */
+export interface ContextProjectInstructionsManifest {
+  schemaVersion: 1;
+  state: "empty" | "present";
+  itemCount: number;
+  totalBytes: number;
+  sourceHash: string;
+  contentHash: string;
+  sources: ContextProjectInstructionSource[];
+  bundleRef?: ArtifactRef;
+}
+
 function canonicalSourceRef(source: ContextSourceRef): ContextSourceRef {
   if (source.kind === "event") {
     return {
@@ -225,6 +251,8 @@ export interface ContextManifest {
     compaction: ContextCompactionSlotManifest;
     "lane-context": ContextSlotManifest;
   };
+  /** Optional only for schema-v1 events written before project loading existed. */
+  projectInstructions?: ContextProjectInstructionsManifest;
   prefixHash: string;
   dynamicHash: string;
   upperWatermark: number;

@@ -20,6 +20,14 @@ Native clipboard access is provided by the optional
 daemon, RPC, inline-session serialization, IPython, or image resizing stack;
 workspace policy, limits, persistence, and pi-ai integration are local glue.
 
+The ancestor ordering and same-directory precedence used by
+src/runtime/project-instructions.ts minimally adapt Pi coding-agent 0.84.3's
+resource-loader.ts, audited at commit
+1defa151e0c1dac87d38a2d0ac09d67f817b30f9. Nausicaa keeps only the Markdown
+instruction contract; Pi's extension/package resource framework and global
+agent directory are intentionally not ported. Canonical-path checks, no-follow
+reads, bounded sizes, request-time reload, and CAS/manifest identity are local.
+
 Pi and Prime Agent:
 Copyright (c) 2025 Mario Zechner
 Copyright (c) 2026 Prime Intellect

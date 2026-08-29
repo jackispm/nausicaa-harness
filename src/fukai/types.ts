@@ -13,6 +13,7 @@ import type {
   ContextCompactionGeneration,
   ContextCompactionSummary,
   ContextManifest,
+  ContextProjectInstructionsManifest,
   ContextSourceRef,
 } from "../domain/context.js";
 import type { ToolDefinition } from "../domain/ports.js";
@@ -33,6 +34,15 @@ export interface FukaiArtifactSelection {
     offset: number;
     length: number;
   };
+}
+
+/** Exact trusted Markdown selected for this request's stable system prefix. */
+export interface FukaiProjectInstruction {
+  path: string;
+  content: string;
+  byteLength: number;
+  pathHash: string;
+  contentHash: string;
 }
 
 export interface FukaiBudget {
@@ -115,6 +125,9 @@ export interface FukaiContextRequest {
   /** Current Turn intent, pinned as a dynamic user reminder outside the stable prefix. */
   activeObjective?: string;
   systemPrompt: string;
+  projectInstructions?: readonly FukaiProjectInstruction[];
+  /** Hash-only Ledger projection plus a Store ref for exact reconstruction. */
+  projectInstructionManifest?: ContextProjectInstructionsManifest;
   conversationRefs: readonly FukaiConversationRef[];
   artifactSelections: readonly FukaiArtifactSelection[];
   tools: readonly ToolDefinition[];
