@@ -16,6 +16,10 @@ describe("tool presentation registry", () => {
       "edit",
       "file_info",
       "find",
+      "git_diff",
+      "git_log",
+      "git_show",
+      "git_status",
       "grep",
       "list_files",
       "path_copy",
@@ -28,6 +32,7 @@ describe("tool presentation registry", () => {
       "process_status",
       "read_file",
       "read_image",
+      "read_many",
       "respond_to_advice",
       "web_fetch",
       "web_search",
@@ -216,6 +221,98 @@ describe("tool presentation registry", () => {
     });
     expect(write.summary).toBe("src/new.ts · 10 B written");
     expect(text(write.expanded)).not.toContain("export {}");
+  });
+
+  it("renders bounded multi-file reads as one semantic batch", () => {
+    const rendered = renderToolPresentation({
+      name: "read_many",
+      arguments: {
+        targets: [{ path: "src/main.ts" }, { path: "src/config.ts" }],
+      },
+      result: {
+        count: 2,
+        succeeded: 1,
+        failed: 1,
+        truncated: true,
+        results: [
+          {
+            path: "src/main.ts",
+            ok: true,
+            offset: 1,
+            lineCount: 2,
+            content: "export const main = true;\nrun();",
+            truncated: true,
+          },
+          { path: "src/config.ts", ok: false, error: "Path is protected" },
+        ],
+      },
+      status: "succeeded",
+      width: 80,
+    });
+
+    expect(rendered.summary).toBe("2 files · 1 read · 1 failed");
+    expect(text(rendered.expanded)).toContain("read    src/main.ts · lines 1-2 · more");
+    expect(text(rendered.expanded)).toContain("failed  src/config.ts · Path is protected");
+    expect(text(rendered.expanded)).toContain("export const main = true;");
+    expect(text(rendered.expanded)).not.toContain('"results"');
+  });
+
+  it("renders read-only Git tools without exposing result envelopes", () => {
+    const status = renderToolPresentation({
+      name: "git_status",
+      result: {
+        branch: "main...origin/main",
+        entries: [
+          { status: " M", path: "src/main.ts" },
+          { status: "??", path: "test/new.test.ts" },
+        ],
+        omittedProtectedPaths: 1,
+        truncated: false,
+      },
+      status: "succeeded",
+      width: 80,
+    });
+    expect(status.summary).toBe("main...origin/main · 2 changes");
+    expect(text(status.expanded)).toContain(" M  src/main.ts");
+    expect(text(status.expanded)).toContain("1 protected path omitted");
+
+    const diff = renderToolPresentation({
+      name: "git_diff",
+      arguments: { from: "0123456789abcdef", to: "fedcba9876543210" },
+      result: {
+        output: [
+          "diff --git a/a.ts b/a.ts",
+          "index 3367afd..3e75765 100644",
+          "--- a/a.ts",
+          "+++ b/a.ts",
+          "@@ -1 +1 @@",
+          "-old",
+          "+new",
+        ].join("\n"),
+        pathsShown: 1,
+        truncated: false,
+      },
+      status: "succeeded",
+      width: 80,
+    });
+    expect(diff.summary).toBe("git diff 0123456789ab..fedcba987654 · 1 path");
+    expect(diff.expanded.some((row) => row.tone === "removed")).toBe(true);
+    expect(diff.expanded.some((row) => row.tone === "added")).toBe(true);
+    expect(diff.expanded.find((row) => row.text === "--- a/a.ts")?.tone).toBe("context");
+    expect(diff.expanded.find((row) => row.text === "+++ b/a.ts")?.tone).toBe("context");
+    expect(diff.expanded.find((row) => row.text === "-old")?.tone).toBe("removed");
+    expect(diff.expanded.find((row) => row.text === "+new")?.tone).toBe("added");
+    expect(text(diff.expanded)).not.toContain('"output"');
+
+    const log = renderToolPresentation({
+      name: "git_log",
+      arguments: { maxCount: 2 },
+      result: { revision: "0123456789abcdef", maxCount: 2, output: "commit 0123\nSubject" },
+      status: "succeeded",
+      width: 80,
+    });
+    expect(log.summary).toBe("git log 0123456789ab · up to 2");
+    expect(text(log.expanded)).toContain("Subject");
   });
 
   it("renders file metadata, images, and path mutations without result JSON", () => {

@@ -459,10 +459,15 @@ describe("Mowe", () => {
     const catalog = createWorkspaceMoweCatalog({ allowWrite: true, allowPathOperations: true, allowShell: true });
     expect(catalog.modelDefinitions().map((definition) => definition.name)).toEqual([
       "read_file",
+      "read_many",
       "list_files",
       "grep",
       "find",
       "file_info",
+      "git_status",
+      "git_log",
+      "git_show",
+      "git_diff",
       "write_file",
       "edit",
       "directory_create",
@@ -503,10 +508,15 @@ describe("Mowe", () => {
     });
     expect(networkCatalog.modelDefinitions().map((definition) => definition.name)).toEqual([
       "read_file",
+      "read_many",
       "list_files",
       "grep",
       "find",
       "file_info",
+      "git_status",
+      "git_log",
+      "git_show",
+      "git_diff",
       "web_fetch",
       "web_search",
       "write_file",
@@ -527,10 +537,15 @@ describe("Mowe", () => {
     });
     expect(fullCatalog.modelDefinitions().map((definition) => definition.name)).toEqual([
       "read_file",
+      "read_many",
       "list_files",
       "grep",
       "find",
       "file_info",
+      "git_status",
+      "git_log",
+      "git_show",
+      "git_diff",
       "read_image",
       "web_fetch",
       "web_search",
@@ -551,10 +566,15 @@ describe("Mowe", () => {
     });
     expect(jobsCatalog.modelDefinitions().map((definition) => definition.name)).toEqual([
       "read_file",
+      "read_many",
       "list_files",
       "grep",
       "find",
       "file_info",
+      "git_status",
+      "git_log",
+      "git_show",
+      "git_diff",
       "bash",
       "process_start",
       "process_status",

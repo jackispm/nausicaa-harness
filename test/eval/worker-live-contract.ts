@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 
 import type { ToolDefinition } from "../../src/domain/index.js";
 import { createDelegateTaskTool } from "../../src/runtime/delegate-task-tool.js";
-import { createWorkspaceTools } from "../../src/tools/index.js";
 import { canonicalJson, hashJson } from "./fingerprint.js";
+import { createFrozenWorkspaceFixtureV2Tools } from "./tool-contract.js";
 import {
   WORKER_LIVE_FIXTURE_CATALOG,
   WORKER_LIVE_FIXTURE_HASH,
@@ -270,11 +270,8 @@ export interface WorkerLivePairPlan {
 }
 
 // Build identities from production definitions without invoking their dependencies.
-const mainOnlyToolDefinitions = createWorkspaceTools({
+const mainOnlyToolDefinitions = createFrozenWorkspaceFixtureV2Tools({
   allowWrite: false,
-  allowShell: false,
-  includeFileInfo: false,
-  allowPathOperations: false,
 }).map((tool) => structuredClone(tool.definition));
 const delegateTaskDefinition = createDelegateTaskTool({
   dispatcher: {} as never,

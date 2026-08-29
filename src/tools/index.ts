@@ -8,8 +8,24 @@ export {
   type FileInfoToolOptions,
 } from "./file-info.js";
 export { createGrepTool, grepTool } from "./grep.js";
+export {
+  createGitDiffTool,
+  createGitLogTool,
+  createGitShowTool,
+  createGitStatusTool,
+  createGitTools,
+  gitDiffTool,
+  gitLogTool,
+  gitShowTool,
+  gitStatusTool,
+  GIT_TOOL_MAX_OUTPUT_BYTES,
+  GIT_TOOL_MAX_OUTPUT_LINES,
+  GIT_TOOL_TIMEOUT_MS,
+  type GitToolOptions,
+} from "./git.js";
 export { createListFilesTool, listFilesTool } from "./list-files.js";
 export { createReadFileTool, readFileTool } from "./read-file.js";
+export { createReadManyTool, readManyTool } from "./read-many.js";
 export { createReadImageTool, readImageTool } from "./read-image.js";
 export {
   createDirectoryCreateTool,
@@ -89,8 +105,10 @@ import { createEditFileTool } from "./edit-file.js";
 import { createFindTool } from "./find.js";
 import { createFileInfoTool } from "./file-info.js";
 import { createGrepTool } from "./grep.js";
+import { createGitTools } from "./git.js";
 import { createListFilesTool } from "./list-files.js";
 import { createReadFileTool } from "./read-file.js";
+import { createReadManyTool } from "./read-many.js";
 import { createReadImageTool } from "./read-image.js";
 import {
   createDirectoryCreateTool,
@@ -118,6 +136,8 @@ export interface WorkspaceToolOptions extends WorkspacePathPolicy {
   allowPathOperations?: boolean;
   /** Include the default read-only file metadata capability. */
   includeFileInfo?: boolean;
+  /** Include bounded read-only repository status/history/diff capabilities. */
+  includeGit?: boolean;
   /** Enable provider-native workspace image input for the Main lane. */
   allowImages?: boolean;
   /** Enable run-scoped background shell jobs; requires allowShell as well. */
@@ -138,12 +158,16 @@ export function createWorkspaceTools(options: WorkspaceToolOptions = {}): AgentT
   const policy = { protectedPaths: [...(options.protectedPaths ?? [])] };
   const tools = [
     createReadFileTool(policy),
+    createReadManyTool(policy),
     createListFilesTool(policy),
     createGrepTool(policy),
     createFindTool(policy),
   ];
   if (options.includeFileInfo !== false) {
     tools.push(createFileInfoTool(policy));
+  }
+  if (options.includeGit !== false) {
+    tools.push(...createGitTools(policy));
   }
   if (options.allowImages === true) {
     tools.push(createReadImageTool(policy));

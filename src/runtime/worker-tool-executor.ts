@@ -16,10 +16,15 @@ const TOOL_ARGUMENTS_MEDIA_TYPE = "application/vnd.nausicaa.tool-arguments+json"
 export const MAX_WORKER_TOOL_RESULT_BYTES = 256 * 1024;
 const ALLOWED_WORKER_TOOLS = new Set([
   "read_file",
+  "read_many",
   "list_files",
   "grep",
   "find",
   "file_info",
+  "git_status",
+  "git_log",
+  "git_show",
+  "git_diff",
   "read_image",
 ]);
 

@@ -24,12 +24,16 @@ describe("workspace path operation tools", () => {
   it("is included with the explicit workspace write capability", () => {
     expect(createWorkspaceTools({ allowWrite: true, allowPathOperations: true }).map((tool) => tool.definition.name))
       .toEqual([
-        "read_file", "list_files", "grep", "find", "file_info", "write_file", "edit",
+        "read_file", "read_many", "list_files", "grep", "find", "file_info",
+        "git_status", "git_log", "git_show", "git_diff", "write_file", "edit",
         "directory_create", "path_copy", "path_move", "path_delete",
       ]);
     expect(createWorkspaceTools({ allowWrite: true, allowPathOperations: false })
       .map((tool) => tool.definition.name))
-      .toEqual(["read_file", "list_files", "grep", "find", "file_info", "write_file", "edit"]);
+      .toEqual([
+        "read_file", "read_many", "list_files", "grep", "find", "file_info",
+        "git_status", "git_log", "git_show", "git_diff", "write_file", "edit",
+      ]);
   });
   it("creates directories with optional parent creation and remains idempotent", async () => {
     const workspace = await temporaryDirectory("nausicaa-path-create-");

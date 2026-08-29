@@ -3,6 +3,11 @@ import path from "node:path";
 import type { AgentTool, ToolResult } from "../domain/ports.js";
 import { executeRipgrep } from "./ripgrep.js";
 import {
+  decodeSearchCursor,
+  encodeSearchCursor,
+  searchQueryFingerprint,
+} from "./search-cursor.js";
+import {
   boundedInteger,
   compareText,
   discoverSearchFiles,
@@ -45,31 +50,62 @@ interface GrepOutput {
   matchCount: number;
   filesMatched: number;
   truncated: boolean;
+  nextCursor?: string;
 }
 
 interface ParsedLine extends GrepLine {
   path: string;
   column?: number;
   match: boolean;
+  ordinal?: number;
 }
 
-export function createGrepTool(policy: WorkspacePathPolicy = {}): AgentTool {
+interface SearchGrepMatch extends GrepMatch {
+  ordinal: number;
+}
+
+interface GrepCursorAnchor {
+  path: string;
+  line: number;
+  column: number;
+  ordinal: number;
+}
+
+export interface GrepToolOptions {
+  /** Retain the pre-pagination search contract for frozen evaluation fixtures. */
+  pagination?: "cursor" | "legacy";
+}
+
+export function createGrepTool(
+  policy: WorkspacePathPolicy = {},
+  options: GrepToolOptions = {},
+): AgentTool {
   const pathPolicy = snapshotPolicy(policy);
+  const cursorPagination = options.pagination !== "legacy";
+  const properties: Record<string, unknown> = {
+    pattern: { type: "string", description: "Search pattern (regex or literal string)" },
+    path: { type: "string", description: "Directory or file to search (default: current directory)" },
+    glob: { type: "string", description: "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" },
+    ignoreCase: { type: "boolean", description: "Case-insensitive search (default: false)" },
+    literal: { type: "boolean", description: "Treat pattern as a literal string instead of regex (default: false)" },
+    context: { type: "integer", minimum: 0, maximum: HARD_CONTEXT },
+    limit: { type: "integer", minimum: 1, maximum: HARD_LIMIT },
+    ...(cursorPagination ? {
+      cursor: {
+        type: "string",
+        description: "Opaque nextCursor from the previous search with the same pattern, path, glob, and match options. The limit may change.",
+      },
+    } : {}),
+  };
   return {
     definition: {
       name: "grep",
-      description: "Search workspace file contents for a pattern and return bounded structured matches.",
+      description: cursorPagination
+        ? "Search workspace file contents in stable pages and return bounded structured matches. Use nextCursor to continue a truncated page."
+        : "Search workspace file contents for a pattern and return bounded structured matches.",
       parameters: {
         type: "object",
-        properties: {
-          pattern: { type: "string", description: "Search pattern (regex or literal string)" },
-          path: { type: "string", description: "Directory or file to search (default: current directory)" },
-          glob: { type: "string", description: "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'" },
-          ignoreCase: { type: "boolean", description: "Case-insensitive search (default: false)" },
-          literal: { type: "boolean", description: "Treat pattern as a literal string instead of regex (default: false)" },
-          context: { type: "integer", minimum: 0, maximum: HARD_CONTEXT },
-          limit: { type: "integer", minimum: 1, maximum: HARD_LIMIT },
-        },
+        properties,
         required: ["pattern"],
         additionalProperties: false,
       },
@@ -84,6 +120,12 @@ export function createGrepTool(policy: WorkspacePathPolicy = {}): AgentTool {
         const literal = optionalBoolean(arguments_.literal, "literal") ?? false;
         const contextLines = boundedInteger(arguments_.context, "context", 0, 0, HARD_CONTEXT);
         const limit = boundedInteger(arguments_.limit, "limit", DEFAULT_LIMIT, 1, HARD_LIMIT);
+        if (!cursorPagination && "cursor" in arguments_) {
+          throw new Error("cursor is not available in legacy grep pagination mode");
+        }
+        const cursor = cursorPagination
+          ? optionalString(arguments_.cursor, "cursor")
+          : undefined;
         const discovery = await discoverSearchFiles(
           context.workspace,
           requestedPath,
@@ -91,12 +133,28 @@ export function createGrepTool(policy: WorkspacePathPolicy = {}): AgentTool {
           pathPolicy,
           context.signal,
         );
+        const query = cursorPagination
+          ? searchQueryFingerprint({
+            workspace: discovery.root.workspace,
+            root: discovery.root.absolute,
+            pattern,
+            glob: glob ?? null,
+            ignoreCase,
+            literal,
+            contextLines,
+          })
+          : undefined;
+        const anchor = cursor === undefined
+          ? undefined
+          : decodeSearchCursor(cursor, "grep", query!, isGrepCursorAnchor);
         const search = await searchFiles(
           discovery.files,
           discovery.cwd,
           pattern,
           { ignoreCase, literal, contextLines, limit },
           context.signal,
+          anchor,
+          cursorPagination,
         );
         await revalidateExistingWorkspacePath(discovery.root);
         for (const file of search.matchedFiles) {
@@ -106,7 +164,9 @@ export function createGrepTool(policy: WorkspacePathPolicy = {}): AgentTool {
           discovery.root.relative,
           pattern,
           search.matches,
-          discovery.truncated || search.truncated,
+          search.truncated,
+          discovery.truncated,
+          query,
         ));
       } catch (error: unknown) {
         return failure(error instanceof Error ? error.message : "Content search failed");
@@ -123,15 +183,23 @@ async function searchFiles(
   pattern: string,
   options: { ignoreCase: boolean; literal: boolean; contextLines: number; limit: number },
   signal: AbortSignal | undefined,
-): Promise<{ matches: GrepMatch[]; matchedFiles: SearchFile[]; truncated: boolean }> {
+  anchor: GrepCursorAnchor | undefined,
+  cursorPagination: boolean,
+): Promise<{ matches: SearchGrepMatch[]; matchedFiles: SearchFile[]; truncated: boolean }> {
   const fileByArgument = new Map(files.map((file) => [toPosix(file.argument), file]));
   const parsedLines: ParsedLine[] = [];
   let outputTruncated = false;
-  let stoppedAtLimit = false;
+  let hasMore = false;
+  const targetMatches = options.limit + Number(cursorPagination);
+  let start = anchor === undefined ? 0 : firstFileAtOrAfter(files, anchor.path);
 
-  for (let start = 0; start < files.length; start += FILE_BATCH_SIZE) {
+  while (start < files.length) {
     throwIfAborted(signal);
-    const batch = files.slice(start, start + FILE_BATCH_SIZE);
+    const includesAnchorFile = anchor !== undefined && files[start]!.path === anchor.path;
+    const batch = includesAnchorFile
+      ? files.slice(start, start + 1)
+      : files.slice(start, start + FILE_BATCH_SIZE);
+    start += batch.length;
     const arguments_ = [
       "--json",
       "--line-number",
@@ -141,7 +209,7 @@ async function searchFiles(
       "--sort=path",
       "--path-separator=/",
       "--max-count",
-      String(options.limit),
+      String(includesAnchorFile ? anchor.ordinal + targetMatches : targetMatches),
     ];
     if (options.ignoreCase) arguments_.push("--ignore-case");
     if (options.literal) arguments_.push("--fixed-strings");
@@ -153,30 +221,41 @@ async function searchFiles(
       throw new Error(ripgrepError(result.stderr, result.exitCode));
     }
     outputTruncated ||= result.outputTruncated;
-    parsedLines.push(...parseRipgrepJson(result.stdout, fileByArgument, result.outputTruncated));
-    const observedMatches = parsedLines.reduce((count, line) => count + Number(line.match), 0);
-    if (observedMatches >= options.limit) {
-      stoppedAtLimit = true;
+    const parsedBatch = parseRipgrepJson(result.stdout, fileByArgument, result.outputTruncated);
+    if (includesAnchorFile && !containsAnchor(parsedBatch, anchor)) {
+      throw new Error(result.outputTruncated
+        ? "grep cursor could not be reached within the search output limit; narrow the query or restart without cursor"
+        : "grep cursor no longer matches the workspace; restart the search without cursor");
+    }
+    parsedLines.push(...parsedBatch);
+    const observedMatches = parsedLines.reduce((count, line) => (
+      count + Number(isMatchAfter(line, anchor))
+    ), 0);
+    if (observedMatches >= targetMatches) {
+      hasMore = true;
       break;
     }
     if (result.outputTruncated) break;
   }
 
   const matchLines = parsedLines
-    .filter((line): line is ParsedLine & { column: number } => line.match && line.column !== undefined)
+    .filter((line): line is ParsedLine & { column: number; ordinal: number } => (
+      line.match && line.column !== undefined && line.ordinal !== undefined && isMatchAfter(line, anchor)
+    ))
     .sort(compareParsedLines)
-    .slice(0, options.limit);
+  hasMore ||= matchLines.length > options.limit;
+  const selectedMatchLines = matchLines.slice(0, options.limit);
   const allLines = new Map<string, ParsedLine>();
   for (const line of parsedLines.sort(compareParsedLines)) {
     allLines.set(lineKey(line.path, line.line), line);
   }
-  const matches = matchLines.map((match) => withContext(match, allLines, options.contextLines));
+  const matches = selectedMatchLines.map((match) => withContext(match, allLines, options.contextLines));
   const matchedPaths = new Set(matches.map((match) => match.path));
   const matchedFiles = files.filter((file) => matchedPaths.has(file.path));
   return {
     matches,
     matchedFiles,
-    truncated: outputTruncated || stoppedAtLimit,
+    truncated: outputTruncated || hasMore,
   };
 }
 
@@ -188,6 +267,7 @@ function parseRipgrepJson(
   const rawLines = output.toString("utf8").split("\n");
   if (outputTruncated) rawLines.pop();
   const parsed: ParsedLine[] = [];
+  const ordinals = new Map<string, number>();
   for (const rawLine of rawLines) {
     if (rawLine.length === 0) continue;
     let event: unknown;
@@ -208,12 +288,15 @@ function parseRipgrepJson(
     const bounded = boundLine(rawText.replace(/\r?\n$/, ""));
     const column = event.type === "match" ? firstColumn(event.data.submatches) : undefined;
     if (event.type === "match" && column === undefined) continue;
+    const ordinal = event.type === "match" ? (ordinals.get(file.path) ?? 0) + 1 : undefined;
+    if (ordinal !== undefined) ordinals.set(file.path, ordinal);
     parsed.push({
       path: file.path,
       line,
       text: bounded.text,
       ...(bounded.truncated ? { truncated: true as const } : {}),
       ...(column === undefined ? {} : { column }),
+      ...(ordinal === undefined ? {} : { ordinal }),
       match: event.type === "match",
     });
   }
@@ -221,10 +304,10 @@ function parseRipgrepJson(
 }
 
 function withContext(
-  match: ParsedLine & { column: number },
+  match: ParsedLine & { column: number; ordinal: number },
   lines: ReadonlyMap<string, ParsedLine>,
   context: number,
-): GrepMatch {
+): SearchGrepMatch {
   const before: GrepLine[] = [];
   const after: GrepLine[] = [];
   for (let line = match.line - context; line < match.line; line += 1) {
@@ -239,6 +322,7 @@ function withContext(
     path: match.path,
     line: match.line,
     column: match.column,
+    ordinal: match.ordinal!,
     text: match.text,
     ...(match.truncated ? { truncated: true as const } : {}),
     ...(before.length > 0 ? { before } : {}),
@@ -257,26 +341,83 @@ function toGrepLine(line: ParsedLine): GrepLine {
 function boundOutput(
   searchPath: string,
   pattern: string,
-  matches: readonly GrepMatch[],
-  initiallyTruncated: boolean,
+  matches: readonly SearchGrepMatch[],
+  pageTruncated: boolean,
+  discoveryTruncated: boolean,
+  query: string | undefined,
 ): GrepOutput {
   const selected = [...matches];
-  let truncated = initiallyTruncated;
+  let hasRecoverableNextPage = pageTruncated;
   while (true) {
+    const visibleMatches = selected.map(({ ordinal: _, ...match }) => match);
+    const truncated = discoveryTruncated || hasRecoverableNextPage;
     const output: GrepOutput = {
       path: searchPath,
       pattern,
-      matches: selected,
-      matchCount: selected.length,
-      filesMatched: new Set(selected.map((match) => match.path)).size,
+      matches: visibleMatches,
+      matchCount: visibleMatches.length,
+      filesMatched: new Set(visibleMatches.map((match) => match.path)).size,
       truncated,
+      ...(query !== undefined && hasRecoverableNextPage && selected.length > 0
+        ? { nextCursor: encodeSearchCursor("grep", query, grepAnchor(selected.at(-1)!)) }
+        : {}),
     };
     if (Buffer.byteLength(JSON.stringify(output), "utf8") <= MAX_RESULT_BYTES || selected.length === 0) {
       return output;
     }
     selected.pop();
-    truncated = true;
+    hasRecoverableNextPage = true;
   }
+}
+
+function firstFileAtOrAfter(files: readonly SearchFile[], anchor: string): number {
+  let low = 0;
+  let high = files.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    if (files[middle]!.path < anchor) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function containsAnchor(lines: readonly ParsedLine[], anchor: GrepCursorAnchor): boolean {
+  return lines.some((line) => line.match
+    && line.path === anchor.path
+    && line.line === anchor.line
+    && line.column === anchor.column
+    && line.ordinal === anchor.ordinal);
+}
+
+function isMatchAfter(line: ParsedLine, anchor: GrepCursorAnchor | undefined): boolean {
+  if (!line.match || line.column === undefined) return false;
+  if (anchor === undefined) return true;
+  return compareText(line.path, anchor.path) > 0
+    || (line.path === anchor.path && (
+      line.line > anchor.line
+      || (line.line === anchor.line && line.column > anchor.column)
+    ));
+}
+
+function grepAnchor(match: SearchGrepMatch): GrepCursorAnchor {
+  return {
+    path: match.path,
+    line: match.line,
+    column: match.column,
+    ordinal: match.ordinal,
+  };
+}
+
+function isGrepCursorAnchor(value: unknown): value is GrepCursorAnchor {
+  return isRecord(value)
+    && typeof value.path === "string"
+    && value.path.length > 0
+    && Number.isSafeInteger(value.line)
+    && (value.line as number) > 0
+    && Number.isSafeInteger(value.column)
+    && (value.column as number) > 0
+    && Number.isSafeInteger(value.ordinal)
+    && (value.ordinal as number) > 0;
 }
 
 function compareParsedLines(left: ParsedLine, right: ParsedLine): number {

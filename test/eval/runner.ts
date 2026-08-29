@@ -20,7 +20,6 @@ import {
 } from "../../src/runtime/index.js";
 import { JsonlLedger } from "../../src/ledger/index.js";
 import { boundedRedactedText } from "../../src/runtime/redaction.js";
-import { createWorkspaceTools } from "../../src/tools/index.js";
 import {
   buildPairedReport,
   evaluateReleaseDecision,
@@ -46,7 +45,11 @@ import {
   type ToolTraceEntry,
 } from "./fixtures.js";
 import { hashJson } from "./fingerprint.js";
-import { assertEvaluationToolContract, assertModelRequestToolContract } from "./tool-contract.js";
+import {
+  assertEvaluationToolContract,
+  assertModelRequestToolContract,
+  createFrozenWorkspaceFixtureV2Tools,
+} from "./tool-contract.js";
 
 export const PHASE24_EVALUATION_ENV = "NAUSICAA_PHASE24_EVAL";
 export const PHASE24_EVALUATION_ID = "phase-2.4";
@@ -398,11 +401,8 @@ export async function executeEvaluationArm(
   let runResult: RunExecutionResult | undefined;
   let error: string | undefined;
   const toolTrace: ToolTraceEntry[] = [];
-  const workspaceTools = createWorkspaceTools({
+  const workspaceTools = createFrozenWorkspaceFixtureV2Tools({
     allowWrite: fixture.allowWrite,
-    allowShell: false,
-    allowPathOperations: false,
-    includeFileInfo: false,
     protectedPaths: [resolve(dataDir)],
   });
   assertEvaluationToolContract(workspaceTools, fixture.allowWrite);

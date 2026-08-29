@@ -93,10 +93,15 @@ describe("runtime activation parity", () => {
     expect(sessionModel.requests[0]?.signal).toBeInstanceOf(AbortSignal);
     expect(oneShotModel.requests[0]?.tools.map((tool) => tool.name)).toEqual([
       "read_file",
+      "read_many",
       "list_files",
       "grep",
       "find",
       "file_info",
+      "git_status",
+      "git_log",
+      "git_show",
+      "git_diff",
       "read_image",
       "web_fetch",
       "web_search",

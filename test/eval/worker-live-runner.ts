@@ -40,7 +40,6 @@ import {
   type RunExecutionResult,
 } from "../../src/runtime/index.js";
 import { persistedErrorText } from "../../src/runtime/redaction.js";
-import { createWorkspaceTools } from "../../src/tools/index.js";
 import {
   FileContentAddressedStore,
   createArtifactRef,
@@ -76,6 +75,7 @@ import {
 import { canonicalJson, hashJson } from "./fingerprint.js";
 import {
   assertEvaluationToolContract,
+  createFrozenWorkspaceFixtureV2Tools,
 } from "./tool-contract.js";
 
 export const WORKER_LIVE_EVALUATION_ID = "worker-live-ab-v2";
@@ -470,11 +470,8 @@ export async function executeWorkerLiveArm(
   const fixture = await createWorkerLiveFixture(task, options.rootDirectory);
   const dataDir = join(options.rootDirectory, "state");
   const toolTrace: WorkerLiveRecordedToolTraceEntry[] = [];
-  const workspaceTools = createWorkspaceTools({
+  const workspaceTools = createFrozenWorkspaceFixtureV2Tools({
     allowWrite: manifest.execution.allowWrite,
-    allowShell: manifest.execution.allowShell,
-    allowPathOperations: false,
-    includeFileInfo: false,
     protectedPaths: [resolve(dataDir)],
   });
   assertEvaluationToolContract(workspaceTools, false);

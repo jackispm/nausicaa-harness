@@ -65,10 +65,15 @@ export const TOOL_PRESENTATION_RENDERERS: Readonly<Record<string, ToolPresentati
   Object.freeze({
     bash: renderBash,
     read_file: renderReadFile,
+    read_many: renderReadMany,
     list_files: renderListFiles,
     grep: renderGrep,
     find: renderFind,
     file_info: renderFileInfo,
+    git_status: renderGitStatus,
+    git_log: renderGitLog,
+    git_show: renderGitShow,
+    git_diff: renderGitDiff,
     read_image: renderReadImage,
     write_file: renderWriteFile,
     edit: renderEdit,
@@ -113,20 +118,31 @@ export function renderRichDiffRows(diff: string, width: number): ToolPresentatio
   for (const unsafeLine of safeText(diff).split("\n")) {
     const rawLine = unsafeLine.replaceAll("\t", "   ");
     const parsed = /^([+\- ])(\s*\d+)\s(.*)$/.exec(rawLine);
-    if (parsed === null) {
-      rows.push(...wrapRows(rawLine, safeWidth, "context"));
+    if (parsed !== null) {
+      const prefix = parsed[1] ?? " ";
+      const lineNumber = parsed[2] ?? "";
+      const content = parsed[3] ?? "";
+      const gutter = `${prefix}${lineNumber} `;
+      const tone: ToolLineTone = prefix === "+"
+        ? "added"
+        : prefix === "-"
+          ? "removed"
+          : "context";
+      rows.push(...wrapPrefixed(gutter, content, safeWidth, tone));
       continue;
     }
-    const prefix = parsed[1] ?? " ";
-    const lineNumber = parsed[2] ?? "";
-    const content = parsed[3] ?? "";
-    const gutter = `${prefix}${lineNumber} `;
-    const tone: ToolLineTone = prefix === "+"
-      ? "added"
-      : prefix === "-"
-        ? "removed"
-        : "context";
-    rows.push(...wrapPrefixed(gutter, content, safeWidth, tone));
+    const unifiedPrefix = rawLine[0];
+    const isFileHeader = rawLine.startsWith("+++") || rawLine.startsWith("---");
+    if (!isFileHeader && (unifiedPrefix === "+" || unifiedPrefix === "-")) {
+      rows.push(...wrapPrefixed(
+        unifiedPrefix,
+        rawLine.slice(1),
+        safeWidth,
+        unifiedPrefix === "+" ? "added" : "removed",
+      ));
+      continue;
+    }
+    rows.push(...wrapRows(rawLine, safeWidth, "context"));
   }
   return rows;
 }
@@ -206,6 +222,52 @@ function renderReadFile(context: ToolRenderContext): ToolPresentation {
   return {
     summary: `${path}${range.length === 0 ? "" : ` · ${range}`}${more}`,
     collapsed: [],
+    expanded: boundedRows(rows),
+  };
+}
+
+function renderReadMany(context: ToolRenderContext): ToolPresentation {
+  const targets = Array.isArray(context.arguments?.targets)
+    ? context.arguments.targets.filter(isRecord)
+    : [];
+  const callSummary = targets.length === 0
+    ? "file batch"
+    : `${targets.length} file${targets.length === 1 ? "" : "s"}`;
+  const failure = resultFailure(context, callSummary);
+  if (failure !== undefined && !Array.isArray(context.result?.results)) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, callSummary);
+
+  const results = Array.isArray(context.result.results)
+    ? context.result.results.filter(isRecord)
+    : [];
+  const rows: ToolPresentationLine[] = [];
+  for (const result of results) {
+    const path = stringValue(result.path) ?? "unknown file";
+    if (result.ok !== true) {
+      const error = toolErrorMessage(result.error) ?? "read failed";
+      rows.push(...wrapPrefixed("failed  ", `${path} · ${error}`, context.width, "error"));
+      continue;
+    }
+    const offset = integer(result.offset) ?? 1;
+    const count = integer(result.lineCount) ?? 0;
+    const range = count <= 0 ? "empty" : `lines ${offset}-${offset + count - 1}`;
+    rows.push(...wrapPrefixed(
+      "read    ",
+      `${path} · ${range}${result.truncated === true ? " · more" : ""}`,
+      context.width,
+      "muted",
+    ));
+    const content = stringValue(result.content);
+    if (content !== undefined && content.length > 0) {
+      rows.push(...wrapRows(content, context.width, "output"));
+    }
+  }
+  const succeeded = integer(context.result.succeeded)
+    ?? results.filter((result) => result.ok === true).length;
+  const failed = integer(context.result.failed) ?? results.length - succeeded;
+  return {
+    summary: `${results.length} files · ${succeeded} read${failed === 0 ? "" : ` · ${failed} failed`}`,
+    collapsed: headPreview(rows, 6),
     expanded: boundedRows(rows),
   };
 }
@@ -339,6 +401,107 @@ function renderFileInfo(context: ToolRenderContext): ToolPresentation {
     collapsed: [],
     expanded: rows,
   };
+}
+
+function renderGitStatus(context: ToolRenderContext): ToolPresentation {
+  const failure = resultFailure(context, "git status");
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, "git status");
+
+  const entries = Array.isArray(context.result.entries)
+    ? context.result.entries.filter(isRecord)
+    : [];
+  const branch = stringValue(context.result.branch);
+  const rows: ToolPresentationLine[] = [];
+  for (const entry of entries) {
+    const status = stringValue(entry.status) ?? "??";
+    const path = stringValue(entry.path) ?? "unknown path";
+    rows.push(...wrapPrefixed(`${status.padEnd(3)} `, path, context.width, "output"));
+  }
+  if (rows.length === 0) rows.push(line("Working tree clean", "muted"));
+  appendGitWarnings(rows, context.result);
+  return {
+    summary: `${branch ?? "repository"} · ${entries.length} change${entries.length === 1 ? "" : "s"}`,
+    collapsed: headPreview(rows, 6),
+    expanded: boundedRows(rows),
+  };
+}
+
+function renderGitLog(context: ToolRenderContext): ToolPresentation {
+  const revision = shortRevision(stringValue(context.result?.revision)
+    ?? stringValue(context.arguments?.revision)
+    ?? "HEAD");
+  const maxCount = integer(context.result?.maxCount) ?? integer(context.arguments?.maxCount) ?? 10;
+  return renderGitText(context, `git log ${revision} · up to ${maxCount}`, false);
+}
+
+function renderGitShow(context: ToolRenderContext): ToolPresentation {
+  const revision = shortRevision(stringValue(context.result?.revision)
+    ?? stringValue(context.arguments?.revision)
+    ?? "HEAD");
+  const pathsShown = integer(context.result?.pathsShown);
+  return renderGitText(
+    context,
+    `git show ${revision}${pathsShown === undefined ? "" : ` · ${pathsShown} path${pathsShown === 1 ? "" : "s"}`}`,
+    context.arguments?.statOnly !== true,
+  );
+}
+
+function renderGitDiff(context: ToolRenderContext): ToolPresentation {
+  const from = stringValue(context.arguments?.from);
+  const to = stringValue(context.arguments?.to);
+  const staged = context.arguments?.staged === true;
+  const comparison = staged
+    ? `staged${from === undefined ? "" : ` from ${shortRevision(from)}`}`
+    : from === undefined
+      ? "working tree"
+      : to === undefined
+        ? `from ${shortRevision(from)}`
+        : `${shortRevision(from)}..${shortRevision(to)}`;
+  const pathsShown = integer(context.result?.pathsShown);
+  return renderGitText(
+    context,
+    `git diff ${comparison}${pathsShown === undefined ? "" : ` · ${pathsShown} path${pathsShown === 1 ? "" : "s"}`}`,
+    context.arguments?.statOnly !== true,
+  );
+}
+
+function renderGitText(
+  context: ToolRenderContext,
+  summary: string,
+  richDiff: boolean,
+): ToolPresentation {
+  const failure = resultFailure(context, summary);
+  if (failure !== undefined) return failure;
+  if (context.result === undefined) return rawOrEmpty(context, summary);
+  const output = stringValue(context.result.output) ?? "";
+  const rows = output.length === 0
+    ? [line("(no output)", "muted")]
+    : richDiff
+      ? renderRichDiffRows(output, context.width)
+      : wrapRows(output, context.width, "output");
+  appendGitWarnings(rows, context.result);
+  return {
+    summary,
+    collapsed: headPreview(rows, 6),
+    expanded: boundedRows(rows),
+  };
+}
+
+function appendGitWarnings(
+  rows: ToolPresentationLine[],
+  result: Record<string, unknown>,
+): void {
+  const omitted = integer(result.omittedProtectedPaths);
+  if (omitted !== undefined && omitted > 0) {
+    rows.push(line(`${omitted} protected path${omitted === 1 ? "" : "s"} omitted`, "warning"));
+  }
+  if (result.pathsTruncated === true) rows.push(line("Changed path set truncated", "warning"));
+  if (result.truncated === true) rows.push(line(truncationSummary(result), "warning"));
+}
+
+function shortRevision(value: string): string {
+  return value.length > 12 && /^[0-9a-f]+$/iu.test(value) ? value.slice(0, 12) : oneLine(value);
 }
 
 function renderReadImage(context: ToolRenderContext): ToolPresentation {

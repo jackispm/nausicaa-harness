@@ -27,10 +27,15 @@ describe("web tools", () => {
     expect(createWorkspaceTools().map((tool) => tool.definition.name)).not.toContain("web_fetch");
     expect(createWorkspaceTools({ allowNetwork: true }).map((tool) => tool.definition.name)).toEqual([
       "read_file",
+      "read_many",
       "list_files",
       "grep",
       "find",
       "file_info",
+      "git_status",
+      "git_log",
+      "git_show",
+      "git_diff",
       "web_fetch",
       "web_search",
     ]);

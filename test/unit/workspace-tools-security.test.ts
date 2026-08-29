@@ -43,26 +43,40 @@ describe("workspace tool path security", () => {
   it("keeps writes and shell disabled by default and enables them independently", () => {
     expect(createWorkspaceTools().map((tool) => tool.definition.name)).toEqual([
       "read_file",
+      "read_many",
       "list_files",
       "grep",
       "find",
       "file_info",
+      "git_status",
+      "git_log",
+      "git_show",
+      "git_diff",
     ]);
     expect(createWorkspaceTools({ allowWrite: true }).map((tool) => tool.definition.name))
       .toEqual([
-        "read_file", "list_files", "grep", "find", "file_info", "write_file", "edit",
+        "read_file", "read_many", "list_files", "grep", "find", "file_info",
+        "git_status", "git_log", "git_show", "git_diff", "write_file", "edit",
         "directory_create", "path_copy", "path_move", "path_delete",
       ]);
     expect(createWorkspaceTools({ allowShell: true }).map((tool) => tool.definition.name))
-      .toEqual(["read_file", "list_files", "grep", "find", "file_info", "bash"]);
+      .toEqual([
+        "read_file", "read_many", "list_files", "grep", "find", "file_info",
+        "git_status", "git_log", "git_show", "git_diff", "bash",
+      ]);
     expect(createWorkspaceTools({ allowShell: true, allowWrite: true, allowPathOperations: true })
       .map((tool) => tool.definition.name))
       .toEqual([
         "read_file",
+        "read_many",
         "list_files",
         "grep",
         "find",
         "file_info",
+        "git_status",
+        "git_log",
+        "git_show",
+        "git_diff",
         "write_file",
         "edit",
         "directory_create",
@@ -73,15 +87,23 @@ describe("workspace tool path security", () => {
       ]);
     expect(createWorkspaceTools({ allowProcessJobs: true })
       .map((tool) => tool.definition.name))
-      .toEqual(["read_file", "list_files", "grep", "find", "file_info"]);
+      .toEqual([
+        "read_file", "read_many", "list_files", "grep", "find", "file_info",
+        "git_status", "git_log", "git_show", "git_diff",
+      ]);
     expect(createWorkspaceTools({ allowShell: true, allowProcessJobs: true })
       .map((tool) => tool.definition.name))
       .toEqual([
         "read_file",
+        "read_many",
         "list_files",
         "grep",
         "find",
         "file_info",
+        "git_status",
+        "git_log",
+        "git_show",
+        "git_diff",
         "bash",
         "process_start",
         "process_status",

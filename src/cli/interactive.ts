@@ -41,6 +41,7 @@ import {
 } from "./image-markers.js";
 import {
   collaborationModeOptions,
+  filterSelectorOptions,
   modelSelectorOptions,
   normalizeModelSelector,
   parseCollaborationMode,
@@ -48,6 +49,7 @@ import {
   parseThemeChoice,
   permissionProfileOptions,
   themeSelectorOptions,
+  type SelectorOption,
   type ThemeChoice,
 } from "./selectors.js";
 import { SelectorOverlay } from "./selector-component.js";
@@ -202,16 +204,52 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider([
     { name: "help", description: "Show commands" },
     { name: "status", description: "Show session state" },
-    { name: "model", description: "Switch the Main model" },
-    { name: "permissions", description: "Change the tool capability boundary" },
-    { name: "mode", description: "Switch between Default and Plan" },
-    { name: "plan", description: "Enter Plan mode, optionally with a prompt" },
-    { name: "theme", description: "Select the TUI color scheme" },
-    { name: "goal", description: "Show or revise the Run Goal" },
+    {
+      name: "model",
+      description: "Switch the Main model",
+      argumentHint: "[model]",
+      getArgumentCompletions: (prefix) => commandArgumentCompletions(
+        modelSelectorOptions(
+          options.session.snapshot().model,
+          options.session.tetoModel,
+          options.modelChoices ?? [],
+        ),
+        prefix,
+      ),
+    },
+    {
+      name: "permissions",
+      description: "Change the tool capability boundary",
+      argumentHint: "[read-only|workspace|full-access]",
+      getArgumentCompletions: (prefix) => commandArgumentCompletions(
+        permissionProfileOptions(options.session.snapshot().permissionProfile),
+        prefix,
+      ),
+    },
+    {
+      name: "mode",
+      description: "Switch between Default and Plan",
+      argumentHint: "[default|plan]",
+      getArgumentCompletions: (prefix) => commandArgumentCompletions(
+        collaborationModeOptions(options.session.snapshot().collaborationMode),
+        prefix,
+      ),
+    },
+    { name: "plan", description: "Enter Plan mode, optionally with a prompt", argumentHint: "[prompt]" },
+    {
+      name: "theme",
+      description: "Select the TUI color scheme",
+      argumentHint: "[auto|light|dark]",
+      getArgumentCompletions: (prefix) => commandArgumentCompletions(
+        themeSelectorOptions(themePreference),
+        prefix,
+      ),
+    },
+    { name: "goal", description: "Show or revise the Run Goal", argumentHint: "[statement]" },
     { name: "new", description: "Start a new Run" },
     { name: "resume", description: "Resume the current Turn" },
     { name: "cancel", description: "Cancel the active Turn" },
-    { name: "resolve", description: "Resolve an unknown tool operation" },
+    { name: "resolve", description: "Resolve an unknown tool operation", argumentHint: "<operation-id>" },
     { name: "copy", description: "Copy the last assistant answer" },
     { name: "exit", description: "Exit Nausicaa" },
   ], options.session.workspace));
@@ -1036,7 +1074,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     commandLine: string,
     commandImages?: readonly UserImage[],
   ): Promise<void> => {
-    const [command, ...args] = commandLine.split(/\s+/);
+    const { command, argument } = parseInteractiveCommand(commandLine);
     try {
       switch (command) {
         case "/help":
@@ -1058,28 +1096,28 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           writeStatus(options.session.snapshot());
           break;
         case "/model": {
-          if (args.length === 0) {
+          if (argument.length === 0) {
             showModelSelector();
             break;
           }
-          const selected = normalizeModelSelector(args.join(" "));
+          const selected = normalizeModelSelector(argument);
           await applyModelSelection(selected);
           break;
         }
         case "/permissions": {
-          if (args.length === 0) {
+          if (argument.length === 0) {
             showPermissionSelector();
             break;
           }
-          await applyPermissionProfile(args.join(" "));
+          await applyPermissionProfile(argument);
           break;
         }
         case "/mode": {
-          if (args.length === 0) {
+          if (argument.length === 0) {
             showCollaborationModeSelector();
             break;
           }
-          await applyCollaborationMode(args.join(" "));
+          await applyCollaborationMode(argument);
           break;
         }
         case "/plan": {
@@ -1088,7 +1126,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             throw new Error("/plan is unavailable while Main is working");
           }
           await applyCollaborationMode("plan");
-          const prompt = args.join(" ").trim();
+          const prompt = argument;
           if (prompt.length > 0) {
             await options.session.submit({
               inputId: createInputId(),
@@ -1102,15 +1140,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           break;
         }
         case "/theme": {
-          if (args.length === 0) {
+          if (argument.length === 0) {
             showThemeSelector();
             break;
           }
-          applyThemeChoice(parseThemeChoice(args.join(" ")));
+          applyThemeChoice(parseThemeChoice(argument));
           break;
         }
         case "/goal": {
-          const statement = args.join(" ").trim();
+          const statement = argument;
           if (statement.length === 0) {
             const goal = options.session.snapshot().goal;
             appendNotice(goal === undefined
@@ -1147,12 +1185,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           await options.session.cancel();
           break;
         case "/resolve":
-          if (args[0] === undefined) throw new Error("/resolve requires an operation id");
-          await options.session.resolveOperation(args[0]);
+          if (argument.length === 0) throw new Error("/resolve requires an operation id");
+          await options.session.resolveOperation(argument.split(/\s+/)[0]!);
           appendNotice("Operation resolved as failed.", "warning");
           break;
         case "/copy": {
-          if (args.length > 0) throw new Error("Usage: /copy");
+          if (argument.length > 0) throw new Error("Usage: /copy");
           if (
             options.session.snapshot().status === "running"
             || options.session.snapshot().status === "cancelling"
@@ -1440,6 +1478,29 @@ function unknownToolDetail(operationId: string): string {
 
 function oneLine(value: string): string {
   return value.replace(/\s+/g, " ").trim().slice(0, 160);
+}
+
+function commandArgumentCompletions(
+  options: readonly SelectorOption[],
+  prefix: string,
+): Array<{ value: string; label: string; description?: string }> {
+  return filterSelectorOptions(options, prefix).map((option) => ({
+    value: option.value,
+    label: option.label,
+    ...(option.description === undefined ? {} : { description: option.description }),
+  }));
+}
+
+function parseInteractiveCommand(commandLine: string): {
+  command: string;
+  argument: string;
+} {
+  // Prime Agent 7787f074 splits once, preserving a multiline command argument.
+  const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(commandLine.trim());
+  return {
+    command: match?.[1] ?? commandLine,
+    argument: (match?.[2] ?? "").trim(),
+  };
 }
 
 function capitalize(value: string): string {

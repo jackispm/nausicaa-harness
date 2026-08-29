@@ -1002,6 +1002,57 @@ describe("interactive TUI", () => {
     }
   });
 
+  it.each([44, 100])(
+    "completes command arguments and preserves a multiline Goal at %i columns",
+    async (columns) => {
+      const root = await mkdtemp(join(tmpdir(), `nausicaa-tui-command-arguments-${columns}-`));
+      const terminal = new MemoryTerminal(columns, 28);
+      const previousExitCode = process.exitCode;
+      try {
+        const session = await SessionController.open({
+          workspace: root,
+          dataDir: join(root, "state"),
+          model: "scripted",
+          policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+        }, {
+          mainModel: new ScriptedModel([]),
+          createRunId: () => `interactive-command-arguments-${columns}`,
+        });
+        const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+        await terminal.started;
+        terminal.type("/permissions fu");
+        await waitForOutput(terminal, "Full Access");
+        terminal.send("\r");
+        terminal.send("\r");
+        await waitForOutput(terminal, "Permissions set to full-access");
+        expect(session.snapshot().permissionProfile).toBe("full-access");
+
+        terminal.type("/goal Keep the first line");
+        terminal.send("\n");
+        terminal.type("and preserve the second line");
+        terminal.send("\r");
+        await waitForCondition(
+          () => session.snapshot().goal?.statement === "Keep the first line\nand preserve the second line",
+          "multiline Goal revision",
+        );
+
+        // Completing an argument and submitting a multiline command must leave
+        // the editor focused for the next command on both narrow and wide TUIs.
+        terminal.type("/status");
+        terminal.send("\r");
+        await waitForOutput(terminal, "Queue / Tokens");
+
+        terminal.type("/exit");
+        terminal.send("\r");
+        await expect(running).resolves.toBe(0);
+      } finally {
+        process.exitCode = previousExitCode;
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("uses Prime-style focused selectors to switch Main and restores editor focus", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-selectors-"));
     const terminal = new MemoryTerminal(100, 28);

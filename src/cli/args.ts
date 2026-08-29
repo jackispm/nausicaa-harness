@@ -297,7 +297,7 @@ Options:
                           Fukai compaction output budget
   --fukai-max-wall-clock-ms <number>
                           Fukai compaction wall-clock budget
-  --allow-write           Allow workspace file writes for this run
+  --allow-write           Override settings to allow workspace writes (default)
   --allow-shell           Explicit high privilege: shell may read/write outside the workspace
   --allow-network         Allow public web fetch/search tools for this run
   --workspace <path>      Bound tools to this workspace

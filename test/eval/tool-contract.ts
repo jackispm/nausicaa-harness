@@ -1,18 +1,15 @@
-import type { AgentTool } from "../../src/domain/index.js";
+import type { AgentTool, ToolDefinition, ToolResult } from "../../src/domain/index.js";
 import type { ModelRequest } from "../../src/domain/index.js";
 import { createAdviceResponseTool } from "../../src/runtime/index.js";
-import { createWorkspaceTools } from "../../src/tools/index.js";
+import { createGrepTool, createWorkspaceTools } from "../../src/tools/index.js";
 import { hashJson } from "./fingerprint.js";
 
 // Keep the pre-registered evaluation surface stable while the product tool
 // catalog evolves independently.
-const readOnlyTools = createWorkspaceTools({ allowWrite: false, allowShell: false, includeFileInfo: false });
-const writeTools = createWorkspaceTools({
-  allowWrite: true,
-  allowShell: false,
-  includeFileInfo: false,
-  allowPathOperations: false,
-});
+const FROZEN_READ_TOOL_NAMES = ["read_file", "list_files", "grep", "find"] as const;
+const FROZEN_WRITE_TOOL_NAMES = [...FROZEN_READ_TOOL_NAMES, "write_file", "edit"] as const;
+const readOnlyTools = createFrozenWorkspaceFixtureV2Tools({ allowWrite: false });
+const writeTools = createFrozenWorkspaceFixtureV2Tools({ allowWrite: true });
 const adviceDefinition = createAdviceResponseTool({} as never).definition;
 
 export const FROZEN_TOOL_CONTRACT = deepFreeze({
@@ -41,6 +38,44 @@ export const FROZEN_TOOL_CONTRACT = deepFreeze({
 } as const);
 
 export const FROZEN_TOOL_CONTRACT_HASH = hashJson(FROZEN_TOOL_CONTRACT);
+
+export function createFrozenWorkspaceFixtureV2Tools(options: {
+  allowWrite: boolean;
+  protectedPaths?: readonly string[];
+}): AgentTool[] {
+  const policy = { protectedPaths: [...(options.protectedPaths ?? [])] };
+  const productTools = createWorkspaceTools({
+    allowWrite: options.allowWrite,
+    allowShell: false,
+    includeFileInfo: false,
+    includeGit: false,
+    allowPathOperations: false,
+    ...policy,
+  });
+  const toolsByName = new Map(productTools.map((tool) => [tool.definition.name, tool]));
+  toolsByName.set("grep", createGrepTool(policy, { pagination: "legacy" }));
+  const names = options.allowWrite ? FROZEN_WRITE_TOOL_NAMES : FROZEN_READ_TOOL_NAMES;
+  return names.map((name) => {
+    const tool = toolsByName.get(name);
+    if (tool === undefined) throw new Error(`Frozen evaluation tool ${name} is unavailable`);
+    const definition = workspaceFixtureV2Definition(tool.definition);
+    return {
+      definition,
+      execute: async (arguments_, context): Promise<ToolResult> => {
+        if ((name === "grep" || name === "find") && "cursor" in arguments_) {
+          return {
+            content: JSON.stringify({ error: "cursor is not part of workspace-fixture-v2" }),
+            isError: true,
+          };
+        }
+        const result = await tool.execute(arguments_, context);
+        return name === "grep" || name === "find"
+          ? stripSearchCursor(result)
+          : result;
+      },
+    };
+  });
+}
 
 export function assertEvaluationToolContract(
   tools: readonly AgentTool[],
@@ -78,4 +113,29 @@ function deepFreeze<T>(value: T): T {
   Object.freeze(value);
   for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
   return value;
+}
+
+function workspaceFixtureV2Definition(source: ToolDefinition): ToolDefinition {
+  const definition = structuredClone(source);
+  if (definition.name === "grep") {
+    definition.description = "Search workspace file contents for a pattern and return bounded structured matches.";
+    delete definition.parameters.properties?.cursor;
+  } else if (definition.name === "find") {
+    definition.description = "Find workspace files by glob pattern while respecting ignore files and protected paths.";
+    delete definition.parameters.properties?.cursor;
+  }
+  return definition;
+}
+
+function stripSearchCursor(result: ToolResult): ToolResult {
+  let value: unknown;
+  try {
+    value = JSON.parse(result.content) as unknown;
+  } catch {
+    return result;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return result;
+  const output = { ...(value as Record<string, unknown>) };
+  delete output.nextCursor;
+  return { ...result, content: JSON.stringify(output) };
 }

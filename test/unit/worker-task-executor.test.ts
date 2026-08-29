@@ -238,10 +238,15 @@ describe("WorkerTaskExecutor", () => {
         (request): ModelResponse => {
           expect(request.tools.map((tool) => tool.name)).toEqual([
             "read_file",
+            "read_many",
             "list_files",
             "grep",
             "find",
             "file_info",
+            "git_status",
+            "git_log",
+            "git_show",
+            "git_diff",
           ]);
           return {
             content: "I will inspect the installation note.",

@@ -36,19 +36,52 @@ describe("workspace search tools", () => {
     await writeFile(path.join(workspace, "src", "nested", "b.ts"), "b");
     await writeFile(path.join(workspace, "src", "ignored.js"), "js");
 
-    const result = await createFindTool().execute({
+    const tool = createFindTool();
+    const result = await tool.execute({
       pattern: "**/*.ts",
       path: "src",
       limit: 2,
     }, context(workspace));
 
     expect(result.isError).toBe(false);
-    expect(JSON.parse(result.content)).toEqual({
+    const first = JSON.parse(result.content) as {
+      path: string;
+      pattern: string;
+      files: string[];
+      count: number;
+      truncated: boolean;
+      nextCursor?: string;
+    };
+    expect(first).toMatchObject({
       path: "src",
       pattern: "**/*.ts",
       files: ["src/a.ts", "src/nested/b.ts"],
       count: 2,
       truncated: true,
+    });
+    expect(first.nextCursor).toEqual(expect.any(String));
+
+    const repeated = await tool.execute({
+      pattern: "**/*.ts",
+      path: "src",
+      limit: 2,
+    }, context(workspace));
+    expect((JSON.parse(repeated.content) as { nextCursor: string }).nextCursor).toBe(first.nextCursor);
+
+    const continued = await tool.execute({
+      pattern: "**/*.ts",
+      path: "src",
+      limit: 3,
+      cursor: first.nextCursor,
+    }, context(workspace));
+
+    expect(continued.isError).toBe(false);
+    expect(JSON.parse(continued.content)).toEqual({
+      path: "src",
+      pattern: "**/*.ts",
+      files: ["src/z.ts"],
+      count: 1,
+      truncated: false,
     });
   });
 
@@ -97,7 +130,8 @@ describe("workspace search tools", () => {
     await writeFile(path.join(workspace, "z.txt"), "hit z");
     await writeFile(path.join(workspace, "a.txt"), "hit a\nhit again");
 
-    const result = await createGrepTool().execute({
+    const tool = createGrepTool();
+    const result = await tool.execute({
       pattern: "hit",
       limit: 2,
     }, context(workspace));
@@ -106,6 +140,7 @@ describe("workspace search tools", () => {
       matchCount: number;
       filesMatched: number;
       truncated: boolean;
+      nextCursor?: string;
     };
 
     expect(result.isError).toBe(false);
@@ -116,6 +151,76 @@ describe("workspace search tools", () => {
     expect(output.matchCount).toBe(2);
     expect(output.filesMatched).toBe(1);
     expect(output.truncated).toBe(true);
+    expect(output.nextCursor).toEqual(expect.any(String));
+
+    const continued = await tool.execute({
+      pattern: "hit",
+      limit: 2,
+      cursor: output.nextCursor,
+    }, context(workspace));
+
+    expect(continued.isError).toBe(false);
+    expect(JSON.parse(continued.content)).toEqual({
+      path: ".",
+      pattern: "hit",
+      matches: [{ path: "z.txt", line: 1, column: 1, text: "hit z" }],
+      matchCount: 1,
+      filesMatched: 1,
+      truncated: false,
+    });
+  });
+
+  it("rejects malformed, tampered, cross-tool, and query-mismatched cursors", async () => {
+    const workspace = await temporaryDirectory("nausicaa-search-cursor-");
+    await writeFile(path.join(workspace, "a.ts"), "hit");
+    await writeFile(path.join(workspace, "b.ts"), "hit");
+    const find = createFindTool();
+    const grep = createGrepTool();
+    const first = await find.execute({ pattern: "*.ts", limit: 1 }, context(workspace));
+    const cursor = (JSON.parse(first.content) as { nextCursor: string }).nextCursor;
+    const [payload, signature] = cursor.split(".") as [string, string];
+    const tamperedSignature = `${signature[0] === "A" ? "B" : "A"}${signature.slice(1)}`;
+
+    for (const invalidCursor of ["not-a-cursor", `${payload}.${tamperedSignature}`]) {
+      const invalid = await find.execute({
+        pattern: "*.ts",
+        limit: 1,
+        cursor: invalidCursor,
+      }, context(workspace));
+      expect(invalid.isError).toBe(true);
+      expect(JSON.parse(invalid.content).error).toMatch(/invalid or expired/);
+    }
+
+    const mismatched = await find.execute({
+      pattern: "*.js",
+      limit: 1,
+      cursor,
+    }, context(workspace));
+    expect(mismatched.isError).toBe(true);
+    expect(JSON.parse(mismatched.content).error).toMatch(/does not match this find query/);
+
+    const wrongTool = await grep.execute({
+      pattern: "hit",
+      limit: 1,
+      cursor,
+    }, context(workspace));
+    expect(wrongTool.isError).toBe(true);
+    expect(JSON.parse(wrongTool.content).error).toMatch(/belongs to find, not grep/);
+  });
+
+  it("diagnoses a grep cursor whose anchor changed between pages", async () => {
+    const workspace = await temporaryDirectory("nausicaa-grep-cursor-change-");
+    const file = path.join(workspace, "input.txt");
+    await writeFile(file, "hit one\nhit two\n");
+    const tool = createGrepTool();
+    const first = await tool.execute({ pattern: "hit", limit: 1 }, context(workspace));
+    const cursor = (JSON.parse(first.content) as { nextCursor: string }).nextCursor;
+
+    await writeFile(file, "miss one\nhit two\n");
+    const continued = await tool.execute({ pattern: "hit", limit: 1, cursor }, context(workspace));
+
+    expect(continued.isError).toBe(true);
+    expect(JSON.parse(continued.content).error).toMatch(/no longer matches the workspace/);
   });
 
   it("does not expose protected paths, symbolic links, or hard links", async () => {
