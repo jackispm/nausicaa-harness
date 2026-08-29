@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,9 +8,14 @@ import type { AgentTool, ModelPort, ModelResponse, UserImage } from "../../src/d
 import { ScriptedModel } from "../../src/model/index.js";
 import { JsonlLedger } from "../../src/ledger/index.js";
 import {
+  listWorkspaceRuns,
   SessionController,
   type SessionRuntimeEvent,
 } from "../../src/runtime/index.js";
+import {
+  MESSAGE_MEDIA_TYPE,
+  projectSessionTranscript,
+} from "../../src/runtime/session-artifacts.js";
 import type { RuntimeFukaiCompactionFactory } from "../../src/runtime/fukai-compaction-runtime.js";
 import { FileContentAddressedStore } from "../../src/store/index.js";
 import { FileProcessJobRegistry } from "../../src/tools/process-jobs.js";
@@ -24,6 +29,122 @@ afterEach(async () => {
 });
 
 describe("SessionController", () => {
+  it("projects assistant tool-call presence from its durable message", async () => {
+    const root = await temporaryRoot();
+    const runId = "assistant-tool-call-projection";
+    const store = await FileContentAddressedStore.open(join(root, "store"));
+    const messageRef = await store.put(JSON.stringify({
+      role: "assistant",
+      content: "I need a tool",
+      toolCalls: [{ id: "read-1", name: "read_file", arguments: { path: "README.md" } }],
+      createdAt: "2026-08-30T00:00:00.000Z",
+    }), MESSAGE_MEDIA_TYPE);
+    const ledger = await JsonlLedger.open(join(root, "ledger.jsonl"));
+    await ledger.append({
+      runId,
+      turnId: "turn-1",
+      laneId: "main",
+      type: "assistant.message",
+      payload: { messageRef },
+      correlationId: "turn:turn-1",
+      idempotencyKey: "assistant:tool-call",
+      visibility: "lane",
+    });
+
+    const transcript = await projectSessionTranscript(
+      store,
+      await ledger.read({ runId }),
+      runId,
+    );
+
+    expect(transcript).toEqual([{
+      role: "assistant",
+      content: "I need a tool",
+      hasToolCalls: true,
+      turnId: "turn-1",
+    }]);
+    await ledger.close();
+  });
+
+  it("lists workspace Runs newest first with projected status and Goal", async () => {
+    const root = await temporaryRoot();
+    const dataDir = join(root, "state");
+    let now = new Date("2026-08-30T10:00:00.000Z");
+    const clock = { now: () => new Date(now) };
+
+    const older = await SessionController.open({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+    }, { mainModel: new ScriptedModel([response("older answer")]), createRunId: () => "older-run", clock });
+    await older.reviseGoal("Inspect the older Run");
+    await older.close();
+    const olderLedger = await JsonlLedger.open(join(dataDir, "runs", "older-run", "ledger.jsonl"));
+    await olderLedger.append({
+      runId: "older-run",
+      laneId: "main",
+      type: "goal.revised",
+      payload: {
+        goal: {
+          version: 2,
+          statement: "Inspect the older Run",
+          successCriteria: [],
+          hardConstraints: [],
+        },
+      },
+      correlationId: "run:older-run",
+      idempotencyKey: "test:older:updated",
+      visibility: "run",
+      occurredAt: now.toISOString(),
+    });
+    await olderLedger.close();
+
+    now = new Date("2026-08-30T10:05:00.000Z");
+    const newer = await SessionController.open({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+    }, { mainModel: new ScriptedModel([response("newer answer")]), createRunId: () => "newer-run", clock });
+    await newer.reviseGoal("Inspect the newer Run");
+    await newer.close();
+    const newerLedger = await JsonlLedger.open(join(dataDir, "runs", "newer-run", "ledger.jsonl"));
+    await newerLedger.append({
+      runId: "newer-run",
+      laneId: "main",
+      type: "goal.revised",
+      payload: {
+        goal: {
+          version: 2,
+          statement: "Inspect the newer Run",
+          successCriteria: [],
+          hardConstraints: [],
+        },
+      },
+      correlationId: "run:newer-run",
+      idempotencyKey: "test:newer:updated",
+      visibility: "run",
+      occurredAt: now.toISOString(),
+    });
+    await newerLedger.close();
+
+    const damagedDir = join(dataDir, "runs", "damaged-run");
+    await mkdir(damagedDir, { recursive: true });
+    await writeFile(join(damagedDir, "ledger.jsonl"), "not-json\n", "utf8");
+
+    const runs = await listWorkspaceRuns(dataDir, root);
+    expect(runs.map((run) => run.runId)).toEqual(["newer-run", "older-run"]);
+    expect(runs[0]).toMatchObject({
+      runId: "newer-run",
+      goal: "Inspect the newer Run",
+      status: "ready",
+      createdAt: "2026-08-30T10:05:00.000Z",
+      updatedAt: "2026-08-30T10:05:00.000Z",
+    });
+    expect(await listWorkspaceRuns(join(root, "missing-state"), root)).toEqual([]);
+  });
+
   it("uses a per-Run durable process-job registry when configured", async () => {
     const root = await temporaryRoot();
     const dataDir = join(root, "state");

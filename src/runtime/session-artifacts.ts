@@ -24,6 +24,7 @@ export type SessionTranscriptEntry =
   | {
       role: "assistant";
       content: string;
+      hasToolCalls: boolean;
       turnId: string;
     }
   | {
@@ -93,7 +94,12 @@ export async function projectSessionTranscript(
         if (message.role !== "assistant") {
           throw new SessionProtocolError("Assistant transcript artifact is not an assistant message");
         }
-        transcript.push({ role: "assistant", content: message.content, turnId });
+        transcript.push({
+          role: "assistant",
+          content: message.content,
+          hasToolCalls: message.toolCalls.length > 0,
+          turnId,
+        });
       }
       continue;
     }

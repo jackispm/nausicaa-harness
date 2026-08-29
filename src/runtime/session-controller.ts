@@ -197,6 +197,24 @@ export interface SessionSnapshot {
   blocker?: string;
 }
 
+export type WorkspaceRunStatus =
+  | "ready"
+  | "active"
+  | "waiting"
+  | "interrupted"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+/** Read-only metadata used by resume selectors and startup discovery. */
+export interface WorkspaceRunSummary {
+  runId: string;
+  goal: string;
+  status: WorkspaceRunStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface WorkerTaskSummary {
   total: number;
   queued: number;
@@ -2123,43 +2141,63 @@ export async function findLatestRunId(
   dataDir: string,
   workspace: string,
 ): Promise<string | undefined> {
+  return (await listWorkspaceRuns(dataDir, workspace))[0]?.runId;
+}
+
+/** List resumable Runs for one canonical workspace, newest first. */
+export async function listWorkspaceRuns(
+  dataDir: string,
+  workspace: string,
+): Promise<WorkspaceRunSummary[]> {
   const canonicalWorkspace = await realpath(resolve(workspace));
   const runsDir = resolve(dataDir, "runs");
   let entries;
   try {
     entries = await readdir(runsDir, { withFileTypes: true });
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
-  const candidates: Array<{ runId: string; occurredAt: string }> = [];
+  const candidates: WorkspaceRunSummary[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || !isValidRunId(entry.name)) continue;
-    const ledgerPath = join(runsDir, entry.name, "ledger.jsonl");
-    const info = await lstat(ledgerPath).catch((error: unknown) => {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      throw error;
-    });
-    if (info === undefined) continue;
-    if (!info.isFile() || info.isSymbolicLink()) {
-      throw new SessionProtocolError(`Invalid Ledger candidate: ${ledgerPath}`);
+    try {
+      const ledgerPath = join(runsDir, entry.name, "ledger.jsonl");
+      const info = await lstat(ledgerPath);
+      if (!info.isFile() || info.isSymbolicLink()) continue;
+      const events = parseCommittedEvents(await readFile(ledgerPath), ledgerPath);
+      const created = events.find((event) => event.type === "run.created");
+      if (created === undefined) continue;
+      const recordedWorkspace = await realpath(created.payload.workspace).catch(() => undefined);
+      if (recordedWorkspace !== canonicalWorkspace) continue;
+      const projection = projectRun(events, entry.name);
+      candidates.push({
+        runId: entry.name,
+        goal: projection.goal?.statement ?? created.payload.goal.statement,
+        status: workspaceRunStatus(projection),
+        createdAt: created.occurredAt,
+        updatedAt: events.at(-1)?.occurredAt ?? created.occurredAt,
+      });
+    } catch {
+      // One damaged or unreadable Run must not hide healthy sessions.
     }
-    const events = parseCommittedEvents(await readFile(ledgerPath), ledgerPath);
-    const created = events.find((event) => event.type === "run.created");
-    if (created === undefined) {
-      throw new SessionProtocolError(`Run ${entry.name} is missing run.created`);
-    }
-    const recordedWorkspace = await realpath(created.payload.workspace).catch(() => undefined);
-    if (recordedWorkspace !== canonicalWorkspace) continue;
-    candidates.push({
-      runId: entry.name,
-      occurredAt: events.at(-1)?.occurredAt ?? created.occurredAt,
-    });
   }
   candidates.sort((left, right) =>
-    left.occurredAt.localeCompare(right.occurredAt)
-    || left.runId.localeCompare(right.runId));
-  return candidates.at(-1)?.runId;
+    right.updatedAt.localeCompare(left.updatedAt)
+    || right.runId.localeCompare(left.runId));
+  return candidates;
+}
+
+function workspaceRunStatus(
+  projection: ReturnType<typeof projectRun>,
+): WorkspaceRunStatus {
+  if (projection.run.status === "completed" || projection.run.status === "failed") {
+    return projection.run.status;
+  }
+  const latestTurn = Object.values(projection.turns)
+    .sort((left, right) => right.lastOffset - left.lastOffset)[0];
+  if (latestTurn === undefined || latestTurn.status === "completed") return "ready";
+  return latestTurn.status;
 }
 
 function parseCommittedEvents(contents: Buffer, path: string): AnyEvent[] {

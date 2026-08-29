@@ -22,7 +22,7 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 - TTY 默认进入持续 Session：一个 Run 可包含多个 Turn，支持 steering、取消、恢复和 `--continue`。
 - 运行中按 Enter 注入 steering，按 Alt+Enter 排队 follow-up；输入和 ACK 都写入 Ledger。
 - `pi-tui` 只负责终端 surface；SessionController、Ledger 和模型执行保持独立，未来可接桌面 UI。
-- `--daemon` 启动最小长期 Host，并在 `<data-dir>/daemon/control.sock` 提供 Unix JSONL 控制面；客户端可发送 `start`、`stop`、`status`、`attach`、`detach`、`wake` 和 `events.subscribe`。启动时会扫描 `<data-dir>/runs`，重新排队已持久化但尚未投递的输入和被进程中断的活动 Turn；它与普通 TUI/print 入口分离，当前仍是本地单进程 Host。
+- `--daemon` 启动最小长期 Host，并在 `<data-dir>/daemon/control.sock` 提供 Unix JSONL 控制面；客户端可发送 `start`、`stop`、`status`、`attach`、`detach`、`wake` 和 `events.subscribe`。Host 会在启动时及运行期间串行扫描 `<data-dir>/runs`，重新排队已持久化但尚未投递的输入和被进程中断的活动 Turn；它不会抢占正被交互 TUI 持有的 Run。daemon 与普通 TUI/print 入口分离，当前仍是本地单进程 Host。
 
 当前没有通用 graph DSL 或插件市场；Mowe 的 `MoweCatalog` 提供窄的本地注册 seam，便于接入自定义 AgentTool，而不要求引入 Cordis 级插件运行时。
 
@@ -71,7 +71,7 @@ nausicaa --allow-shell "运行测试并分析失败原因"
 
 也可设置 `NAUSICAA_MODEL`，省略每次调用的 `--model`。交互会话默认使用 `workspace` 权限：可读写当前工作区，但不开放宿主 Shell 或网络。`/permissions` 可在 `read-only`、`workspace`、`full-access` 三档之间切换；`full-access` 等同于明确开放工作区写入、宿主 Shell、网络和后台进程，因此边界会直接显示在底部状态栏。`/plan [prompt]` 进入只读 Plan 模式，`/mode` 可在 Default 与 Plan 间切换。
 
-`/goal` 查看当前 Run 的长期目标，`/goal <statement>` 修订它，`/copy` 将最后一条 assistant 回答复制到系统剪贴板；普通消息仍是各自 Turn 的当前任务。运行状态默认写入工作区的 `.nausicaa/`；使用 `nausicaa --resume <run-id>` 从已提交边界继续。若恢复时发现结果未知的工具操作，CLI 会打印 operation ID 和显式结算命令；确认其应按失败处理后再执行该命令，运行时不会自动重放副作用。
+`/goal` 查看当前 Run 的长期目标，`/goal <statement>` 修订它；`/session` 打开当前工作区的 Run 选择器，`/session <run-id>` 可直接切换；`/copy` 将最后一条 assistant 回答复制到系统剪贴板。普通消息仍是各自 Turn 的当前任务。运行状态默认写入工作区的 `.nausicaa/`；使用 `nausicaa --resume <run-id>` 从已提交边界继续。若恢复时发现结果未知的工具操作，CLI 会打印 operation ID 和显式结算命令；确认其应按失败处理后再执行该命令，运行时不会自动重放副作用。
 
 `npm run dev -- <参数>` 通过 `tsx` 直接运行 TypeScript 源码，是开发调试入口，不是产品交互模型。构建后的产品入口是 `nausicaa`；`npm start -- <参数>` 直接运行 `dist/cli.js`。因此别人项目看起来是“进入 CLI”，是因为它们发布了一个 bin；本项目也通过 `package.json` 的 `bin.nausicaa` 提供同样的入口。
 

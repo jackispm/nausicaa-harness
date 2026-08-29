@@ -378,7 +378,7 @@ describe("TUI components", () => {
 
 class NavigationTerminal implements Terminal {
   kittyProtocolActive = false;
-  private input?: (data: string) => void;
+  private input: ((data: string) => void) | undefined;
 
   constructor(readonly columns: number, readonly rows: number) {}
 

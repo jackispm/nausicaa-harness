@@ -15,9 +15,11 @@ import {
 } from "@earendil-works/pi-tui";
 
 import {
+  listWorkspaceRuns,
   SessionController,
   type SessionRuntimeEvent,
   type SessionSnapshot,
+  type WorkspaceRunSummary,
 } from "../runtime/index.js";
 import {
   MAX_USER_IMAGE_BYTES,
@@ -70,6 +72,7 @@ import {
   WorkerTaskSummaryLine,
   selectLatestToolExpandHint,
   setNausicaaColorScheme,
+  terminalSafeText,
 } from "./tui-components.js";
 
 export interface InteractiveOptions {
@@ -246,6 +249,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       ),
     },
     { name: "goal", description: "Show or revise the Run Goal", argumentHint: "[statement]" },
+    { name: "session", description: "Switch between workspace Runs", argumentHint: "[run-id]" },
     { name: "new", description: "Start a new Run" },
     { name: "resume", description: "Resume the current Turn" },
     { name: "cancel", description: "Cancel the active Turn" },
@@ -594,6 +598,42 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       if (closed || generation !== transcriptGeneration) return;
       appendNotice("Assistant message could not be rendered; the Ledger still contains the event.", "error");
     }
+  };
+
+  const loadAttachedTranscript = async (reset: boolean): Promise<void> => {
+    if (reset) {
+      transcriptGeneration += 1;
+      header.setCompact(false);
+      resetTranscript();
+      toolBlocks.clear();
+      renderedAssistants.clear();
+      resetResponse();
+      clearShortcutGuide();
+    }
+    const entries = await options.session.transcript();
+    if (entries.length > 0 && terminal.rows < 36) header.setCompact(true);
+    entries.forEach((entry) => {
+      if (entry.role === "user") {
+        addPromptToHistory(entry.content);
+        appendBlock(new UserMessageBlock(entry.content, entry.imageTypes));
+        return;
+      }
+      if (entry.role === "assistant") {
+        renderedAssistants.add(assistantKey(entry.turnId, entry.content));
+        appendAssistant(new AssistantMessageBlock(entry.content, entry.hasToolCalls));
+        return;
+      }
+      const detail = entry.status === "unknown"
+        ? unknownToolDetail(entry.operationId)
+        : entry.isError ? entry.content : "";
+      const block = new ToolStatusBlock(entry.toolName, entry.status, detail);
+      block.setExpanded(entry.status === "unknown" || toolsExpanded);
+      if (entry.arguments !== undefined) block.setArguments(JSON.stringify(entry.arguments, null, 2));
+      if (entry.status !== "unknown") block.setResult(entry.content);
+      selectLatestToolExpandHint([...toolBlocks.values()], block);
+      toolBlocks.set(entry.operationId, block);
+      appendBlock(block);
+    });
   };
 
   const renderRuntimeEvent = async (
@@ -1071,6 +1111,47 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     mountSelector(selector, restorePreview);
   };
 
+  const switchSession = async (runId: string): Promise<void> => {
+    const current = options.session.snapshot();
+    if (current.status === "running" || current.status === "cancelling") {
+      throw new Error("/session is unavailable while Main is working");
+    }
+    if (current.runId === runId) {
+      appendNotice(`Run ${runId} is already attached.`, "info");
+      return;
+    }
+    await options.session.attachRun(runId);
+    await loadAttachedTranscript(true);
+    await refreshQueue();
+    appendNotice(`Attached Run ${runId}.`, "success");
+  };
+
+  const showSessionSelector = async (): Promise<void> => {
+    const snapshot = options.session.snapshot();
+    if (snapshot.status === "running" || snapshot.status === "cancelling") {
+      throw new Error("/session is unavailable while Main is working");
+    }
+    const runs = await listWorkspaceRuns(options.session.dataDir, options.session.workspace);
+    if (runs.length === 0) {
+      appendNotice("No saved Runs exist for this workspace.", "info");
+      return;
+    }
+    const selector = new SelectorOverlay({
+      title: "Runs",
+      subtitle: "Resume a saved Run from this workspace.",
+      options: workspaceRunOptions(runs, snapshot.runId),
+      ...(snapshot.runId === undefined ? {} : { current: snapshot.runId }),
+      onSelect: (value) => {
+        closeSelector(false);
+        void switchSession(value).catch((error: unknown) => {
+          appendNotice(error instanceof Error ? error.message : String(error), "error");
+        });
+      },
+      onCancel: () => closeSelector(true),
+    });
+    mountSelector(selector);
+  };
+
   const handleCommand = async (
     commandLine: string,
     commandImages?: readonly UserImage[],
@@ -1082,10 +1163,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           appendBlock(new Markdown([
             "### Commands",
             "`/status` session details  ·  `/goal [statement]` show or revise Goal",
+            "`/session [run-id]` switch saved Run  ·  `/new` new Run",
             "`/permissions [profile]` capability boundary  ·  `/plan [prompt]` enter Plan mode",
             "`/mode [default|plan]` collaboration mode  ·  `/model [selector]` switch Main model",
             "`/theme [auto|light|dark]` change colors",
-            "`/new` new Run  ·  `/resume` resume",
+            "`/resume` resume the current Turn",
             "`/cancel` cancel active Turn  ·  `/resolve <operation-id>` resolve recovery",
             "`/copy` copy the last assistant answer",
             "`/exit` close session  ·  `Alt+Enter` queue follow-up",
@@ -1162,6 +1244,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           }
           break;
         }
+        case "/session":
+          if (argument.length === 0) {
+            await showSessionSelector();
+          } else {
+            await switchSession(argument.trim());
+          }
+          break;
         case "/new":
           await options.session.newRun();
           transcriptGeneration += 1;
@@ -1398,28 +1487,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   });
 
   if (options.session.snapshot().runId !== undefined) {
-    const entries = await options.session.transcript();
-    if (entries.length > 0 && terminal.rows < 36) header.setCompact(true);
-    for (const entry of entries) {
-      if (entry.role === "user") {
-        addPromptToHistory(entry.content);
-        appendBlock(new UserMessageBlock(entry.content, entry.imageTypes));
-      } else if (entry.role === "assistant") {
-        renderedAssistants.add(assistantKey(entry.turnId, entry.content));
-        appendAssistant(new AssistantMessageBlock(entry.content));
-      } else if (entry.role === "tool") {
-        const detail = entry.status === "unknown"
-          ? unknownToolDetail(entry.operationId)
-          : entry.isError ? entry.content : "";
-        const block = new ToolStatusBlock(entry.toolName, entry.status, detail);
-        block.setExpanded(entry.status === "unknown" || toolsExpanded);
-        if (entry.arguments !== undefined) block.setArguments(JSON.stringify(entry.arguments, null, 2));
-        if (entry.status !== "unknown") block.setResult(entry.content);
-        selectLatestToolExpandHint([...toolBlocks.values()], block);
-        toolBlocks.set(entry.operationId, block);
-        appendBlock(block);
-      }
-    }
+    await loadAttachedTranscript(false);
   }
 
   tui.start();
@@ -1478,8 +1546,8 @@ function unknownToolDetail(operationId: string): string {
   return `unresolved ${operationId}; use /resolve`;
 }
 
-function oneLine(value: string): string {
-  return value.replace(/\s+/g, " ").trim().slice(0, 160);
+function oneLine(value: string, maxWidth = 160): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, maxWidth);
 }
 
 function commandArgumentCompletions(
@@ -1491,6 +1559,23 @@ function commandArgumentCompletions(
     label: option.label,
     ...(option.description === undefined ? {} : { description: option.description }),
   }));
+}
+
+function workspaceRunOptions(
+  runs: readonly WorkspaceRunSummary[],
+  currentRunId?: string,
+): SelectorOption[] {
+  return runs.map((run) => ({
+    value: run.runId,
+    label: run.runId === currentRunId ? `${run.runId} (current)` : run.runId,
+    description: `${capitalize(run.status)} · ${formatRunTime(run.updatedAt)} · ${oneLine(terminalSafeText(run.goal), 72)}`,
+  }));
+}
+
+function formatRunTime(value: string): string {
+  const normalized = value.trim();
+  if (normalized.length < 16) return normalized;
+  return normalized.slice(0, 16).replace("T", " ");
 }
 
 function parseInteractiveCommand(commandLine: string): {

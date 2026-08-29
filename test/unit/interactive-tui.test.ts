@@ -1146,6 +1146,223 @@ describe("interactive TUI", () => {
     }
   });
 
+  it("switches saved workspace Runs through the session selector and reloads transcript", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-sessions-"));
+    const dataDir = join(root, "state");
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const older = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("OLDER_TRANSCRIPT_ANSWER")]),
+        createRunId: () => "older-session-run",
+      });
+      await older.reviseGoal("OLDER_SESSION_GOAL");
+      await older.submit({ inputId: "older-input", text: "OLDER_SESSION_GOAL" });
+      await older.waitForIdle();
+      await older.close();
+
+      const current = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("CURRENT_TRANSCRIPT_ANSWER")]),
+        createRunId: () => "current-session-run",
+      });
+      await current.reviseGoal("CURRENT_SESSION_GOAL");
+      await current.submit({ inputId: "current-input", text: "CURRENT_SESSION_GOAL" });
+      await current.waitForIdle();
+      const running = runInteractive({ session: current, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("/session");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Resume a saved Run from this workspace");
+      terminal.send("\x1b");
+      terminal.type("/status");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Queue / Tokens");
+      expect(current.snapshot().runId).toBe("current-session-run");
+
+      const selectorCount = countOccurrences(
+        terminal.output,
+        "Resume a saved Run from this workspace",
+      );
+      terminal.type("/session");
+      terminal.send("\r");
+      await waitForCondition(
+        () => countOccurrences(
+          terminal.output,
+          "Resume a saved Run from this workspace",
+        ) > selectorCount,
+        "second session selector",
+      );
+      terminal.type("older-session-run");
+      await waitForOutput(terminal, "OLDER_SESSION_GOAL");
+      const beforeSwitch = terminal.output.length;
+      terminal.send("\r");
+      await waitForCondition(
+        () => current.snapshot().runId === "older-session-run",
+        "selected Run attachment",
+      );
+      await waitForOutput(terminal, "Attached Run older-session-run");
+      await waitForOutput(terminal, "OLDER_TRANSCRIPT_ANSWER");
+      const olderFrame = terminal.output.slice(beforeSwitch);
+      expect(olderFrame).toContain("OLDER_TRANSCRIPT_ANSWER");
+      expect(olderFrame.lastIndexOf("OLDER_TRANSCRIPT_ANSWER"))
+        .toBeGreaterThan(olderFrame.lastIndexOf("CURRENT_TRANSCRIPT_ANSWER"));
+      await expect(current.transcript()).resolves.toEqual([
+        expect.objectContaining({ role: "user", content: "OLDER_SESSION_GOAL" }),
+        expect.objectContaining({ role: "assistant", content: "OLDER_TRANSCRIPT_ANSWER" }),
+      ]);
+
+      terminal.type("/session current-session-run");
+      terminal.send("\r");
+      await waitForCondition(
+        () => current.snapshot().runId === "current-session-run",
+        "direct Run attachment",
+      );
+      await waitForOutput(terminal, "Attached Run current-session-run");
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("clears the previous transcript when an attached Run cannot hydrate its artifacts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-session-artifact-"));
+    const dataDir = join(root, "state");
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const damaged = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("DAMAGED_TRANSCRIPT_ANSWER")]),
+        createRunId: () => "damaged-artifact-run",
+      });
+      await damaged.reviseGoal("DAMAGED_ARTIFACT_GOAL");
+      await damaged.submit({ inputId: "damaged-input", text: "DAMAGED_ARTIFACT_GOAL" });
+      await damaged.waitForIdle();
+      await damaged.close();
+      await rm(join(dataDir, "runs", "damaged-artifact-run", "store"), {
+        recursive: true,
+        force: true,
+      });
+
+      const current = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("CURRENT_ARTIFACT_ANSWER")]),
+        createRunId: () => "current-artifact-run",
+      });
+      await current.reviseGoal("CURRENT_ARTIFACT_GOAL");
+      await current.submit({ inputId: "current-input", text: "CURRENT_ARTIFACT_GOAL" });
+      await current.waitForIdle();
+      const running = runInteractive({ session: current, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      await waitForOutput(terminal, "CURRENT_ARTIFACT_ANSWER");
+      terminal.type("/session damaged-artifact-run");
+      const chunkCountBeforeSwitch = terminal.outputChunks.length;
+      terminal.send("\r");
+      await waitForCondition(
+        () => current.snapshot().runId === "damaged-artifact-run",
+        "damaged Run attachment",
+      );
+      await waitForOutput(terminal, "was not found");
+      const transition = terminal.outputChunks.slice(chunkCountBeforeSwitch).join("");
+      expect(transition).toContain("was not found");
+      expect(transition).not.toContain("CURRENT_ARTIFACT_GOAL");
+      expect(transition).not.toContain("CURRENT_ARTIFACT_ANSWER");
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses session switching while Main has an active Turn", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-session-active-"));
+    const dataDir = join(root, "state");
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    let releaseCurrent = (_response: ModelResponse): void => {};
+    try {
+      const saved = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([]),
+        createRunId: () => "saved-session-run",
+      });
+      await saved.reviseGoal("Saved Run");
+      await saved.close();
+
+      const responseGate = new Promise<ModelResponse>((resolve) => { releaseCurrent = resolve; });
+      const current = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([async () => responseGate]),
+        createRunId: () => "active-session-run",
+      });
+      const running = runInteractive({ session: current, terminal, forceAltScreen: true });
+      await terminal.started;
+      terminal.type("Keep working");
+      terminal.send("\r");
+      await waitForCondition(() => current.snapshot().status === "running", "active Turn");
+
+      terminal.type("/session saved-session-run");
+      terminal.send("\r");
+      await waitForOutput(terminal, "/session is unavailable while Main is working");
+      expect(current.snapshot().runId).toBe("active-session-run");
+      terminal.type("/session");
+      terminal.send("\r");
+      await waitForCondition(
+        () => countOccurrences(
+          terminal.output,
+          "/session is unavailable while Main is working",
+        ) >= 2,
+        "selector rejection during active Turn",
+      );
+      expect(current.snapshot().runId).toBe("active-session-run");
+
+      releaseCurrent(response("ACTIVE_SESSION_ANSWER"));
+      await current.waitForIdle();
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      releaseCurrent(response("cleanup"));
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("rolls back an unconfirmed theme preview during SIGTERM shutdown", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-selector-signal-"));
     const terminal = new MemoryTerminal(100, 28);
