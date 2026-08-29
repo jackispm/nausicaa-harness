@@ -1353,6 +1353,121 @@ describe("runtime Fukai compaction source windows", () => {
 });
 
 describe("Fukai compaction generation provenance", () => {
+  it("authorizes the bounded context artifact of a projected tool result", async () => {
+    const ledger = new MemoryLedger();
+    const store = new MemoryContentAddressedStore();
+    const runId = "run-projected-tool-compaction";
+    await ledger.append({
+      runId,
+      laneId: "main",
+      type: "run.created",
+      payload: {
+        goal,
+        workspace: "/workspace",
+        policy: {
+          maxMainStepsPerActivation: 4,
+          maxModelTokens: 10_000,
+          tetoEnabled: false,
+          tetoMaxOutputTokens: 200,
+          tetoTokenRatio: 0.1,
+        },
+      },
+      correlationId: "run:projected-tool-compaction",
+      idempotencyKey: "run:projected-tool-compaction:created",
+      visibility: "run",
+    });
+    const resultRef = await store.put(JSON.stringify({
+      role: "tool",
+      content: "complete result",
+      toolCallId: "call-1",
+      toolName: "read_image",
+      isError: false,
+      createdAt: "1970-01-01T00:00:00.000Z",
+    }), "application/vnd.nausicaa.conversation-message+json");
+    const contextRef = await store.put(JSON.stringify({
+      role: "tool",
+      content: "bounded model projection",
+      toolCallId: "call-1",
+      toolName: "read_image",
+      isError: false,
+      createdAt: "1970-01-01T00:00:00.000Z",
+    }), "application/vnd.nausicaa.conversation-message+json");
+    const resultEvent = await ledger.append({
+      runId,
+      laneId: "main",
+      type: "tool.succeeded",
+      payload: {
+        operationId: "operation-1",
+        toolCallId: "call-1",
+        name: "read_image",
+        resultRef,
+        contextRef,
+      },
+      correlationId: "run:projected-tool-compaction",
+      idempotencyKey: "run:projected-tool-compaction:tool:succeeded",
+      visibility: "lane",
+    });
+    const sourceRefs = [{ kind: "conversation" as const, ref: contextRef }];
+    const budget = {
+      maxInputTokens: 1_000,
+      maxOutputTokens: 1_000,
+      maxWallClockMs: 1_000,
+    };
+    const compactionId = deriveContextCompactionId({
+      runId,
+      laneId: "main",
+      cursor: `offset:${resultEvent.globalOffset}`,
+      upperWatermark: resultEvent.globalOffset,
+      goalVersion: goal.version,
+      policyVersion: "policy-v1",
+      sourceRefs,
+      budget,
+    });
+    const provider = createFukaiCompactionProvider({
+      store,
+      generateSummary: (request) => ({
+        schemaVersion: 1,
+        goal: request.goal,
+        decisions: ["Retain the bounded tool projection"],
+        verifiedResults: [],
+        openQuestions: [],
+        sourceRefs: [...request.sourceRefs],
+      }),
+    });
+    const selection = await provider.compact({
+      compactionId,
+      runId,
+      laneId: "main",
+      goal,
+      policyVersion: "policy-v1",
+      cursor: `offset:${resultEvent.globalOffset}`,
+      upperWatermark: resultEvent.globalOffset,
+      sourceRefs,
+      budget,
+    });
+    const core = new FukaiCore(ledger, new ContentStoreFukaiSource(store));
+
+    await expect(core.commitCompaction({
+      runId,
+      laneId: "main",
+      compactionId,
+      goal,
+      policyVersion: "policy-v1",
+      selection,
+    })).resolves.toMatchObject({
+      payload: { sourceRefs },
+    });
+    await expect(core.readCompaction({
+      runId,
+      laneId: "main",
+      goalVersion: goal.version,
+      policyVersion: "policy-v1",
+    })).resolves.toMatchObject({
+      status: "ready",
+      dependenciesVerified: true,
+    });
+  });
+
   it("survives provider persistence, Core commit/read, and context manifest assembly", async () => {
     const ledger = new MemoryLedger();
     const store = new MemoryContentAddressedStore();

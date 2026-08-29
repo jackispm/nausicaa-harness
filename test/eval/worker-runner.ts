@@ -176,6 +176,8 @@ export async function executeWorkerArm(
   const tools = traceWorkerTools(createWorkspaceTools({
     allowWrite: false,
     allowShell: false,
+    allowPathOperations: false,
+    includeFileInfo: false,
     protectedPaths: [resolve(options.rootDirectory, "state")],
   }), toolTrace);
   const barrier = new MainWorkerBarrier();

@@ -712,6 +712,10 @@ describe("event payload validation", () => {
   it("rejects malformed optional telemetry fields", () => {
     expect(() => validateEventPayload("model.requested", {
       ...validPayloads["model.requested"],
+      truncations: [{ kind: "image-budget", detail: "one image was omitted" }],
+    })).not.toThrow();
+    expect(() => validateEventPayload("model.requested", {
+      ...validPayloads["model.requested"],
       sessionId: "",
     })).toThrow(/sessionId/);
     expect(() => validateEventPayload("model.requested", {

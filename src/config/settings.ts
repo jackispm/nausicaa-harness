@@ -52,6 +52,8 @@ export interface Settings {
   dataDir?: string;
   allowShell?: boolean;
   allowWrite?: boolean;
+  /** Enable network-backed Mowe tools (web_fetch and web_search). */
+  allowNetwork?: boolean;
   fukaiCompaction?: FukaiCompactionSettings;
 }
 
@@ -65,6 +67,7 @@ export interface ResolvedSettings {
   dataDir: string;
   allowShell: boolean;
   allowWrite: boolean;
+  allowNetwork: boolean;
   fukaiCompaction: ResolvedFukaiCompactionSettings;
 }
 
@@ -85,6 +88,7 @@ const allowedKeys = new Set<keyof Settings>([
   "dataDir",
   "allowShell",
   "allowWrite",
+  "allowNetwork",
   "fukaiCompaction",
 ]);
 
@@ -147,6 +151,7 @@ export const resolveSettings = (
     dataDir: isAbsolute(dataDir) ? resolve(dataDir) : resolve(workspace, dataDir),
     allowShell: merged.allowShell ?? false,
     allowWrite: merged.allowWrite ?? false,
+    allowNetwork: merged.allowNetwork ?? false,
     fukaiCompaction,
   };
 };
@@ -182,6 +187,7 @@ const readSettingsFile = async (path: string): Promise<Settings> => {
   validateOptionalString(value.dataDir, "dataDir", path);
   validateOptionalBoolean(value.allowShell, "allowShell", path);
   validateOptionalBoolean(value.allowWrite, "allowWrite", path);
+  validateOptionalBoolean(value.allowNetwork, "allowNetwork", path);
   validateOptionalBoolean(value.tetoEnabled, "tetoEnabled", path);
   validateOptionalInteger(value.maxSteps, "maxSteps", path);
   validateOptionalInteger(value.maxModelTokens, "maxModelTokens", path);

@@ -180,8 +180,8 @@ describe("RetryingModelPort", () => {
     const withoutStream = retrying(completionOnly);
     const withStream = retrying(new StreamSequence([[{ type: "done", response }]]));
 
-    expect(withoutStream.capabilities("vision")).toBe(capabilities);
-    expect(withStream.capabilities("text")).toEqual({ imageInput: false });
+    expect(withoutStream.capabilities?.("vision")).toBe(capabilities);
+    expect(withStream.capabilities).toBeUndefined();
     expect(withoutStream.stream).toBeUndefined();
     expect(withStream.stream).toBeTypeOf("function");
   });

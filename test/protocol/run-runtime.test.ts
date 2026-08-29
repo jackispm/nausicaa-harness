@@ -401,6 +401,22 @@ describe("executeRun", () => {
       mainModel: new ScriptedModel([response("should not run")]),
       tools: [noopTool],
     })).rejects.toThrow("Cannot change fukaiCompaction while resuming a Run");
+
+    await expect(executeRun({
+      workspace: root,
+      dataDir: state,
+      model: "scripted",
+      resumeRunId: first.runId,
+      fukaiCompaction: {
+        ...disabled,
+        thresholdRatio: 0.75,
+        retainRatio: 0.15,
+        minimumGainTokens: 1,
+      },
+    }, {
+      mainModel: new ScriptedModel([response("should not run")]),
+      tools: [noopTool],
+    })).rejects.toThrow("Cannot change fukaiCompaction while resuming a Run");
   });
 
   it("composes a complete Main-only Run on the file-backed runtime", async () => {

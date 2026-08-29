@@ -1946,7 +1946,10 @@ function eventAuthorizesContextSource(
       return sameArtifactRef(event.payload.responseRef, source.ref);
     case "tool.succeeded":
     case "tool.failed":
-      return sameArtifactRef(event.payload.resultRef, source.ref);
+      // Modern events compact only the bounded, model-visible projection.
+      // resultRef remains the compatibility source for legacy events that did
+      // not record a separate contextRef.
+      return sameArtifactRef(event.payload.contextRef ?? event.payload.resultRef, source.ref);
     case "run.completed":
     case "turn.completed":
       return event.payload.answerRef !== undefined

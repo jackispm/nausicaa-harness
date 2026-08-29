@@ -103,6 +103,10 @@ const main = async (): Promise<number> => {
       return await runDaemonMode({
         workspace,
         settings: resolvedSettings,
+        ...(fukaiCompaction === undefined ? {} : { fukaiCompaction }),
+        ...(options.workerEnabled === undefined
+          ? {}
+          : { workerEnabled: options.workerEnabled }),
         ...(options.daemonSocket === undefined ? {} : { socketPath: options.daemonSocket }),
       });
     }
@@ -298,6 +302,9 @@ const writeJson = (value: unknown): void => {
 interface DaemonModeOptions {
   workspace: string;
   settings: ResolvedSettings;
+  /** Preserve explicit startup policy when the daemon creates/resumes Runs. */
+  fukaiCompaction?: ResolvedSettings["fukaiCompaction"];
+  workerEnabled?: boolean;
   socketPath?: string;
 }
 
@@ -319,10 +326,19 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
         tetoMaxOutputTokens: 64,
         tetoTokenRatio: 0.1,
       },
+      ...(options.fukaiCompaction === undefined
+        ? {}
+        : { fukaiCompaction: options.fukaiCompaction }),
+      ...(options.workerEnabled === undefined
+        ? {}
+        : { workerEnabled: options.workerEnabled }),
       maxOutputTokens: options.settings.maxOutputTokens,
       allowWrite: options.settings.allowWrite,
       allowShell: options.settings.allowShell,
       allowNetwork: options.settings.allowNetwork,
+      ...(options.settings.allowShell
+        ? { processJobRegistryDir: options.settings.dataDir }
+        : {}),
     },
   });
   const socketPath = resolve(

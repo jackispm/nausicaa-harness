@@ -15,6 +15,7 @@ import type {
   ModelRequest,
   ModelResponse,
 } from "../../src/domain/index.js";
+import { estimateUserImageTokens } from "../../src/domain/images.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
 import { sha256, stableJson } from "../../src/ledger/hash.js";
 import { ScriptedModel } from "../../src/model/index.js";
@@ -68,7 +69,11 @@ async function setup(
   input = "npm install",
   budget?: { maxModelTokens: number; maxWallClockMs: number },
   runTokenBudget?: RunTokenBudget,
-  options: { workspace?: string; tools?: readonly AgentTool[] } = {},
+  options: {
+    workspace?: string;
+    tools?: readonly AgentTool[];
+    signal?: AbortSignal;
+  } = {},
 ) {
   const clock: Clock = {
     now: () => new Date("2026-08-27T12:00:00.000Z"),
@@ -89,6 +94,7 @@ async function setup(
     runId: "run-1",
     ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
     ...(options.tools === undefined ? {} : { tools: options.tools }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
     ...(runTokenBudget === undefined ? {} : { runTokenBudget }),
     workerLaneId: "worker-1",
     clock,
@@ -235,6 +241,7 @@ describe("WorkerTaskExecutor", () => {
             "list_files",
             "grep",
             "find",
+            "file_info",
           ]);
           return {
             content: "I will inspect the installation note.",
@@ -285,6 +292,217 @@ describe("WorkerTaskExecutor", () => {
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }
+  });
+
+  it("records a terminal tool fact before propagating lane cancellation", async () => {
+    const controller = new AbortController();
+    const cancellingTool: AgentTool = {
+      definition: {
+        name: "read_file",
+        description: "Cancel after returning one settled read",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      async execute() {
+        controller.abort(new Error("worker lane cancelled"));
+        return { content: "settled before cancellation", isError: false };
+      },
+    };
+    const model = new ScriptedModel([{
+      content: "Read once",
+      toolCalls: [{ id: "cancelled-read", name: "read_file", arguments: {} }],
+      stopReason: "toolUse",
+      usage: { input: 20, output: 5, cacheRead: 0, cacheWrite: 0 },
+    }]);
+    const { executor, ledger } = await setup(
+      model,
+      "Inspect evidence",
+      { maxModelTokens: 1_000, maxWallClockMs: 5_000 },
+      undefined,
+      { tools: [cancellingTool], signal: controller.signal },
+    );
+
+    await expect(executor.runOnce()).resolves.toEqual({ status: "idle", reason: "stopped" });
+    const events = await ledger.read({ runId: "run-1" });
+    const requested = events.find((event) => event.type === "tool.requested");
+    const terminalOperationIds = events.flatMap((event) => (
+      event.type === "tool.succeeded" || event.type === "tool.failed"
+        ? [event.payload.operationId]
+        : []
+    ));
+    expect(requested?.type).toBe("tool.requested");
+    expect(terminalOperationIds).toEqual([requested?.payload.operationId]);
+  });
+
+  it("charges tool-produced images against the next Worker context budget", async () => {
+    const imageTool: AgentTool = {
+      definition: {
+        name: "read_image",
+        description: "return a tiny image",
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string" } },
+          required: ["path"],
+          additionalProperties: false,
+        },
+      },
+      async execute() {
+        return {
+          content: "image evidence",
+          isError: false,
+          images: [{ type: "image", mimeType: "image/png", data: "AA==" }],
+        };
+      },
+    };
+    const model = new ScriptedModel([{
+      content: "Inspecting the image.",
+      toolCalls: [{ id: "image-call", name: "read_image", arguments: { path: "screen.png" } }],
+      stopReason: "toolUse",
+      usage: { input: 20, output: 5, cacheRead: 0, cacheWrite: 0 },
+    }]);
+    const runTokenBudget = new RunTokenBudget(500);
+    const { executor, ledger } = await setup(
+      model,
+      "Inspect screen.png",
+      { maxModelTokens: 2_000, maxWallClockMs: 5_000 },
+      runTokenBudget,
+      { tools: [imageTool] },
+    );
+
+    await expect(executor.runOnce()).resolves.toMatchObject({
+      status: "failed",
+      reason: expect.stringContaining("run-budget-exhausted"),
+    });
+    expect(model.callCount).toBe(1);
+    const events = await ledger.read({ runId: "run-1" });
+    expect(events.filter((event) => event.type === "model.requested")).toHaveLength(1);
+    expect(events.some((event) => event.type === "tool.succeeded")).toBe(true);
+  });
+
+  it("keeps a compliant tool image available to the next Worker request", async () => {
+    const image = { type: "image" as const, mimeType: "image/png", data: "AA==" };
+    const imageTool: AgentTool = {
+      definition: {
+        name: "read_image",
+        description: "return one compliant image",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      async execute() {
+        return { content: "image evidence", isError: false, images: [image] };
+      },
+    };
+    const model = new ScriptedModel([
+      {
+        content: "Inspecting the image.",
+        toolCalls: [{ id: "image-call", name: "read_image", arguments: {} }],
+        stopReason: "toolUse",
+        usage: { input: 20, output: 5, cacheRead: 0, cacheWrite: 0 },
+      },
+      (request): ModelResponse => {
+        const result = request.messages.find((message) => message.role === "tool");
+        expect(result?.images).toEqual([image]);
+        expect(result?.content).not.toContain("IMAGE BLOCK");
+        return {
+          content: "The image is visible.",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: { input: 30, output: 5, cacheRead: 0, cacheWrite: 0 },
+        };
+      },
+    ]);
+    const { executor } = await setup(
+      model,
+      "Inspect the image",
+      { maxModelTokens: 5_000, maxWallClockMs: 5_000 },
+      new RunTokenBudget(5_000),
+      { tools: [imageTool] },
+    );
+
+    await expect(executor.runOnce()).resolves.toMatchObject({ status: "completed" });
+    expect(model.requests).toHaveLength(2);
+  });
+
+  it("omits tool images beyond the Worker task byte budget but retains durable evidence", async () => {
+    const imageBytes = 2_560 * 1024;
+    const image = {
+      type: "image" as const,
+      mimeType: "image/png",
+      data: Buffer.alloc(imageBytes).toString("base64"),
+    };
+    const overflowImage = {
+      type: "image" as const,
+      mimeType: "image/png",
+      data: "AA==",
+    };
+    const imageTool: AgentTool = {
+      definition: {
+        name: "read_image",
+        description: "return compliant image batches",
+        parameters: {
+          type: "object",
+          properties: { batch: { type: "boolean" } },
+          required: ["batch"],
+          additionalProperties: false,
+        },
+      },
+      async execute(arguments_) {
+        return arguments_.batch === true
+          ? { content: "full image batch", isError: false, images: [image, image, image, image] }
+          : { content: "overflow image", isError: false, images: [overflowImage] };
+      },
+    };
+    const calls = [
+      { id: "image-batch", name: "read_image", arguments: { batch: true } },
+      { id: "image-overflow", name: "read_image", arguments: { batch: false } },
+    ];
+    const model = new ScriptedModel([
+      {
+        content: "Inspecting four images.",
+        toolCalls: calls,
+        stopReason: "toolUse",
+        usage: { input: 20, output: 5, cacheRead: 0, cacheWrite: 0 },
+      },
+      (request): ModelResponse => {
+        const results = request.messages.filter((message) => message.role === "tool");
+        expect(results).toHaveLength(2);
+        expect(results.map((message) => message.images?.length ?? 0)).toEqual([4, 0]);
+        expect(results[1]?.content).toContain("1 IMAGE BLOCK OMITTED BY WORKER");
+        return {
+          content: "Compared the retained images.",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: { input: 30, output: 5, cacheRead: 0, cacheWrite: 0 },
+        };
+      },
+    ]);
+    const { executor, ledger, store } = await setup(
+      model,
+      "Inspect the images",
+      { maxModelTokens: 30_000, maxWallClockMs: 10_000 },
+      new RunTokenBudget(30_000),
+      { tools: [imageTool] },
+    );
+
+    await expect(executor.runOnce()).resolves.toMatchObject({ status: "completed" });
+    const succeeded = (await ledger.read({ runId: "run-1" }))
+      .filter((event) => event.type === "tool.succeeded");
+    expect(succeeded).toHaveLength(2);
+    const durable = JSON.parse(new TextDecoder().decode(
+      await store.get(succeeded[1]!.payload.resultRef),
+    )) as { images?: unknown[] };
+    expect(durable.images).toHaveLength(1);
+  });
+
+  it("estimates larger image blocks above the canonical per-image token floor", () => {
+    const image = {
+      type: "image" as const,
+      mimeType: "image/png",
+      data: Buffer.alloc(2 * 1024 * 1024).toString("base64"),
+    };
+
+    expect(estimateUserImageTokens([
+      { type: "image", mimeType: "image/png", data: "AA==" },
+    ])).toBe(1_024);
+    expect(estimateUserImageTokens([image])).toBe(2_048);
   });
 
   it("rejects write and shell tools at the Worker boundary", async () => {

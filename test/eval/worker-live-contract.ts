@@ -273,6 +273,8 @@ export interface WorkerLivePairPlan {
 const mainOnlyToolDefinitions = createWorkspaceTools({
   allowWrite: false,
   allowShell: false,
+  includeFileInfo: false,
+  allowPathOperations: false,
 }).map((tool) => structuredClone(tool.definition));
 const delegateTaskDefinition = createDelegateTaskTool({
   dispatcher: {} as never,

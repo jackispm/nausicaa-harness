@@ -90,9 +90,9 @@ describe("real-model Worker A/B preregistration", () => {
         .toBe(hashJson(WORKER_LIVE_TOOL_CONTRACT.definitions[mode]));
     }
     expect(WORKER_LIVE_TOOL_CONTRACT.hashes).toEqual({
-      "main-only": "sha256:a795d65bd6082de91edf860bbabacdd96d9709874f6d01fd8873de8efd9851de",
-      "main-worker": "sha256:b244aee6e49a3b32bc1073dbe4f1a3fa3d4e01b7dc7c41e909809b122448b950",
-      worker: "sha256:a795d65bd6082de91edf860bbabacdd96d9709874f6d01fd8873de8efd9851de",
+      "main-only": "sha256:a4752b9dbd6137ca72c44b640fbd4f030e55c0999d57a39a71050df09b8db869",
+      "main-worker": "sha256:3976d23fd1c9301890a44397f10f645518e3019c3065998185c6907ee2bf95b8",
+      worker: "sha256:a4752b9dbd6137ca72c44b640fbd4f030e55c0999d57a39a71050df09b8db869",
     });
     expect(WORKER_LIVE_MANIFEST.provenance).toMatchObject({
       baselineCommit: WORKER_LIVE_BASELINE_COMMIT,
@@ -103,7 +103,7 @@ describe("real-model Worker A/B preregistration", () => {
     expect(WORKER_LIVE_MANIFEST.manifestHash)
       .toBe(hashWorkerLiveManifest(WORKER_LIVE_MANIFEST));
     expect(WORKER_LIVE_MANIFEST.manifestHash)
-      .toBe("sha256:8a5777772f7e61734af72a676ca4fbb4e351e6739c4bf52e4679eee66ae97fb9");
+      .toBe("sha256:1ec346f760e3f13c39b25baa575575a34e20a554ea04dbb4e360d7d43c3a1185");
     expect(Object.isFrozen(WORKER_LIVE_MANIFEST)).toBe(true);
     expect(Object.isFrozen(WORKER_LIVE_MANIFEST.arms[0]?.budget)).toBe(true);
     expect(Object.isFrozen(WORKER_LIVE_MANIFEST.execution)).toBe(true);

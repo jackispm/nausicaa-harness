@@ -8,6 +8,7 @@ import type { AgentTool, ModelResponse } from "../../src/domain/index.js";
 import { JsonlLedger, projectRun } from "../../src/ledger/index.js";
 import { ScriptedModel, type ScriptedModelStep } from "../../src/model/index.js";
 import { SessionController } from "../../src/runtime/index.js";
+import { FileContentAddressedStore } from "../../src/store/index.js";
 
 const roots: string[] = [];
 
@@ -121,6 +122,57 @@ describe("Session Main model selection", () => {
     expect(restartedModel.requests[0]?.model).toBe("openrouter:vision");
     await restarted.close();
   });
+
+  it("degrades historical images for text-only models and restores them after switching back", async () => {
+    const root = await temporaryRoot();
+    const image = { type: "image" as const, mimeType: "image/png" as const, data: "AQID" };
+    const model = new CapabilityScriptedModel([
+      response("vision turn complete"),
+      response("text turn complete"),
+      response("vision restored"),
+    ]);
+    const session = await openSession(
+      root,
+      model,
+      "model-image-switch",
+      [],
+      "openrouter:vision",
+    );
+
+    await session.submit({ inputId: "vision-input", text: "Inspect this", images: [image] });
+    await session.waitForIdle();
+    await session.selectModel("openrouter:text");
+    await session.submit({ inputId: "text-input", text: "Summarize without vision" });
+    await session.waitForIdle();
+    await session.selectModel("openrouter:vision");
+    await session.submit({ inputId: "vision-again", text: "Revisit the original image" });
+    await session.waitForIdle();
+    await session.close();
+
+    expect(model.requests.map((request) => request.model)).toEqual([
+      "openrouter:vision",
+      "openrouter:text",
+      "openrouter:vision",
+    ]);
+    expect(requestImages(model.requests[0]?.messages ?? [])).toEqual([image]);
+    expect(requestImages(model.requests[1]?.messages ?? [])).toEqual([]);
+    expect(model.requests[1]?.messages.some((message) => (
+      message.content.includes("selected model does not support image input")
+    ))).toBe(true);
+    expect(requestImages(model.requests[2]?.messages ?? [])).toEqual([image]);
+
+    const runState = join(root, "state", "runs", "model-image-switch");
+    const ledger = await JsonlLedger.open(join(runState, "ledger.jsonl"));
+    const events = await ledger.read({ runId: "model-image-switch" });
+    const firstUser = events.find((event) => event.type === "user.message");
+    expect(firstUser?.type).toBe("user.message");
+    const store = await FileContentAddressedStore.open(join(runState, "store"));
+    const durable = JSON.parse(new TextDecoder().decode(
+      await store.get(firstUser!.payload.messageRef),
+    )) as { images?: unknown[] };
+    expect(durable.images).toEqual([image]);
+    await ledger.close();
+  });
 });
 
 class CapabilityScriptedModel extends ScriptedModel {
@@ -149,11 +201,12 @@ async function openSession(
   model: CapabilityScriptedModel,
   runId: string,
   tools: readonly AgentTool[] = [],
+  initialModel = "openrouter:initial",
 ): Promise<SessionController> {
   return SessionController.open({
     workspace: root,
     dataDir: join(root, "state"),
-    model: "openrouter:initial",
+    model: initialModel,
     tetoModel: "openrouter:teto-fixed",
     workerModel: "openrouter:worker-fixed",
     policy: {
@@ -166,6 +219,12 @@ async function openSession(
     tools,
     createRunId: () => runId,
   });
+}
+
+function requestImages(messages: readonly import("../../src/domain/index.js").ConversationMessage[]) {
+  return messages.flatMap((message) => (
+    message.role === "user" || message.role === "tool" ? message.images ?? [] : []
+  ));
 }
 
 function response(content: string): ModelResponse {

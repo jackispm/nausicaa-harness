@@ -82,6 +82,14 @@ describe("executeRun Worker lane", () => {
     });
     expect(mainModel.callCount).toBeGreaterThanOrEqual(2);
     expect(workerModel.callCount).toBe(1);
+    expect(workerModel.requests[0]?.tools.map((tool) => tool.name)).toEqual([
+      "read_file",
+      "list_files",
+      "grep",
+      "find",
+      "file_info",
+      "read_image",
+    ]);
 
     const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
     const events = await ledger.read({ runId: result.runId });

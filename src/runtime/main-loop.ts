@@ -40,12 +40,20 @@ import type {
   FukaiConversationRef,
   MainContextProvider,
 } from "../fukai/types.js";
+import { MoweExecutor } from "../mowe/index.js";
+import type {
+  MoweCall,
+  MoweCallResult,
+  MoweExecutionRequest,
+} from "../mowe/types.js";
+import { MAX_MOWE_MAX_OUTPUT_BYTES } from "../mowe/types.js";
 import {
   boundedRedactedText,
   persistedErrorText,
   redactSensitiveText,
 } from "./redaction.js";
 import { deriveRuntimePolicyVersion } from "./fukai-compaction-runtime.js";
+import { resolveImageInputCapability } from "./model-capabilities.js";
 import type { RunTokenBudget } from "./run-token-budget.js";
 
 const DEFAULT_SYSTEM_PROMPT = `You are Main, the primary execution lane.
@@ -129,7 +137,10 @@ export interface MainLoopDeps {
   contextProvider: MainContextProvider;
   conversationStore: MainConversationStore;
   eventSink: MainEventSink;
-  tools: readonly AgentTool[];
+  /** Legacy AgentTool catalog; optional when a complete Mowe executor is supplied. */
+  tools?: readonly AgentTool[];
+  /** Unified Mowe tool system; omitted to build one around the supplied tools. */
+  mowe?: MoweExecutor;
   clock?: Clock;
   /** Monotonic milliseconds used for provider/context latency metrics. */
   monotonicNow?: () => number;
@@ -149,6 +160,8 @@ export interface MainLoopDeps {
   compactForPressure?: (
     context: MainCompactionPressureContext,
   ) => Promise<FukaiCompactionSelection | undefined>;
+  /** Host/UI approval seam for Mowe tools that declare `requiresApproval`. */
+  approve?: MoweExecutionRequest["approve"];
   onStreamEvent?: (event: MainStreamEvent) => void;
 }
 
@@ -238,8 +251,7 @@ export class MainLoop {
   private readonly contextProvider: MainContextProvider;
   private readonly conversationStore: MainConversationStore;
   private readonly eventSink: MainEventSink;
-  private readonly tools: readonly AgentTool[];
-  private readonly toolsByName: ReadonlyMap<string, AgentTool>;
+  private readonly mowe: MoweExecutor;
   private readonly clock: Clock;
   private readonly monotonicNow: () => number;
   private readonly beforeStep: MainLoopDeps["beforeStep"];
@@ -247,6 +259,7 @@ export class MainLoop {
   private readonly afterStep: MainLoopDeps["afterStep"];
   private readonly selectCompaction: MainLoopDeps["selectCompaction"];
   private readonly compactForPressure: MainLoopDeps["compactForPressure"];
+  private readonly approve: MainLoopDeps["approve"];
   private readonly onStreamEvent: MainLoopDeps["onStreamEvent"];
   private readonly streamSequences = new Map<string, number>();
   private readonly modelCallAttempts = new Map<string, number>();
@@ -258,8 +271,17 @@ export class MainLoop {
     this.contextProvider = deps.contextProvider;
     this.conversationStore = deps.conversationStore;
     this.eventSink = deps.eventSink;
-    this.tools = [...deps.tools];
-    this.toolsByName = indexTools(this.tools);
+    this.mowe = deps.mowe ?? new MoweExecutor({
+      catalog: deps.tools ?? [],
+      maxConcurrency: 4,
+      // Mowe may persist/project the complete sanitized result. The Main
+      // context boundary applies its own smaller inline budget below.
+      sanitizeResult: (result) => ({
+        content: redactSensitiveText(result.content),
+        isError: result.isError,
+        ...(result.images === undefined ? {} : { images: structuredClone(result.images) }),
+      }),
+    });
     this.clock = deps.clock ?? systemClock;
     this.monotonicNow = deps.monotonicNow ?? defaultMonotonicNow;
     this.beforeStep = deps.beforeStep;
@@ -267,6 +289,7 @@ export class MainLoop {
     this.afterStep = deps.afterStep;
     this.selectCompaction = deps.selectCompaction;
     this.compactForPressure = deps.compactForPressure;
+    this.approve = deps.approve;
     this.onStreamEvent = deps.onStreamEvent;
   }
 
@@ -372,6 +395,14 @@ export class MainLoop {
         const requestConversationCount = conversationRefs.length;
 
         const contextStartedAt = this.monotonicNow();
+        // A concurrent selector change applies either to this complete request
+        // boundary or the next one, never halfway through context assembly.
+        const requestModel = this.resolveModel?.() ?? input.model;
+        const imageInputCapability = resolveImageInputCapability(this.model, requestModel);
+        const imageInputSupported = imageInputCapability !== false;
+        const requestTools = this.mowe.catalog.modelDefinitions().filter((definition) => (
+          imageInputSupported || definition.name !== "read_image"
+        ));
         let compaction: FukaiCompactionSelection | undefined;
         if (this.selectCompaction !== undefined) {
           try {
@@ -399,10 +430,13 @@ export class MainLoop {
           systemPrompt: input.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
           conversationRefs,
           artifactSelections,
-          tools: this.tools.map((tool) => tool.definition),
+          tools: requestTools,
           upperWatermark: stepWatermark.globalOffset,
           policyVersion,
           budget: contextBudget,
+          ...(imageInputCapability === undefined
+            ? {}
+            : { imageInputSupported: imageInputCapability }),
           ...(input.signal === undefined ? {} : { signal: input.signal }),
         } as const;
         let view: Awaited<ReturnType<MainContextProvider["build"]>>;
@@ -417,9 +451,6 @@ export class MainLoop {
           view = await this.contextProvider.build(contextRequest);
           compaction = undefined;
         }
-        // Freeze the selector before any optional compaction IO. A concurrent
-        // model change applies at this boundary or the next one, never midway.
-        const requestModel = this.resolveModel?.() ?? input.model;
         const remainingTokens = Math.max(
           1,
           input.policy.maxModelTokens - chargedTokens(usage),
@@ -530,7 +561,7 @@ export class MainLoop {
             model: requestModel,
             systemPrompt: view.systemPrompt,
             messages: view.messages,
-            tools: this.tools.map((tool) => tool.definition),
+            tools: requestTools,
             maxOutputTokens,
             ...(input.signal === undefined ? {} : { signal: input.signal }),
           };
@@ -662,18 +693,16 @@ export class MainLoop {
           : undefined;
         const toolMessages = response.toolCalls.length === 0
           ? []
-          : await settleToolExecutions(response.toolCalls.map((call) =>
-              this.executeTool(
-                input,
-                laneId,
-                correlationId,
-                eventState,
-                eventPrefix,
-                step,
-                call,
-                truncatedToolCallError,
-              ),
-            ));
+          : await this.executeTools(
+              input,
+              laneId,
+              correlationId,
+              eventState,
+              eventPrefix,
+              step,
+              response.toolCalls,
+              truncatedToolCallError,
+            );
         for (const toolMessage of toolMessages) {
           sequence += 1;
           conversationRefs.push({
@@ -818,99 +847,132 @@ export class MainLoop {
     return messages;
   }
 
-  private async executeTool(
+  /**
+   * Mowe owns the unified one-or-many operation boundary. Main keeps the
+   * existing Ledger event shape and conversation refs around that boundary.
+   */
+  private async executeTools(
     input: MainLoopInput,
     laneId: LaneId,
     correlationId: string,
     eventState: { watermark: number },
     eventPrefix: string,
     step: number,
-    call: ToolCall,
+    calls: readonly ToolCall[],
     forcedError?: string,
-  ): Promise<{ message: ConversationMessage; ref: ArtifactRef }> {
+  ): Promise<{ message: ConversationMessage; ref: ArtifactRef }[]> {
     throwIfAborted(input.signal);
-    const operationId = `op:${hashStable({
-      runId: input.runId,
-      turnId: input.turnId,
-      laneId,
-      step,
-      toolCallId: call.id,
-      toolName: call.name,
-    })}`;
-    const argumentsRef = await this.conversationStore.put(
-      stableStringify(call.arguments),
-      TOOL_ARGUMENTS_MEDIA_TYPE,
-    );
-    await this.emit(input, laneId, correlationId, eventState, {
-      type: "tool.requested",
-      payload: {
-        operationId,
+    const preparedCalls: MoweCall[] = [];
+    for (const call of calls) {
+      const operationId = `op:${hashStable({
+        runId: input.runId,
+        turnId: input.turnId,
+        laneId,
+        step,
         toolCallId: call.id,
-        name: call.name,
-        argumentsRef,
-      },
-      idempotencyKey: `${eventPrefix}:step:${step}:tool:${call.id}:requested`,
-    });
-
-    let result: ToolResult;
-    const tool = this.toolsByName.get(call.name);
-    if (forcedError !== undefined) {
-      result = { content: forcedError, isError: true };
-    } else if (tool === undefined) {
-      result = { content: `Unknown tool: ${call.name}`, isError: true };
-    } else {
-      try {
-        result = await tool.execute(call.arguments, {
-          runId: input.runId,
-          workspace: input.workspace,
+        toolName: call.name,
+      })}`;
+      const argumentsRef = await this.conversationStore.put(
+        stableStringify(call.arguments),
+        TOOL_ARGUMENTS_MEDIA_TYPE,
+      );
+      await this.emit(input, laneId, correlationId, eventState, {
+        type: "tool.requested",
+        payload: {
           operationId,
-          ...(input.signal === undefined ? {} : { signal: input.signal }),
+          toolCallId: call.id,
+          name: call.name,
+          argumentsRef,
+        },
+        idempotencyKey: `${eventPrefix}:step:${step}:tool:${call.id}:requested`,
+      });
+      preparedCalls.push({
+        ...structuredClone(call),
+        operationId,
+        // Image-producing tools already enforce their own byte/count limits.
+        // Keeping those results inline lets Fukai apply its separate image
+        // budget without re-reading and duplicating a Mowe artifact.
+        ...(this.mowe.catalog.get(call.name)?.metadata.outputKinds.includes("image") === true
+          ? { projection: { mode: "inline" as const } }
+          : {}),
+        ...(forcedError === undefined ? {} : { forcedError }),
+      });
+    }
+
+    const execution = await this.mowe.execute({
+      runId: input.runId,
+      laneId,
+      workspace: input.workspace,
+      calls: preparedCalls,
+      artifactStore: this.conversationStore,
+      // Keep Mowe's aggregate guard high enough that ordinary tool results
+      // remain available for the durable conversation message. Oversized
+      // batches are still bounded by Mowe and retain a plain-text artifact.
+      limits: { maxOutputBytes: MAX_MOWE_MAX_OUTPUT_BYTES },
+      projection: { mode: "auto", maxBytes: MAX_TOOL_RESULT_BYTES },
+      ...(this.approve === undefined ? {} : { approve: this.approve }),
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+    });
+    const messages: { message: ConversationMessage; ref: ArtifactRef }[] = [];
+    for (const item of execution.results) {
+      // Mowe's response is the retained boundary. A complete source may
+      // already exist once behind projection.artifactRef; do not read it back
+      // and create an unaccounted duplicate in the Ledger store.
+      const retainedResult = {
+        content: redactSensitiveText(item.result.content),
+        isError: item.result.isError,
+        ...(item.result.images === undefined
+          ? {}
+          : { images: structuredClone(item.result.images) }),
+      } satisfies ToolResult;
+      const boundedResult = projectToolResultForContext(item, retainedResult);
+      const message: ConversationMessage = {
+        role: "tool",
+        content: boundedResult.content,
+        toolCallId: item.callId,
+        toolName: item.name,
+        isError: boundedResult.isError,
+        ...(boundedResult.images === undefined
+          ? {}
+          : { images: structuredClone(boundedResult.images) }),
+        createdAt: this.clock.now().toISOString(),
+      };
+      // Transcript and model context intentionally share one bounded artifact.
+      const resultRef = await this.writeMessage(message);
+      const terminalPayload = {
+        operationId: item.operationId,
+        toolCallId: item.callId,
+        name: item.name,
+        contextRef: resultRef,
+      };
+      if (retainedResult.isError) {
+        await this.emit(input, laneId, correlationId, eventState, {
+          type: "tool.failed",
+          payload: {
+            ...terminalPayload,
+            error: boundedRedactedText(retainedResult.content, 1_024),
+            resultRef,
+          },
+          idempotencyKey: `${eventPrefix}:step:${step}:tool:${item.callId}:failed`,
         });
-      } catch (error: unknown) {
-        throwIfAborted(input.signal);
-        result = { content: persistedErrorText(error), isError: true };
+      } else {
+        await this.emit(input, laneId, correlationId, eventState, {
+          type: "tool.succeeded",
+          payload: {
+            ...terminalPayload,
+            resultRef,
+          },
+          idempotencyKey: `${eventPrefix}:step:${step}:tool:${item.callId}:succeeded`,
+        });
       }
+      messages.push({ message, ref: resultRef });
     }
+    // Mowe returns a terminal result for every admitted call, including calls
+    // cancelled while the batch was in flight. Persist those terminal facts
+    // before propagating cancellation so recovery never sees a false pending
+    // tool operation.
     throwIfAborted(input.signal);
-    result = boundToolResult({
-      content: redactSensitiveText(result.content),
-      isError: result.isError,
-    });
-
-    const message: ConversationMessage = {
-      role: "tool",
-      content: result.content,
-      toolCallId: call.id,
-      toolName: call.name,
-      isError: result.isError,
-      createdAt: this.clock.now().toISOString(),
-    };
-    const resultRef = await this.writeMessage(message);
-    if (result.isError) {
-      await this.emit(input, laneId, correlationId, eventState, {
-        type: "tool.failed",
-        payload: {
-          operationId,
-          toolCallId: call.id,
-          name: call.name,
-          error: boundedRedactedText(result.content, 1_024),
-          resultRef,
-        },
-        idempotencyKey: `${eventPrefix}:step:${step}:tool:${call.id}:failed`,
-      });
-    } else {
-      await this.emit(input, laneId, correlationId, eventState, {
-        type: "tool.succeeded",
-        payload: {
-          operationId,
-          toolCallId: call.id,
-          name: call.name,
-          resultRef,
-        },
-        idempotencyKey: `${eventPrefix}:step:${step}:tool:${call.id}:succeeded`,
-      });
-    }
-    return { message, ref: resultRef };
+    return messages;
   }
 
   private async writeMessage(message: ConversationMessage): Promise<ArtifactRef> {
@@ -1253,22 +1315,18 @@ function validateInput(input: MainLoopInput): void {
   }
 }
 
-function indexTools(tools: readonly AgentTool[]): ReadonlyMap<string, AgentTool> {
-  const index = new Map<string, AgentTool>();
-  for (const tool of tools) {
-    if (index.has(tool.definition.name)) {
-      throw new Error(`Duplicate tool definition: ${tool.definition.name}`);
-    }
-    index.set(tool.definition.name, tool);
-  }
-  return index;
-}
-
 function validateToolCalls(calls: readonly ToolCall[]): void {
   const ids = new Set<string>();
   for (const call of calls) {
     if (call.id.length === 0 || call.name.length === 0) {
       throw new Error("Tool calls require non-empty id and name");
+    }
+    if (
+      call.arguments === null
+      || typeof call.arguments !== "object"
+      || Array.isArray(call.arguments)
+    ) {
+      throw new Error(`Tool call arguments must be an object: ${call.id}`);
     }
     if (ids.has(call.id)) {
       throw new Error(`Duplicate tool call id: ${call.id}`);
@@ -1357,10 +1415,90 @@ function cacheOutcome(usage: TokenUsage): CacheOutcome {
 function boundToolResult(result: ToolResult): ToolResult {
   const bytes = Buffer.from(result.content, "utf8");
   if (bytes.byteLength <= MAX_TOOL_RESULT_BYTES) {
-    return result;
+    return {
+      content: result.content,
+      isError: result.isError,
+      ...(result.images === undefined ? {} : { images: structuredClone(result.images) }),
+    };
   }
-  const content = `${new TextDecoder().decode(bytes.subarray(0, MAX_TOOL_RESULT_BYTES))}\n[TRUNCATED BY MAIN LOOP]`;
-  return { content, isError: result.isError };
+  const marker = "\n[TRUNCATED BY MAIN LOOP]";
+  const markerBytes = Buffer.from(marker, "utf8");
+  const prefix = utf8Prefix(
+    bytes,
+    Math.max(0, MAX_TOOL_RESULT_BYTES - markerBytes.byteLength),
+  );
+  const content = `${Buffer.from(prefix).toString("utf8")}${marker}`;
+  return {
+    content,
+    isError: result.isError,
+    // Provider image blocks have their own validated count/byte/token budget.
+    // Counting base64 bytes against the text preview cap would make ordinary
+    // screenshots unusable even though the visual context remains bounded.
+    ...(result.images === undefined ? {} : { images: structuredClone(result.images) }),
+  };
+}
+
+/**
+ * Convert Mowe's bounded projection into the message that enters the next
+ * model request. A complete source may remain behind Mowe's artifact pointer;
+ * only the projection and that pointer cross the Ledger/context boundary.
+ */
+function projectToolResultForContext(
+  item: Pick<MoweCallResult, "projection">,
+  fullResult: ToolResult,
+): ToolResult {
+  const projection = item.projection;
+  if (projection === undefined) return boundToolResult(fullResult);
+  const pointer = projection.artifactRef === undefined
+    ? ""
+    : `\n[Full tool result stored as artifact ${projection.artifactRef.id}; ${projection.byteLength} bytes]`;
+  // Mowe's byte projection counts the canonical base64 envelope and therefore
+  // externalizes most real screenshots. Main deliberately projects text and
+  // validated image blocks on separate budgets so a vision-capable provider
+  // receives the image while the durable artifact remains lossless.
+  const content = (fullResult.images?.length ?? 0) > 0
+    ? fullResult.content
+    : projection.content ?? "[Tool result projected outside inline context]";
+  const images = fullResult.images ?? projection.images;
+  const projected: ToolResult = {
+    content,
+    isError: fullResult.isError,
+    ...(images === undefined ? {} : { images: structuredClone(images) }),
+  };
+  return pointer.length === 0
+    ? boundToolResult(projected)
+    : boundToolResultWithSuffix(projected, pointer);
+}
+
+/** Keep an artifact pointer visible even when the preview itself fills the cap. */
+function boundToolResultWithSuffix(result: ToolResult, suffix: string): ToolResult {
+  const contentBytes = Buffer.from(result.content, "utf8");
+  const suffixBytes = Buffer.from(suffix, "utf8");
+  if (contentBytes.byteLength + suffixBytes.byteLength <= MAX_TOOL_RESULT_BYTES) {
+    return { ...result, content: `${result.content}${suffix}` };
+  }
+  const marker = "\n[TRUNCATED BY MAIN LOOP]";
+  const markerBytes = Buffer.from(marker, "utf8");
+  if (suffixBytes.byteLength + markerBytes.byteLength >= MAX_TOOL_RESULT_BYTES) {
+    return boundToolResult({ ...result, content: suffix });
+  }
+  const prefix = utf8Prefix(
+    contentBytes,
+    MAX_TOOL_RESULT_BYTES - suffixBytes.byteLength - markerBytes.byteLength,
+  );
+  return {
+    ...result,
+    content: `${Buffer.from(prefix).toString("utf8")}${marker}${suffix}`,
+  };
+}
+
+/** Return a valid UTF-8 prefix whose byte length never exceeds the limit. */
+function utf8Prefix(bytes: Uint8Array, maxBytes: number): Uint8Array {
+  const limit = Math.max(0, Math.min(bytes.byteLength, maxBytes));
+  if (limit === bytes.byteLength) return bytes;
+  let end = limit;
+  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end);
 }
 
 function boundedText(value: string, maxCharacters: number): string {
@@ -1425,17 +1563,4 @@ async function raceAbort<T>(
       },
     );
   });
-}
-
-async function settleToolExecutions<T>(
-  operations: readonly Promise<T>[],
-): Promise<T[]> {
-  const outcomes = await Promise.allSettled(operations);
-  const rejected = outcomes.find(
-    (outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
-  );
-  if (rejected !== undefined) {
-    throw rejected.reason;
-  }
-  return outcomes.map((outcome) => (outcome as PromiseFulfilledResult<T>).value);
 }

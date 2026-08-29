@@ -32,6 +32,7 @@ const snapshot: SessionSnapshot = {
   workerEnabled: false,
   allowWrite: false,
   allowShell: false,
+  allowNetwork: false,
   pendingInputs: 2,
   lastCommittedStep: 3,
   usage: { input: 120, output: 30, cacheRead: 80, cacheWrite: 0 },

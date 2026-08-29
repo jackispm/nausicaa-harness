@@ -5,6 +5,7 @@ import type {
   TokenUsage,
   ToolCall,
 } from "./types.js";
+import type { UserImage } from "./images.js";
 
 export interface JsonSchema {
   type: "object";
@@ -69,6 +70,8 @@ export interface ToolExecutionContext {
 export interface ToolResult {
   content: string;
   isError: boolean;
+  /** Optional multimodal blocks returned by tools such as read_image. */
+  images?: UserImage[];
 }
 
 export interface AgentTool {

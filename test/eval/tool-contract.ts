@@ -4,8 +4,15 @@ import { createAdviceResponseTool } from "../../src/runtime/index.js";
 import { createWorkspaceTools } from "../../src/tools/index.js";
 import { hashJson } from "./fingerprint.js";
 
-const readOnlyTools = createWorkspaceTools({ allowWrite: false, allowShell: false });
-const writeTools = createWorkspaceTools({ allowWrite: true, allowShell: false });
+// Keep the pre-registered evaluation surface stable while the product tool
+// catalog evolves independently.
+const readOnlyTools = createWorkspaceTools({ allowWrite: false, allowShell: false, includeFileInfo: false });
+const writeTools = createWorkspaceTools({
+  allowWrite: true,
+  allowShell: false,
+  includeFileInfo: false,
+  allowPathOperations: false,
+});
 const adviceDefinition = createAdviceResponseTool({} as never).definition;
 
 export const FROZEN_TOOL_CONTRACT = deepFreeze({

@@ -135,6 +135,7 @@ describe("settings", () => {
       dataDir: "/work/.nausicaa",
       allowShell: false,
       allowWrite: false,
+      allowNetwork: false,
       fukaiCompaction: {
         enabled: false,
         provider: "none",
@@ -264,6 +265,34 @@ describe("settings", () => {
       { allowShell: true, allowWrite: false },
       {},
     )).toMatchObject({ allowShell: true, allowWrite: false });
+  });
+
+  it("keeps network access disabled by default and supports explicit overrides", () => {
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base" },
+      {},
+      {},
+    ).allowNetwork).toBe(false);
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base" },
+      { allowNetwork: true },
+      {},
+    ).allowNetwork).toBe(true);
+  });
+
+  it("validates allowNetwork in settings files", async () => {
+    const root = await makeRoot();
+    const home = join(root, "home");
+    await mkdir(join(home, ".nausicaa"), { recursive: true });
+    await writeFile(
+      join(home, ".nausicaa", "settings.json"),
+      JSON.stringify({ model: "openrouter:base", allowNetwork: "yes" }),
+    );
+
+    await expect(loadSettings(join(root, "workspace"), { userHome: home }))
+      .rejects.toThrow(/allowNetwork.*boolean/i);
   });
 
   it("validates allowWrite in settings files", async () => {

@@ -127,6 +127,33 @@ describe("daemon runtime composition", () => {
     expect(session.close).toHaveBeenCalledOnce();
   });
 
+  it("passes Host assertion and atomic commit guards into SessionController dependencies", async () => {
+    const session = sessionDouble();
+    const createSession = vi.fn<DaemonSessionFactory>(async (_options, deps) => {
+      expect(deps.assertExecutionLease).toBeTypeOf("function");
+      await deps.assertExecutionLease?.();
+      expect(deps.commitExecutionLease).toBeTypeOf("function");
+      await deps.commitExecutionLease?.(async () => undefined);
+      return session;
+    });
+    const assertLease = vi.fn(async () => undefined);
+    let commitCalls = 0;
+    const commitLease = async <T>(operation: () => Promise<T>): Promise<T> => {
+      commitCalls += 1;
+      return operation();
+    };
+    const activate = createDaemonSessionActivator({
+      session: { workspace: "/workspace", dataDir: "/state", model: "scripted" },
+      createSession,
+    });
+
+    await activate(activation({ assertLease, commitLease }));
+
+    expect(assertLease).toHaveBeenCalledOnce();
+    expect(commitCalls).toBe(1);
+    expect(createSession).toHaveBeenCalledOnce();
+  });
+
   it("composes per-Run Ledger wake admission with the Session activation seam", async () => {
     const ledger = new MemoryLedger();
     const admissionLedger: Ledger = {
@@ -223,5 +250,22 @@ describe("daemon runtime composition", () => {
     await expect(activate(activation({ wakes: [] }))).rejects.toThrow(
       /at least one wake/u,
     );
+  });
+
+  it("rejects unsafe Run IDs before resolving a Ledger path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-daemon-runtime-path-"));
+    roots.push(root);
+    const runtime = await openDaemonRuntime({
+      session: { workspace: root, dataDir: root, model: "scripted" },
+      host: { ownerId: "daemon-path-boundary" },
+    });
+    runtimes.push(runtime);
+    await runtime.start();
+
+    await expect(runtime.host.wake({
+      runId: "../escape",
+      source: "system",
+      dedupeKey: "path-traversal",
+    })).rejects.toThrow(/safe identifier/u);
   });
 });

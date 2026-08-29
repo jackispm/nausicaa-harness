@@ -218,6 +218,40 @@ describe("PiAiModelPort", () => {
     ]);
   });
 
+  it("passes tool-produced image blocks through to the vision provider", async () => {
+    let observedToolContent: unknown;
+    const faux = fauxProvider({
+      provider: "openrouter",
+      models: [{ id: "vision", input: ["text", "image"] }],
+    });
+    faux.setResponses([(context) => {
+      observedToolContent = context.messages[0]?.content;
+      return fauxAssistantMessage("seen");
+    }]);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+
+    await adapter.complete({
+      ...request(),
+      model: "openrouter:vision",
+      messages: [{
+        role: "tool",
+        content: "screen.png",
+        images: [{ type: "image", mimeType: "image/png", data: "AA==" }],
+        toolCallId: "read-image",
+        toolName: "read_image",
+        isError: false,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }],
+    });
+
+    expect(observedToolContent).toEqual([
+      { type: "text", text: "screen.png" },
+      { type: "image", mimeType: "image/png", data: "AA==" },
+    ]);
+  });
+
   it("rejects image input before calling a text-only model", async () => {
     const faux = fauxProvider({
       provider: "openrouter",
@@ -234,6 +268,39 @@ describe("PiAiModelPort", () => {
         role: "user" as const,
         content: "inspect",
         images: [{ type: "image" as const, mimeType: "image/png", data: "AA==" }],
+        createdAt: "2026-01-01T00:00:00.000Z",
+      }],
+    };
+
+    await expect(adapter.complete(imageRequest)).rejects.toThrow(/does not support image/i);
+    const events = await collect(adapter.stream(imageRequest));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "error",
+      error: { message: expect.stringMatching(/does not support image/i) },
+    });
+    expect(faux.state.callCount).toBe(0);
+  });
+
+  it("rejects tool-produced images before calling a text-only model", async () => {
+    const faux = fauxProvider({
+      provider: "openrouter",
+      models: [{ id: "text-only", input: ["text"] }],
+    });
+    faux.setResponses([fauxAssistantMessage("must not run")]);
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+    const imageRequest = {
+      ...request(),
+      model: "openrouter:text-only",
+      messages: [{
+        role: "tool" as const,
+        content: "screen.png",
+        images: [{ type: "image" as const, mimeType: "image/png", data: "AA==" }],
+        toolCallId: "read-image",
+        toolName: "read_image",
+        isError: false,
         createdAt: "2026-01-01T00:00:00.000Z",
       }],
     };

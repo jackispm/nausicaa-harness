@@ -817,7 +817,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       `- **Workspace:** \`${snapshot.workspace}\``,
       `- **Model:** \`${snapshot.model}\``,
       `- **Run / Turn:** \`${snapshot.runId ?? "new"}\` / \`${snapshot.turnId ?? "idle"}\``,
-      `- **State:** ${snapshot.status}; Teto ${snapshot.tetoEnabled ? "on" : "off"}; ${snapshot.allowWrite ? "write enabled" : "file writes off"}; ${snapshot.allowShell ? "shell enabled" : "shell off"}`,
+      `- **State:** ${snapshot.status}; Teto ${snapshot.tetoEnabled ? "on" : "off"}; ${snapshot.allowWrite ? "write enabled" : "file writes off"}; ${snapshot.allowShell ? "shell enabled" : "shell off"}; ${snapshot.allowNetwork ? "network enabled" : "network off"}`,
       `- **Queue / Tokens:** ${snapshot.pendingInputs} pending; ${usage.input + usage.output} used; ${usage.cacheRead} cache-read`,
       ...(snapshot.blocker === undefined ? [] : [`- **Blocked:** ${snapshot.blocker}`]),
     ].join("\n");

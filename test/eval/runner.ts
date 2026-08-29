@@ -401,6 +401,8 @@ export async function executeEvaluationArm(
   const workspaceTools = createWorkspaceTools({
     allowWrite: fixture.allowWrite,
     allowShell: false,
+    allowPathOperations: false,
+    includeFileInfo: false,
     protectedPaths: [resolve(dataDir)],
   });
   assertEvaluationToolContract(workspaceTools, fixture.allowWrite);

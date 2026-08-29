@@ -1,7 +1,13 @@
+import { mkdtemp, mkdir, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import type { AgentTool } from "../../src/domain/ports.js";
 import { MoweCatalog, MoweExecutor } from "../../src/mowe/index.js";
+import { toolResultByteLength } from "../../src/mowe/result-projector.js";
+import { MemoryContentAddressedStore } from "../../src/store/memory.js";
 
 type Deferred = ReturnType<typeof deferred<void>>;
 
@@ -24,6 +30,161 @@ function tool(
 }
 
 describe("Mowe concurrency admission", () => {
+  it("retains completed calls immediately while preserving request order", async () => {
+    const releaseSlow = deferred();
+    const fastFinished = deferred();
+    const store = new MemoryContentAddressedStore();
+    let artifactBytes = 0;
+    let artifactPuts = 0;
+    const slow = tool(
+      "slow_result",
+      async () => {
+        await releaseSlow.promise;
+        return { content: "slow-value", isError: false };
+      },
+      { effect: "read", concurrencySafe: true, maxConcurrency: 2 },
+    );
+    const fast = tool(
+      "fast_result",
+      async () => {
+        fastFinished.resolve();
+        return { content: "0123456789", isError: false };
+      },
+      { effect: "read", concurrencySafe: true, maxConcurrency: 2 },
+    );
+    const catalog = new MoweCatalog();
+    catalog.register(slow.tool, slow.metadata);
+    catalog.register(fast.tool, fast.metadata);
+    const execution = new MoweExecutor({ catalog, maxConcurrency: 2 }).execute({
+      runId: "completion-order",
+      laneId: "main",
+      workspace: "/tmp",
+      limits: { maxOutputBytes: 10 },
+      artifactStore: {
+        put: async (data, mediaType) => {
+          artifactPuts += 1;
+          artifactBytes += typeof data === "string"
+            ? Buffer.byteLength(data, "utf8")
+            : data.byteLength;
+          return store.put(data, mediaType);
+        },
+      },
+      calls: [
+        { id: "slow", name: "slow_result", arguments: {} },
+        {
+          id: "fast",
+          name: "fast_result",
+          arguments: {},
+          projection: { mode: "artifact" },
+        },
+      ],
+    });
+
+    try {
+      await fastFinished.promise;
+      await eventually(() => expect(artifactPuts).toBe(1));
+      expect(artifactBytes).toBe(10);
+    } finally {
+      releaseSlow.resolve();
+    }
+
+    const response = await execution;
+    expect(response.results.map((result) => result.callId)).toEqual(["slow", "fast"]);
+    expect(response.results[0]?.result.content).toBe("");
+    expect(response.results[1]).toMatchObject({
+      callId: "fast",
+      result: { content: "" },
+      projection: { mode: "artifact", byteLength: 10, truncated: false },
+    });
+    const returnedBytes = response.results.reduce((total, result) => {
+      return total
+        + toolResultByteLength(result.result)
+        + Buffer.byteLength(result.error ?? "", "utf8")
+        + Buffer.byteLength(result.projection?.content ?? "", "utf8");
+    }, 0);
+    expect(artifactBytes + returnedBytes).toBeLessThanOrEqual(10);
+  });
+
+  it("reserves output before awaiting artifact storage", async () => {
+    const artifactPutStarted = deferred();
+    const releaseArtifactPut = deferred();
+    const store = new MemoryContentAddressedStore();
+    let artifactPuts = 0;
+    let thirdStarted = false;
+    const catalog = new MoweCatalog();
+    const first = tool(
+      "first_artifact",
+      async () => ({ content: "0123456789", isError: false }),
+      { effect: "read", concurrencySafe: true, maxConcurrency: 2 },
+    );
+    const second = tool(
+      "second_artifact",
+      async () => {
+        await artifactPutStarted.promise;
+        return { content: "abcdefghij", isError: false };
+      },
+      { effect: "read", concurrencySafe: true, maxConcurrency: 2 },
+    );
+    const third = tool(
+      "after_reservation",
+      async () => {
+        thirdStarted = true;
+        return { content: "third", isError: false };
+      },
+      { effect: "read", concurrencySafe: true, maxConcurrency: 2 },
+    );
+    catalog.register(first.tool, first.metadata);
+    catalog.register(second.tool, second.metadata);
+    catalog.register(third.tool, third.metadata);
+    const execution = new MoweExecutor({ catalog, maxConcurrency: 2 }).execute({
+      runId: "synchronous-reservation",
+      laneId: "main",
+      workspace: "/tmp",
+      limits: { maxOutputBytes: 10 },
+      artifactStore: {
+        put: async (data, mediaType) => {
+          artifactPuts += 1;
+          artifactPutStarted.resolve();
+          await releaseArtifactPut.promise;
+          return store.put(data, mediaType);
+        },
+      },
+      calls: [
+        {
+          id: "first",
+          name: "first_artifact",
+          arguments: {},
+          projection: { mode: "artifact" },
+        },
+        {
+          id: "second",
+          name: "second_artifact",
+          arguments: {},
+          projection: { mode: "artifact" },
+        },
+        { id: "third", name: "after_reservation", arguments: {} },
+      ],
+    });
+
+    try {
+      await eventually(() => expect(thirdStarted).toBe(true));
+      expect(artifactPuts).toBe(1);
+    } finally {
+      releaseArtifactPut.resolve();
+    }
+
+    const response = await execution;
+    expect(response.results.map((result) => result.callId)).toEqual([
+      "first",
+      "second",
+      "third",
+    ]);
+    expect(response.results[0]?.projection?.artifactRef).toBeDefined();
+    expect(response.results[1]?.projection).toBeUndefined();
+    expect(response.results[1]?.result.content).toBe("");
+    expect(response.results[2]?.result.content).toBe("");
+  });
+
   it("serializes unsafe calls without reducing independent read concurrency", async () => {
     const releaseUnsafe = deferred();
     const releaseRead = deferred();
@@ -81,6 +242,42 @@ describe("Mowe concurrency admission", () => {
       "succeeded",
     ]);
     expect(unsafeMaximum).toBe(1);
+  });
+
+  it("shares a concurrency slot across whitespace-normalized tool aliases", async () => {
+    const release = deferred();
+    let active = 0;
+    let maximum = 0;
+    const unsafe = tool(
+      "mutate",
+      async () => {
+        active += 1;
+        maximum = Math.max(maximum, active);
+        await release.promise;
+        active -= 1;
+        return { content: "mutated", isError: false };
+      },
+      { effect: "external", concurrencySafe: false, supportsBatch: false },
+    );
+    const catalog = new MoweCatalog();
+    catalog.register(unsafe.tool, unsafe.metadata);
+    const execution = new MoweExecutor({ catalog, maxConcurrency: 2 }).execute({
+      runId: "run-1",
+      laneId: "main",
+      workspace: "/tmp",
+      calls: [
+        { id: "canonical", name: "mutate", arguments: {} },
+        { id: "legacy-alias", name: " mutate ", arguments: {} },
+      ],
+    });
+
+    await eventually(() => expect(active).toBe(1));
+    expect(maximum).toBe(1);
+    release.resolve();
+    await expect(execution).resolves.toMatchObject({
+      results: [{ status: "succeeded" }, { status: "succeeded" }],
+    });
+    expect(maximum).toBe(1);
   });
 
   it("serializes distinct workspace writes while reads continue in the same batch", async () => {
@@ -226,6 +423,74 @@ describe("Mowe concurrency admission", () => {
     await expect(firstExecution).resolves.toMatchObject({ status: "succeeded" });
     await expect(secondExecution).resolves.toMatchObject({ status: "succeeded" });
     expect(writesMaximum).toBe(1);
+  });
+
+  it("shares the workspace write mutex across canonical aliases with a missing leaf", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-mowe-alias-"));
+    const canonicalParent = join(root, "canonical");
+    const aliasParent = join(root, "alias");
+    await mkdir(canonicalParent);
+    await symlink(canonicalParent, aliasParent, "dir");
+    const releaseFirst = deferred();
+    const releaseSecond = deferred();
+    const events: string[] = [];
+    let active = 0;
+    let maximum = 0;
+    const createWrite = (name: string, release: Deferred): AgentTool => ({
+      definition: {
+        name,
+        description: name,
+        parameters: { type: "object", additionalProperties: false },
+      },
+      async execute() {
+        events.push(`start:${name}`);
+        active += 1;
+        maximum = Math.max(maximum, active);
+        await release.promise;
+        active -= 1;
+        return { content: name, isError: false };
+      },
+    });
+    const catalog = new MoweCatalog();
+    catalog.register(createWrite("canonical_write", releaseFirst), {
+      effect: "write",
+      scope: "workspace",
+      concurrencySafe: false,
+    });
+    catalog.register(createWrite("alias_write", releaseSecond), {
+      effect: "write",
+      scope: "workspace",
+      concurrencySafe: false,
+    });
+
+    try {
+      const first = new MoweExecutor({ catalog }).execute({
+        runId: "canonical-run",
+        laneId: "main",
+        workspace: join(canonicalParent, "not-created-yet"),
+        calls: [{ id: "canonical", name: "canonical_write", arguments: {} }],
+      });
+      await eventually(() => expect(events).toContain("start:canonical_write"));
+      const second = new MoweExecutor({ catalog }).execute({
+        runId: "alias-run",
+        laneId: "main",
+        workspace: join(aliasParent, "not-created-yet"),
+        calls: [{ id: "alias", name: "alias_write", arguments: {} }],
+      });
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      expect(events).not.toContain("start:alias_write");
+      expect(maximum).toBe(1);
+      releaseFirst.resolve();
+      await eventually(() => expect(events).toContain("start:alias_write"));
+      releaseSecond.resolve();
+      await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+      expect(maximum).toBe(1);
+    } finally {
+      releaseFirst.resolve();
+      releaseSecond.resolve();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("releases a queued workspace write when its signal is cancelled", async () => {

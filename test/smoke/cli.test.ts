@@ -118,8 +118,9 @@ describe("built CLI", () => {
       expect(failure?.code).toBe(1);
       expect(failure?.stderr).toContain("skipped Run damaged during recovery");
       expect(failure?.stderr).toContain("control path exists and is not a Unix socket");
-      expect(failure?.stderr?.indexOf("skipped Run damaged during recovery"))
-        .toBeLessThan(failure?.stderr?.indexOf("control path exists and is not a Unix socket"));
+      const stderr = failure?.stderr ?? "";
+      expect(stderr.indexOf("skipped Run damaged during recovery"))
+        .toBeLessThan(stderr.indexOf("control path exists and is not a Unix socket"));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

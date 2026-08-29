@@ -5,6 +5,9 @@ export type UserImage = ImageContent;
 export const MAX_USER_IMAGES = 4;
 export const MAX_USER_IMAGE_BYTES = 3 * 1024 * 1024;
 export const MAX_TOTAL_USER_IMAGE_BYTES = 10 * 1024 * 1024;
+/** Conservative provider-input estimate used by every context builder. */
+export const ESTIMATED_IMAGE_TOKENS = 1_024;
+const IMAGE_BYTES_PER_ESTIMATED_TOKEN = 1_024;
 
 const SUPPORTED_MEDIA_TYPES = new Set([
   "image/gif",
@@ -50,6 +53,25 @@ export function validateUserImages(value: unknown): asserts value is UserImage[]
 
 export function userImageSummary(images: readonly UserImage[] | undefined): string[] {
   return (images ?? []).map((image) => image.mimeType);
+}
+
+/** Decoded payload size for a canonical image block. Validate untrusted blocks first. */
+export function userImageByteLength(image: UserImage): number {
+  return Buffer.from(image.data, "base64").byteLength;
+}
+
+/**
+ * Conservative provider-independent estimate. Image tokenization varies by
+ * model, so retain the existing 1,024-token floor and charge larger inputs by
+ * their decoded size as an additional admission signal.
+ */
+export function estimateUserImageTokens(images: readonly UserImage[] | undefined): number {
+  return (images ?? []).reduce((total, image) => (
+    total + Math.max(
+      ESTIMATED_IMAGE_TOKENS,
+      Math.ceil(userImageByteLength(image) / IMAGE_BYTES_PER_ESTIMATED_TOKEN),
+    )
+  ), 0);
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

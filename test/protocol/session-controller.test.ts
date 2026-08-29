@@ -13,6 +13,7 @@ import {
 } from "../../src/runtime/index.js";
 import type { RuntimeFukaiCompactionFactory } from "../../src/runtime/fukai-compaction-runtime.js";
 import { FileContentAddressedStore } from "../../src/store/index.js";
+import { FileProcessJobRegistry } from "../../src/tools/process-jobs.js";
 
 const roots: string[] = [];
 
@@ -23,6 +24,52 @@ afterEach(async () => {
 });
 
 describe("SessionController", () => {
+  it("uses a per-Run durable process-job registry when configured", async () => {
+    const root = await temporaryRoot();
+    const dataDir = join(root, "state");
+    const runId = "durable-process-jobs";
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      allowShell: true,
+      processJobRegistryDir: dataDir,
+      policy: {
+        maxMainStepsPerActivation: 2,
+        maxModelTokens: 10_000,
+        tetoEnabled: false,
+      },
+    }, {
+      mainModel: new ScriptedModel([
+        {
+          ...response("started"),
+          stopReason: "toolUse",
+          toolCalls: [{
+            id: "durable-process-start",
+            name: "process_start",
+            arguments: { command: "printf durable" },
+          }],
+        },
+        response("done"),
+      ]),
+      createRunId: () => runId,
+    });
+
+    await session.submit({ inputId: "durable-process-input", text: "Start the process" });
+    await session.waitForIdle();
+    await session.close();
+
+    const registry = await FileProcessJobRegistry.open(
+      join(dataDir, "runs", runId, "process-jobs.json"),
+    );
+    const entries = await registry.load();
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.snapshot).toMatchObject({
+      runId,
+      state: "succeeded",
+    });
+  });
+
   it("does not construct an interactive compaction runtime while disabled", async () => {
     const root = await temporaryRoot();
     let factoryCalls = 0;
@@ -213,6 +260,19 @@ describe("SessionController", () => {
       mainModel: new ScriptedModel([]),
     });
     await reopened.close();
+
+    await expect(SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      runId: "session-fukai-config",
+      fukaiCompaction: {
+        ...fukaiCompaction,
+        minimumGainTokens: fukaiCompaction.minimumGainTokens + 1,
+      },
+    }, {
+      mainModel: new ScriptedModel([]),
+    })).rejects.toThrow("Cannot change fukaiCompaction while resuming a Run");
   });
 
   it("runs two Turns in one persistent Run with shared conversation context", async () => {
@@ -288,6 +348,8 @@ describe("SessionController", () => {
         "list_files",
         "grep",
         "find",
+        "file_info",
+        "read_image",
       ]);
       markWorkerStarted?.();
       return new Promise<ModelResponse>((resolve) => {

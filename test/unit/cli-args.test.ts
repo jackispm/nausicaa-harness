@@ -23,6 +23,25 @@ describe("parseCliArgs", () => {
     expect(parseCliArgs([], "/work")).not.toHaveProperty("message");
   });
 
+  it("parses the long-lived daemon control mode", () => {
+    expect(parseCliArgs([
+      "--daemon",
+      "--daemon-socket",
+      ".state/control.sock",
+      "--allow-shell",
+      "--allow-network",
+    ], "/work")).toMatchObject({
+      daemon: true,
+      daemonSocket: ".state/control.sock",
+      allowShell: true,
+      allowNetwork: true,
+    });
+    expect(() => parseCliArgs(["--daemon-socket", "/tmp/control.sock"], "/work"))
+      .toThrow(/requires --daemon/u);
+    expect(() => parseCliArgs(["--daemon", "task"], "/work"))
+      .toThrow(/cannot be combined/u);
+  });
+
   it("separates Prime-style @image operands from the task", () => {
     expect(parseCliArgs([
       "@screens/first.png",
@@ -77,6 +96,7 @@ describe("parseCliArgs", () => {
           "30000",
           "--allow-write",
           "--allow-shell",
+          "--allow-network",
           "--resume",
           "run-7",
           "--max-steps",
@@ -102,6 +122,7 @@ describe("parseCliArgs", () => {
       },
       allowWrite: true,
       allowShell: true,
+      allowNetwork: true,
       resume: "run-7",
       maxSteps: 8,
       maxOutputTokens: 8192,
@@ -126,6 +147,14 @@ describe("parseCliArgs", () => {
       message: "task",
     });
     expect(options.allowWrite).toBeUndefined();
+  });
+
+  it("keeps network access unset unless explicitly requested", () => {
+    expect(parseCliArgs(["task"], "/work").allowNetwork).toBeUndefined();
+    expect(parseCliArgs(["--allow-network", "task"], "/work")).toMatchObject({
+      allowNetwork: true,
+      message: "task",
+    });
   });
 
   it("parses explicit Fukai disablement without enabling a provider", () => {
@@ -203,5 +232,8 @@ describe("parseCliArgs", () => {
     expect(usage).toContain("--fukai-compaction");
     expect(usage).toContain("--fukai-provider <none|pi-ai>");
     expect(usage).toMatch(/--allow-shell.*high privilege.*read\/write outside the workspace/i);
+    expect(usage).toContain("--allow-network");
+    expect(usage).toContain("--daemon");
+    expect(usage).toContain("--daemon-socket");
   });
 });

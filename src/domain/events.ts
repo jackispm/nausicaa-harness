@@ -35,6 +35,7 @@ export type ContextTruncationKind =
   | "query-limit"
   | "missing-conversation"
   | "missing-artifact"
+  | "image-budget"
   | "conversation-shape";
 
 export interface ContextTruncation {
@@ -137,6 +138,8 @@ export interface EventPayloadMap {
     toolCallId: string;
     name: string;
     resultRef: ArtifactRef;
+    /** Bounded model-visible projection; legacy events may omit it. */
+    contextRef?: ArtifactRef;
   };
   "tool.failed": {
     operationId: string;
@@ -144,6 +147,8 @@ export interface EventPayloadMap {
     name: string;
     error: string;
     resultRef: ArtifactRef;
+    /** Bounded model-visible projection; legacy events may omit it. */
+    contextRef?: ArtifactRef;
     resolution?: "operator";
   };
   "tool.unknown": {

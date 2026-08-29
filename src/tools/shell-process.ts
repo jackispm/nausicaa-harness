@@ -25,6 +25,19 @@ export interface ShellExecutionResult {
   spawnError?: Error;
 }
 
+/**
+ * A started shell process for callers that need to observe it asynchronously.
+ * Output capture and termination deliberately share the same bounded
+ * primitives as the foreground Bash tool.
+ */
+export interface StartedShellProcess {
+  readonly child: ChildProcess;
+  readonly stdout: ShellOutputCapture;
+  readonly stderr: ShellOutputCapture;
+  readonly executionMarker: string;
+  terminate(): void;
+}
+
 export async function executeShellCommand(input: {
   command: string;
   cwd: string;
@@ -126,6 +139,59 @@ export async function executeShellCommand(input: {
       },
     );
   });
+}
+
+/**
+ * Start a shell command without waiting for its exit.  The returned handle is
+ * intentionally small: process jobs own lifecycle/status bookkeeping while
+ * this module remains responsible for shell selection, bounded output and
+ * process-tree cleanup.
+ */
+export function spawnShellCommand(input: {
+  command: string;
+  cwd: string;
+}): StartedShellProcess {
+  const stdout = new ShellOutputCapture();
+  const stderr = new ShellOutputCapture();
+  const shell = resolveShell();
+  const executionMarker = randomUUID();
+  const commandFromStdin = shell.commandFromStdin === true;
+  let child: ChildProcess;
+  try {
+    child = spawn(
+      shell.executable,
+      commandFromStdin ? shell.arguments : [...shell.arguments, input.command],
+      {
+        cwd: input.cwd,
+        detached: process.platform !== "win32",
+        env: shellEnvironment(executionMarker),
+        stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
+        windowsHide: true,
+      },
+    );
+  } catch (error: unknown) {
+    throw asError(error);
+  }
+  if (commandFromStdin) {
+    child.stdin?.on("error", () => undefined);
+    child.stdin?.end(input.command);
+  }
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => stdout.append(chunk));
+  child.stderr?.on("data", (chunk: string) => stderr.append(chunk));
+
+  let processGroupKillStarted = false;
+  const terminate = (): void => {
+    if (!processGroupKillStarted) {
+      processGroupKillStarted = true;
+      if (child.pid !== undefined) killProcessTree(child.pid);
+    }
+    // A command can deliberately detach a descendant from its process group;
+    // the marker scan is the same bounded fallback used by foreground Bash.
+    cleanupMarkedProcesses(executionMarker);
+  };
+  return { child, stdout, stderr, executionMarker, terminate };
 }
 
 function snapshotResult(

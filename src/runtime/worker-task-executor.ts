@@ -17,6 +17,12 @@ import type {
   ToolCall,
 } from "../domain/index.js";
 import { DEFAULT_TASK_MAX_ATTEMPTS } from "../domain/index.js";
+import {
+  estimateUserImageTokens,
+  MAX_TOTAL_USER_IMAGE_BYTES,
+  MAX_USER_IMAGES,
+  userImageByteLength,
+} from "../domain/images.js";
 import type {
   AgentTool,
   ModelPort,
@@ -38,7 +44,10 @@ import {
   readWorkerExecutionState,
 } from "./worker-task-recovery.js";
 import type { WorkerExecutionState } from "./worker-task-recovery.js";
-import { WorkerToolExecutor } from "./worker-tool-executor.js";
+import {
+  MAX_WORKER_TOOL_RESULT_BYTES,
+  WorkerToolExecutor,
+} from "./worker-tool-executor.js";
 
 export { WorkerTaskExecutorError, WorkerTaskTimeoutError } from "./worker-task-errors.js";
 
@@ -391,6 +400,8 @@ export class WorkerTaskExecutor {
       let cumulativeUsage = structuredClone(state.usage);
       const artifactRefs = [...evidenceRefs];
       let totalToolCalls = 0;
+      let retainedImageBytes = 0;
+      let retainedImageCount = 0;
       let lastResponseRef: ArtifactRef | undefined;
       let lastContent = "";
       let lastStopReason = "stop";
@@ -670,7 +681,14 @@ export class WorkerTaskExecutor {
               })
             )));
             for (const toolMessage of toolMessages) {
-              messages.push(toolMessage.message);
+              const projected = projectWorkerToolMessage(
+                toolMessage.message,
+                retainedImageBytes,
+                retainedImageCount,
+              );
+              messages.push(projected.message);
+              retainedImageBytes += projected.imageBytes;
+              retainedImageCount += projected.imageCount;
               artifactRefs.push(toolMessage.ref.contentHash);
             }
             totalToolCalls += calls.length;
@@ -868,7 +886,16 @@ export class WorkerTaskExecutor {
   }
 
   private async append<K extends EventType>(event: AppendEvent<K>): Promise<void> {
-    if (this.isStopping()) throw new WorkerTaskCancelledError("Worker lane is stopping");
+    // A call admitted before cancellation still needs a durable terminal fact
+    // so recovery can distinguish settled work from a genuinely pending
+    // operation. Non-terminal lifecycle events remain suppressed after stop.
+    if (
+      this.isStopping()
+      && event.type !== "tool.succeeded"
+      && event.type !== "tool.failed"
+    ) {
+      throw new WorkerTaskCancelledError("Worker lane is stopping");
+    }
     await this.eventSink.append(event);
   }
 
@@ -1045,8 +1072,72 @@ function estimateWorkerInputTokens(
   return estimateTextTokens(systemPrompt)
     + estimateTextTokens(stableJson(tools))
     + messages.reduce((total, message) => (
-      total + 8 + estimateTextTokens(message.content)
+      total
+        + 8
+        + estimateTextTokens(message.content)
+        + (message.role === "user" || message.role === "tool"
+          ? estimateUserImageTokens(message.images)
+          : 0)
     ), 0);
+}
+
+interface ProjectedWorkerToolMessage {
+  message: ConversationMessage;
+  imageBytes: number;
+  imageCount: number;
+}
+
+/**
+ * Keep valid images available to the next Worker request until the task-level
+ * image budget is exhausted. Individual image blocks are indivisible, so the
+ * bounded view retains the blocks that fit and marks any omitted remainder.
+ * The durable result ref still points at the full tool message for evidence.
+ */
+function projectWorkerToolMessage(
+  message: ConversationMessage,
+  retainedImageBytes: number,
+  retainedImageCount: number,
+): ProjectedWorkerToolMessage {
+  if (message.role !== "tool" || message.images === undefined || message.images.length === 0) {
+    return { message, imageBytes: 0, imageCount: 0 };
+  }
+  let imageBytes = 0;
+  const images = message.images.slice(0, 0);
+  for (const image of message.images) {
+    if (retainedImageCount + images.length >= MAX_USER_IMAGES) continue;
+    const bytes = userImageByteLength(image);
+    if (!Number.isSafeInteger(bytes)
+      || bytes < 0
+      || retainedImageBytes + imageBytes + bytes > MAX_TOTAL_USER_IMAGE_BYTES) {
+      continue;
+    }
+    images.push(image);
+    imageBytes += bytes;
+  }
+  const omitted = message.images.length - images.length;
+  if (omitted === 0) {
+    return { message, imageBytes, imageCount: images.length };
+  }
+
+  const { images: _allImages, ...withoutImages } = message;
+  const marker = `\n[${omitted} IMAGE BLOCK${omitted === 1 ? "" : "S"} OMITTED BY WORKER: image budget exceeded]`;
+  return {
+    message: {
+      ...withoutImages,
+      content: appendWorkerMarker(message.content, marker),
+      ...(images.length === 0 ? {} : { images }),
+    },
+    imageBytes,
+    imageCount: images.length,
+  };
+}
+
+function appendWorkerMarker(content: string, marker: string): string {
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  const bytes = Buffer.from(content, "utf8");
+  let end = Math.min(bytes.byteLength, Math.max(0, MAX_WORKER_TOOL_RESULT_BYTES - markerBytes));
+  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  return `${bytes.subarray(0, end).toString("utf8")}${marker}`;
 }
 
 function estimateTextTokens(value: string): number {

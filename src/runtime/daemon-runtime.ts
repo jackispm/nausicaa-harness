@@ -7,6 +7,7 @@ import type {
   DaemonHostOptions,
   DaemonHostSnapshot,
   DaemonWakeAdmitter,
+  DaemonWakeRequest,
 } from "./daemon-host.js";
 import { DaemonHost } from "./daemon-host.js";
 import {
@@ -19,8 +20,12 @@ import {
   type SessionControllerOptions,
 } from "./session-controller.js";
 import { persistedErrorText } from "./redaction.js";
-import { JsonlLedger, type Ledger } from "../ledger/index.js";
-import { recoverRun, type RunRecoveryState } from "./recovery.js";
+import { JsonlLedger, projectRun, type Ledger } from "../ledger/index.js";
+import {
+  recoverRun,
+  UnknownToolOperationError,
+  type RunRecoveryState,
+} from "./recovery.js";
 import { projectPendingAdmissions } from "./session-artifacts.js";
 
 /** The minimum surface an activation adapter needs from a SessionController. */
@@ -54,6 +59,7 @@ export type DaemonRunDiscoveryFailureKind =
   | "symlink"
   | "missing-ledger"
   | "invalid-ledger"
+  | "recovery-required"
   | "open-failed"
   | "read-failed";
 
@@ -68,7 +74,15 @@ export interface DiscoveredDaemonRun {
   readonly runId: string;
   readonly ledgerPath: string;
   readonly pendingInputIds: readonly string[];
+  /** Modern Turn left active by a process exit; its input is already delivered. */
+  readonly recoverableTurn?: DaemonRecoverableTurn;
   readonly lastOffset: number;
+}
+
+export interface DaemonRecoverableTurn {
+  readonly turnId: string;
+  readonly inputId: string;
+  readonly startedAtOffset: number;
 }
 
 export interface DaemonRunDiscoveryOptions {
@@ -89,6 +103,7 @@ export interface RecoveredDaemonRun {
   readonly runId: string;
   readonly ledgerPath: string;
   readonly pendingInputIds: readonly string[];
+  readonly recoverableTurn?: DaemonRecoverableTurn;
   readonly recovery: RunRecoveryState;
 }
 
@@ -128,9 +143,35 @@ export function createDaemonSessionActivator(
       throw abortedActivation(request.signal);
     }
 
+    const sessionAssert = request.assertLease;
+    const sessionCommit = request.commitLease;
+    const configuredAssert = sessionDeps.assertExecutionLease;
+    const configuredCommit = sessionDeps.commitExecutionLease;
+    const assertExecutionLease = sessionAssert === undefined
+      ? configuredAssert
+      : configuredAssert === undefined
+        ? sessionAssert
+        : async (): Promise<void> => {
+          await configuredAssert();
+          await sessionAssert();
+        };
+    const activationDeps: SessionControllerDeps = assertExecutionLease === undefined
+      ? sessionDeps
+      : { ...sessionDeps, assertExecutionLease };
+    const commitExecutionLease = sessionCommit === undefined
+      ? configuredCommit
+      : async <T>(operation: () => Promise<T>): Promise<T> => sessionCommit(async () => {
+          await configuredAssert?.();
+          return configuredCommit === undefined
+            ? operation()
+            : configuredCommit(operation);
+        });
+    const guardedDeps: SessionControllerDeps = commitExecutionLease === undefined
+      ? activationDeps
+      : { ...activationDeps, commitExecutionLease };
     const session = await createSession(
       { ...options.session, runId: request.runId },
-      sessionDeps,
+      guardedDeps,
     );
     let cancelling = false;
     const cancel = (): void => {
@@ -176,6 +217,12 @@ export interface DaemonRuntime {
   readonly admitWake: DaemonWakeAdmitter;
   start(): Promise<DaemonHostSnapshot>;
   stop(): Promise<DaemonHostSnapshot>;
+  /** Restore Ledger inputs which were admitted before this daemon started. */
+  recoverPendingRuns(): Promise<DaemonRuntimeRecoveryResult>;
+}
+
+export interface DaemonRuntimeRecoveryResult extends DaemonRunRecoveryResult {
+  readonly queuedRunIds: readonly string[];
 }
 
 /**
@@ -232,12 +279,63 @@ export async function openDaemonRuntime(
     admitWake,
     activate,
   });
+  const recoverPendingRuns = async (): Promise<DaemonRuntimeRecoveryResult> => {
+    if (host.status !== "running") {
+      throw new DaemonRuntimeCompositionError(
+        "recoverPendingRuns requires a running daemon Host",
+      );
+    }
+    const recovered = await recoverPendingDaemonRuns({
+      dataDir: options.session.dataDir,
+      openLedger,
+    });
+    const queuedRunIds: string[] = [];
+    for (const run of recovered.runs) {
+      const pending = projectPendingAdmissions(run.recovery.events);
+      const wakes = pending.map((event): DaemonWakeRequest => ({
+        runId: run.runId,
+        source: sourceFromCorrelation(event.correlationId),
+        dedupeKey: `recovered:${event.payload.inputId}:${event.globalOffset}`,
+        wakeId: `recovery:${run.runId}:${event.payload.inputId}`,
+        inputId: event.payload.inputId,
+        payloadRef: event.payload.messageRef,
+        occurredAt: event.occurredAt,
+      }));
+      if (run.recoverableTurn !== undefined) {
+        const turn = run.recoverableTurn;
+        const admitted = run.recovery.events.find((event): event is Extract<
+          RunRecoveryState["events"][number],
+          { type: "input.admitted" }
+        > => event.type === "input.admitted" && event.payload.inputId === turn.inputId);
+        const started = run.recovery.events.find((event) => (
+          event.type === "turn.started" && event.payload.turnId === turn.turnId
+        ));
+        wakes.push({
+          runId: run.runId,
+          source: "system",
+          dedupeKey: `recovered-turn:${turn.turnId}:${turn.startedAtOffset}`,
+          wakeId: `recovery:${run.runId}:turn:${turn.turnId}`,
+          inputId: turn.inputId,
+          ...(admitted === undefined ? {} : { payloadRef: admitted.payload.messageRef }),
+          ...(started === undefined ? {} : { occurredAt: started.occurredAt }),
+        });
+      }
+      if (wakes.length === 0) continue;
+      host.restorePending(wakes);
+      queuedRunIds.push(run.runId);
+    }
+    return {
+      ...recovered,
+      queuedRunIds,
+    };
+  };
   return {
     host,
     activate,
     admitWake,
     start: () => host.start(),
     stop: () => host.stop(),
+    recoverPendingRuns,
   };
 }
 
@@ -272,10 +370,10 @@ export async function discoverDaemonRuns(
   ));
   const candidates = entries
     .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-    .sort((left, right) => left.name.localeCompare(right.name));
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .slice(0, normalized.maxRuns);
 
   for (const entry of candidates) {
-    if (runs.length >= normalized.maxRuns) break;
     const runPath = resolve(root, entry.name);
     if (entry.isSymbolicLink()) {
       failures.push(failure(runPath, entry.name, "symlink", "Run directory is a symbolic link"));
@@ -324,10 +422,12 @@ export async function discoverDaemonRuns(
         continue;
       }
       const pendingInputIds = projectPendingAdmissions(events).map((event) => event.payload.inputId);
+      const recoverableTurn = projectRecoverableDaemonTurn(events, entry.name);
       runs.push({
         runId: entry.name,
         ledgerPath,
         pendingInputIds,
+        ...(recoverableTurn === undefined ? {} : { recoverableTurn }),
         lastOffset: events.at(-1)?.globalOffset ?? 0,
       });
     } catch (error: unknown) {
@@ -344,9 +444,9 @@ export async function discoverDaemonRuns(
 }
 
 /**
- * Reopen and recover only Runs which had an undelivered admitted input at the
- * time of discovery. Recovery uses the existing `recoverRun` projection and
- * idempotency rules; this function does not create a second daemon journal.
+ * Reopen and inspect only Runs which have recoverable work. Inspection never
+ * repairs the Ledger before the Host acquires its execution lease and does not
+ * create a second daemon journal.
  */
 export async function recoverPendingDaemonRuns(
   options: DaemonRunDiscoveryOptions,
@@ -360,7 +460,9 @@ export async function recoverPendingDaemonRuns(
   ));
 
   for (const candidate of discovered.runs) {
-    if (candidate.pendingInputIds.length === 0) continue;
+    if (candidate.pendingInputIds.length === 0 && candidate.recoverableTurn === undefined) {
+      continue;
+    }
     let ledger: Ledger;
     try {
       ledger = await openLedger(candidate.runId, candidate.ledgerPath);
@@ -369,16 +471,30 @@ export async function recoverPendingDaemonRuns(
       continue;
     }
     try {
-      const recovery = await recoverRun(ledger, candidate.runId);
+      // Discovery can run beside another daemon. Keep it read-only until the
+      // Host has acquired the Run's execution lease.
+      const recovery = await recoverRun(ledger, candidate.runId, { mode: "inspect" });
+      const recoverableTurn = projectRecoverableDaemonTurn(
+        recovery.events,
+        candidate.runId,
+      );
       runs.push({
         runId: candidate.runId,
         ledgerPath: candidate.ledgerPath,
         pendingInputIds: projectPendingAdmissions(recovery.events)
           .map((event) => event.payload.inputId),
+        ...(recoverableTurn === undefined ? {} : { recoverableTurn }),
         recovery,
       });
     } catch (error: unknown) {
-      failures.push(failure(candidate.ledgerPath, candidate.runId, "invalid-ledger", persistedErrorText(error)));
+      failures.push(failure(
+        candidate.ledgerPath,
+        candidate.runId,
+        error instanceof UnknownToolOperationError
+          ? "recovery-required"
+          : "invalid-ledger",
+        persistedErrorText(error),
+      ));
     } finally {
       try {
         await ledger.close();
@@ -388,6 +504,28 @@ export async function recoverPendingDaemonRuns(
     }
   }
   return { runs, failures };
+}
+
+/** Find a delivered modern input whose Turn has no terminal lifecycle fact. */
+function projectRecoverableDaemonTurn(
+  events: readonly RunRecoveryState["events"][number][],
+  runId: string,
+): DaemonRecoverableTurn | undefined {
+  const projection = projectRun(events, runId);
+  if (projection.run.status !== "running") return undefined;
+  const turnId = projection.activeTurnId;
+  if (turnId === undefined || turnId.startsWith("legacy:")) return undefined;
+  const turn = projection.turns[turnId];
+  if (turn?.inputId === undefined) return undefined;
+  const started = events.find((event) => (
+    event.type === "turn.started" && event.payload.turnId === turnId
+  ));
+  if (started === undefined) return undefined;
+  return {
+    turnId,
+    inputId: turn.inputId,
+    startedAtOffset: started.globalOffset,
+  };
 }
 
 function normalizeDiscoveryOptions(
@@ -447,7 +585,39 @@ async function openExistingRunLedger(
   dataDir: string,
   runId: string,
 ): Promise<Ledger> {
-  const ledgerPath = resolve(dataDir, "runs", runId, "ledger.jsonl");
+  if (!isSafeRunId(runId)) {
+    throw new DaemonRuntimeCompositionError(
+      `Run ID is not a safe identifier: ${persistedErrorText(runId)}`,
+    );
+  }
+  const runsRoot = resolve(dataDir, "runs");
+  const runPath = resolve(runsRoot, runId);
+  const ledgerPath = resolve(runPath, "ledger.jsonl");
+  if (!isWithin(runsRoot, runPath) || !isWithin(runPath, ledgerPath)) {
+    throw new DaemonRuntimeCompositionError(`Run ${runId} Ledger escapes the Run directory`);
+  }
+  const rootInfo = await lstat(runsRoot).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (rootInfo === undefined) {
+    throw new DaemonRuntimeCompositionError(`Run ${runId} does not have a Ledger; create the Run before waking it`);
+  }
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+    throw new DaemonRuntimeCompositionError("Run directory must be a regular directory");
+  }
+  const runInfo = await lstat(runPath).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (runInfo === undefined) {
+    throw new DaemonRuntimeCompositionError(
+      `Run ${runId} does not have a Ledger; create the Run before waking it`,
+    );
+  }
+  if (runInfo.isSymbolicLink() || !runInfo.isDirectory()) {
+    throw new DaemonRuntimeCompositionError(`Run ${runId} directory is not a regular directory`);
+  }
   const info = await lstat(ledgerPath).catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
@@ -512,6 +682,11 @@ function validateRuntimeOptions(options: DaemonRuntimeOptions): void {
   if (options.session.dataDir.trim().length === 0) {
     throw new DaemonRuntimeCompositionError("session.dataDir must not be empty");
   }
+}
+
+function sourceFromCorrelation(correlationId: string): DaemonWakeRequest["source"] {
+  const match = /^daemon:(timer|webhook|file|a2a|user|system):/u.exec(correlationId);
+  return match?.[1] as DaemonWakeRequest["source"] ?? "system";
 }
 
 function validateActivationRequest(request: DaemonActivationRequest): void {

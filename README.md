@@ -8,21 +8,25 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 
 - 基于 [`pi-ai`](https://github.com/earendil-works/pi/tree/main/packages/ai) 接入模型与 OpenRouter，不重复实现 provider 调度。
 - 启动消息支持 Prime 风格的 `@image` 输入；图片作为 `pi-ai` 原生多模态内容传递，不维护自定义 provider 协议。
-- Main 运行有界 tool loop，默认提供工作区内的 `list_files`、`read_file`、`grep` 和 `find`；搜索结果和文件读取均有大小限制。
-- `--allow-write` 额外启用原子写入工具 `write_file` 和精确替换工具 `edit`，两者只操作工作区内文件。
+- Main 运行有界 tool loop，并通过 Mowe 统一执行单个或批量调用。默认工作区工具为 `list_files`、`read_file`、`grep`、`find` 和 `file_info`；按需可启用 `read_image`、网络、写入、Shell 与后台进程。搜索、读取、图片和元数据结果均有大小限制。
+- `--allow-write` 额外启用原子写入 `write_file`、精确替换 `edit`，以及受同一路径边界保护的 `directory_create`、`path_copy`、`path_move` 和 `path_delete`。
 - `--allow-shell` 独立启用 `bash`。这是显式高权限能力：命令虽从工作区启动，但可按当前系统账号权限读写工作区外部；它不会随 `--allow-write` 自动开启，反之亦然。
+- 在嵌入式运行时中，`allowProcessJobs` 与 `allowShell` 同时开启后提供 `process_start`、`process_status`、`process_output`、`process_kill` 和 `process_list`，用于在同一 Run 内启动、观察、读取、终止和诊断有界后台进程；Job 固定以工作区为 cwd、按 Run 隔离、输出有界并支持超时/取消。默认注册表仍为进程内模式；daemon 可按 Run 自动注入 `FileProcessJobRegistry`，持久化启动/终态快照，重启时将未绑定 OS 进程的 running 记录标为 orphaned，不假装恢复进程。普通 TUI/print 仍保持进程内注册表，避免把一次性会话状态写入磁盘。
+- `--allow-network` 启用 `web_fetch` 和批量 `web_search`。网络工具默认关闭，使用同源重定向、SSRF、响应大小、超时和取消边界；部署可通过 provider seam 替换搜索/抓取后端。
 - 工作区文件工具始终保护 `.env`、`.git`、`.nausicaa`、私钥和常见凭据路径，即使开启 `--allow-write` 也不能访问；高权限 `bash` 不受此路径策略约束。
 - JSONL Ledger 与内容寻址 Store 保存事实和大对象，支持 checkpoint 与 Run 恢复。
 - Teto 辅助线读取固定大小的观察帧，低频检查目标偏离、意图缺失和更优方法。
 - Advice 通过持久 Inbox 在 Main 的自然边界进入上下文，可明确接受、延后或拒绝。
-- Worker 作为显式 opt-in 的 bounded sub-agent lane，通过 A2A 接收 Main 委派的任务；它可在同一工作区使用受限的 `read_file`、`list_files`、`grep` 和 `find`，最多 2 次模型轮次和 4 次只读工具调用，不能写文件、执行 Shell 或继续委派；默认不会增加模型调用。
+- Worker 作为显式 opt-in 的 bounded sub-agent lane，通过 A2A 接收 Main 委派的任务；它默认可在同一工作区使用受限的 `read_file`、`list_files`、`grep`、`find` 和 `file_info`，最多 2 次模型轮次和 4 次只读工具调用，不能写文件、执行 Shell、访问网络或继续委派；Worker 模型明确声明视觉输入能力时，默认 catalog 还会加入 `read_image`；默认不会增加模型调用。
+- 启用 Worker 时，Main 额外获得 `delegate_task`；Teto live 模式额外获得 `respond_to_advice`。两者仍经过 Mowe 的 catalog、schema admission、operation ID、结果投影和恢复边界。
 - TTY 默认进入持续 Session：一个 Run 可包含多个 Turn，支持 steering、取消、恢复和 `--continue`。
 - 运行中按 Enter 注入 steering，按 Alt+Enter 排队 follow-up；输入和 ACK 都写入 Ledger。
 - `pi-tui` 只负责终端 surface；SessionController、Ledger 和模型执行保持独立，未来可接桌面 UI。
+- `--daemon` 启动最小长期 Host，并在 `<data-dir>/daemon/control.sock` 提供 Unix JSONL 控制面；客户端可发送 `start`、`stop`、`status`、`attach`、`detach`、`wake` 和 `events.subscribe`。启动时会扫描 `<data-dir>/runs`，重新排队已持久化但尚未投递的输入和被进程中断的活动 Turn；它与普通 TUI/print 入口分离，当前仍是本地单进程 Host。
 
-当前没有通用 graph DSL 或插件市场。
+当前没有通用 graph DSL 或插件市场；Mowe 的 `MoweCatalog` 提供窄的本地注册 seam，便于接入自定义 AgentTool，而不要求引入 Cordis 级插件运行时。
 
-`read_file` 支持按行分页读取；`grep` 搜索内容，`find` 按 glob 查找文件。`write_file` 只在已有目录中写文件，不负责创建目录；`edit` 要求被替换文本唯一匹配。工作区文件工具会拒绝绝对路径、`..`、已有符号链接和受保护路径；当前威胁模型不覆盖同一系统账号下的其他进程并发替换文件系统节点。`bash` 有独立的环境变量白名单、取消/超时和有界输出，但不会继承这些文件路径限制。
+`read_file` 支持按行分页读取；`grep` 搜索内容，`find` 按 glob 查找文件。`write_file` 只在已有目录中写文件，不负责创建目录；`edit` 要求被替换文本唯一匹配。工作区文件工具会拒绝绝对路径、`..`、已有符号链接和受保护路径；当前威胁模型不覆盖同一系统账号下的其他进程并发替换文件系统节点。`bash` 有独立的环境变量白名单、取消/超时和有界输出，但不会继承这些文件路径限制；需要异步观察开发服务器或测试进程时，使用上述 Job 生命周期工具，而不是在 `bash` 中放任后台命令。
 
 ## 本地使用
 

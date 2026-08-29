@@ -315,6 +315,7 @@ function contextTruncation(value: unknown, path: string): void {
     "query-limit",
     "missing-conversation",
     "missing-artifact",
+    "image-budget",
     "conversation-shape",
   ] as const);
   if (item.ref !== undefined) {
@@ -940,6 +941,7 @@ const payloadValidators = {
     string(item.toolCallId, `${path}.toolCallId`, false);
     string(item.name, `${path}.name`, false);
     artifactRef(item.resultRef, `${path}.resultRef`);
+    if (item.contextRef !== undefined) artifactRef(item.contextRef, `${path}.contextRef`);
   },
   "tool.failed": (value, path) => {
     const item = payloadObject(value, path, [
@@ -954,6 +956,7 @@ const payloadValidators = {
     string(item.name, `${path}.name`, false);
     string(item.error, `${path}.error`);
     artifactRef(item.resultRef, `${path}.resultRef`);
+    if (item.contextRef !== undefined) artifactRef(item.contextRef, `${path}.contextRef`);
     if (item.resolution !== undefined) {
       oneOf(item.resolution, `${path}.resolution`, ["operator"] as const);
     }

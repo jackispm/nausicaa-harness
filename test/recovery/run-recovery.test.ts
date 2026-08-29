@@ -72,6 +72,45 @@ describe("Run recovery", () => {
     await expect(recoverRun(ledger, "run-1")).resolves.toMatchObject({ startStep: 2 });
   });
 
+  it("projects an interrupted Run for inspection without changing its Ledger", async () => {
+    const ledger = new MemoryLedger();
+    await append(ledger, "run.created", {
+      goal: { version: 1, statement: "Inspect", successCriteria: [], hardConstraints: [] },
+      workspace: "/workspace",
+      policy,
+    }, "created");
+    await append(ledger, "user.message", { messageRef: ref("user") }, "user");
+    await append(ledger, "step.started", { step: 1 }, "step-1");
+    await append(ledger, "model.completed", {
+      model: "scripted",
+      responseRef: ref("answer"),
+      stopReason: "toolUse",
+      usage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 1 },
+    }, "model-1");
+    const before = await ledger.read({ runId: "run-1" });
+
+    const inspected = await recoverRun(ledger, "run-1", { mode: "inspect" });
+
+    expect(await ledger.read({ runId: "run-1" })).toEqual(before);
+    expect(inspected).toMatchObject({
+      runId: "run-1",
+      goal: { statement: "Inspect" },
+      policy,
+      workspace: "/workspace",
+      startStep: 2,
+      upperWatermark: before.at(-1)?.globalOffset,
+      pressureEligibleConversationCount: 0,
+      priorUsage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 1 },
+    });
+    expect(inspected.conversationRefs.map((item) => item.ref.id)).toEqual([
+      "user",
+      "answer",
+    ]);
+    expect(inspected.events).toEqual(before);
+    expect(inspected.events.at(-1)).toMatchObject({ type: "model.completed" });
+    expect(inspected.events.some((event) => event.type === "step.failed")).toBe(false);
+  });
+
   it("protects steering admitted after the latest successful Main request", async () => {
     const ledger = new MemoryLedger();
     await append(ledger, "run.created", {
@@ -177,6 +216,41 @@ describe("Run recovery", () => {
         "steering-1",
         "steering-2",
       ]);
+  });
+
+  it("keeps Worker-local transcripts out of recovered Main context", async () => {
+    const ledger = new MemoryLedger();
+    await append(ledger, "run.created", {
+      goal: { version: 1, statement: "Inspect", successCriteria: [], hardConstraints: [] },
+      workspace: "/workspace",
+      policy,
+    }, "created");
+    await append(ledger, "user.message", { messageRef: ref("main-user") }, "main-user");
+    await ledger.append({
+      runId: "run-1",
+      laneId: "worker",
+      type: "assistant.message",
+      payload: { messageRef: ref("worker-answer") },
+      correlationId: "worker-task",
+      idempotencyKey: "worker:task:assistant",
+    });
+    await ledger.append({
+      runId: "run-1",
+      laneId: "worker",
+      type: "tool.succeeded",
+      payload: {
+        operationId: "worker-operation",
+        toolCallId: "worker-call",
+        name: "read_file",
+        resultRef: ref("worker-result"),
+      },
+      correlationId: "worker-task",
+      idempotencyKey: "worker:task:tool:worker-call:succeeded",
+    });
+
+    const recovered = await recoverRun(ledger, "run-1");
+
+    expect(recovered.conversationRefs.map((item) => item.ref.id)).toEqual(["main-user"]);
   });
 
   it("refuses to resume a tool operation whose side-effect outcome is unknown", async () => {

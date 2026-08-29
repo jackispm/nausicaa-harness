@@ -107,7 +107,15 @@ function isConversationMessage(value: unknown): value is ConversationMessage {
       return false;
     }
   }
-  if (value.images !== undefined) return false;
+  if (value.role === "tool" && value.images !== undefined) {
+    try {
+      validateUserImages(value.images);
+    } catch {
+      return false;
+    }
+  } else if (value.images !== undefined) {
+    return false;
+  }
   if (value.role === "tool") {
     return typeof value.toolCallId === "string"
       && typeof value.toolName === "string"

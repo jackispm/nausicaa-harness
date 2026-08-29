@@ -60,6 +60,7 @@ describe("runtime activation parity", () => {
       maxOutputTokens: 8_192,
       allowWrite: true,
       allowShell: true,
+      allowNetwork: true,
       signal: oneShotAbort.signal,
     }, {
       mainModel: oneShotModel,
@@ -75,6 +76,7 @@ describe("runtime activation parity", () => {
       maxOutputTokens: 8_192,
       allowWrite: true,
       allowShell: true,
+      allowNetwork: true,
     }, {
       mainModel: sessionModel,
       clock,
@@ -94,9 +96,22 @@ describe("runtime activation parity", () => {
       "list_files",
       "grep",
       "find",
+      "file_info",
+      "read_image",
+      "web_fetch",
+      "web_search",
       "write_file",
       "edit",
+      "directory_create",
+      "path_copy",
+      "path_move",
+      "path_delete",
       "bash",
+      "process_start",
+      "process_status",
+      "process_output",
+      "process_kill",
+      "process_list",
     ]);
   });
 

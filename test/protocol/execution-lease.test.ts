@@ -237,6 +237,50 @@ describe("ExecutionLeaseStore protocol", () => {
     expect(await store.inspect("run-1")).not.toHaveProperty("leaseId");
   });
 
+  it("linearizes a fenced commit before expiry takeover", async () => {
+    const clock = new MutableClock(1_000);
+    const store = new MemoryExecutionLeaseStore({
+      clock,
+      createLeaseId: leaseIds("lease-old", "lease-new"),
+    });
+    const current = await acquire(store);
+    let releaseCommit!: () => void;
+    const commitGate = new Promise<void>((resolve) => { releaseCommit = resolve; });
+    let commitStarted!: () => void;
+    const started = new Promise<void>((resolve) => { commitStarted = resolve; });
+    const committed = store.runIfCurrent(identity(current), async () => {
+      commitStarted();
+      await commitGate;
+      return "durable";
+    });
+    await started;
+    clock.advance(100);
+    let takeoverSettled = false;
+    const takeover = store.claim({
+      runId: "run-1",
+      ownerId: "worker-2",
+      acquisitionId: "acquire-2",
+      ttlMs: 100,
+    }).then((result) => {
+      takeoverSettled = true;
+      return result;
+    });
+    await Promise.resolve();
+    expect(takeoverSettled).toBe(false);
+
+    releaseCommit();
+    await expect(committed).resolves.toEqual({ status: "committed", value: "durable" });
+    await expect(takeover).resolves.toMatchObject({
+      status: "acquired",
+      lease: { fencingToken: 2 },
+    });
+    let staleOperationRan = false;
+    await expect(store.runIfCurrent(identity(current), async () => {
+      staleOperationRan = true;
+    })).resolves.toEqual({ status: "lost" });
+    expect(staleOperationRan).toBe(false);
+  });
+
   it("never reacquires on a stale acquisition retry", async () => {
     const clock = new MutableClock(1_000);
     const store = new MemoryExecutionLeaseStore({

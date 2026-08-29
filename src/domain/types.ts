@@ -71,6 +71,8 @@ export type ConversationMessage =
       toolCallId: string;
       toolName: string;
       isError: boolean;
+      /** Tool-produced media is kept with the durable conversation message. */
+      images?: UserImage[];
       createdAt: string;
     };
 

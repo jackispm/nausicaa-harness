@@ -473,6 +473,8 @@ export async function executeWorkerLiveArm(
   const workspaceTools = createWorkspaceTools({
     allowWrite: manifest.execution.allowWrite,
     allowShell: manifest.execution.allowShell,
+    allowPathOperations: false,
+    includeFileInfo: false,
     protectedPaths: [resolve(dataDir)],
   });
   assertEvaluationToolContract(workspaceTools, false);

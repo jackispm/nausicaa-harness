@@ -50,12 +50,19 @@ import {
   type ContentAddressedStore,
 } from "../store/index.js";
 import { IntentNavigator, ObservationFrameBuilder } from "../teto/index.js";
-import { createWorkspaceTools } from "../tools/index.js";
+import {
+  createWorkspaceTools,
+  FileProcessJobRegistry,
+  ProcessJobManager,
+  type WebFetchProvider,
+  type WebSearchProvider,
+} from "../tools/index.js";
 import { createAdviceResponseTool } from "./advice-tool.js";
 import {
   MainLoop,
   MainRunTokenBudgetExhaustedError,
   type MainBoundaryMessage,
+  type MainLoopDeps,
   type MainStreamEvent,
 } from "./main-loop.js";
 import {
@@ -86,6 +93,7 @@ import {
   WorkerLaneScheduler,
 } from "./worker-lane-scheduler.js";
 import { WorkerTaskExecutor } from "./worker-task-executor.js";
+import { shouldAdvertiseImageTools } from "./model-capabilities.js";
 import {
   MESSAGE_MEDIA_TYPE,
   projectPendingAdmissions,
@@ -146,6 +154,7 @@ export interface SessionSnapshot {
   workerEnabled: boolean;
   allowWrite: boolean;
   allowShell: boolean;
+  allowNetwork: boolean;
   pendingInputs: number;
   lastCommittedStep: number;
   usage: TokenUsage;
@@ -190,6 +199,10 @@ export interface SessionControllerOptions {
   maxOutputTokens?: number;
   allowWrite?: boolean;
   allowShell?: boolean;
+  /** Explicitly enable network-backed workspace tools for Main. */
+  allowNetwork?: boolean;
+  /** Optional root directory for per-Run durable process-job metadata. */
+  processJobRegistryDir?: string;
   runId?: string;
 }
 
@@ -200,8 +213,20 @@ export interface SessionControllerDeps {
   tools?: readonly AgentTool[];
   /** Optional bounded read-only tools for Worker; defaults to the workspace set. */
   workerTools?: readonly AgentTool[];
+  /** Optional provider seams for network-backed Main tools. */
+  webFetchProvider?: WebFetchProvider;
+  webSearchProvider?: WebSearchProvider;
+  /** Host/TUI approval boundary for Main tools that explicitly require approval. */
+  approveTool?: MainLoopDeps["approve"];
   /** Test/plugin seam for the opt-in activation-scoped compaction adapter. */
   createCompactionRuntime?: RuntimeFukaiCompactionFactory;
+  /**
+   * Optional durable-write guard. Daemon activations use this to re-check
+   * their execution lease before appending a fact; ordinary sessions omit it.
+   */
+  assertExecutionLease?: () => void | Promise<void>;
+  /** Atomically serialize one Ledger commit with execution-lease takeover. */
+  commitExecutionLease?: <T>(operation: () => Promise<T>) => Promise<T>;
   clock?: Clock;
   createRunId?: () => string;
 }
@@ -215,6 +240,7 @@ interface AttachedRun {
   policy: RunPolicy;
   tokenBudget: RunTokenBudget;
   mainModel: string;
+  processJobs?: ProcessJobManager;
   worker?: WorkerLaneRuntime;
 }
 
@@ -242,6 +268,8 @@ export class SessionController {
   readonly maxOutputTokens: number;
   readonly allowWrite: boolean;
   readonly allowShell: boolean;
+  readonly allowNetwork: boolean;
+  readonly processJobRegistryDir: string | undefined;
 
   private readonly deps: SessionControllerDeps;
   private readonly clock: Clock;
@@ -276,6 +304,10 @@ export class SessionController {
     this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS;
     this.allowWrite = options.allowWrite === true;
     this.allowShell = options.allowShell === true;
+    this.allowNetwork = options.allowNetwork === true;
+    this.processJobRegistryDir = options.processJobRegistryDir === undefined
+      ? undefined
+      : resolve(options.processJobRegistryDir);
     this.deps = deps;
     this.clock = deps.clock ?? systemClock;
     this.requestedWorkerEnabled = options.workerEnabled ?? options.policy?.workerEnabled;
@@ -405,6 +437,7 @@ export class SessionController {
         || (this.attached === undefined && this.policy.workerEnabled === true),
       allowWrite: this.allowWrite,
       allowShell: this.allowShell,
+      allowNetwork: this.allowNetwork,
       pendingInputs: pending.length,
       lastCommittedStep: this.active === undefined
         ? 0
@@ -470,7 +503,6 @@ export class SessionController {
     }
     const attached = this.attached;
     const events = await attached.ledger.read({ runId: attached.runId });
-    attached.sink.replaceCache(events);
     return projectPendingInputs(attached.store, events);
   }
 
@@ -744,8 +776,8 @@ export class SessionController {
         throw new SessionProtocolError("Cancel the active Turn before resolving an operation");
       }
       const attached = this.requireAttached();
-      const resolution = await resolvePendingToolOperation(
-        attached.ledger,
+      await resolvePendingToolOperation(
+        attached.sink,
         attached.store,
         attached.runId,
         operationId,
@@ -753,9 +785,6 @@ export class SessionController {
       );
       const events = await attached.ledger.read({ runId: attached.runId });
       attached.sink.replaceCache(events);
-      if (resolution !== undefined) {
-        this.publish({ kind: "event", event: resolution });
-      }
       if (projectRun(events, attached.runId).unknownOperations.length > 0) {
         this.publishState();
         return;
@@ -825,6 +854,7 @@ export class SessionController {
       candidate.worker?.scheduler.enqueue();
       if (previous !== undefined) {
         await this.stopWorkerLane(previous);
+        await previous.processJobs?.close().catch(() => undefined);
         previous.sink.deactivate();
         await previous.ledger.close();
       }
@@ -864,7 +894,7 @@ export class SessionController {
         // Stop the Run-scoped Worker before checkpointing so a terminal reply
         // cannot race the checksum and land after the final checkpoint.
         await this.stopWorkerLane(this.attached);
-        await commitRunCheckpoint(this.attached.ledger, this.attached.runId).catch(() => undefined);
+        await commitRunCheckpoint(this.attached.sink, this.attached.runId).catch(() => undefined);
       }
       await this.detach();
       this.status = "closed";
@@ -883,7 +913,13 @@ export class SessionController {
     let attached: AttachedRun | undefined;
     try {
       const store = await FileContentAddressedStore.open(resolve(stateDir, "store"));
-      const sink = new SessionEventSink(ledger, [], (event) => this.publish(event));
+      const sink = new SessionEventSink(
+        ledger,
+        [],
+        (event) => this.publish(event),
+        this.deps.assertExecutionLease,
+        this.deps.commitExecutionLease,
+      );
       const goal: Goal = {
         version: 1,
         statement: goalStatement,
@@ -940,6 +976,9 @@ export class SessionController {
         policy: this.policy,
         tokenBudget: new RunTokenBudget(this.policy.maxModelTokens),
         mainModel: this.model,
+        ...(this.allowShell
+          ? { processJobs: await this.createProcessJobManager(runId) }
+          : {}),
       };
       if (this.policy.workerEnabled === true) {
         attached.worker = this.createWorkerLaneRuntime(attached);
@@ -950,6 +989,7 @@ export class SessionController {
     } catch (error: unknown) {
       if (attached !== undefined) {
         await this.stopWorkerLane(attached);
+        await attached.processJobs?.close().catch(() => undefined);
       }
       await ledger.close();
       throw error;
@@ -968,17 +1008,21 @@ export class SessionController {
       runId: attached.runId,
       clock: this.clock,
     });
+    const workerModel = this.deps.workerModel
+      ?? this.deps.mainModel
+      ?? createOpenRouterModelPort();
     const executor = new WorkerTaskExecutor({
       inbox,
       eventSink: attached.sink,
       store: attached.store,
-      model: this.deps.workerModel ?? this.deps.mainModel ?? createOpenRouterModelPort(),
+      model: workerModel,
       modelName: this.workerModel,
       runId: attached.runId,
       workspace: this.workspace,
       tools: this.deps.workerTools ?? createWorkspaceTools({
         allowWrite: false,
         allowShell: false,
+        allowImages: shouldAdvertiseImageTools(workerModel, this.workerModel),
         protectedPaths: [this.dataDir],
       }),
       runTokenBudget: attached.tokenBudget,
@@ -1032,7 +1076,13 @@ export class SessionController {
       attached = {
         runId,
         ledger,
-        sink: new SessionEventSink(ledger, events, (event) => this.publish(event)),
+        sink: new SessionEventSink(
+          ledger,
+          events,
+          (event) => this.publish(event),
+          this.deps.assertExecutionLease,
+          this.deps.commitExecutionLease,
+        ),
         store,
         goal: projection.goal,
         policy: projection.run.policy,
@@ -1043,6 +1093,9 @@ export class SessionController {
         // Schema-v1 Runs created before model.selected keep the caller's
         // configured selector until the first explicit selection is recorded.
         mainModel: projection.lanes.main?.model ?? this.model,
+        ...(this.allowShell
+          ? { processJobs: await this.createProcessJobManager(runId) }
+          : {}),
       };
       if (projection.run.policy.workerEnabled === true) {
         attached.worker = this.createWorkerLaneRuntime(attached);
@@ -1051,6 +1104,7 @@ export class SessionController {
     } catch (error: unknown) {
       if (attached !== undefined) {
         await this.stopWorkerLane(attached);
+        await attached.processJobs?.close().catch(() => undefined);
       }
       await ledger.close().catch(() => undefined);
       throw error;
@@ -1191,6 +1245,16 @@ export class SessionController {
       const tools = [...(this.deps.tools ?? createWorkspaceTools({
         allowWrite: this.allowWrite,
         allowShell: this.allowShell,
+        allowProcessJobs: this.allowShell,
+        ...(attached.processJobs === undefined ? {} : { processJobManager: attached.processJobs }),
+        allowImages: shouldAdvertiseImageTools(model, this.model),
+        allowNetwork: this.allowNetwork,
+        ...(this.deps.webFetchProvider === undefined
+          ? {}
+          : { webFetchProvider: this.deps.webFetchProvider }),
+        ...(this.deps.webSearchProvider === undefined
+          ? {}
+          : { webSearchProvider: this.deps.webSearchProvider }),
         protectedPaths: [this.dataDir],
       }))];
       if (attached.policy.tetoEnabled) {
@@ -1277,6 +1341,9 @@ export class SessionController {
         tools,
         clock: this.clock,
         runTokenBudget: attached.tokenBudget,
+        ...(this.deps.approveTool === undefined
+          ? {}
+          : { approve: this.deps.approveTool }),
         beforeStep: async ({ step }) => {
           const continuation = outputContinuationMessageId === undefined
             ? []
@@ -1406,7 +1473,7 @@ export class SessionController {
     } finally {
       await scheduler?.stop().catch(() => undefined);
       if (this.status !== "closed") {
-        await commitRunCheckpoint(attached.ledger, attached.runId).catch(() => undefined);
+        await commitRunCheckpoint(attached.sink, attached.runId).catch(() => undefined);
       }
       const ownsTurn = this.active?.turnId === turn.turnId;
       if (ownsTurn) this.active = undefined;
@@ -1695,6 +1762,7 @@ export class SessionController {
     this.execution = undefined;
     if (attached !== undefined) {
       await this.stopWorkerLane(attached);
+      await attached.processJobs?.close().catch(() => undefined);
       attached.sink.deactivate();
       await attached.ledger.close();
     }
@@ -1707,8 +1775,9 @@ export class SessionController {
     this.execution = undefined;
     if (attached !== undefined) {
       await this.stopWorkerLane(attached);
+      await attached.processJobs?.close().catch(() => undefined);
+      await commitRunCheckpoint(attached.sink, attached.runId).catch(() => undefined);
       attached.sink.deactivate();
-      await commitRunCheckpoint(attached.ledger, attached.runId).catch(() => undefined);
       await attached.ledger.close().catch(() => undefined);
     }
     if (this.status !== "closed") {
@@ -1719,6 +1788,21 @@ export class SessionController {
 
   private async stopWorkerLane(attached: AttachedRun): Promise<void> {
     await attached.worker?.scheduler.stop().catch(() => undefined);
+  }
+
+  private async createProcessJobManager(runId: string): Promise<ProcessJobManager> {
+    const registry = this.processJobRegistryDir === undefined
+      ? undefined
+      : await FileProcessJobRegistry.open(resolve(
+          this.processJobRegistryDir,
+          "runs",
+          runId,
+          "process-jobs.json",
+        ));
+    return ProcessJobManager.open({
+      protectedPaths: [this.dataDir],
+      ...(registry === undefined ? {} : { registry }),
+    });
   }
 
   private requireAttached(): AttachedRun {
@@ -1795,6 +1879,8 @@ class SessionEventSink implements Ledger {
     private readonly ledger: Ledger,
     events: readonly AnyEvent[],
     private readonly onEvent: (event: SessionRuntimeEvent) => void,
+    private readonly beforeAppend?: () => void | Promise<void>,
+    private readonly commitAppend?: <T>(operation: () => Promise<T>) => Promise<T>,
   ) {
     this.events = [...events];
     this.lastOffset = highestGlobalOffset(events);
@@ -1819,7 +1905,18 @@ class SessionEventSink implements Ledger {
 
   async append<K extends EventType>(input: AppendEvent<K>): Promise<EventEnvelope<K>> {
     if (!this.active) throw new SessionProtocolError("Session event sink is closed");
-    const event = await this.ledger.append(input);
+    const append = async (): Promise<EventEnvelope<K>> => {
+      if (!this.active) throw new SessionProtocolError("Session event sink is closed");
+      return this.ledger.append(input);
+    };
+    const event = this.commitAppend === undefined
+      ? await (async (): Promise<EventEnvelope<K>> => {
+          // Compatibility fallback for non-daemon custom SessionController
+          // integrations which only provide the cooperative assertion seam.
+          await this.beforeAppend?.();
+          return append();
+        })()
+      : await this.commitAppend(append);
     // Detach may race the ledger write. The event is durable and will be
     // replayed on the next attachment, but a retired surface must not publish
     // it into the new attachment's event stream or cache.
@@ -2090,6 +2187,18 @@ function validateOptions(options: SessionControllerOptions): void {
   if (options.workerEnabled !== undefined && typeof options.workerEnabled !== "boolean") {
     throw new SessionProtocolError("workerEnabled must be a boolean");
   }
+  if (
+    options.processJobRegistryDir !== undefined
+    && (
+      typeof options.processJobRegistryDir !== "string"
+      || options.processJobRegistryDir.trim().length === 0
+      || options.processJobRegistryDir.includes("\0")
+    )
+  ) {
+    throw new SessionProtocolError(
+      "processJobRegistryDir must be a non-empty path without NUL",
+    );
+  }
   if (options.fukaiCompaction !== undefined) {
     try {
       normalizeFukaiCompactionPolicy(options.fukaiCompaction);
@@ -2126,7 +2235,10 @@ const validateRequestedFukaiPolicy = (
     }
     return;
   }
-  if (!sameFukaiCompactionPolicy(normalizeFukaiCompactionPolicy(requested), recorded)) {
+  if (!sameFukaiCompactionPolicy(
+    normalizeFukaiCompactionPolicy(requested),
+    normalizeFukaiCompactionPolicy(recorded),
+  )) {
     throw new SessionProtocolError("Cannot change fukaiCompaction while resuming a Run");
   }
 };
@@ -2138,7 +2250,10 @@ const sameFukaiCompactionPolicy = (
   && left.provider === right.provider
   && left.maxInputTokens === right.maxInputTokens
   && left.maxOutputTokens === right.maxOutputTokens
-  && left.maxWallClockMs === right.maxWallClockMs;
+  && left.maxWallClockMs === right.maxWallClockMs
+  && left.thresholdRatio === right.thresholdRatio
+  && left.retainRatio === right.retainRatio
+  && left.minimumGainTokens === right.minimumGainTokens;
 
 function validateSubmit(request: SessionSubmitRequest): void {
   if (request.inputId.length === 0 || request.inputId.includes("\0")) {

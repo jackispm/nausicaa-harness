@@ -38,6 +38,14 @@ export interface MainExecutionRecoveryProjection {
   usage: TokenUsage;
 }
 
+export interface RunRecoveryOptions {
+  /**
+   * `resume` seals an interrupted Main Step before projecting the Run.
+   * `inspect` validates and projects durable facts without changing them.
+   */
+  mode?: "resume" | "inspect";
+}
+
 export class RunRecoveryError extends Error {}
 
 export class UnknownToolOperationError extends RunRecoveryError {
@@ -57,6 +65,7 @@ export class UnknownToolOperationError extends RunRecoveryError {
 export const recoverRun = async (
   ledger: Ledger,
   runId: RunId,
+  options: RunRecoveryOptions = {},
 ): Promise<RunRecoveryState> => {
   let events = await ledger.read({ runId });
   if (events.length === 0) {
@@ -70,7 +79,7 @@ export const recoverRun = async (
   }
 
   const interruptedStep = findInterruptedStep(events);
-  if (interruptedStep !== undefined) {
+  if (interruptedStep !== undefined && (options.mode ?? "resume") === "resume") {
     const started = events.find((event) =>
       event.type === "step.started"
       && event.laneId === "main"
@@ -337,6 +346,10 @@ const recoverConversationRefs = (events: readonly AnyEvent[]): FukaiConversation
   };
 
   for (const event of events) {
+    // Worker and auxiliary lanes keep their own transcripts. Their findings
+    // enter Main only through a Main-owned boundary message, never by replaying
+    // lane-local assistant/tool artifacts as if they were Main conversation.
+    if (event.laneId !== "main") continue;
     switch (event.type) {
       case "user.message":
         add(event.payload.messageRef, event.globalOffset, `event:${event.eventId}`);
@@ -354,19 +367,17 @@ const recoverConversationRefs = (events: readonly AnyEvent[]): FukaiConversation
         break;
       }
       case "model.completed":
-        if (event.laneId === "main") {
-          pendingModelMessages.push({
-            ref: event.payload.responseRef,
-            offset: event.globalOffset,
-            eventId: event.eventId,
-            consumed: false,
-          });
-        }
+        pendingModelMessages.push({
+          ref: event.payload.responseRef,
+          offset: event.globalOffset,
+          eventId: event.eventId,
+          consumed: false,
+        });
         break;
       case "tool.succeeded":
       case "tool.failed":
         add(
-          event.payload.resultRef,
+          event.payload.contextRef ?? event.payload.resultRef,
           event.globalOffset,
           mainStepConversationGroup(event.idempotencyKey)
             ?? `operation:${event.payload.operationId}`,

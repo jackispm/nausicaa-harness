@@ -61,15 +61,28 @@ export type ExecutionLeaseReleaseResult =
   | Readonly<{ status: "released" }>
   | Readonly<{ status: "lost" }>;
 
+export type ExecutionLeaseCommitResult<T> =
+  | Readonly<{ status: "committed"; value: T }>
+  | Readonly<{ status: "lost" }>;
+
 /** Operational execution authority only; durable Run state remains elsewhere. */
 export interface ExecutionLeaseStore {
   claim(input: ExecutionLeaseClaim): Promise<ExecutionLeaseClaimResult>;
   renew(input: ExecutionLeaseRenewal): Promise<ExecutionLeaseRenewResult>;
   /**
-   * Checks this store only. A future persistent adapter must combine the same
-   * fence with its commit guard; verify-then-append is not an atomic Ledger fence.
+   * Checks this store only. Callers must use `runIfCurrent` for a durable
+   * mutation because verify-then-append is not an atomic fence.
    */
   verify(input: ExecutionLeaseIdentity): Promise<boolean>;
+  /**
+   * Run one durable commit while the lease identity is still current. The
+   * implementation must serialize takeover with the complete async operation,
+   * not merely verify before invoking it.
+   */
+  runIfCurrent<T>(
+    input: ExecutionLeaseIdentity,
+    operation: () => Promise<T>,
+  ): Promise<ExecutionLeaseCommitResult<T>>;
   release(input: ExecutionLeaseRelease): Promise<ExecutionLeaseReleaseResult>;
   inspect(runId: string): Promise<ExecutionLeaseStatus | undefined>;
 }
@@ -171,6 +184,25 @@ export class MemoryExecutionLeaseStore implements ExecutionLeaseStore {
       const { nowMs } = this.observeTime(identity.runId);
       const current = this.liveLease(identity.runId, nowMs);
       return current !== undefined && sameIdentity(current.value, identity);
+    });
+  }
+
+  async runIfCurrent<T>(
+    input: ExecutionLeaseIdentity,
+    operation: () => Promise<T>,
+  ): Promise<ExecutionLeaseCommitResult<T>> {
+    const identity = validateIdentity(input);
+    if (typeof operation !== "function") {
+      throw new TypeError("operation must be a function");
+    }
+    return this.runExclusive(async () => {
+      const { nowMs } = this.observeTime(identity.runId);
+      const current = this.liveLease(identity.runId, nowMs);
+      if (current === undefined || !sameIdentity(current.value, identity)) {
+        return Object.freeze({ status: "lost" as const });
+      }
+      const value = await operation();
+      return Object.freeze({ status: "committed" as const, value });
     });
   }
 
@@ -428,7 +460,7 @@ export class MemoryExecutionLeaseStore implements ExecutionLeaseStore {
     }
   }
 
-  private runExclusive<T>(operation: () => T): Promise<T> {
+  private runExclusive<T>(operation: () => T | Promise<T>): Promise<T> {
     const result = this.tail.then(operation, operation);
     this.tail = result.then(
       () => undefined,
@@ -439,7 +471,7 @@ export class MemoryExecutionLeaseStore implements ExecutionLeaseStore {
 }
 
 export class ExecutionLeaseProtocolError extends Error {
-  override readonly name = "ExecutionLeaseProtocolError";
+  override readonly name: string = "ExecutionLeaseProtocolError";
 }
 
 function validateClaim(input: ExecutionLeaseClaim): ExecutionLeaseClaim {

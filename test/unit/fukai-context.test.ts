@@ -666,6 +666,237 @@ describe("FukaiContextProvider", () => {
       },
     })).rejects.toBeInstanceOf(FukaiBudgetError);
   });
+
+  it("accounts for images returned by tools in the request token estimate", async () => {
+    const store = new MemoryContentAddressedStore();
+    const assistant = await putMessage(store, {
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: "image-call", name: "read_image", arguments: { path: "shot.png" } }],
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    const plainResult = await putMessage(store, {
+      role: "tool",
+      content: "image metadata",
+      toolCallId: "image-call",
+      toolName: "read_image",
+      isError: false,
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    const imageResult = await putMessage(store, {
+      role: "tool",
+      content: "image metadata",
+      toolCallId: "image-call",
+      toolName: "read_image",
+      isError: false,
+      images: [{ type: "image", data: "AQID", mimeType: "image/png" }],
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    const largeImageResult = await putMessage(store, {
+      role: "tool",
+      content: "large image metadata",
+      toolCallId: "image-call",
+      toolName: "read_image",
+      isError: false,
+      images: [{
+        type: "image",
+        data: Buffer.alloc(2 * 1024 * 1024).toString("base64"),
+        mimeType: "image/png",
+      }],
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    const provider = new FukaiContextProvider(new ContentStoreFukaiSource(store));
+    const common = {
+      runId: "run-tool-image-budget",
+      laneId: "main",
+      laneKind: "main" as const,
+      goal: { version: 1, statement: "Inspect an image", successCriteria: [], hardConstraints: [] },
+      systemPrompt: "Main",
+      artifactSelections: [],
+      tools: [],
+      upperWatermark: 2,
+      policyVersion: "1",
+      budget: {
+        maxInputTokens: 4_000,
+        maxConversationMessages: 10,
+        maxArtifacts: 0,
+        maxArtifactBytes: 0,
+        maxQueries: 10,
+      },
+    };
+
+    const plain = await provider.build({
+      ...common,
+      conversationRefs: [
+        { ref: assistant, sequence: 1 },
+        { ref: plainResult, sequence: 2 },
+      ],
+    });
+    const multimodal = await provider.build({
+      ...common,
+      conversationRefs: [
+        { ref: assistant, sequence: 1 },
+        { ref: imageResult, sequence: 2 },
+      ],
+    });
+    const large = await provider.build({
+      ...common,
+      conversationRefs: [
+        { ref: assistant, sequence: 1 },
+        { ref: largeImageResult, sequence: 2 },
+      ],
+    });
+
+    expect(multimodal.usage.estimatedInputTokens - plain.usage.estimatedInputTokens).toBe(1_024);
+    expect(multimodal.manifest.slots.inbox.estimatedTokens
+      - plain.manifest.slots.inbox.estimatedTokens).toBe(1_024);
+    expect(large.usage.estimatedInputTokens - plain.usage.estimatedInputTokens)
+      .toBeGreaterThanOrEqual(2_048);
+  });
+
+  it("keeps newest images under cumulative request count and byte budgets", async () => {
+    const store = new MemoryContentAddressedStore();
+    const tinyImage = { type: "image" as const, data: "AA==", mimeType: "image/png" as const };
+    const oldCount = await putMessage(store, {
+      role: "user",
+      content: "older count evidence",
+      images: [tinyImage, tinyImage, tinyImage, tinyImage],
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    const recentCount = await putMessage(store, {
+      role: "user",
+      content: "newest count evidence",
+      images: [tinyImage],
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    const largeImage = {
+      type: "image" as const,
+      data: Buffer.alloc(3 * 1024 * 1024).toString("base64"),
+      mimeType: "image/png" as const,
+    };
+    const recentLargeImage = {
+      type: "image" as const,
+      data: Buffer.alloc(2 * 1024 * 1024).toString("base64"),
+      mimeType: "image/png" as const,
+    };
+    const oldBytes = await putMessage(store, {
+      role: "user",
+      content: "older byte evidence",
+      images: [largeImage, largeImage, largeImage],
+      createdAt: "2026-01-01T00:00:02.000Z",
+    });
+    const recentBytes = await putMessage(store, {
+      role: "user",
+      content: "newest byte evidence",
+      images: [recentLargeImage],
+      createdAt: "2026-01-01T00:00:03.000Z",
+    });
+    const provider = new FukaiContextProvider(new ContentStoreFukaiSource(store));
+    const common = {
+      runId: "run-image-limits",
+      laneId: "main",
+      laneKind: "main" as const,
+      goal: { version: 1, statement: "Inspect images", successCriteria: [], hardConstraints: [] },
+      systemPrompt: "Main",
+      artifactSelections: [],
+      tools: [],
+      upperWatermark: 4,
+      policyVersion: "1",
+      budget: {
+        maxInputTokens: 20_000,
+        maxConversationMessages: 10,
+        maxArtifacts: 0,
+        maxArtifactBytes: 0,
+        maxQueries: 10,
+      },
+    };
+
+    const countBounded = await provider.build({
+      ...common,
+      conversationRefs: [
+        { ref: oldCount, sequence: 1 },
+        { ref: recentCount, sequence: 2 },
+      ],
+    });
+    const byteBounded = await provider.build({
+      ...common,
+      conversationRefs: [
+        { ref: oldBytes, sequence: 3 },
+        { ref: recentBytes, sequence: 4 },
+      ],
+    });
+
+    expect(countBounded.messages.map((message) => messageImages(message).length)).toEqual([3, 1]);
+    expect(countBounded.messages[0]?.content).toContain("1 IMAGE BLOCK OMITTED BY FUKAI");
+    expect(byteBounded.messages.map((message) => messageImages(message).length)).toEqual([2, 1]);
+    expect(byteBounded.messages[0]?.content).toContain("request image budget exceeded");
+    expect(byteBounded.truncations).toContainEqual(expect.objectContaining({ kind: "image-budget" }));
+    expect(byteBounded.manifest.slots.inbox.state).toBe("bounded");
+  });
+
+  it("degrades images only for an explicitly text-only request", async () => {
+    const store = new MemoryContentAddressedStore();
+    const image = { type: "image" as const, data: "AQID", mimeType: "image/png" as const };
+    const user = await putMessage(store, {
+      role: "user",
+      content: "user visual evidence",
+      images: [image],
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    const assistant = await putMessage(store, {
+      role: "assistant",
+      content: "inspect it",
+      toolCalls: [{ id: "image-call", name: "read_image", arguments: {} }],
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    const tool = await putMessage(store, {
+      role: "tool",
+      content: "tool visual evidence",
+      toolCallId: "image-call",
+      toolName: "read_image",
+      isError: false,
+      images: [image],
+      createdAt: "2026-01-01T00:00:02.000Z",
+    });
+    const provider = new FukaiContextProvider(new ContentStoreFukaiSource(store));
+    const common = {
+      runId: "run-model-image-capability",
+      laneId: "main",
+      laneKind: "main" as const,
+      goal: { version: 1, statement: "Inspect images", successCriteria: [], hardConstraints: [] },
+      systemPrompt: "Main",
+      conversationRefs: [
+        { ref: user, sequence: 1 },
+        { ref: assistant, sequence: 2 },
+        { ref: tool, sequence: 3 },
+      ],
+      artifactSelections: [],
+      tools: [],
+      upperWatermark: 3,
+      policyVersion: "1",
+      budget: {
+        maxInputTokens: 5_000,
+        maxConversationMessages: 10,
+        maxArtifacts: 0,
+        maxArtifactBytes: 0,
+        maxQueries: 10,
+      },
+    };
+
+    const unknown = await provider.build(common);
+    const vision = await provider.build({ ...common, imageInputSupported: true });
+    const text = await provider.build({ ...common, imageInputSupported: false });
+
+    expect(unknown.messages.filter((message) => messageImages(message).length > 0)).toHaveLength(2);
+    expect(vision.messages).toEqual(unknown.messages);
+    expect(text.messages.every((message) => messageImages(message).length === 0)).toBe(true);
+    expect(text.messages.filter((message) => message.content.includes("does not support image input")))
+      .toHaveLength(2);
+    expect(text.truncations.filter((item) => item.kind === "image-budget")).toHaveLength(2);
+    expect(text.manifest.slots.inbox.state).toBe("bounded");
+    expect(text.cacheKey).not.toBe(vision.cacheKey);
+    expect(text.manifest.dynamicHash).not.toBe(vision.manifest.dynamicHash);
+  });
 });
 
 async function putMessage(
@@ -673,4 +904,8 @@ async function putMessage(
   message: ConversationMessage,
 ) {
   return store.put(JSON.stringify(message), "application/vnd.nausicaa.conversation-message+json");
+}
+
+function messageImages(message: ConversationMessage) {
+  return message.role === "user" || message.role === "tool" ? message.images ?? [] : [];
 }

@@ -22,10 +22,16 @@ import type {
 import { MemoryLedger } from "../../src/ledger/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import {
+  MoweCatalog,
+  MoweExecutor,
+  type MoweAgentTool,
+} from "../../src/mowe/index.js";
+import {
   MainLoop,
   MainRunTokenBudgetExhaustedError,
   type MainStreamEvent,
 } from "../../src/runtime/main-loop.js";
+import { projectMainExecutionRecovery } from "../../src/runtime/recovery.js";
 import { RunTokenBudget } from "../../src/runtime/run-token-budget.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
 
@@ -38,6 +44,184 @@ afterEach(async () => {
 });
 
 describe("MainLoop", () => {
+  it("rejects malformed tool arguments before recording a tool operation", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const model = new ScriptedModel([{
+      content: "invalid call",
+      toolCalls: [{
+        id: "bad-arguments",
+        name: "noop",
+        arguments: null as unknown as Record<string, unknown>,
+      }],
+      stopReason: "toolUse",
+      usage: tokenUsage(10, 5),
+    }]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+    });
+
+    await expect(loop.run({
+      runId: "malformed-tool-arguments",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    })).rejects.toThrow(/arguments must be an object/u);
+
+    const events = await ledger.read({ runId: "malformed-tool-arguments" });
+    expect(events.some((event) => event.type === "tool.requested")).toBe(false);
+  });
+
+  it("accepts Mowe as the only tool authority", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const mowe = new MoweExecutor({ catalog: new MoweCatalog([]) });
+    const model = new ScriptedModel([{
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      mowe,
+    });
+
+    await expect(loop.run({
+      runId: "main-mowe-only",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    })).resolves.toMatchObject({ finalText: "done", completed: true });
+    expect(model.requests[0]?.tools).toEqual([]);
+  });
+
+  it("routes required tool approval through the host seam", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    let executions = 0;
+    const approvals: string[] = [];
+    const guardedTool: MoweAgentTool = {
+      definition: {
+        name: "guarded_tool",
+        description: "Requires host approval",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      metadata: { requiresApproval: true, effect: "write", scope: "workspace" },
+      async execute() {
+        executions += 1;
+        return { content: "approved", isError: false };
+      },
+    };
+    const model = new ScriptedModel([
+      {
+        content: "use guarded tool",
+        toolCalls: [{ id: "guarded-call", name: "guarded_tool", arguments: {} }],
+        stopReason: "toolUse",
+        usage: tokenUsage(5, 2),
+      },
+      {
+        content: "done",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(5, 2),
+      },
+    ]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [guardedTool],
+      approve: ({ operationId }) => {
+        approvals.push(operationId);
+        return true;
+      },
+    });
+
+    await expect(loop.run({
+      runId: "main-tool-approval",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      initialMessage: "Go",
+    })).resolves.toMatchObject({ completed: true, finalText: "done" });
+
+    expect(executions).toBe(1);
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]).toMatch(/^op:/u);
+    expect((await ledger.read({ runId: "main-tool-approval" })).some((event) => (
+      event.type === "tool.succeeded" && event.payload.toolCallId === "guarded-call"
+    ))).toBe(true);
+  });
+
+  it("uses an injected Mowe catalog as the model-visible tool source", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const staleTool: AgentTool = {
+      definition: {
+        name: "stale_tool",
+        description: "Should not be advertised when Mowe is injected",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      async execute() {
+        return { content: "stale", isError: false };
+      },
+    };
+    const liveTool: AgentTool = {
+      definition: {
+        name: "live_tool",
+        description: "The Mowe-owned tool",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      async execute() {
+        return { content: "live", isError: false };
+      },
+    };
+    const mowe = new MoweExecutor({ catalog: new MoweCatalog([liveTool]) });
+    const model = new ScriptedModel([{
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [staleTool],
+      mowe,
+    });
+
+    await loop.run({
+      runId: "main-mowe-schema-source",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    });
+
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual(["live_tool"]);
+  });
+
   it("wires an explicit Fukai capsule selector without changing the default loop", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
@@ -1442,6 +1626,226 @@ describe("MainLoop", () => {
     expect(JSON.stringify(model.requests[1]?.messages)).not.toContain(openRouterKey);
   });
 
+  it("shares one bounded transcript artifact while Mowe retains the full source once", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const fullContent = `${"前缀内容 ".repeat(40_000)}END`;
+    const model = new ScriptedModel([
+      {
+        content: "inspect the result",
+        toolCalls: [{ id: "large-call", name: "large_tool", arguments: {} }],
+        stopReason: "toolUse",
+        usage: tokenUsage(5, 2),
+      },
+      {
+        content: "done",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(5, 2),
+      },
+    ]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [{
+        definition: {
+          name: "large_tool",
+          description: "returns a large result",
+          parameters: { type: "object", additionalProperties: false },
+        },
+        async execute() {
+          return { content: fullContent, isError: false };
+        },
+      }],
+    });
+
+    const outcome = await loop.run({
+      runId: "large-tool-result-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      contextBudget: { maxInputTokens: 100_000 },
+      initialMessage: "Go",
+    });
+
+    const events = await ledger.read({ runId: "large-tool-result-run" });
+    const succeeded = events.find((event) => event.type === "tool.succeeded");
+    expect(succeeded?.type).toBe("tool.succeeded");
+    if (succeeded?.type !== "tool.succeeded") throw new Error("Missing tool.succeeded event");
+    const durable = JSON.parse(new TextDecoder().decode(await store.get(succeeded.payload.resultRef))) as {
+      role: string;
+      content: string;
+    };
+    expect(durable.role).toBe("tool");
+    expect(durable.content).not.toBe(fullContent);
+    expect(durable.content).toContain("Full tool result stored as artifact");
+
+    const visibleTool = model.requests[1]?.messages.find((message) => message.role === "tool");
+    expect(visibleTool?.content).toContain("[TRUNCATED BY MAIN LOOP]");
+    expect(Buffer.byteLength(visibleTool?.content ?? "", "utf8")).toBeLessThanOrEqual(256 * 1024);
+    expect(visibleTool?.content).toBe(durable.content);
+    expect(succeeded.payload.contextRef?.id).toBe(succeeded.payload.resultRef.id);
+
+    const contextMessage = await Promise.all(outcome.conversationRefs.map(async ({ ref }) => {
+      const parsed = JSON.parse(new TextDecoder().decode(await store.get(ref))) as {
+        role?: string;
+        content?: string;
+      };
+      return parsed.role === "tool" && parsed.content === visibleTool?.content ? parsed : undefined;
+    })).then((messages) => messages.find((message) => message !== undefined));
+    expect(contextMessage?.content).toBe(visibleTool?.content);
+  });
+
+  it("does not amplify a Mowe result beyond its aggregate output budget", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const fullContent = "0123456789abcdef";
+    const tool: AgentTool = {
+      definition: {
+        name: "aggregate_tool",
+        description: "returns a result larger than the test aggregate budget",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      async execute() {
+        return { content: fullContent, isError: false };
+      },
+    };
+    const mowe = new class extends MoweExecutor {
+      override execute(request: Parameters<MoweExecutor["execute"]>[0]) {
+        return super.execute({
+          ...request,
+          limits: { ...request.limits, maxOutputBytes: 8 },
+        });
+      }
+    }({ catalog: [tool] });
+    const model = new ScriptedModel([
+      {
+        content: "inspect",
+        toolCalls: [{ id: "aggregate-call", name: "aggregate_tool", arguments: {} }],
+        stopReason: "toolUse",
+        usage: tokenUsage(5, 2),
+      },
+      {
+        content: "done",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(5, 2),
+      },
+    ]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [tool],
+      mowe,
+    });
+
+    await loop.run({
+      runId: "aggregate-result-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      initialMessage: "Go",
+    });
+
+    const events = await ledger.read({ runId: "aggregate-result-run" });
+    const succeeded = events.find((event) => event.type === "tool.succeeded");
+    if (succeeded?.type !== "tool.succeeded") throw new Error("Missing tool.succeeded event");
+    const durable = JSON.parse(new TextDecoder().decode(
+      await store.get(succeeded.payload.resultRef),
+    )) as { role: string; content: string };
+    expect(durable.role).toBe("tool");
+    expect(durable.content).not.toBe(fullContent);
+    expect(Buffer.byteLength(durable.content, "utf8")).toBeLessThanOrEqual(8);
+
+    const visibleTool = model.requests[1]?.messages.find((message) => message.role === "tool");
+    expect(visibleTool?.content).toBe(durable.content);
+  });
+
+  it("keeps bounded tool images in the next request and recovery context", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    // Valid canonical base64 representing a 300 KiB image payload. The tool
+    // boundary intentionally does not inspect image magic bytes.
+    const image = {
+      type: "image" as const,
+      mimeType: "image/png",
+      data: "A".repeat(400_000),
+    };
+    const model = new ScriptedModel([
+      {
+        content: "inspect image",
+        toolCalls: [{ id: "image-call", name: "image_tool", arguments: {} }],
+        stopReason: "toolUse",
+        usage: tokenUsage(5, 2),
+      },
+      {
+        content: "done",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(5, 2),
+      },
+    ]);
+    const imageTool: MoweAgentTool = {
+      definition: {
+        name: "image_tool",
+        description: "returns a large image",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      metadata: { outputKinds: ["image", "json"] },
+      async execute() {
+        return { content: "large image", isError: false, images: [image] };
+      },
+    };
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [imageTool],
+    });
+
+    const outcome = await loop.run({
+      runId: "large-tool-image-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      contextBudget: { maxInputTokens: 100_000 },
+      initialMessage: "Go",
+    });
+
+    const visibleTool = model.requests[1]?.messages.find((message) => message.role === "tool");
+    if (visibleTool?.role !== "tool") throw new Error("Missing visible tool result");
+    expect(visibleTool.images).toEqual([image]);
+    expect(visibleTool?.content).toContain("large image");
+    expect(Buffer.byteLength(visibleTool?.content ?? "", "utf8")).toBeLessThanOrEqual(256 * 1024);
+
+    const events = await ledger.read({ runId: "large-tool-image-run" });
+    const succeeded = events.find((event) => event.type === "tool.succeeded");
+    if (succeeded?.type !== "tool.succeeded") throw new Error("Missing tool.succeeded event");
+    expect(succeeded.payload.contextRef).toBeDefined();
+    const contextArtifact = JSON.parse(new TextDecoder().decode(
+      await store.get(succeeded.payload.contextRef!),
+    )) as { role: string; images?: unknown[]; content: string };
+    expect(contextArtifact.images).toEqual([image]);
+    expect(contextArtifact.content).toContain("large image");
+
+    const recovered = projectMainExecutionRecovery(events);
+    const recoveredTool = recovered.conversationRefs.find((ref) => ref.ref.id === succeeded.payload.contextRef!.id);
+    expect(recoveredTool).toBeDefined();
+    expect(succeeded.payload.contextRef?.id).toBe(succeeded.payload.resultRef.id);
+    expect(outcome.conversationRefs.some((ref) => ref.ref.id === succeeded.payload.resultRef.id)).toBe(true);
+  });
+
   it("waits for every parallel tool execution before rejecting cancellation", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
@@ -1518,6 +1922,16 @@ describe("MainLoop", () => {
     releaseDelayed?.();
     expect(await outcome).toBeInstanceOf(Error);
     expect(delayedFinished).toBe(true);
+    const events = await ledger.read({ runId: "cancelled-tools-run" });
+    const requested = events.filter((event) => event.type === "tool.requested");
+    const terminal = events.filter((event) => (
+      event.type === "tool.succeeded" || event.type === "tool.failed"
+    ));
+    expect(requested).toHaveLength(2);
+    expect(terminal).toHaveLength(2);
+    expect(new Set(terminal.map((event) => event.payload.operationId))).toEqual(
+      new Set(requested.map((event) => event.payload.operationId)),
+    );
     const watermark = await ledger.watermark();
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(await ledger.watermark()).toBe(watermark);

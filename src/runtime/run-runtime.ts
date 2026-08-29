@@ -44,11 +44,17 @@ import {
   type ContentAddressedStore,
 } from "../store/index.js";
 import { IntentNavigator, ObservationFrameBuilder } from "../teto/index.js";
-import { createWorkspaceTools } from "../tools/index.js";
+import {
+  createWorkspaceTools,
+  ProcessJobManager,
+  type WebFetchProvider,
+  type WebSearchProvider,
+} from "../tools/index.js";
 import { createAdviceResponseTool } from "./advice-tool.js";
 import {
   MainLoop,
   MainRunTokenBudgetExhaustedError,
+  type MainLoopDeps,
 } from "./main-loop.js";
 import { persistedErrorText } from "./redaction.js";
 import {
@@ -82,6 +88,7 @@ import {
   WorkerLaneScheduler,
 } from "./worker-lane-scheduler.js";
 import { WorkerTaskExecutor } from "./worker-task-executor.js";
+import { shouldAdvertiseImageTools } from "./model-capabilities.js";
 
 export interface RunExecutionRequest {
   workspace: string;
@@ -106,6 +113,8 @@ export interface RunExecutionRequest {
   maxOutputTokens?: number;
   allowWrite?: boolean;
   allowShell?: boolean;
+  /** Explicitly enable network-backed workspace tools for Main. */
+  allowNetwork?: boolean;
   signal?: AbortSignal;
 }
 
@@ -117,6 +126,11 @@ export interface RunExecutionDeps {
   tools?: readonly AgentTool[];
   /** Optional bounded read-only tools for Worker; defaults to the workspace set. */
   workerTools?: readonly AgentTool[];
+  /** Optional provider seams for network-backed Main tools. */
+  webFetchProvider?: WebFetchProvider;
+  webSearchProvider?: WebSearchProvider;
+  /** Host approval boundary for Main tools that explicitly require approval. */
+  approveTool?: MainLoopDeps["approve"];
   /** Optional explicit selector for a previously committed Fukai capsule. */
   selectCompaction?: (context: {
     runId: string;
@@ -157,6 +171,7 @@ export const executeRun = async (
   const ledger = await JsonlLedger.open(resolve(stateDir, "ledger.jsonl"));
   let scheduler: TetoScheduler | ReflectionScheduler | undefined;
   let workerScheduler: WorkerLaneScheduler | undefined;
+  let processJobManager: ProcessJobManager | undefined;
 
   try {
     const sink = new ObservableEventSink(ledger, deps.onEvent);
@@ -303,6 +318,7 @@ export const executeRun = async (
     }
 
     const mainModel = compactionModel ?? deps.mainModel ?? createOpenRouterModelPort();
+    const mainAdvertisesImages = shouldAdvertiseImageTools(mainModel, request.model);
     const mainUpperWatermark = compactionRuntime === undefined
       ? setup.upperWatermark
       : await ledger.watermark();
@@ -318,9 +334,24 @@ export const executeRun = async (
       events: setup.events,
       clock,
     });
+    if (deps.tools === undefined && request.allowShell === true) {
+      processJobManager = new ProcessJobManager({
+        protectedPaths: [resolve(request.dataDir)],
+      });
+    }
     const tools = [...(deps.tools ?? createWorkspaceTools({
       allowWrite: request.allowWrite === true,
       allowShell: request.allowShell === true,
+      allowProcessJobs: request.allowShell === true,
+      ...(processJobManager === undefined ? {} : { processJobManager }),
+      allowImages: mainAdvertisesImages,
+      allowNetwork: request.allowNetwork === true,
+      ...(deps.webFetchProvider === undefined
+        ? {}
+        : { webFetchProvider: deps.webFetchProvider }),
+      ...(deps.webSearchProvider === undefined
+        ? {}
+        : { webSearchProvider: deps.webSearchProvider }),
       protectedPaths: [resolve(request.dataDir)],
     }))];
     if (auxiliaryMode === "teto") {
@@ -371,9 +402,14 @@ export const executeRun = async (
         clock,
       });
       const workerModel = deps.workerModel ?? mainModel;
+      const workerAdvertisesImages = shouldAdvertiseImageTools(
+        workerModel,
+        request.workerModel ?? request.model,
+      );
       const workerTools = deps.workerTools ?? createWorkspaceTools({
         allowWrite: false,
         allowShell: false,
+        allowImages: workerAdvertisesImages,
         protectedPaths: [resolve(request.dataDir)],
       });
       const workerExecutor = new WorkerTaskExecutor({
@@ -418,6 +454,7 @@ export const executeRun = async (
       tools,
       clock,
       runTokenBudget,
+      ...(deps.approveTool === undefined ? {} : { approve: deps.approveTool }),
       ...(outputContinuationMessageId === undefined
         && scheduler === undefined
         && workerScheduler === undefined
@@ -589,6 +626,7 @@ export const executeRun = async (
   } finally {
     await scheduler?.stop().catch(() => undefined);
     await workerScheduler?.stop().catch(() => undefined);
+    await processJobManager?.close().catch(() => undefined);
     await ledger.close();
   }
 };
@@ -914,7 +952,8 @@ const validateRequestedFukaiPolicy = (
     return;
   }
   const normalized = normalizeFukaiCompactionPolicy(requested);
-  if (!sameFukaiCompactionPolicy(normalized, recorded)) {
+  const normalizedRecorded = normalizeFukaiCompactionPolicy(recorded);
+  if (!sameFukaiCompactionPolicy(normalized, normalizedRecorded)) {
     throw new Error("Cannot change fukaiCompaction while resuming a Run");
   }
 };
@@ -926,7 +965,10 @@ const sameFukaiCompactionPolicy = (
   && left.provider === right.provider
   && left.maxInputTokens === right.maxInputTokens
   && left.maxOutputTokens === right.maxOutputTokens
-  && left.maxWallClockMs === right.maxWallClockMs;
+  && left.maxWallClockMs === right.maxWallClockMs
+  && left.thresholdRatio === right.thresholdRatio
+  && left.retainRatio === right.retainRatio
+  && left.minimumGainTokens === right.minimumGainTokens;
 
 function rethrowIfAborted(signal: AbortSignal | undefined): void {
   if (!signal?.aborted) return;

@@ -33,6 +33,7 @@ export class RetryingModelPort implements ModelPort {
   private readonly maxDelayMs: number;
   private readonly sleep: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   private readonly random: () => number;
+  readonly capabilities?: (model: string) => ModelCapabilities;
   readonly stream?: (request: ModelRequest) => AsyncIterable<ModelStreamEvent>;
 
   constructor(
@@ -50,13 +51,12 @@ export class RetryingModelPort implements ModelPort {
     this.maxDelayMs = options.maxDelayMs;
     this.sleep = options.sleep ?? abortableSleep;
     this.random = options.random ?? Math.random;
+    if (delegate.capabilities !== undefined) {
+      this.capabilities = (model) => delegate.capabilities!(model);
+    }
     if (delegate.stream !== undefined) {
       this.stream = (request) => this.retryStream(request);
     }
-  }
-
-  capabilities(model: string): ModelCapabilities {
-    return this.delegate.capabilities?.(model) ?? { imageInput: false };
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {

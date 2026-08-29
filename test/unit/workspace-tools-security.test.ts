@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   createListFilesTool,
   createReadFileTool,
+  createProcessJobTools,
   createWorkspaceTools,
   createWriteFileTool,
   listFilesTool,
@@ -45,22 +46,87 @@ describe("workspace tool path security", () => {
       "list_files",
       "grep",
       "find",
+      "file_info",
     ]);
     expect(createWorkspaceTools({ allowWrite: true }).map((tool) => tool.definition.name))
-      .toEqual(["read_file", "list_files", "grep", "find", "write_file", "edit"]);
+      .toEqual([
+        "read_file", "list_files", "grep", "find", "file_info", "write_file", "edit",
+        "directory_create", "path_copy", "path_move", "path_delete",
+      ]);
     expect(createWorkspaceTools({ allowShell: true }).map((tool) => tool.definition.name))
-      .toEqual(["read_file", "list_files", "grep", "find", "bash"]);
-    expect(createWorkspaceTools({ allowShell: true, allowWrite: true })
+      .toEqual(["read_file", "list_files", "grep", "find", "file_info", "bash"]);
+    expect(createWorkspaceTools({ allowShell: true, allowWrite: true, allowPathOperations: true })
       .map((tool) => tool.definition.name))
       .toEqual([
         "read_file",
         "list_files",
         "grep",
         "find",
+        "file_info",
         "write_file",
         "edit",
+        "directory_create",
+        "path_copy",
+        "path_move",
+        "path_delete",
         "bash",
       ]);
+    expect(createWorkspaceTools({ allowProcessJobs: true })
+      .map((tool) => tool.definition.name))
+      .toEqual(["read_file", "list_files", "grep", "find", "file_info"]);
+    expect(createWorkspaceTools({ allowShell: true, allowProcessJobs: true })
+      .map((tool) => tool.definition.name))
+      .toEqual([
+        "read_file",
+        "list_files",
+        "grep",
+        "find",
+        "file_info",
+        "bash",
+        "process_start",
+        "process_status",
+        "process_output",
+        "process_kill",
+        "process_list",
+      ]);
+    expect(createProcessJobTools).toBeTypeOf("function");
+  });
+
+  it("paginates large directory listings with a stable continuation offset", async () => {
+    const workspace = await temporaryDirectory("nausicaa-workspace-list-page-");
+    for (const name of ["a.txt", "b.txt", "c.txt", "d.txt"]) {
+      await writeFile(path.join(workspace, name), name, "utf8");
+    }
+    const context = { runId: "run-1", workspace, operationId: "operation-1" };
+    const tool = createListFilesTool();
+
+    const first = await tool.execute({ path: ".", maxEntries: 2 }, context);
+    expect(first.isError).toBe(false);
+    expect(JSON.parse(first.content)).toMatchObject({
+      offset: 0,
+      entries: [
+        { path: "a.txt", type: "file" },
+        { path: "b.txt", type: "file" },
+      ],
+      truncated: true,
+      nextOffset: 2,
+    });
+
+    const second = await tool.execute({
+      path: ".",
+      offset: JSON.parse(first.content).nextOffset,
+      maxEntries: 2,
+    }, context);
+    expect(second.isError).toBe(false);
+    expect(JSON.parse(second.content)).toMatchObject({
+      offset: 2,
+      entries: [
+        { path: "c.txt", type: "file" },
+        { path: "d.txt", type: "file" },
+      ],
+      truncated: false,
+    });
+    expect(JSON.parse(second.content)).not.toHaveProperty("nextOffset");
   });
 
   it("denies sensitive files and hides protected entries from root listings", async () => {

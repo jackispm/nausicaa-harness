@@ -16,21 +16,31 @@ import {
 
 const DEFAULT_MAX_ENTRIES = 200;
 const HARD_MAX_ENTRIES = 1_000;
+const HARD_MAX_OFFSET = 1_000_000;
+
+interface ListFilesOutput {
+  path: string;
+  offset: number;
+  entries: Array<{ path: string; type: "file" | "directory" | "symlink" | "other" }>;
+  truncated: boolean;
+  nextOffset?: number;
+}
 
 export function createListFilesTool(policy: WorkspacePathPolicy = {}): AgentTool {
   const pathPolicy = snapshotPolicy(policy);
   return {
-  definition: {
-    name: "list_files",
-    description: "List workspace files in stable order without following directory symlinks.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Workspace-relative directory; defaults to ." },
-        recursive: { type: "boolean" },
-        maxEntries: { type: "integer", minimum: 1, maximum: HARD_MAX_ENTRIES },
-      },
-      additionalProperties: false,
+    definition: {
+      name: "list_files",
+      description: "List workspace files in stable order without following directory symlinks. Use offset and nextOffset to continue a large listing.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Workspace-relative directory; defaults to ." },
+          recursive: { type: "boolean" },
+          offset: { type: "integer", minimum: 0, maximum: HARD_MAX_OFFSET, description: "Number of stable entries to skip before returning this page" },
+          maxEntries: { type: "integer", minimum: 1, maximum: HARD_MAX_ENTRIES },
+        },
+        additionalProperties: false,
     },
   },
 
@@ -39,6 +49,7 @@ export function createListFilesTool(policy: WorkspacePathPolicy = {}): AgentTool
       throwIfAborted(context.signal);
       const requestedPath = optionalString(arguments_.path, "path") ?? ".";
       const recursive = optionalBoolean(arguments_.recursive, "recursive") ?? false;
+      const offset = boundedOffset(arguments_.offset);
       const maxEntries = boundedInteger(
         arguments_.maxEntries,
         "maxEntries",
@@ -50,7 +61,9 @@ export function createListFilesTool(policy: WorkspacePathPolicy = {}): AgentTool
         requestedPath,
         pathPolicy,
       );
-      const entries: Array<{ path: string; type: "file" | "directory" | "symlink" | "other" }> = [];
+      const entries: ListFilesOutput["entries"] = [];
+      const stopAfter = offset + maxEntries;
+      let discovered = 0;
       let truncated = false;
 
       const visit = async (directory: ResolvedWorkspacePath): Promise<void> => {
@@ -74,7 +87,7 @@ export function createListFilesTool(policy: WorkspacePathPolicy = {}): AgentTool
         children.sort((left, right) => left.name.localeCompare(right.name));
         for (const child of children) {
           throwIfAborted(context.signal);
-          if (entries.length >= maxEntries) {
+          if (discovered >= stopAfter) {
             truncated = true;
             return;
           }
@@ -89,7 +102,10 @@ export function createListFilesTool(policy: WorkspacePathPolicy = {}): AgentTool
               : child.isSymbolicLink()
                 ? "symlink"
                 : "other";
-          entries.push({ path: relativePath(resolved.workspace, absolute), type });
+          discovered += 1;
+          if (discovered > offset) {
+            entries.push({ path: relativePath(resolved.workspace, absolute), type });
+          }
           if (recursive && child.isDirectory()) {
             await visit(await resolveExistingWorkspacePath(
               resolved.workspace,
@@ -104,7 +120,13 @@ export function createListFilesTool(policy: WorkspacePathPolicy = {}): AgentTool
       };
 
       await visit(resolved);
-      return success({ path: resolved.relative, entries, truncated });
+      return success({
+        path: resolved.relative,
+        offset,
+        entries,
+        truncated,
+        ...(truncated ? { nextOffset: offset + entries.length } : {}),
+      });
     } catch (error: unknown) {
       return failure(error instanceof Error ? error.message : "Directory listing failed");
     }
@@ -153,7 +175,15 @@ function boundedInteger(
   return value as number;
 }
 
-function success(value: unknown): ToolResult {
+function boundedOffset(value: unknown): number {
+  if (value === undefined) return 0;
+  if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > HARD_MAX_OFFSET) {
+    throw new TypeError(`offset must be an integer between 0 and ${HARD_MAX_OFFSET}`);
+  }
+  return value as number;
+}
+
+function success(value: ListFilesOutput): ToolResult {
   return { content: JSON.stringify(value), isError: false };
 }
 

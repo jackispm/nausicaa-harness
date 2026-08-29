@@ -9,6 +9,8 @@ export type OutputMode = "interactive" | "print" | "json";
 export interface CliOptions {
   help: boolean;
   version: boolean;
+  daemon: boolean;
+  daemonSocket?: string;
   mode: OutputMode;
   modeExplicit: boolean;
   continue: boolean;
@@ -24,6 +26,8 @@ export interface CliOptions {
   maxOutputTokens?: number;
   allowShell?: boolean;
   allowWrite?: boolean;
+  /** Explicitly enable network-backed workspace tools. */
+  allowNetwork?: boolean;
   /** Explicit Fukai compaction declaration; parsing it never runs a provider. */
   fukaiCompaction?: FukaiCompactionSettings;
   fileArgs: string[];
@@ -68,6 +72,7 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   const options: CliOptions = {
     help: false,
     version: false,
+    daemon: false,
     mode: "interactive",
     modeExplicit: false,
     continue: false,
@@ -95,6 +100,13 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
       case "--json":
         options.mode = "json";
         options.modeExplicit = true;
+        break;
+      case "--daemon":
+        options.daemon = true;
+        break;
+      case "--daemon-socket":
+        options.daemonSocket = readValue(args, index, argument);
+        index += 1;
         break;
       case "--mode": {
         const mode = readValue(args, index, argument);
@@ -177,6 +189,9 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
       case "--allow-shell":
         options.allowShell = true;
         break;
+      case "--allow-network":
+        options.allowNetwork = true;
+        break;
       case "--workspace":
         options.workspace = readValue(args, index, argument);
         index += 1;
@@ -236,6 +251,19 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   if (options.resume !== undefined && options.continue) {
     throw new CliUsageError("--resume and --continue are mutually exclusive");
   }
+  if (options.daemonSocket !== undefined && !options.daemon) {
+    throw new CliUsageError("--daemon-socket requires --daemon");
+  }
+  if (options.daemon && (
+    options.modeExplicit
+    || options.continue
+    || options.resume !== undefined
+    || options.resolveOperation !== undefined
+    || options.fileArgs.length > 0
+    || options.message !== undefined
+  )) {
+    throw new CliUsageError("--daemon cannot be combined with a task, resume, or output mode");
+  }
   return options;
 };
 
@@ -243,10 +271,13 @@ export const usage = `Nausicaa 0.1
 
 Usage:
   nausicaa [options] [@image ...] [message]
+  nausicaa --daemon [options]
 
 Options:
   -p, --print             Run once and print the final answer
   --json                  Emit NDJSON events and results
+  --daemon                Run the long-lived daemon control host
+  --daemon-socket <path>  Unix JSONL control socket (default: <data-dir>/daemon/control.sock)
   --mode <interactive|print|json>
                           Select the output mode
   --model <provider:id>   Main model, for example openrouter:openai/gpt-5-mini
@@ -268,6 +299,7 @@ Options:
                           Fukai compaction wall-clock budget
   --allow-write           Allow workspace file writes for this run
   --allow-shell           Explicit high privilege: shell may read/write outside the workspace
+  --allow-network         Allow public web fetch/search tools for this run
   --workspace <path>      Bound tools to this workspace
   --data-dir <path>       Runtime state directory (default: .nausicaa)
   --max-steps <number>    Maximum Main model steps (default: 24)

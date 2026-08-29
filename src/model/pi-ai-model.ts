@@ -262,11 +262,22 @@ function toPiMessage(
     };
   }
   if (message.role === "tool") {
+    if ((message.images?.length ?? 0) > 0 && !model.input.includes("image")) {
+      throw new Error("Selected model does not support image input");
+    }
+    const content: Array<
+      | { type: "text"; text: string }
+      | { type: "image"; data: string; mimeType: string }
+    > = [];
+    if (message.content.length > 0) {
+      content.push({ type: "text", text: message.content });
+    }
+    content.push(...(message.images ?? []).map((image) => structuredClone(image)));
     return {
       role: "toolResult",
       toolCallId: message.toolCallId,
       toolName: message.toolName,
-      content: [{ type: "text", text: message.content }],
+      content,
       isError: message.isError,
       timestamp,
     };

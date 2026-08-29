@@ -121,6 +121,8 @@ export interface FukaiContextRequest {
   upperWatermark: number;
   policyVersion: string;
   budget: FukaiBudget;
+  /** False removes image blocks while retaining an explicit textual marker. */
+  imageInputSupported?: boolean;
   /** Optional verified capsule selected for this request. */
   compaction?: FukaiCompactionSelection;
   signal?: AbortSignal;
@@ -134,6 +136,7 @@ export type FukaiTruncationKind =
   | "query-limit"
   | "missing-conversation"
   | "missing-artifact"
+  | "image-budget"
   | "conversation-shape";
 
 export interface FukaiTruncation {

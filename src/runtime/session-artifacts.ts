@@ -29,6 +29,7 @@ export type SessionTranscriptEntry =
   | {
       role: "tool";
       content: string;
+      imageTypes?: string[];
       turnId: string;
       toolName: string;
       toolCallId: string;
@@ -121,6 +122,9 @@ export async function projectSessionTranscript(
     upsertTranscriptToolEntry(transcript, toolEntryIndexes, {
       role: "tool",
       content: message.content,
+      ...(userImageSummary(message.images).length === 0
+        ? {}
+        : { imageTypes: userImageSummary(message.images) }),
       turnId,
       toolName: event.payload.name,
       toolCallId: event.payload.toolCallId,
@@ -187,8 +191,15 @@ export async function readConversationArtifact(
     } catch (error: unknown) {
       throw new SessionProtocolError("Conversation image artifact is invalid", { cause: error });
     }
+  } else if ((value as { role?: unknown }).role === "tool"
+    && (value as { images?: unknown }).images !== undefined) {
+    try {
+      validateUserImages((value as { images?: unknown }).images);
+    } catch (error: unknown) {
+      throw new SessionProtocolError("Conversation tool image artifact is invalid", { cause: error });
+    }
   } else if ((value as { images?: unknown }).images !== undefined) {
-    throw new SessionProtocolError("Only user messages may contain images");
+    throw new SessionProtocolError("Only user and tool messages may contain images");
   }
   return value as ConversationMessage;
 }
