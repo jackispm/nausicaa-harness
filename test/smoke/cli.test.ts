@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -89,6 +89,37 @@ describe("built CLI", () => {
       expect(failure?.stderr).toContain("Resume with:");
       expect(failure?.stderr).toContain("--workspace");
       expect(failure?.stderr).toContain("--data-dir");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("discovers and reports damaged Runs before exposing the daemon socket", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-cli-daemon-"));
+    const stateDir = join(root, "state");
+    try {
+      await mkdir(join(stateDir, "runs", "damaged"), { recursive: true });
+      await writeFile(join(stateDir, "runs", "damaged", "ledger.jsonl"), "not-json\n");
+      const failure = await execFileAsync(builtCli, [
+        "--daemon",
+        "--workspace",
+        root,
+        "--data-dir",
+        stateDir,
+        "--daemon-socket",
+        "/dev/null",
+      ], {
+        cwd: process.cwd(),
+        env: { ...process.env, NAUSICAA_MODEL: "scripted" },
+      }).then(
+        () => undefined,
+        (error: unknown) => error as { code?: number; stderr?: string },
+      );
+      expect(failure?.code).toBe(1);
+      expect(failure?.stderr).toContain("skipped Run damaged during recovery");
+      expect(failure?.stderr).toContain("control path exists and is not a Unix socket");
+      expect(failure?.stderr?.indexOf("skipped Run damaged during recovery"))
+        .toBeLessThan(failure?.stderr?.indexOf("control path exists and is not a Unix socket"));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

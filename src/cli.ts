@@ -10,12 +10,15 @@ import {
   resolveSettings,
   SettingsError,
   type Settings,
+  type ResolvedSettings,
 } from "./config/index.js";
 import type { AnyEvent } from "./domain/events.js";
 import { DEFAULT_MAIN_OUTPUT_TOKENS } from "./domain/types.js";
 import {
+  DaemonControlServer,
   executeRun,
   findLatestRunId,
+  openDaemonRuntime,
   SessionController,
 } from "./runtime/index.js";
 import {
@@ -48,6 +51,7 @@ const main = async (): Promise<number> => {
   }
   if (
     !options.modeExplicit
+    && !options.daemon
     && (!process.stdin.isTTY || !process.stdout.isTTY)
   ) {
     process.stderr.write(
@@ -62,6 +66,7 @@ const main = async (): Promise<number> => {
   let resolvedMaxOutputTokens = DEFAULT_MAIN_OUTPUT_TOKENS;
   let resolvedAllowWrite = false;
   let resolvedAllowShell = false;
+  let resolvedAllowNetwork = false;
   let activeRunId = options.resume;
   try {
     const settings = await loadSettings(workspace);
@@ -76,6 +81,7 @@ const main = async (): Promise<number> => {
       ...(options.dataDir === undefined ? {} : { dataDir: options.dataDir }),
       ...(options.allowWrite === undefined ? {} : { allowWrite: options.allowWrite }),
       ...(options.allowShell === undefined ? {} : { allowShell: options.allowShell }),
+      ...(options.allowNetwork === undefined ? {} : { allowNetwork: options.allowNetwork }),
       ...(options.fukaiCompaction === undefined
         ? {}
         : { fukaiCompaction: options.fukaiCompaction }),
@@ -92,6 +98,14 @@ const main = async (): Promise<number> => {
     resolvedMaxOutputTokens = resolvedSettings.maxOutputTokens;
     resolvedAllowWrite = resolvedSettings.allowWrite;
     resolvedAllowShell = resolvedSettings.allowShell;
+    resolvedAllowNetwork = resolvedSettings.allowNetwork;
+    if (options.daemon) {
+      return await runDaemonMode({
+        workspace,
+        settings: resolvedSettings,
+        ...(options.daemonSocket === undefined ? {} : { socketPath: options.daemonSocket }),
+      });
+    }
     const processedImages = await processImageInputs(options.fileArgs, {
       workspace,
       protectedPaths: [resolvedSettings.dataDir],
@@ -120,6 +134,7 @@ const main = async (): Promise<number> => {
         },
         allowWrite: resolvedSettings.allowWrite,
         allowShell: resolvedSettings.allowShell,
+        allowNetwork: resolvedSettings.allowNetwork,
         ...(selectedRunId === undefined ? {} : { runId: selectedRunId }),
       });
       if (options.resolveOperation !== undefined) {
@@ -170,6 +185,7 @@ const main = async (): Promise<number> => {
         },
         allowWrite: resolvedSettings.allowWrite,
         allowShell: resolvedSettings.allowShell,
+        allowNetwork: resolvedSettings.allowNetwork,
         signal: controller.signal,
       }, {
         onEvent: (event: AnyEvent) => {
@@ -216,6 +232,7 @@ const main = async (): Promise<number> => {
         maxOutputTokens: resolvedMaxOutputTokens,
         allowWrite: resolvedAllowWrite,
         allowShell: resolvedAllowShell,
+        allowNetwork: resolvedAllowNetwork,
         operationId,
       });
       if (options.mode === "json") {
@@ -248,6 +265,7 @@ const main = async (): Promise<number> => {
         maxOutputTokens: resolvedMaxOutputTokens,
         allowWrite: resolvedAllowWrite,
         allowShell: resolvedAllowShell,
+        allowNetwork: resolvedAllowNetwork,
       });
       if (options.mode === "json") {
         writeJson({
@@ -277,6 +295,72 @@ const writeJson = (value: unknown): void => {
   process.stdout.write(`${stringifyRedactedJson(value)}\n`);
 };
 
+interface DaemonModeOptions {
+  workspace: string;
+  settings: ResolvedSettings;
+  socketPath?: string;
+}
+
+/** Run the minimal local daemon host until an explicit process signal. */
+const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
+  const daemon = await openDaemonRuntime({
+    host: {
+      leasePath: resolve(options.settings.dataDir, "daemon", "execution-lease.json"),
+    },
+    session: {
+      workspace: options.workspace,
+      dataDir: options.settings.dataDir,
+      model: options.settings.model,
+      tetoModel: options.settings.tetoModel,
+      policy: {
+        maxMainStepsPerActivation: options.settings.maxSteps,
+        maxModelTokens: options.settings.maxModelTokens,
+        tetoEnabled: options.settings.tetoEnabled,
+        tetoMaxOutputTokens: 64,
+        tetoTokenRatio: 0.1,
+      },
+      maxOutputTokens: options.settings.maxOutputTokens,
+      allowWrite: options.settings.allowWrite,
+      allowShell: options.settings.allowShell,
+      allowNetwork: options.settings.allowNetwork,
+    },
+  });
+  const socketPath = resolve(
+    options.workspace,
+    options.socketPath ?? resolve(options.settings.dataDir, "daemon", "control.sock"),
+  );
+  const control = new DaemonControlServer({ host: daemon.host, socketPath });
+  let resolveShutdown!: () => void;
+  const shutdown = new Promise<void>((resolvePromise) => {
+    resolveShutdown = resolvePromise;
+  });
+  const onSignal = (): void => resolveShutdown();
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  try {
+    await daemon.start();
+    const recovered = await daemon.recoverPendingRuns();
+    for (const failure of recovered.failures) {
+      process.stderr.write(
+        `Nausicaa daemon skipped Run ${failure.runId ?? "<unknown>"} during recovery `
+        + `(${failure.kind}): ${failure.error}\n`,
+      );
+    }
+    await control.listen();
+    const recoveredText = recovered.queuedRunIds.length === 0
+      ? ""
+      : `; recovered ${recovered.queuedRunIds.length} pending Run(s)`;
+    process.stdout.write(`Nausicaa daemon listening on ${socketPath}${recoveredText}\n`);
+    await shutdown;
+    return 0;
+  } finally {
+    process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
+    await control.close().catch(() => undefined);
+    await daemon.stop().catch(() => undefined);
+  }
+};
+
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 
 const combineInitialMessage = (
@@ -295,6 +379,7 @@ interface ResumeCommandOptions {
   maxOutputTokens: number;
   allowWrite: boolean;
   allowShell: boolean;
+  allowNetwork: boolean;
   operationId?: string;
 }
 
@@ -309,6 +394,7 @@ const buildResumeCommand = (options: ResumeCommandOptions): string => [
   String(options.maxOutputTokens),
   ...(options.allowWrite ? ["--allow-write"] : []),
   ...(options.allowShell ? ["--allow-shell"] : []),
+  ...(options.allowNetwork ? ["--allow-network"] : []),
   "--resume",
   shellQuote(options.runId),
   ...(options.operationId === undefined
