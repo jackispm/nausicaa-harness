@@ -1,5 +1,5 @@
-import { lstat } from "node:fs/promises";
-import { resolve } from "node:path";
+import { lstat, readdir } from "node:fs/promises";
+import { relative, resolve } from "node:path";
 
 import type {
   DaemonActivationRequest,
@@ -20,6 +20,8 @@ import {
 } from "./session-controller.js";
 import { persistedErrorText } from "./redaction.js";
 import { JsonlLedger, type Ledger } from "../ledger/index.js";
+import { recoverRun, type RunRecoveryState } from "./recovery.js";
+import { projectPendingAdmissions } from "./session-artifacts.js";
 
 /** The minimum surface an activation adapter needs from a SessionController. */
 export interface DaemonSession {
@@ -41,6 +43,58 @@ export class DaemonRuntimeCompositionError extends Error {
 
 export class DaemonRuntimeActivationError extends Error {
   override readonly name = "DaemonRuntimeActivationError";
+}
+
+export class DaemonRunDiscoveryError extends Error {
+  override readonly name = "DaemonRunDiscoveryError";
+}
+
+export type DaemonRunDiscoveryFailureKind =
+  | "invalid-run-id"
+  | "symlink"
+  | "missing-ledger"
+  | "invalid-ledger"
+  | "open-failed"
+  | "read-failed";
+
+export interface DaemonRunDiscoveryFailure {
+  readonly path: string;
+  readonly runId?: string;
+  readonly kind: DaemonRunDiscoveryFailureKind;
+  readonly error: string;
+}
+
+export interface DiscoveredDaemonRun {
+  readonly runId: string;
+  readonly ledgerPath: string;
+  readonly pendingInputIds: readonly string[];
+  readonly lastOffset: number;
+}
+
+export interface DaemonRunDiscoveryOptions {
+  /** Root containing the conventional `<dataDir>/runs/<runId>/ledger.jsonl`. */
+  readonly dataDir: string;
+  /** Optional bound to keep a damaged or unexpectedly large directory bounded. */
+  readonly maxRuns?: number;
+  /** Test/backend seam; the default opens a regular JsonlLedger at ledgerPath. */
+  readonly openLedger?: (runId: string, ledgerPath: string) => Promise<Ledger>;
+}
+
+export interface DaemonRunDiscoveryResult {
+  readonly runs: readonly DiscoveredDaemonRun[];
+  readonly failures: readonly DaemonRunDiscoveryFailure[];
+}
+
+export interface RecoveredDaemonRun {
+  readonly runId: string;
+  readonly ledgerPath: string;
+  readonly pendingInputIds: readonly string[];
+  readonly recovery: RunRecoveryState;
+}
+
+export interface DaemonRunRecoveryResult {
+  readonly runs: readonly RecoveredDaemonRun[];
+  readonly failures: readonly DaemonRunDiscoveryFailure[];
 }
 
 export interface DaemonSessionActivatorOptions {
@@ -185,6 +239,208 @@ export async function openDaemonRuntime(
     start: () => host.start(),
     stop: () => host.stop(),
   };
+}
+
+/**
+ * Discover Runs which already have a regular Ledger on disk.
+ *
+ * Discovery is deliberately explicit and read-only: it never creates a Run,
+ * admits an input, or wakes a Host. A malformed child is returned as a
+ * failure so one damaged Ledger cannot hide healthy Runs beside it.
+ */
+export async function discoverDaemonRuns(
+  options: DaemonRunDiscoveryOptions,
+): Promise<DaemonRunDiscoveryResult> {
+  const normalized = normalizeDiscoveryOptions(options);
+  const root = resolve(normalized.dataDir, "runs");
+  const rootInfo = await lstat(root).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new DaemonRunDiscoveryError(
+      `Unable to inspect Run directory: ${persistedErrorText(error)}`,
+    );
+  });
+  if (rootInfo === undefined) return { runs: [], failures: [] };
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+    throw new DaemonRunDiscoveryError("Run directory must be a regular directory");
+  }
+
+  const entries = await readdir(root, { withFileTypes: true });
+  const runs: DiscoveredDaemonRun[] = [];
+  const failures: DaemonRunDiscoveryFailure[] = [];
+  const openLedger = normalized.openLedger ?? ((runId: string, ledgerPath: string) => (
+    JsonlLedger.open(ledgerPath)
+  ));
+  const candidates = entries
+    .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+    .sort((left, right) => left.name.localeCompare(right.name));
+
+  for (const entry of candidates) {
+    if (runs.length >= normalized.maxRuns) break;
+    const runPath = resolve(root, entry.name);
+    if (entry.isSymbolicLink()) {
+      failures.push(failure(runPath, entry.name, "symlink", "Run directory is a symbolic link"));
+      continue;
+    }
+    if (!isSafeRunId(entry.name)) {
+      failures.push(failure(runPath, entry.name, "invalid-run-id", "Run directory name is not a safe identifier"));
+      continue;
+    }
+    const ledgerPath = resolve(runPath, "ledger.jsonl");
+    if (!isWithin(root, ledgerPath)) {
+      failures.push(failure(ledgerPath, entry.name, "invalid-run-id", "Run Ledger escapes the Run directory"));
+      continue;
+    }
+    const ledgerInfo = await lstat(ledgerPath).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      failures.push(failure(ledgerPath, entry.name, "read-failed", persistedErrorText(error)));
+      return undefined;
+    });
+    if (ledgerInfo === undefined) {
+      if (!failures.some((candidate) => candidate.path === ledgerPath)) {
+        failures.push(failure(ledgerPath, entry.name, "missing-ledger", "Run Ledger does not exist"));
+      }
+      continue;
+    }
+    if (ledgerInfo.isSymbolicLink() || !ledgerInfo.isFile()) {
+      failures.push(failure(ledgerPath, entry.name, "symlink", "Run Ledger must be a regular file"));
+      continue;
+    }
+
+    let ledger: Ledger;
+    try {
+      ledger = await openLedger(entry.name, ledgerPath);
+    } catch (error: unknown) {
+      failures.push(failure(ledgerPath, entry.name, "open-failed", persistedErrorText(error)));
+      continue;
+    }
+    try {
+      const events = await ledger.read();
+      if (events.length === 0) {
+        failures.push(failure(ledgerPath, entry.name, "invalid-ledger", "Run Ledger is empty"));
+        continue;
+      }
+      if (events.some((event) => event.runId !== entry.name)) {
+        failures.push(failure(ledgerPath, entry.name, "invalid-ledger", "Ledger contains another Run ID"));
+        continue;
+      }
+      const pendingInputIds = projectPendingAdmissions(events).map((event) => event.payload.inputId);
+      runs.push({
+        runId: entry.name,
+        ledgerPath,
+        pendingInputIds,
+        lastOffset: events.at(-1)?.globalOffset ?? 0,
+      });
+    } catch (error: unknown) {
+      failures.push(failure(ledgerPath, entry.name, "invalid-ledger", persistedErrorText(error)));
+    } finally {
+      try {
+        await ledger.close();
+      } catch (error: unknown) {
+        failures.push(failure(ledgerPath, entry.name, "read-failed", `Unable to close Ledger: ${persistedErrorText(error)}`));
+      }
+    }
+  }
+  return { runs, failures };
+}
+
+/**
+ * Reopen and recover only Runs which had an undelivered admitted input at the
+ * time of discovery. Recovery uses the existing `recoverRun` projection and
+ * idempotency rules; this function does not create a second daemon journal.
+ */
+export async function recoverPendingDaemonRuns(
+  options: DaemonRunDiscoveryOptions,
+): Promise<DaemonRunRecoveryResult> {
+  const normalized = normalizeDiscoveryOptions(options);
+  const discovered = await discoverDaemonRuns(normalized);
+  const runs: RecoveredDaemonRun[] = [];
+  const failures = [...discovered.failures];
+  const openLedger = normalized.openLedger ?? ((runId: string, ledgerPath: string) => (
+    JsonlLedger.open(ledgerPath)
+  ));
+
+  for (const candidate of discovered.runs) {
+    if (candidate.pendingInputIds.length === 0) continue;
+    let ledger: Ledger;
+    try {
+      ledger = await openLedger(candidate.runId, candidate.ledgerPath);
+    } catch (error: unknown) {
+      failures.push(failure(candidate.ledgerPath, candidate.runId, "open-failed", persistedErrorText(error)));
+      continue;
+    }
+    try {
+      const recovery = await recoverRun(ledger, candidate.runId);
+      runs.push({
+        runId: candidate.runId,
+        ledgerPath: candidate.ledgerPath,
+        pendingInputIds: projectPendingAdmissions(recovery.events)
+          .map((event) => event.payload.inputId),
+        recovery,
+      });
+    } catch (error: unknown) {
+      failures.push(failure(candidate.ledgerPath, candidate.runId, "invalid-ledger", persistedErrorText(error)));
+    } finally {
+      try {
+        await ledger.close();
+      } catch (error: unknown) {
+        failures.push(failure(candidate.ledgerPath, candidate.runId, "read-failed", `Unable to close Ledger: ${persistedErrorText(error)}`));
+      }
+    }
+  }
+  return { runs, failures };
+}
+
+function normalizeDiscoveryOptions(
+  options: DaemonRunDiscoveryOptions,
+): DaemonRunDiscoveryOptions & { readonly dataDir: string; readonly maxRuns: number } {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new DaemonRunDiscoveryError("discovery options must be an object");
+  }
+  if (
+    typeof options.dataDir !== "string"
+    || options.dataDir.trim().length === 0
+    || options.dataDir.includes("\0")
+  ) {
+    throw new DaemonRunDiscoveryError("dataDir must be a non-empty path without NUL");
+  }
+  const maxRuns = options.maxRuns ?? Number.MAX_SAFE_INTEGER;
+  if (!Number.isSafeInteger(maxRuns) || maxRuns < 1) {
+    throw new DaemonRunDiscoveryError("maxRuns must be a positive safe integer");
+  }
+  if (options.openLedger !== undefined && typeof options.openLedger !== "function") {
+    throw new DaemonRunDiscoveryError("openLedger must be a function");
+  }
+  return {
+    ...options,
+    dataDir: resolve(options.dataDir),
+    maxRuns,
+  };
+}
+
+function isSafeRunId(value: string): boolean {
+  return (
+    value.length > 0
+    && value.trim() === value
+    && value !== "."
+    && value !== ".."
+    && !value.includes("\0")
+    && !value.includes("/")
+    && !value.includes("\\")
+  );
+}
+
+function isWithin(root: string, target: string): boolean {
+  const outside = relative(root, target);
+  return outside === "" || (outside !== ".." && !outside.startsWith("../"));
+}
+
+function failure(
+  path: string,
+  runId: string,
+  kind: DaemonRunDiscoveryFailureKind,
+  error: string,
+): DaemonRunDiscoveryFailure {
+  return { path, runId, kind, error };
 }
 
 async function openExistingRunLedger(
