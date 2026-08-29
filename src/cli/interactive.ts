@@ -103,6 +103,11 @@ interface QueuedSubmission {
   resolve: () => void;
 }
 
+interface PromptStash {
+  text: string;
+  images: readonly (readonly [number, UserImage])[];
+}
+
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_INTERRUPT_EXIT_WINDOW_MS = 1_000;
 
@@ -157,6 +162,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   } | undefined;
   const submissionQueue: QueuedSubmission[] = [];
   const pastedImages = new Map<number, UserImage>();
+  const promptStashes = new Map<string, PromptStash>();
+  let detachedPromptStashSequence = 1;
+  let promptStashScope = options.session.snapshot().runId ?? "<new-run:0>";
   const promptHistory: string[] = [];
   const reservedImageMarkerIds = new Set<number>();
   const pastedImageBudgetBytes = options.pastedImageBudgetBytes ?? MAX_PASTED_IMAGE_BYTES;
@@ -329,7 +337,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       "**Prompt**",
       "`Tab` complete paths  ·  `Alt+Enter` queue follow-up",
       "**Controls**",
-      `\`${pasteImageLabel}\` paste image  ·  \`Ctrl+O\` tool output  ·  \`Ctrl+T\` thinking`,
+      `\`${pasteImageLabel}\` paste image  ·  \`Ctrl+S\` stash prompt`,
+      "`Ctrl+O` tool output  ·  `Ctrl+T` thinking",
       "**Help**",
       "`/help` commands  ·  `Ctrl+C` cancel or clear; twice when idle to exit",
     ].join("\n\n"), 1, 0, nausicaaMarkdownTheme));
@@ -400,6 +409,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     pastedImages.set(id, image);
     const keep = new Set(imageMarkerIds(editor.getText()));
     keep.add(id);
+    for (const stash of promptStashes.values()) {
+      for (const [markerId] of stash.images) keep.add(markerId);
+    }
     try {
       evictImagesToBudget(
         pastedImages,
@@ -484,6 +496,55 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           );
         }
       });
+  };
+
+  const promptStashKey = (): string => promptStashScope;
+
+  const adoptAttachedPromptStashScope = (): void => {
+    const runId = options.session.snapshot().runId;
+    if (runId === undefined || !promptStashScope.startsWith("<new-run:")) return;
+    const stash = promptStashes.get(promptStashScope);
+    if (stash !== undefined) promptStashes.set(runId, stash);
+    promptStashes.delete(promptStashScope);
+    promptStashScope = runId;
+  };
+
+  const snapshotPromptStash = (text: string): PromptStash => {
+    const markerIds = new Set(imageMarkerIds(text));
+    const images = [...pastedImages.entries()]
+      .filter(([markerId]) => markerIds.has(markerId))
+      .map(([markerId, image]) => [markerId, structuredClone(image)] as const);
+    return { text, images };
+  };
+
+  const handlePromptStash = (): void => {
+    const key = promptStashKey();
+    // Expand pi-tui paste placeholders before clearing the editor so a large
+    // pasted prompt remains complete even though this client has no paste-
+    // snapshot restoration API.
+    const text = editor.getExpandedText();
+    if (text.trim().length > 0) {
+      if (promptStashes.has(key)) {
+        appendNotice("Prompt stash already has a draft.", "warning");
+        return;
+      }
+      promptStashes.set(key, snapshotPromptStash(text));
+      editor.setText("");
+      appendNotice("Stashed prompt.", "success");
+      return;
+    }
+
+    const stash = promptStashes.get(key);
+    if (stash === undefined) {
+      appendNotice("No prompt to stash.", "info");
+      return;
+    }
+    promptStashes.delete(key);
+    for (const [markerId, image] of stash.images) {
+      pastedImages.set(markerId, structuredClone(image));
+    }
+    editor.setText(stash.text);
+    appendNotice("Restored stashed prompt.", "success");
   };
 
   const appendAssistant = (
@@ -1124,6 +1185,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       return;
     }
     await options.session.attachRun(runId);
+    if (promptStashScope.startsWith("<new-run:")) {
+      promptStashes.delete(promptStashScope);
+    }
+    promptStashScope = runId;
     await loadAttachedTranscript(true);
     await refreshQueue();
     appendNotice(`Attached Run ${runId}.`, "success");
@@ -1175,7 +1240,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             "`/cancel` cancel active Turn  ·  `/resolve <operation-id>` resolve recovery",
             "`/copy` copy the last assistant answer",
             "`/exit` close session  ·  `Alt+Enter` queue follow-up",
-            `\`${pasteImageLabel}\` paste image  ·  \`Ctrl+T\` thinking  ·  \`Ctrl+O\` tool output`,
+            `\`${pasteImageLabel}\` paste image  ·  \`Ctrl+S\` stash prompt`,
+            "`Ctrl+T` thinking  ·  `Ctrl+O` tool output",
             "`Ctrl+Up/Down` jump between prompts  ·  `Ctrl+Shift+F` search transcript",
             "`Ctrl+C` cancel/clear",
           ].join("\n\n"), 1, 0, nausicaaMarkdownTheme));
@@ -1249,6 +1315,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
               : `Goal v${goal.version}: ${goal.statement}`);
           } else {
             const goal = await options.session.reviseGoal(statement);
+            adoptAttachedPromptStashScope();
             appendNotice(`Goal v${goal.version}: ${goal.statement}`, "success");
           }
           break;
@@ -1262,6 +1329,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           break;
         case "/new":
           await options.session.newRun();
+          promptStashes.delete(promptStashKey());
+          promptStashScope = `<new-run:${detachedPromptStashSequence}>`;
+          detachedPromptStashSequence += 1;
           transcriptGeneration += 1;
           header.setCompact(false);
           resetTranscript();
@@ -1338,6 +1408,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           : { images: structuredClone(submission.images) }),
         delivery: submission.delivery,
       });
+      adoptAttachedPromptStashScope();
       addPromptToHistory(value);
     } catch (error: unknown) {
       const currentDraft = editor.getExpandedText();
@@ -1448,6 +1519,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
     if (matchesKey(data, pasteImageKey)) {
       queueClipboardImagePaste();
+      return { consume: true };
+    }
+    if (matchesKey(data, "ctrl+s")) {
+      handlePromptStash();
       return { consume: true };
     }
     if (matchesKey(data, "alt+enter")) {

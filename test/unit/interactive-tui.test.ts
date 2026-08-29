@@ -363,6 +363,7 @@ describe("interactive TUI", () => {
       await terminal.started;
       terminal.send("?");
       await waitForOutput(terminal, "Prompt");
+      expect(terminal.output).toContain("Ctrl+S");
       expect(model.callCount).toBe(0);
 
       terminal.type("why?");
@@ -370,6 +371,63 @@ describe("interactive TUI", () => {
       await waitForOutput(terminal, "QUESTION_ANSWER");
       expect(model.requests[0]?.messages.at(-1))
         .toMatchObject({ role: "user", content: "why?" });
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("stashes and restores an image draft with Ctrl+S without submitting it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-prompt-stash-"));
+    const previousExitCode = process.exitCode;
+    try {
+      const model = new ScriptedModel([response("STASH_ANSWER")]);
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, { mainModel: model });
+      const terminal = new MemoryTerminal(100, 28);
+      const running = runInteractive({
+        session,
+        terminal,
+        forceAltScreen: true,
+        clipboardImageReader: async () => ({
+          bytes: TINY_PNG,
+          mimeType: "image/png",
+        }),
+      });
+
+      await terminal.started;
+      terminal.send("\x16");
+      await waitForOutput(terminal, "[image #1]");
+      terminal.type(" draft to keep for later");
+      terminal.send("\x13");
+      await waitForOutput(terminal, "Stashed prompt");
+      expect(model.callCount).toBe(0);
+
+      terminal.type("do not replace the stash");
+      terminal.send("\x13");
+      await waitForOutput(terminal, "Prompt stash already has a draft");
+      terminal.send("\x03");
+
+      // Ctrl+S on an empty editor restores the exact draft, which can then be
+      // submitted normally.
+      terminal.send("\x13");
+      await waitForOutput(terminal, "Restored stashed prompt");
+      terminal.send("\r");
+      await waitForOutput(terminal, "STASH_ANSWER");
+      expect(model.requests[0]?.messages.at(-1))
+        .toMatchObject({
+          role: "user",
+          content: "[image #1] draft to keep for later",
+          images: [{ mimeType: "image/png", data: TINY_PNG.toString("base64") }],
+        });
 
       terminal.type("/exit");
       terminal.send("\r");
