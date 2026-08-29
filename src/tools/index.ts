@@ -1,4 +1,10 @@
-export { createBashTool, bashTool } from "./bash.js";
+export {
+  createBashTool,
+  bashTool,
+  type BashCommandExecutionInput,
+  type BashCommandExecutor,
+  type BashToolOptions,
+} from "./bash.js";
 export { createEditFileTool, editFileTool } from "./edit-file.js";
 export { createFindTool, findTool } from "./find.js";
 export {
@@ -100,7 +106,7 @@ export {
 } from "./web.js";
 
 import type { AgentTool } from "../domain/ports.js";
-import { createBashTool } from "./bash.js";
+import { createBashTool, type BashCommandExecutor } from "./bash.js";
 import { createEditFileTool } from "./edit-file.js";
 import { createFindTool } from "./find.js";
 import { createFileInfoTool } from "./file-info.js";
@@ -131,6 +137,8 @@ import { createWriteFileTool } from "./write-file.js";
 
 export interface WorkspaceToolOptions extends WorkspacePathPolicy {
   allowShell?: boolean;
+  /** Replace the foreground Bash execution backend; ignored unless allowShell is true. */
+  bashCommandExecutor?: BashCommandExecutor;
   allowWrite?: boolean;
   /** Include directory/copy/move/delete helpers with write tools. */
   allowPathOperations?: boolean;
@@ -194,7 +202,11 @@ export function createWorkspaceTools(options: WorkspaceToolOptions = {}): AgentT
     }
   }
   if (options.allowShell === true) {
-    tools.push(createBashTool());
+    tools.push(createBashTool({
+      ...(options.bashCommandExecutor === undefined
+        ? {}
+        : { commandExecutor: options.bashCommandExecutor }),
+    }));
     if (options.allowProcessJobs === true) {
       tools.push(...createProcessJobTools(
         options.processJobManager ?? new ProcessJobManager(policy),

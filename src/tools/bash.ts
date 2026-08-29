@@ -5,7 +5,25 @@ import { executeShellCommand, type ShellExecutionResult } from "./shell-process.
 
 const MAX_TIMEOUT_SECONDS = 2_147_483_647 / 1_000;
 
-export function createBashTool(): AgentTool {
+export interface BashCommandExecutionInput {
+  command: string;
+  cwd: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/** Narrow execution seam for an OS sandbox or another host-owned backend. */
+export type BashCommandExecutor = (
+  input: BashCommandExecutionInput,
+) => Promise<ShellExecutionResult>;
+
+export interface BashToolOptions {
+  /** Defaults to the existing unrestricted host-shell executor. */
+  commandExecutor?: BashCommandExecutor;
+}
+
+export function createBashTool(options: BashToolOptions = {}): AgentTool {
+  const commandExecutor = options.commandExecutor ?? executeShellCommand;
   return {
     definition: {
       name: "bash",
@@ -50,7 +68,7 @@ export function createBashTool(): AgentTool {
           return failure({ error: "Workspace is not a directory" });
         }
 
-        const execution = await executeShellCommand({
+        const execution = await commandExecutor({
           command,
           cwd: context.workspace,
           ...(timeout === undefined ? {} : { timeoutMs: timeout * 1_000 }),

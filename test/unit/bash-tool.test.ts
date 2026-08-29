@@ -5,7 +5,12 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createBashTool } from "../../src/tools/bash.js";
+import {
+  createBashTool,
+  type BashCommandExecutionInput,
+  type BashCommandExecutor,
+} from "../../src/tools/bash.js";
+import { createWorkspaceTools } from "../../src/tools/index.js";
 
 const temporaryDirectories: string[] = [];
 const supportsProcessListing = process.platform !== "win32"
@@ -41,6 +46,115 @@ describe("bash tool", () => {
       exitCode: 0,
       truncated: false,
     });
+  });
+
+  it("passes command context to an injected executor and preserves output metadata", async () => {
+    const workspace = await temporaryDirectory();
+    const controller = new AbortController();
+    let received: BashCommandExecutionInput | undefined;
+    const commandExecutor: BashCommandExecutor = async (input) => {
+      received = input;
+      return {
+        stdout: {
+          content: "bounded tail",
+          truncated: true,
+          truncatedBy: "bytes",
+          totalBytes: 60_000,
+          totalLines: 2_500,
+          outputBytes: 12,
+          outputLines: 1,
+        },
+        stderr: {
+          content: "warning",
+          truncated: false,
+          truncatedBy: null,
+          totalBytes: 7,
+          totalLines: 1,
+          outputBytes: 7,
+          outputLines: 1,
+        },
+        exitCode: 0,
+        aborted: false,
+        timedOut: false,
+      };
+    };
+
+    const result = await createBashTool({ commandExecutor }).execute(
+      { command: "npm test", timeout: 1.25 },
+      toolContext(workspace, controller.signal),
+    );
+
+    expect(received).toEqual({
+      command: "npm test",
+      cwd: workspace,
+      timeoutMs: 1_250,
+      signal: controller.signal,
+    });
+    expect(result.isError).toBe(false);
+    expect(parse(result)).toEqual({
+      stdout: "bounded tail",
+      stderr: "warning",
+      exitCode: 0,
+      aborted: false,
+      timedOut: false,
+      truncated: true,
+      truncation: {
+        stdout: {
+          truncated: true,
+          truncatedBy: "bytes",
+          totalBytes: 60_000,
+          totalLines: 2_500,
+          outputBytes: 12,
+          outputLines: 1,
+        },
+        stderr: {
+          truncated: false,
+          truncatedBy: null,
+          totalBytes: 7,
+          totalLines: 1,
+          outputBytes: 7,
+          outputLines: 1,
+        },
+      },
+    });
+  });
+
+  it("fails closed when an injected executor throws", async () => {
+    const workspace = await temporaryDirectory();
+    let calls = 0;
+    const commandExecutor: BashCommandExecutor = async () => {
+      calls += 1;
+      throw new Error("sandbox initialization failed");
+    };
+
+    const result = await createBashTool({ commandExecutor }).execute(
+      { command: "printf escaped > escaped.txt" },
+      toolContext(workspace),
+    );
+
+    expect(calls).toBe(1);
+    expect(result.isError).toBe(true);
+    expect(parse(result)).toEqual({ error: "sandbox initialization failed" });
+    await expect(readFile(path.join(workspace, "escaped.txt"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("forwards the injected executor through the workspace tool catalog", async () => {
+    const workspace = await temporaryDirectory();
+    let received: BashCommandExecutionInput | undefined;
+    const commandExecutor: BashCommandExecutor = async (input) => {
+      received = input;
+      return successfulExecution("catalog executor");
+    };
+    const bash = createWorkspaceTools({ allowShell: true, bashCommandExecutor: commandExecutor })
+      .find((tool) => tool.definition.name === "bash");
+
+    expect(bash).toBeDefined();
+    const result = await bash!.execute({ command: "build" }, toolContext(workspace));
+
+    expect(received).toEqual({ command: "build", cwd: workspace });
+    expect(result.isError).toBe(false);
+    expect(parse(result).stdout).toBe("catalog executor");
   });
 
   it("executes Bash syntax and describes that boundary explicitly", async () => {
@@ -302,4 +416,32 @@ async function temporaryDirectory(): Promise<string> {
 
 async function delay(milliseconds: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function successfulExecution(
+  stdout: string,
+): Awaited<ReturnType<BashCommandExecutor>> {
+  return {
+    stdout: {
+      content: stdout,
+      truncated: false,
+      truncatedBy: null,
+      totalBytes: Buffer.byteLength(stdout, "utf8"),
+      totalLines: stdout.length === 0 ? 0 : 1,
+      outputBytes: Buffer.byteLength(stdout, "utf8"),
+      outputLines: stdout.length === 0 ? 0 : 1,
+    },
+    stderr: {
+      content: "",
+      truncated: false,
+      truncatedBy: null,
+      totalBytes: 0,
+      totalLines: 0,
+      outputBytes: 0,
+      outputLines: 0,
+    },
+    exitCode: 0,
+    aborted: false,
+    timedOut: false,
+  };
 }
