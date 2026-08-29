@@ -3,6 +3,7 @@
 import { resolve } from "node:path";
 
 import { CliUsageError, parseCliArgs, usage } from "./cli/args.js";
+import { selectNewRecoveryFailures } from "./cli/daemon-recovery-reporting.js";
 import { processImageInputs } from "./cli/image-input.js";
 import { runInteractive } from "./cli/interactive.js";
 import {
@@ -20,6 +21,7 @@ import {
   findLatestRunId,
   openDaemonRuntime,
   SessionController,
+  type DaemonRunDiscoveryFailure,
 } from "./runtime/index.js";
 import {
   persistedErrorText,
@@ -310,6 +312,18 @@ interface DaemonModeOptions {
 
 /** Run the minimal local daemon host until an explicit process signal. */
 const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
+  const reportedRecoveryFailures = new Set<string>();
+  let reportedReconciliationError: string | undefined;
+  const reportRecoveryFailures = (
+    failures: readonly DaemonRunDiscoveryFailure[],
+  ): void => {
+    for (const failure of selectNewRecoveryFailures(failures, reportedRecoveryFailures)) {
+      process.stderr.write(
+        `Nausicaa daemon skipped Run ${failure.runId ?? "<unknown>"} during recovery `
+        + `(${failure.kind}): ${failure.error}\n`,
+      );
+    }
+  };
   const daemon = await openDaemonRuntime({
     host: {
       leasePath: resolve(options.settings.dataDir, "daemon", "execution-lease.json"),
@@ -340,6 +354,22 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
         ? { processJobRegistryDir: options.settings.dataDir }
         : {}),
     },
+    reconciliation: {
+      // A short, serialized poll closes the gap between startup recovery and
+      // Runs admitted while the daemon remains alive. No model calls happen
+      // during discovery; activation still goes through the Host lease.
+      intervalMs: 5_000,
+      onResult: (result) => {
+        reportRecoveryFailures(result.failures);
+        reportedReconciliationError = undefined;
+      },
+      onError: (error) => {
+        const message = persistedErrorText(error);
+        if (message === reportedReconciliationError) return;
+        reportedReconciliationError = message;
+        process.stderr.write(`Nausicaa daemon reconciliation failed: ${message}\n`);
+      },
+    },
   });
   const socketPath = resolve(
     options.workspace,
@@ -356,12 +386,7 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
   try {
     await daemon.start();
     const recovered = await daemon.recoverPendingRuns();
-    for (const failure of recovered.failures) {
-      process.stderr.write(
-        `Nausicaa daemon skipped Run ${failure.runId ?? "<unknown>"} during recovery `
-        + `(${failure.kind}): ${failure.error}\n`,
-      );
-    }
+    reportRecoveryFailures(recovered.failures);
     await control.listen();
     const recoveredText = recovered.queuedRunIds.length === 0
       ? ""

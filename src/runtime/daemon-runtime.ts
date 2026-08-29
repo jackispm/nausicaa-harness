@@ -20,7 +20,12 @@ import {
   type SessionControllerOptions,
 } from "./session-controller.js";
 import { persistedErrorText } from "./redaction.js";
-import { JsonlLedger, projectRun, type Ledger } from "../ledger/index.js";
+import {
+  JsonlLedger,
+  LedgerWriterLockedError,
+  projectRun,
+  type Ledger,
+} from "../ledger/index.js";
 import {
   recoverRun,
   UnknownToolOperationError,
@@ -60,6 +65,7 @@ export type DaemonRunDiscoveryFailureKind =
   | "missing-ledger"
   | "invalid-ledger"
   | "recovery-required"
+  | "busy"
   | "open-failed"
   | "read-failed";
 
@@ -209,6 +215,16 @@ export interface DaemonRuntimeOptions {
   readonly wake?: Omit<LedgerWakeAdmissionAdapterOptions, "ledger">;
   /** Override the Ledger opener for tests or another local Ledger backend. */
   readonly openLedger?: (runId: string) => Promise<Ledger>;
+  /** Optional live discovery loop. Scans are single-flight and never overlap. */
+  readonly reconciliation?: DaemonReconciliationOptions;
+}
+
+export interface DaemonReconciliationOptions {
+  readonly intervalMs: number;
+  /** Observe successful scans, including isolated per-Run failures. */
+  readonly onResult?: (result: DaemonRuntimeRecoveryResult) => void | Promise<void>;
+  /** Observe a scan-level failure. Throwing here never terminates the loop. */
+  readonly onError?: (error: unknown) => void | Promise<void>;
 }
 
 export interface DaemonRuntime {
@@ -279,12 +295,13 @@ export async function openDaemonRuntime(
     admitWake,
     activate,
   });
-  const recoverPendingRuns = async (): Promise<DaemonRuntimeRecoveryResult> => {
-    if (host.status !== "running") {
-      throw new DaemonRuntimeCompositionError(
-        "recoverPendingRuns requires a running daemon Host",
-      );
-    }
+  let activeRecovery: Promise<DaemonRuntimeRecoveryResult> | undefined;
+  let reconciliationTimer: ReturnType<typeof setTimeout> | undefined;
+  let reconciliationEnabled = false;
+  let stopping = false;
+  let stopPromise: Promise<DaemonHostSnapshot> | undefined;
+
+  const performRecovery = async (): Promise<DaemonRuntimeRecoveryResult> => {
     const recovered = await recoverPendingDaemonRuns({
       dataDir: options.session.dataDir,
       openLedger,
@@ -329,12 +346,91 @@ export async function openDaemonRuntime(
       queuedRunIds,
     };
   };
+
+  const recoverPendingRuns = async (): Promise<DaemonRuntimeRecoveryResult> => {
+    if (host.status !== "running" || stopping) {
+      throw new DaemonRuntimeCompositionError(
+        "recoverPendingRuns requires a running daemon Host",
+      );
+    }
+    if (activeRecovery !== undefined) return activeRecovery;
+    const recovery = performRecovery();
+    activeRecovery = recovery;
+    void recovery.then(
+      () => { if (activeRecovery === recovery) activeRecovery = undefined; },
+      () => { if (activeRecovery === recovery) activeRecovery = undefined; },
+    );
+    return recovery;
+  };
+
+  const scheduleReconciliation = (): void => {
+    const reconciliation = options.reconciliation;
+    if (
+      reconciliation === undefined
+      || !reconciliationEnabled
+      || stopping
+      || host.status !== "running"
+      || reconciliationTimer !== undefined
+    ) return;
+    const timer = setTimeout(() => {
+      if (reconciliationTimer !== timer) return;
+      reconciliationTimer = undefined;
+      if (!reconciliationEnabled || stopping || host.status !== "running") return;
+      void (async () => {
+        try {
+          const result = await recoverPendingRuns();
+          await reconciliation.onResult?.(result);
+        } catch (error: unknown) {
+          try {
+            await reconciliation.onError?.(error);
+          } catch {
+            // Observability callbacks must not disable future reconciliation.
+          }
+        } finally {
+          scheduleReconciliation();
+        }
+      })();
+    }, reconciliation.intervalMs);
+    reconciliationTimer = timer;
+    timer.unref?.();
+  };
+
+  const start = async (): Promise<DaemonHostSnapshot> => {
+    if (stopPromise !== undefined) await stopPromise;
+    const snapshot = await host.start();
+    stopping = false;
+    if (options.reconciliation !== undefined) {
+      reconciliationEnabled = true;
+      scheduleReconciliation();
+    }
+    return snapshot;
+  };
+
+  const stop = (): Promise<DaemonHostSnapshot> => {
+    if (stopPromise !== undefined) return stopPromise;
+    stopping = true;
+    reconciliationEnabled = false;
+    if (reconciliationTimer !== undefined) {
+      clearTimeout(reconciliationTimer);
+      reconciliationTimer = undefined;
+    }
+    const operation = (async (): Promise<DaemonHostSnapshot> => {
+      await activeRecovery?.catch(() => undefined);
+      return host.stop();
+    })();
+    stopPromise = operation;
+    void operation.then(
+      () => { if (stopPromise === operation) stopPromise = undefined; },
+      () => { if (stopPromise === operation) stopPromise = undefined; },
+    );
+    return operation;
+  };
   return {
     host,
     activate,
     admitWake,
-    start: () => host.start(),
-    stop: () => host.stop(),
+    start,
+    stop,
     recoverPendingRuns,
   };
 }
@@ -408,7 +504,12 @@ export async function discoverDaemonRuns(
     try {
       ledger = await openLedger(entry.name, ledgerPath);
     } catch (error: unknown) {
-      failures.push(failure(ledgerPath, entry.name, "open-failed", persistedErrorText(error)));
+      failures.push(failure(
+        ledgerPath,
+        entry.name,
+        error instanceof LedgerWriterLockedError ? "busy" : "open-failed",
+        persistedErrorText(error),
+      ));
       continue;
     }
     try {
@@ -467,7 +568,12 @@ export async function recoverPendingDaemonRuns(
     try {
       ledger = await openLedger(candidate.runId, candidate.ledgerPath);
     } catch (error: unknown) {
-      failures.push(failure(candidate.ledgerPath, candidate.runId, "open-failed", persistedErrorText(error)));
+      failures.push(failure(
+        candidate.ledgerPath,
+        candidate.runId,
+        error instanceof LedgerWriterLockedError ? "busy" : "open-failed",
+        persistedErrorText(error),
+      ));
       continue;
     }
     try {
@@ -678,6 +784,27 @@ function validateRuntimeOptions(options: DaemonRuntimeOptions): void {
   }
   if (options.openLedger !== undefined && typeof options.openLedger !== "function") {
     throw new DaemonRuntimeCompositionError("openLedger must be a function");
+  }
+  if (options.reconciliation !== undefined) {
+    const reconciliation = options.reconciliation;
+    if (
+      reconciliation === null
+      || typeof reconciliation !== "object"
+      || Array.isArray(reconciliation)
+    ) {
+      throw new DaemonRuntimeCompositionError("reconciliation options must be an object");
+    }
+    if (!Number.isSafeInteger(reconciliation.intervalMs) || reconciliation.intervalMs < 1) {
+      throw new DaemonRuntimeCompositionError(
+        "reconciliation.intervalMs must be a positive safe integer",
+      );
+    }
+    if (reconciliation.onResult !== undefined && typeof reconciliation.onResult !== "function") {
+      throw new DaemonRuntimeCompositionError("reconciliation.onResult must be a function");
+    }
+    if (reconciliation.onError !== undefined && typeof reconciliation.onError !== "function") {
+      throw new DaemonRuntimeCompositionError("reconciliation.onError must be a function");
+    }
   }
   if (options.session.dataDir.trim().length === 0) {
     throw new DaemonRuntimeCompositionError("session.dataDir must not be empty");
