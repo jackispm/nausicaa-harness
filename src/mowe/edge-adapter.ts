@@ -23,6 +23,16 @@ const EFFECTS: readonly EdgeManifest["effect"][] = ["read", "compute", "write", 
 const SCOPES: readonly EdgeManifest["scope"][] = ["workspace", "run", "lane", "host"];
 const RECOVERY_SEMANTICS: readonly EdgeRecoverySemantics[] = ["none", "retry", "reconcile"];
 const HASH_PATTERN = /^sha256:[0-9a-f]{64}$/;
+export const MAX_EDGE_MANIFEST_BYTES = 1024 * 1024;
+export const MAX_EDGE_SCHEMA_BYTES = 512 * 1024;
+export const MAX_EDGE_JSON_DEPTH = 64;
+export const MAX_EDGE_JSON_NODES = 50_000;
+const MAX_EDGE_STRING_BYTES = 64 * 1024;
+const MAX_EDGE_IDENTITY_BYTES = 512;
+// Host-granted metadata is intentionally not inferred from object shape.  A
+// capability entering a public snapshot must either satisfy the manifest
+// contract strictly or be the exact object produced by the host rebind path.
+const REBOUND_CAPABILITIES = new WeakSet<object>();
 const MANIFEST_KEYS = [
   "manifestVersion",
   "sourceId",
@@ -143,6 +153,31 @@ export function assertEdgeAdapterOwnsManifest(
  * Turn that already holds this capability.
  */
 export function createEdgeCapability(options: CreateEdgeCapabilityOptions): EdgeCapability {
+  return createEdgeCapabilityInternal(options, false);
+}
+
+/**
+ * Rebind a validated capability to host-owned metadata.  Edge declarations are
+ * requests, so the registry may deliberately quarantine an ungranted edge as
+ * `external/host/approval-required` without changing the provenance manifest.
+ */
+export function rebindEdgeCapabilityMetadata(
+  capability: EdgeCapability,
+  metadata: MoweToolMetadata,
+): EdgeCapability {
+  const rebound = createEdgeCapabilityInternal({
+    manifest: capability.manifest,
+    tool: capability.tool,
+    metadata,
+  }, true);
+  REBOUND_CAPABILITIES.add(rebound);
+  return rebound;
+}
+
+function createEdgeCapabilityInternal(
+  options: CreateEdgeCapabilityOptions,
+  allowBoundaryOverride: boolean,
+): EdgeCapability {
   const manifest = validateEdgeManifest(options.manifest);
   const definition = normalizeToolDefinition(options.tool.definition);
   if (definition.name !== manifest.capabilityName) {
@@ -159,8 +194,19 @@ export function createEdgeCapability(options: CreateEdgeCapabilityOptions): Edge
   }
 
   const embedded = (options.tool as MoweAgentTool).metadata;
-  const metadata = normalizeCapabilityMetadata(manifest, embedded, options.metadata);
-  const receiver = options.tool;
+  const metadata = normalizeCapabilityMetadata(
+    manifest,
+    embedded,
+    options.metadata,
+    allowBoundaryOverride,
+  );
+  // AgentTool implementations conventionally do not use `this`; binding a
+  // frozen receiver prevents a mutable provider object from changing the
+  // behavior of a capability after it has been published.
+  const receiver = Object.freeze({
+    definition: deepFreeze(structuredClone(definition)),
+    ...(metadata === undefined ? {} : { metadata }),
+  });
   const executeImplementation = options.tool.execute;
   const execute = Object.freeze((...args: Parameters<AgentTool["execute"]>) => (
     executeImplementation.call(receiver, ...args)
@@ -193,10 +239,13 @@ export function createEdgeCapabilitySnapshot(
   const names = new Set<string>();
   const capabilities = options.capabilities.map((candidate, index) => {
     const record = asRecord(candidate, `snapshot.capabilities[${index}]`);
-    const capability = createEdgeCapability({
+    const tool = record.tool as MoweAgentTool;
+    const candidateCapability = candidate as EdgeCapability;
+    const capability = createEdgeCapabilityInternal({
       manifest: record.manifest as EdgeManifest,
-      tool: record.tool as AgentTool,
-    });
+      tool,
+      ...(tool.metadata === undefined ? {} : { metadata: tool.metadata }),
+    }, REBOUND_CAPABILITIES.has(candidateCapability));
     const name = capability.manifest.capabilityName;
     if (names.has(name)) {
       fail(`snapshot.capabilities[${index}].manifest.capabilityName`, `duplicate capability ${name}`);
@@ -207,8 +256,11 @@ export function createEdgeCapabilitySnapshot(
 
   const snapshotHash = sha256(stableJson({
     generation: options.generation,
-    createdAt,
-    manifests: capabilities.map(({ manifest }) => manifest.manifestHash),
+    capabilities: capabilities.map(({ manifest, tool }) => ({
+      manifestHash: manifest.manifestHash,
+      definition: tool.definition,
+      metadata: tool.metadata ?? {},
+    })),
   }));
   return Object.freeze({
     generation: options.generation,
@@ -265,6 +317,9 @@ function normalizeManifest(value: unknown, requireHash: boolean): EdgeManifestIn
     ),
     provenance,
   };
+  if (Buffer.byteLength(stableJson(normalized), "utf8") > MAX_EDGE_MANIFEST_BYTES) {
+    fail("manifest", `must not exceed ${MAX_EDGE_MANIFEST_BYTES} UTF-8 bytes`);
+  }
   return deepFreeze(normalized);
 }
 
@@ -289,9 +344,13 @@ function normalizeProvenance(value: unknown): EdgeProvenance {
 }
 
 function normalizeSchema(value: unknown, path: string): JsonSchema {
-  assertJsonValue(value, path);
+  assertJsonValue(value, path, new Set<object>(), { nodes: 0 }, 0);
   const record = asRecord(value, path);
   if (record.type !== "object") fail(`${path}.type`, "must equal object");
+  validateSchemaNode(record, path, 0);
+  if (Buffer.byteLength(stableJson(record), "utf8") > MAX_EDGE_SCHEMA_BYTES) {
+    fail(path, `must not exceed ${MAX_EDGE_SCHEMA_BYTES} UTF-8 bytes`);
+  }
   return deepFreeze(cloneJson(record) as unknown as JsonSchema);
 }
 
@@ -309,14 +368,15 @@ function normalizeCapabilityMetadata(
   manifest: EdgeManifest,
   embedded: MoweToolMetadata | undefined,
   supplied: MoweToolMetadata | undefined,
+  allowBoundaryOverride = false,
 ): MoweToolMetadata {
   for (const [label, metadata] of [["tool.metadata", embedded], ["metadata", supplied]] as const) {
     if (metadata === undefined) continue;
     if (!isRecord(metadata)) fail(label, "must be an object");
-    if (metadata.effect !== undefined && metadata.effect !== manifest.effect) {
+    if (!allowBoundaryOverride && metadata.effect !== undefined && metadata.effect !== manifest.effect) {
       fail(`${label}.effect`, `must equal manifest effect ${manifest.effect}`);
     }
-    if (metadata.scope !== undefined && metadata.scope !== manifest.scope) {
+    if (!allowBoundaryOverride && metadata.scope !== undefined && metadata.scope !== manifest.scope) {
       fail(`${label}.scope`, `must equal manifest scope ${manifest.scope}`);
     }
     if (metadata.version !== undefined && metadata.version !== manifest.capabilityVersion) {
@@ -326,10 +386,27 @@ function normalizeCapabilityMetadata(
   const merged = {
     ...cloneMetadata(embedded),
     ...cloneMetadata(supplied),
-    effect: manifest.effect,
-    scope: manifest.scope,
+    effect: allowBoundaryOverride
+      ? (supplied?.effect ?? embedded?.effect ?? manifest.effect)
+      : manifest.effect,
+    scope: allowBoundaryOverride
+      ? (supplied?.scope ?? embedded?.scope ?? manifest.scope)
+      : manifest.scope,
     version: manifest.capabilityVersion,
   } satisfies MoweToolMetadata;
+  if (!EFFECTS.includes(merged.effect as EdgeManifest["effect"])) {
+    fail("metadata.effect", "must be read, compute, write, or external");
+  }
+  if (!SCOPES.includes(merged.scope as EdgeManifest["scope"])) {
+    fail("metadata.scope", "must be workspace, run, lane, or host");
+  }
+  // A non-idempotent declaration is never safe to treat as deterministic or
+  // freely parallelizable, even when an adapter supplied optimistic hints.
+  if (!manifest.idempotent) {
+    merged.deterministic = false;
+    merged.supportsBatch = false;
+    merged.concurrencySafe = false;
+  }
   return deepFreeze(merged);
 }
 
@@ -363,8 +440,23 @@ function assertExactKeys(
   }
 }
 
-function assertJsonValue(value: unknown, path: string, seen = new Set<object>()): void {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+function assertJsonValue(
+  value: unknown,
+  path: string,
+  seen = new Set<object>(),
+  budget: { nodes: number } = { nodes: 0 },
+  depth = 0,
+): void {
+  budget.nodes += 1;
+  if (budget.nodes > MAX_EDGE_JSON_NODES) fail(path, `must not exceed ${MAX_EDGE_JSON_NODES} JSON nodes`);
+  if (depth > MAX_EDGE_JSON_DEPTH) fail(path, `must not exceed JSON depth ${MAX_EDGE_JSON_DEPTH}`);
+  if (value === null || typeof value === "boolean") return;
+  if (typeof value === "string") {
+    if (Buffer.byteLength(value, "utf8") > MAX_EDGE_STRING_BYTES) {
+      fail(path, `string must not exceed ${MAX_EDGE_STRING_BYTES} UTF-8 bytes`);
+    }
+    return;
+  }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) fail(path, "must contain only finite JSON numbers");
     return;
@@ -373,14 +465,17 @@ function assertJsonValue(value: unknown, path: string, seen = new Set<object>())
   if (seen.has(value)) fail(path, "must not contain cycles");
   seen.add(value);
   if (Array.isArray(value)) {
-    value.forEach((item, index) => assertJsonValue(item, `${path}[${index}]`, seen));
+    value.forEach((item, index) => assertJsonValue(item, `${path}[${index}]`, seen, budget, depth + 1));
   } else {
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) {
       fail(path, "must contain only plain JSON objects");
     }
     for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      assertJsonValue(item, `${path}.${key}`, seen);
+      if (Buffer.byteLength(key, "utf8") > MAX_EDGE_IDENTITY_BYTES) {
+        fail(path, `object keys must not exceed ${MAX_EDGE_IDENTITY_BYTES} UTF-8 bytes`);
+      }
+      assertJsonValue(item, `${path}.${key}`, seen, budget, depth + 1);
     }
   }
   seen.delete(value);
@@ -407,13 +502,58 @@ function requiredString(value: unknown, path: string): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     fail(path, "must be a non-empty string");
   }
+  if (Buffer.byteLength(value, "utf8") > MAX_EDGE_STRING_BYTES) {
+    fail(path, `must not exceed ${MAX_EDGE_STRING_BYTES} UTF-8 bytes`);
+  }
   return value;
 }
 
 function requiredIdentity(value: unknown, path: string): string {
   const identity = requiredString(value, path);
   if (identity !== identity.trim()) fail(path, "must not have surrounding whitespace");
+  if (Buffer.byteLength(identity, "utf8") > MAX_EDGE_IDENTITY_BYTES) {
+    fail(path, `must not exceed ${MAX_EDGE_IDENTITY_BYTES} UTF-8 bytes`);
+  }
   return identity;
+}
+
+function validateSchemaNode(value: unknown, path: string, depth: number): void {
+  if (typeof value === "boolean") return;
+  const record = asRecord(value, path);
+  if (record.type !== undefined) {
+    const allowed = ["array", "boolean", "integer", "null", "number", "object", "string"];
+    const types = Array.isArray(record.type) ? record.type : [record.type];
+    if (types.length === 0
+      || types.some((item) => typeof item !== "string" || !allowed.includes(item))
+      || new Set(types).size !== types.length) {
+      fail(`${path}.type`, "must be one type or an array of unique JSON Schema types");
+    }
+  }
+  if (record.properties !== undefined) {
+    const properties = asRecord(record.properties, `${path}.properties`);
+    for (const [key, schema] of Object.entries(properties)) {
+      validateSchemaNode(schema, `${path}.properties.${key}`, depth + 1);
+    }
+  }
+  if (record.required !== undefined) {
+    if (!Array.isArray(record.required)
+      || record.required.some((item) => typeof item !== "string")
+      || new Set(record.required).size !== record.required.length) {
+      fail(`${path}.required`, "must be an array of unique strings");
+    }
+  }
+  if (record.additionalProperties !== undefined
+    && typeof record.additionalProperties !== "boolean") {
+    validateSchemaNode(record.additionalProperties, `${path}.additionalProperties`, depth + 1);
+  }
+  if (record.items !== undefined) {
+    if (Array.isArray(record.items)) {
+      record.items.forEach((item, index) => validateSchemaNode(item, `${path}.items[${index}]`, depth + 1));
+    } else {
+      validateSchemaNode(record.items, `${path}.items`, depth + 1);
+    }
+  }
+  if (depth > MAX_EDGE_JSON_DEPTH) fail(path, `must not exceed JSON depth ${MAX_EDGE_JSON_DEPTH}`);
 }
 
 function optionalString(value: unknown, path: string): string | undefined {

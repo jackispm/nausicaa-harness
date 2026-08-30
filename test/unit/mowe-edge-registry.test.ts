@@ -207,6 +207,61 @@ describe("Mowe edge registry", () => {
     expect(result.results[0]?.error).toMatch(/effect/u);
   });
 
+  it("quarantines an edge that has no explicit host grant", async () => {
+    const registry = new MoweEdgeRegistry({ adapters: [adapter("untrusted", ["untrusted_tool"])] });
+    const snapshot = await registry.refresh();
+    expect(snapshot.catalog.get("untrusted_tool")?.metadata).toMatchObject({
+      effect: "external",
+      scope: "host",
+      requiresApproval: true,
+      deterministic: false,
+      supportsBatch: false,
+      concurrencySafe: false,
+    });
+    expect(snapshot.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "host-grant-denied", sourceId: "untrusted", severity: "warning" }),
+    ]));
+  });
+
+  it("admits only effects and scopes covered by a host grant", async () => {
+    const registry = new MoweEdgeRegistry({
+      adapters: [adapter("writer", ["edge_write"], { effects: { edge_write: "write" } })],
+      hostGrants: { writer: { effects: ["write"], scopes: ["workspace"] } },
+    });
+    const snapshot = await registry.refresh();
+    expect(snapshot.catalog.get("edge_write")?.metadata).toMatchObject({
+      effect: "write",
+      scope: "workspace",
+      requiresApproval: true,
+    });
+
+    const denied = new MoweEdgeRegistry({
+      adapters: [adapter("writer", ["edge_write"], { effects: { edge_write: "write" } })],
+      hostGrants: { writer: { effects: ["read"], scopes: ["run"] } },
+    });
+    const deniedSnapshot = await denied.refresh();
+    expect(deniedSnapshot.catalog.has("edge_write")).toBe(false);
+    expect(deniedSnapshot.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "host-grant-denied", sourceId: "writer", severity: "error" }),
+    ]));
+  });
+
+  it("keeps unrelated capabilities during a source-scoped refresh", async () => {
+    let names = ["first"];
+    const first = adapter("first-edge", names);
+    const second = adapter("second-edge", ["second"]);
+    const registry = new MoweEdgeRegistry({ adapters: [
+      { ...first, discover: async () => names.map((name) => manifest("first-edge", name)) },
+      second,
+    ] });
+    await registry.refresh();
+    names = ["updated"];
+    const refreshed = await registry.refreshSource("first-edge");
+    expect(refreshed.catalog.has("updated")).toBe(true);
+    expect(refreshed.catalog.has("first")).toBe(false);
+    expect(refreshed.catalog.has("second")).toBe(true);
+  });
+
   it("does not depend on object key order when computing a generation hash", async () => {
     const firstManifest = manifest("same", "same_tool");
     const secondManifest = createEdgeManifest({

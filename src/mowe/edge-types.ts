@@ -64,7 +64,10 @@ export interface EdgeDiscoveryContext {
 
 export interface EdgeLoadContext extends EdgeDiscoveryContext {}
 
-export type EdgeReleaseReason = "refresh" | "shutdown";
+/** Adapter-owned refresh hook. It must preserve already published capabilities. */
+export interface EdgeRefreshContext extends EdgeDiscoveryContext {}
+
+export type EdgeReleaseReason = "unregister" | "shutdown";
 
 export interface EdgeReleaseContext {
   readonly reason: EdgeReleaseReason;
@@ -82,6 +85,16 @@ export interface EdgeAdapterHealth {
   readonly retryAfterMs?: number;
 }
 
+/** Host-owned permission grant for one external edge source. */
+export interface EdgeHostGrant {
+  /** Effects the host explicitly permits this source to request. */
+  readonly effects: readonly MoweEffect[];
+  /** Scopes the host explicitly permits this source to request. */
+  readonly scopes: readonly MoweToolScope[];
+  /** A host opt-in to skip the normal approval callback for this source. */
+  readonly allowWithoutApproval?: boolean;
+}
+
 /**
  * Source adapter boundary. Discovery returns only validated manifests; loading
  * performs progressive work and returns a capability pinned to that manifest.
@@ -91,6 +104,8 @@ export interface EdgeAdapter {
   readonly sourceType: EdgeSourceType;
   discover(context: EdgeDiscoveryContext): Promise<readonly EdgeManifest[]>;
   load(manifest: EdgeManifest, context: EdgeLoadContext): Promise<EdgeCapability>;
+  /** Refresh adapter-owned caches/connections without invalidating an active snapshot. */
+  refresh?(context: EdgeRefreshContext): Promise<void>;
   health?(): Promise<EdgeAdapterHealth>;
   release?(context: EdgeReleaseContext): Promise<void>;
 }

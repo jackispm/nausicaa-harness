@@ -1,11 +1,12 @@
 import type { AgentTool } from "../domain/ports.js";
 import { sha256, stableJson } from "../ledger/hash.js";
 import { MoweCatalog } from "./catalog.js";
-import type { MoweToolMetadata } from "./types.js";
+import type { MoweEffect, MoweToolMetadata, MoweToolScope } from "./types.js";
 import {
   assertEdgeAdapterOwnsManifest,
   createEdgeCapability,
   createEdgeCapabilitySnapshot,
+  rebindEdgeCapabilityMetadata,
   validateEdgeManifest,
 } from "./edge-adapter.js";
 import type {
@@ -13,9 +14,16 @@ import type {
   EdgeAdapterHealth,
   EdgeCapability,
   EdgeCapabilitySnapshot,
+  EdgeHostGrant,
   EdgeManifest,
+  EdgeReleaseReason,
   EdgeSourceType,
 } from "./edge-types.js";
+
+const EDGE_EFFECTS: readonly MoweEffect[] = ["read", "compute", "write", "external"];
+const EDGE_SCOPES: readonly MoweToolScope[] = ["workspace", "run", "lane", "host"];
+const DEFAULT_EDGE_REFRESH_TIMEOUT_MS = 60_000;
+const MAX_EDGE_REFRESH_TIMEOUT_MS = 15 * 60_000;
 
 export type MoweEdgeAdapterLike = EdgeAdapter;
 export type MoweEdgeKind = EdgeSourceType;
@@ -39,7 +47,8 @@ export interface MoweEdgeDiagnostic {
     | "manifest-mismatch"
     | "tool-invalid"
     | "tool-collision"
-    | "catalog-rejected";
+    | "catalog-rejected"
+    | "host-grant-denied";
   readonly severity: MoweEdgeDiagnosticSeverity;
   readonly sourceId?: string;
   readonly toolName?: string;
@@ -98,11 +107,17 @@ export interface MoweEdgeRegistryOptions {
   readonly catalog?: MoweCatalog | readonly AgentTool[];
   readonly adapters?: readonly EdgeAdapter[];
   readonly workspace?: string;
+  /** Explicit host-owned permissions; an omitted source is quarantined. */
+  readonly hostGrants?: Readonly<Record<string, EdgeHostGrant>>;
 }
 
 export interface MoweEdgeRefreshOptions {
   readonly workspace?: string;
   readonly signal?: AbortSignal;
+  /** Bound discovery/load so one unresponsive edge cannot block publication. */
+  readonly timeoutMs?: number;
+  /** Internal/source-scoped refresh selector used by refreshSource(). */
+  readonly sourceIds?: readonly string[];
 }
 
 interface RegisteredEdge {
@@ -135,14 +150,18 @@ export class MoweEdgeRegistry {
   readonly #baseCatalog: MoweCatalog;
   readonly #edges = new Map<string, RegisteredEdge>();
   readonly #workspace: string;
+  readonly #hostGrants: ReadonlyMap<string, EdgeHostGrant>;
   #generation = -1;
   #closed = false;
+  #revision = 0;
   #refreshQueue: Promise<MoweEdgeRegistrySnapshot> = Promise.resolve(undefined as never);
+  #releaseQueue: Promise<void> = Promise.resolve();
   #current: MoweEdgeRegistrySnapshot;
 
   constructor(options: MoweEdgeRegistryOptions = {}) {
     this.#baseCatalog = cloneCatalog(options.catalog ?? []);
     this.#workspace = options.workspace ?? ".";
+    this.#hostGrants = normalizeHostGrants(options.hostGrants);
     this.#current = this.#buildSnapshot([], [], []);
     for (const adapter of options.adapters ?? []) this.register(adapter);
   }
@@ -169,6 +188,7 @@ export class MoweEdgeRegistry {
       manifests: [],
       capabilities: [],
     });
+    this.#revision += 1;
     return this;
   }
 
@@ -177,7 +197,13 @@ export class MoweEdgeRegistry {
   }
 
   unregister(sourceId: string): boolean {
-    return this.#edges.delete(normalizeSourceId(sourceId));
+    const target = normalizeSourceId(sourceId);
+    const edge = this.#edges.get(target);
+    if (edge === undefined) return false;
+    this.#edges.delete(target);
+    this.#revision += 1;
+    this.#queueRelease(edge, "unregister");
+    return true;
   }
 
   has(sourceId: string): boolean {
@@ -186,6 +212,7 @@ export class MoweEdgeRegistry {
 
   enable(sourceId: string): this {
     const edge = this.#requireEdge(sourceId);
+    this.#revision += 1;
     edge.enabled = true;
     if (edge.health === "disabled") edge.health = "registered";
     return this;
@@ -193,6 +220,7 @@ export class MoweEdgeRegistry {
 
   disable(sourceId: string): this {
     const edge = this.#requireEdge(sourceId);
+    this.#revision += 1;
     edge.enabled = false;
     edge.health = "disabled";
     return this;
@@ -259,34 +287,22 @@ export class MoweEdgeRegistry {
   async refreshSource(sourceId: string, options: MoweEdgeRefreshOptions = {}): Promise<MoweEdgeRegistrySnapshot> {
     const target = normalizeSourceId(sourceId);
     if (!this.#edges.has(target)) throw new MoweEdgeRegistryError(`Unknown edge sourceId: ${sourceId}`);
-    return this.refresh(options);
+    return this.refresh({ ...options, sourceIds: [target] });
   }
 
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
-    await Promise.all([...this.#edges.values()].map(async (edge) => {
-      const release = edge.adapter.release;
-      if (release === undefined) {
-        edge.health = "closed";
-        edge.enabled = false;
-        return;
-      }
-      try {
-        await release.call(edge.adapter, { reason: "shutdown" });
-        edge.health = "closed";
-        edge.enabled = false;
-      } catch (error) {
-        edge.health = "failed";
-        edge.enabled = false;
-        edge.diagnostics = [diagnostic(
-          "adapter-failed",
-          "error",
-          edge.sourceId,
-          `Edge release failed: ${errorMessage(error)}`,
-        )];
-      }
-    }));
+    this.#revision += 1;
+    // Let an in-flight refresh finish its adapter call before shutdown. Its
+    // commit guard observes #closed/#revision and cannot publish stale state.
+    await this.#refreshQueue.catch(() => this.#current);
+    for (const edge of this.#edges.values()) this.#queueRelease(edge, "shutdown");
+    await this.#releaseQueue;
+    for (const edge of this.#edges.values()) {
+      edge.enabled = false;
+      if (edge.health !== "failed") edge.health = "closed";
+    }
     const edges = [...this.#edges.values()].map((edge) => this.#edgeSnapshot(edge, []));
     this.#current = this.#buildSnapshot(edges, [], edges.flatMap((edge) => edge.diagnostics));
   }
@@ -294,115 +310,196 @@ export class MoweEdgeRegistry {
   async #performRefresh(options: MoweEdgeRefreshOptions): Promise<MoweEdgeRegistrySnapshot> {
     if (this.#closed) return this.#current;
     const workspace = options.workspace ?? this.#workspace;
-    const edges = [...this.#edges.values()].sort((left, right) => left.sourceId.localeCompare(right.sourceId));
+    const revision = this.#revision;
+    const controller = createRefreshController(options.signal, options.timeoutMs);
+    const signal = controller.signal;
+    const requested = options.sourceIds === undefined
+      ? undefined
+      : new Set(options.sourceIds.map(normalizeSourceId));
+    const edges = [...this.#edges.values()].sort((left, right) => compareText(left.sourceId, right.sourceId));
+    // Work on detached state.  Public mutations can happen while an adapter is
+    // awaiting I/O; the revision/identity check below then discards this build.
+    const workingEdges = edges.map((edge) => {
+      const selected = requested === undefined || requested.has(edge.sourceId);
+      return selected
+        ? {
+            adapter: edge.adapter,
+            sourceId: edge.sourceId,
+            sourceType: edge.sourceType,
+            enabled: edge.enabled,
+            health: edge.enabled ? "discovering" as const : "disabled" as const,
+            diagnostics: [] as MoweEdgeDiagnostic[],
+            manifests: [] as EdgeManifest[],
+            capabilities: [] as EdgeCapability[],
+          }
+        : {
+            adapter: edge.adapter,
+            sourceId: edge.sourceId,
+            sourceType: edge.sourceType,
+            enabled: edge.enabled,
+            health: edge.health,
+            diagnostics: [...edge.diagnostics],
+            manifests: [...edge.manifests],
+            capabilities: [...edge.capabilities],
+            ...(edge.adapterHealth === undefined ? {} : { adapterHealth: edge.adapterHealth }),
+          };
+    });
     const loaded: LoadedCapability[] = [];
-
-    for (const edge of edges) {
-      edge.diagnostics = [];
-      edge.manifests = [];
-      edge.capabilities = [];
-      if (!edge.enabled) {
-        edge.health = "disabled";
-        continue;
+    // A source-scoped refresh must keep capabilities from the other edges in
+    // the candidate generation. They are copied from the last committed state
+    // and participate in the same deterministic collision pass as refreshed
+    // capabilities.
+    for (const edge of workingEdges) {
+      const selected = requested === undefined || requested.has(edge.sourceId);
+      if (selected) continue;
+      for (const capability of edge.capabilities) {
+        loaded.push({ edge, capability, fingerprint: capabilityFingerprint(capability) });
       }
-      edge.health = "discovering";
-      try {
-        const manifests = await edge.adapter.discover(edgeContext(workspace, options.signal));
-        if (!Array.isArray(manifests)) throw new MoweEdgeRegistryError("Edge discover() must return an array");
-        const sortedManifests = [...manifests].sort(compareManifest);
-        for (const candidate of sortedManifests) {
-          let manifest: EdgeManifest;
-          try {
-            manifest = validateEdgeManifest(candidate);
-            assertEdgeAdapterOwnsManifest(edge.adapter, manifest);
-          } catch (error) {
-            edge.diagnostics.push(diagnostic(
-              "manifest-invalid",
-              "error",
-              edge.sourceId,
-              errorMessage(error),
-              isRecord(candidate) && typeof candidate.capabilityName === "string" ? candidate.capabilityName : undefined,
-            ));
-            continue;
+    }
+    try {
+      for (const edge of workingEdges) {
+        if (signal.aborted) return this.#current;
+        const selected = requested === undefined || requested.has(edge.sourceId);
+        if (!selected || !edge.enabled) continue;
+        try {
+          if (edge.adapter.refresh !== undefined) {
+            await awaitWithSignal(
+              edge.adapter.refresh.call(edge.adapter, edgeContext(workspace, signal)),
+              signal,
+            );
           }
-          edge.manifests.push(manifest);
-          try {
-            const loadedResult = await edge.adapter.load(manifest, edgeContext(workspace, options.signal));
-            if (loadedResult.manifest.manifestHash !== manifest.manifestHash) {
-              throw new MoweEdgeRegistryError("Loaded capability manifest does not match discovered manifest");
+          const manifests = await awaitWithSignal(
+            edge.adapter.discover(edgeContext(workspace, signal)),
+            signal,
+          );
+          if (!Array.isArray(manifests)) throw new MoweEdgeRegistryError("Edge discover() must return an array");
+          for (const candidate of [...manifests].sort(compareManifest)) {
+            let manifest: EdgeManifest;
+            try {
+              manifest = validateEdgeManifest(candidate);
+              // Use the identity captured at registration, not mutable adapter
+              // fields, as the ownership boundary.
+              assertEdgeAdapterOwnsManifest(
+                { sourceId: edge.sourceId, sourceType: edge.sourceType },
+                manifest,
+              );
+            } catch (error) {
+              edge.diagnostics.push(diagnostic(
+                "manifest-invalid",
+                "error",
+                edge.sourceId,
+                errorMessage(error),
+                isRecord(candidate) && typeof candidate.capabilityName === "string" ? candidate.capabilityName : undefined,
+              ));
+              continue;
             }
-            const capability = createEdgeCapability({
-              manifest,
-              tool: loadedResult.tool,
-            });
-            const fingerprint = sha256(stableJson({
-              manifest: capability.manifest,
-              definition: capability.tool.definition,
-              metadata: capability.tool.metadata,
-            }));
-            const loadedEntry = { edge, capability, fingerprint };
-            edge.capabilities.push(capability);
-            loaded.push(loadedEntry);
-          } catch (error) {
-            edge.diagnostics.push(diagnostic(
-              "adapter-failed",
-              "error",
-              edge.sourceId,
-              `Edge capability load failed: ${errorMessage(error)}`,
-              manifest.capabilityName,
-            ));
+            edge.manifests.push(manifest);
+            try {
+              const loadedResult = await awaitWithSignal(
+                edge.adapter.load(manifest, edgeContext(workspace, signal)),
+                signal,
+              );
+              if (loadedResult.manifest.manifestHash !== manifest.manifestHash) {
+                throw new MoweEdgeRegistryError("Loaded capability manifest does not match discovered manifest");
+              }
+              const rawCapability = createEdgeCapability({ manifest, tool: loadedResult.tool });
+              const capability = applyHostGrant(
+                rawCapability,
+                this.#hostGrants.get(edge.sourceId),
+                edge,
+              );
+              if (capability === undefined) continue;
+              const fingerprint = capabilityFingerprint(capability);
+              edge.capabilities.push(capability);
+              loaded.push({ edge, capability, fingerprint });
+            } catch (error) {
+              if (signal.aborted) return this.#current;
+              edge.diagnostics.push(diagnostic(
+                "adapter-failed",
+                "error",
+                edge.sourceId,
+                `Edge capability load failed: ${errorMessage(error)}`,
+                manifest.capabilityName,
+              ));
+            }
           }
+          if (edge.adapter.health === undefined) {
+            delete edge.adapterHealth;
+          } else {
+            edge.adapterHealth = await awaitWithSignal(edge.adapter.health(), signal);
+          }
+          edge.health = healthFrom(edge, edge.adapterHealth);
+        } catch (error) {
+          if (signal.aborted) return this.#current;
+          edge.health = "failed";
+          edge.diagnostics.push(diagnostic(
+            "adapter-failed",
+            "error",
+            edge.sourceId,
+            `Edge discovery failed: ${errorMessage(error)}`,
+          ));
         }
-        edge.adapterHealth = edge.adapter.health === undefined ? undefined : await edge.adapter.health();
-        edge.health = healthFrom(edge, edge.adapterHealth);
-      } catch (error) {
-        edge.health = "failed";
-        edge.diagnostics.push(diagnostic(
-          "adapter-failed",
-          "error",
-          edge.sourceId,
-          `Edge discovery failed: ${errorMessage(error)}`,
-        ));
       }
-    }
 
-    const selected: MoweEdgeToolSnapshot[] = [];
-    const occupied = new Set(this.#baseCatalog.entries().map((entry) => entry.tool.definition.name));
-    loaded.sort(compareLoaded);
-    for (const item of loaded) {
-      const name = item.capability.manifest.capabilityName;
-      if (occupied.has(name)) {
-        item.edge.diagnostics.push(diagnostic(
-          "tool-collision",
-          "error",
-          item.edge.sourceId,
-          `Tool name collides with an existing catalog entry: ${name}`,
+      const selected: MoweEdgeToolSnapshot[] = [];
+      const occupied = new Set(this.#baseCatalog.entries().map((entry) => entry.tool.definition.name));
+      loaded.sort(compareLoaded);
+      for (const item of loaded) {
+        if (signal.aborted) return this.#current;
+        const name = item.capability.manifest.capabilityName;
+        if (occupied.has(name)) {
+          item.edge.diagnostics.push(diagnostic(
+            "tool-collision",
+            "error",
+            item.edge.sourceId,
+            `Tool name collides with an existing catalog entry: ${name}`,
+            name,
+          ));
+          if (item.edge.health === "healthy") item.edge.health = "degraded";
+          continue;
+        }
+        occupied.add(name);
+        selected.push({
           name,
-        ));
-        if (item.edge.health === "healthy") item.edge.health = "degraded";
-        continue;
+          sourceId: item.edge.sourceId,
+          kind: item.capability.manifest.sourceType,
+          version: item.capability.manifest.capabilityVersion,
+          manifestHash: item.capability.manifest.manifestHash,
+          capability: item.capability,
+          tool: item.capability.tool,
+          metadata: item.capability.tool.metadata ?? {},
+        });
       }
-      occupied.add(name);
-      selected.push({
-        name,
-        sourceId: item.edge.sourceId,
-        kind: item.capability.manifest.sourceType,
-        version: item.capability.manifest.capabilityVersion,
-        manifestHash: item.capability.manifest.manifestHash,
-        capability: item.capability,
-        tool: item.capability.tool,
-        metadata: item.capability.tool.metadata ?? {},
-      });
-    }
 
-    const edgeSnapshots = edges.map((edge) => this.#edgeSnapshot(
-      edge,
-      selected.filter((tool) => tool.sourceId === edge.sourceId),
-    ));
-    if (this.#closed) return this.#current;
-    const snapshot = this.#buildSnapshot(edgeSnapshots, selected, edgeSnapshots.flatMap((edge) => edge.diagnostics));
-    this.#current = snapshot;
-    return snapshot;
+      const edgeSnapshots = workingEdges.map((edge) => this.#edgeSnapshot(
+        edge,
+        selected.filter((tool) => tool.sourceId === edge.sourceId),
+      ));
+      if (signal.aborted || this.#closed || revision !== this.#revision) return this.#current;
+      for (const edge of edges) {
+        if (this.#edges.get(edge.sourceId) !== edge) return this.#current;
+      }
+      const snapshot = this.#buildSnapshot(
+        edgeSnapshots,
+        selected,
+        edgeSnapshots.flatMap((edge) => edge.diagnostics),
+      );
+      if (signal.aborted || this.#closed || revision !== this.#revision) return this.#current;
+      for (const edge of workingEdges) {
+        const current = this.#edges.get(edge.sourceId);
+        if (current === undefined) continue;
+        current.health = edge.health;
+        current.diagnostics = [...edge.diagnostics];
+        current.manifests = [...edge.manifests];
+        current.capabilities = [...edge.capabilities];
+        if (edge.adapterHealth === undefined) delete current.adapterHealth;
+        else current.adapterHealth = edge.adapterHealth;
+      }
+      this.#current = snapshot;
+      return snapshot;
+    } finally {
+      controller.dispose();
+    }
   }
 
   #edgeSnapshot(edge: RegisteredEdge, tools: readonly MoweEdgeToolSnapshot[]): MoweEdgeSnapshot {
@@ -497,6 +594,26 @@ export class MoweEdgeRegistry {
     if (edge === undefined) throw new MoweEdgeRegistryError(`Unknown edge sourceId: ${sourceId}`);
     return edge;
   }
+
+  #queueRelease(edge: RegisteredEdge, reason: EdgeReleaseReason): void {
+    const refreshBarrier = this.#refreshQueue;
+    this.#releaseQueue = this.#releaseQueue.then(async () => {
+      await refreshBarrier.catch(() => this.#current);
+      const release = edge.adapter.release;
+      if (release === undefined) return;
+      try {
+        await release.call(edge.adapter, { reason });
+      } catch (error) {
+        edge.health = "failed";
+        edge.diagnostics.push(diagnostic(
+          "adapter-failed",
+          "error",
+          edge.sourceId,
+          `Edge release failed: ${errorMessage(error)}`,
+        ));
+      }
+    }).catch(() => undefined);
+  }
 }
 
 export const EdgeRegistry = MoweEdgeRegistry;
@@ -539,17 +656,17 @@ function immutableCatalog(catalog: MoweCatalog): MoweCatalog {
 function healthSnapshot(edge: RegisteredEdge): MoweEdgeHealthSnapshot {
   const version = edge.manifests[0]?.capabilityVersion;
   const manifestHash = edge.manifests[0]?.manifestHash;
-    return freeze({
-      sourceId: edge.sourceId,
-      kind: edge.sourceType,
-      enabled: edge.enabled,
-      health: edge.health,
-      ...(version === undefined ? {} : { version }),
-      ...(manifestHash === undefined ? {} : { manifestHash }),
-      ...(edge.adapterHealth?.message === undefined ? {} : { message: edge.adapterHealth.message }),
-      ...(edge.adapterHealth?.retryAfterMs === undefined ? {} : { retryAfterMs: edge.adapterHealth.retryAfterMs }),
-      diagnostics: edge.diagnostics,
-    });
+  return freeze({
+    sourceId: edge.sourceId,
+    kind: edge.sourceType,
+    enabled: edge.enabled,
+    health: edge.health,
+    ...(version === undefined ? {} : { version }),
+    ...(manifestHash === undefined ? {} : { manifestHash }),
+    ...(edge.adapterHealth?.message === undefined ? {} : { message: edge.adapterHealth.message }),
+    ...(edge.adapterHealth?.retryAfterMs === undefined ? {} : { retryAfterMs: edge.adapterHealth.retryAfterMs }),
+    diagnostics: [...edge.diagnostics],
+  });
 }
 
 function healthFrom(edge: RegisteredEdge, health: EdgeAdapterHealth | undefined): MoweEdgeHealth {
@@ -574,6 +691,14 @@ function compareLoaded(left: LoadedCapability, right: LoadedCapability): number 
   return left.capability.manifest.capabilityName.localeCompare(right.capability.manifest.capabilityName)
     || left.edge.sourceId.localeCompare(right.edge.sourceId)
     || left.fingerprint.localeCompare(right.fingerprint);
+}
+
+function capabilityFingerprint(capability: EdgeCapability): string {
+  return sha256(stableJson({
+    manifest: capability.manifest,
+    definition: capability.tool.definition,
+    metadata: capability.tool.metadata,
+  }));
 }
 
 function compareToolSnapshots(left: MoweEdgeToolSnapshot, right: MoweEdgeToolSnapshot): number {
@@ -606,6 +731,139 @@ function normalizeSourceId(value: string): string {
     throw new MoweEdgeRegistryError("Edge sourceId must be a non-empty token");
   }
   return value;
+}
+
+function normalizeHostGrants(
+  input: Readonly<Record<string, EdgeHostGrant>> | undefined,
+): ReadonlyMap<string, EdgeHostGrant> {
+  if (input === undefined) return new Map();
+  if (!isRecord(input)) throw new MoweEdgeRegistryError("hostGrants must be an object");
+  const grants = new Map<string, EdgeHostGrant>();
+  for (const [rawSourceId, candidate] of Object.entries(input)) {
+    const sourceId = normalizeSourceId(rawSourceId);
+    if (!isRecord(candidate)) {
+      throw new MoweEdgeRegistryError(`Host grant for ${sourceId} must be an object`);
+    }
+    const effects = normalizeGrantValues(candidate.effects, EDGE_EFFECTS, `${sourceId}.effects`);
+    const scopes = normalizeGrantValues(candidate.scopes, EDGE_SCOPES, `${sourceId}.scopes`);
+    if (candidate.allowWithoutApproval !== undefined
+      && typeof candidate.allowWithoutApproval !== "boolean") {
+      throw new MoweEdgeRegistryError(`${sourceId}.allowWithoutApproval must be a boolean`);
+    }
+    grants.set(sourceId, freeze({
+      effects,
+      scopes,
+      ...(candidate.allowWithoutApproval === undefined
+        ? {}
+        : { allowWithoutApproval: candidate.allowWithoutApproval }),
+    }));
+  }
+  return grants;
+}
+
+function normalizeGrantValues<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  path: string,
+): readonly T[] {
+  if (!Array.isArray(value) || value.length === 0
+    || value.some((item) => typeof item !== "string" || !allowed.includes(item as T))) {
+    throw new MoweEdgeRegistryError(`${path} must be a non-empty array of supported values`);
+  }
+  if (new Set(value).size !== value.length) {
+    throw new MoweEdgeRegistryError(`${path} must not contain duplicates`);
+  }
+  return Object.freeze([...value] as T[]);
+}
+
+function applyHostGrant(
+  capability: EdgeCapability,
+  grant: EdgeHostGrant | undefined,
+  edge: RegisteredEdge,
+): EdgeCapability | undefined {
+  const metadata = capability.tool.metadata ?? {};
+  if (grant === undefined) {
+    edge.diagnostics.push(diagnostic(
+      "host-grant-denied",
+      "warning",
+      edge.sourceId,
+      "No host grant is configured; capability is quarantined behind explicit approval",
+      capability.manifest.capabilityName,
+    ));
+    return rebindEdgeCapabilityMetadata(capability, {
+      ...metadata,
+      effect: "external",
+      scope: "host",
+      requiresApproval: true,
+      deterministic: false,
+      supportsBatch: false,
+      concurrencySafe: false,
+      supportsStreaming: false,
+      maxConcurrency: 1,
+    });
+  }
+  if (!grant.effects.includes(capability.manifest.effect)
+    || !grant.scopes.includes(capability.manifest.scope)) {
+    edge.diagnostics.push(diagnostic(
+      "host-grant-denied",
+      "error",
+      edge.sourceId,
+      `Host grant does not permit ${capability.manifest.effect}/${capability.manifest.scope}`,
+      capability.manifest.capabilityName,
+    ));
+    return undefined;
+  }
+  return rebindEdgeCapabilityMetadata(capability, {
+    ...metadata,
+    effect: capability.manifest.effect,
+    scope: capability.manifest.scope,
+    requiresApproval: grant.allowWithoutApproval === true
+      ? (metadata.requiresApproval ?? false)
+      : true,
+  });
+}
+
+function createRefreshController(
+  parentSignal: AbortSignal | undefined,
+  timeoutMs = DEFAULT_EDGE_REFRESH_TIMEOUT_MS,
+): { signal: AbortSignal; dispose(): void } {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_EDGE_REFRESH_TIMEOUT_MS) {
+    throw new MoweEdgeRegistryError(
+      `Edge refresh timeoutMs must be an integer between 1 and ${MAX_EDGE_REFRESH_TIMEOUT_MS}`,
+    );
+  }
+  const controller = new AbortController();
+  const abortFromParent = (): void => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted === true) abortFromParent();
+  else parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+  const timeout = setTimeout(() => {
+    controller.abort(new Error(`Edge refresh timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  timeout.unref?.();
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timeout);
+      parentSignal?.removeEventListener("abort", abortFromParent);
+    },
+  };
+}
+
+function awaitWithSignal<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(abortReason(signal));
+    signal.addEventListener("abort", abort, { once: true });
+    pending.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("Edge refresh cancelled");
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
