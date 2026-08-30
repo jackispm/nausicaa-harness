@@ -38,6 +38,7 @@ import type {
   FukaiBudget,
   FukaiCompactionSelection,
   FukaiConversationRef,
+  FukaiEdgeContextContribution,
   MainContextProvider,
 } from "../fukai/types.js";
 import { MoweExecutor } from "../mowe/index.js";
@@ -165,6 +166,8 @@ export interface MainLoopDeps {
   tools?: readonly AgentTool[];
   /** Unified Mowe tool system; omitted to build one around the supplied tools. */
   mowe?: MoweExecutor;
+  /** Selected edge Skill context captured for this activation. */
+  edgeContext?: readonly FukaiEdgeContextContribution[];
   clock?: Clock;
   /** Monotonic milliseconds used for provider/context latency metrics. */
   monotonicNow?: () => number;
@@ -289,6 +292,7 @@ export class MainLoop {
   private readonly compactForPressure: MainLoopDeps["compactForPressure"];
   private readonly approve: MainLoopDeps["approve"];
   private readonly onStreamEvent: MainLoopDeps["onStreamEvent"];
+  private readonly edgeContext: readonly FukaiEdgeContextContribution[];
   private readonly artifactAuthorization: RunArtifactAuthorization | undefined;
   private readonly streamSequences = new Map<string, number>();
   private readonly modelCallAttempts = new Map<string, number>();
@@ -335,6 +339,9 @@ export class MainLoop {
     this.compactForPressure = deps.compactForPressure;
     this.approve = deps.approve;
     this.onStreamEvent = deps.onStreamEvent;
+    this.edgeContext = deps.edgeContext === undefined
+      ? []
+      : Object.freeze(deps.edgeContext.map((item) => structuredClone(item)));
   }
 
   async run(input: MainLoopInput): Promise<MainLoopResult> {
@@ -504,6 +511,8 @@ export class MainLoop {
           systemPrompt: effectiveSystemPrompt(input, tools),
           projectInstructions: projectInstructions.files,
           projectInstructionManifest: projectInstructionsManifest,
+          ...(this.edgeContext.length === 0 ? {} : { edgeContext: this.edgeContext }),
+          ...(this.edgeContext.length === 0 ? {} : { skillContext: this.edgeContext }),
           conversationRefs,
           artifactSelections,
           tools,

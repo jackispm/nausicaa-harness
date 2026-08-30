@@ -184,7 +184,7 @@ export function createDaemonSessionActivator(
       ? activationDeps
       : { ...activationDeps, commitExecutionLease };
     const session = await createSession(
-      { ...options.session, runId: request.runId },
+      { ...options.session, runId: request.runId, closeEdgeCompositionOnClose: false },
       guardedDeps,
     );
     let cancelling = false;
@@ -225,6 +225,8 @@ export interface DaemonRuntimeOptions {
   readonly openLedger?: (runId: string) => Promise<Ledger>;
   /** Optional live discovery loop. Scans are single-flight and never overlap. */
   readonly reconciliation?: DaemonReconciliationOptions;
+  /** Host-owned edge composition shutdown hook, invoked once after Host stop. */
+  readonly closeEdgeComposition?: () => void | Promise<void>;
 }
 
 export interface DaemonReconciliationOptions {
@@ -262,6 +264,11 @@ export async function openDaemonRuntime(
 ): Promise<DaemonRuntime> {
   validateRuntimeOptions(options);
   const sessionDeps = options.sessionDeps ?? {};
+  const closeEdgeComposition = closeOnce(
+    options.closeEdgeComposition
+      ?? options.session.edgeSnapshotProvider?.close
+      ?? sessionDeps.edgeSnapshotProvider?.close,
+  );
   const activate = createDaemonSessionActivator({
     session: options.session,
     sessionDeps,
@@ -423,7 +430,11 @@ export async function openDaemonRuntime(
     }
     const operation = (async (): Promise<DaemonHostSnapshot> => {
       await activeRecovery?.catch(() => undefined);
-      return host.stop();
+      try {
+        return await host.stop();
+      } finally {
+        await closeEdgeComposition();
+      }
     })();
     stopPromise = operation;
     void operation.then(
@@ -439,6 +450,15 @@ export async function openDaemonRuntime(
     start,
     stop,
     recoverPendingRuns,
+  };
+}
+
+function closeOnce(close: (() => void | Promise<void>) | undefined): () => Promise<void> {
+  let closing: Promise<void> | undefined;
+  return (): Promise<void> => {
+    if (closing !== undefined) return closing;
+    closing = Promise.resolve().then(async () => close?.());
+    return closing;
   };
 }
 

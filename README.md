@@ -30,6 +30,9 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 不会自行启动进程或获得权限；adapter registry 在刷新时校验 manifest，并为后续 Turn
 创建带 generation 的不可变工具快照。Main 通过 Mowe 使用快照，Worker 仍只获得固定的
 只读工具集。交互会话中的 `/edges` 只读取状态投影，不直接管理 edge 进程。
+每个 Main Turn 在工具和上下文组装前捕获一次 registry snapshot；Turn 期间的刷新只影响后续
+Turn。Skill 正文只会在显式选择后以有界、标记为不可信的 Fukai context 数据进入 Main，
+不会成为工具、`projectInstructions`、系统策略或 Worker 上下文。
 
 ```json
 {
@@ -45,7 +48,8 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 ```
 
 命令行可用 `--edges`、`--no-edges` 和 `--refresh-edges` 覆盖本次启动的 edge 开关。
-`--refresh-edges` 只请求宿主刷新；没有 registry 时也不会进行网络或外部进程调用。
+`--refresh-edges` 只请求宿主刷新；没有 registry 时也不会进行网络或外部进程调用。当前
+实现没有插件热加载、自动安装市场或完整的远程 daemon parity；插件声明保持诊断状态。
 
 `read_file` 支持按行分页，`read_many` 可在共享字节预算内并发读取最多 16 个窗口；`grep` 与 `find` 在截断时返回绑定查询的续页 cursor。Git 查看工具使用固定参数、受保护路径过滤、可信可执行文件解析和有界输出，不要求开放 Shell。`write_file` 只在已有目录中写文件，不负责创建目录；`edit` 要求被替换文本唯一匹配。工作区文件工具会拒绝绝对路径、`..`、已有符号链接和受保护路径；当前威胁模型不覆盖同一系统账号下的其他进程并发替换文件系统节点。两档 `bash` 都有独立的环境变量白名单、取消/超时和有界输出；`workspace` 档再由 Seatbelt 或 bubblewrap 限制写入、网络和进程边界，`full-access` 档则明确运行在宿主权限下。需要异步观察开发服务器或测试进程时使用 Full Access 提供的 Job 生命周期工具，而不是在前台 `bash` 中放任后台命令。
 

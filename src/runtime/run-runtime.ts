@@ -96,6 +96,10 @@ import {
   materializeWorkspaceEdgeTools,
   type WorkspaceEdgeToolSnapshot,
 } from "../mowe/workspace-catalog.js";
+import {
+  captureEdgeTurnSnapshot,
+  type EdgeTurnSnapshotProvider,
+} from "./edge-runtime.js";
 
 export interface RunExecutionRequest {
   workspace: string;
@@ -124,6 +128,8 @@ export interface RunExecutionRequest {
   allowNetwork?: boolean;
   /** Registry snapshot captured before this Run/Turn; never refreshed mid-turn. */
   edgeSnapshot?: WorkspaceEdgeToolSnapshot;
+  /** Optional composition seam; captured once before Main context assembly. */
+  edgeSnapshotProvider?: EdgeTurnSnapshotProvider;
   signal?: AbortSignal;
 }
 
@@ -140,6 +146,7 @@ export interface RunExecutionDeps {
   webSearchProvider?: WebSearchProvider;
   /** Embedding seam for a captured edge snapshot when request data is shared. */
   edgeSnapshot?: WorkspaceEdgeToolSnapshot;
+  edgeSnapshotProvider?: EdgeTurnSnapshotProvider;
   /** Host approval boundary for Main tools that explicitly require approval. */
   approveTool?: MainLoopDeps["approve"];
   /** Test/embedding seam for the OS-enforced workspace Bash boundary. */
@@ -336,6 +343,11 @@ export const executeRun = async (
     }
 
     const mainModel = compactionModel ?? deps.mainModel ?? createOpenRouterModelPort();
+    const edgeProjection = await captureEdgeTurnSnapshot(
+      request.edgeSnapshotProvider ?? deps.edgeSnapshotProvider,
+      edgeSnapshot,
+      request.signal,
+    );
     const mainAdvertisesImages = shouldAdvertiseImageTools(mainModel, request.model);
     const mainUpperWatermark = compactionRuntime === undefined
       ? setup.upperWatermark
@@ -388,7 +400,7 @@ export const executeRun = async (
         ? {}
         : { webSearchProvider: deps.webSearchProvider }),
       protectedPaths: [resolve(request.dataDir)],
-    })), ...materializeWorkspaceEdgeTools(edgeSnapshot)];
+    })), ...materializeWorkspaceEdgeTools(edgeProjection.edgeSnapshot)];
     if (auxiliaryMode === "teto") {
       if (adviceDelivery === "live") tools.push(createAdviceResponseTool(inbox));
       const tetoModel = deps.tetoModel ?? mainModel;
@@ -489,6 +501,9 @@ export const executeRun = async (
       tools,
       clock,
       runTokenBudget,
+      ...(edgeProjection.contextContributions.length === 0
+        ? {}
+        : { edgeContext: edgeProjection.contextContributions }),
       ...(deps.approveTool === undefined ? {} : { approve: deps.approveTool }),
       ...(outputContinuationMessageId === undefined
         && scheduler === undefined
@@ -663,6 +678,11 @@ export const executeRun = async (
     await scheduler?.stop().catch(() => undefined);
     await workerScheduler?.stop().catch(() => undefined);
     await processJobManager?.close().catch(() => undefined);
+    try {
+      await (request.edgeSnapshotProvider ?? deps.edgeSnapshotProvider)?.close?.();
+    } catch {
+      // Edge shutdown is best effort after the durable Run boundary closes.
+    }
     await ledger.close();
   }
 };

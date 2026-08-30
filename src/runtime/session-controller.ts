@@ -120,6 +120,10 @@ import {
   materializeWorkspaceEdgeTools,
   type WorkspaceEdgeToolSnapshot,
 } from "../mowe/workspace-catalog.js";
+import {
+  captureEdgeTurnSnapshot,
+  type EdgeTurnSnapshotProvider,
+} from "./edge-runtime.js";
 
 export {
   SessionProtocolError,
@@ -295,6 +299,10 @@ export interface SessionControllerOptions {
   allowNetwork?: boolean;
   /** Registry snapshot captured for subsequent Turns; refresh never mutates it. */
   edgeSnapshot?: WorkspaceEdgeToolSnapshot;
+  /** Captured exactly once immediately before each Main Turn assembly. */
+  edgeSnapshotProvider?: EdgeTurnSnapshotProvider;
+  /** Session owns the provider by default; daemon composition disables this. */
+  closeEdgeCompositionOnClose?: boolean;
   /** Initial collaboration behavior; interactive users may change it later. */
   collaborationMode?: SessionCollaborationMode;
   /** Optional root directory for per-Run durable process-job metadata. */
@@ -314,6 +322,8 @@ export interface SessionControllerDeps {
   webSearchProvider?: WebSearchProvider;
   /** Fallback edge snapshot for embedders that keep request options separate. */
   edgeSnapshot?: WorkspaceEdgeToolSnapshot;
+  edgeSnapshotProvider?: EdgeTurnSnapshotProvider;
+  closeEdgeCompositionOnClose?: boolean;
   /** Test/embedding seam for the default workspace-confined foreground Bash. */
   workspaceCommandSandbox?: WorkspaceCommandSandbox;
   /** Host/TUI approval boundary for Main tools that explicitly require approval. */
@@ -374,6 +384,8 @@ export class SessionController {
   private readonly requestedWorkerEnabled: boolean | undefined;
   private readonly workspaceCommandSandbox: WorkspaceCommandSandbox;
   private readonly edgeSnapshot: WorkspaceEdgeToolSnapshot | undefined;
+  private readonly edgeSnapshotProvider: EdgeTurnSnapshotProvider | undefined;
+  private readonly closeEdgeCompositionOnClose: boolean;
   private selectedMainModel: string;
   private writeAllowed: boolean;
   private shellAllowed: boolean;
@@ -422,6 +434,10 @@ export class SessionController {
     this.edgeSnapshot = edgeSnapshot === undefined
       ? undefined
       : freezeWorkspaceEdgeToolSnapshot(edgeSnapshot);
+    this.edgeSnapshotProvider = options.edgeSnapshotProvider ?? deps.edgeSnapshotProvider;
+    this.closeEdgeCompositionOnClose = options.closeEdgeCompositionOnClose
+      ?? deps.closeEdgeCompositionOnClose
+      ?? true;
     this.clock = deps.clock ?? systemClock;
     this.requestedWorkerEnabled = options.workerEnabled ?? options.policy?.workerEnabled;
     this.policy = resolveRunPolicy({
@@ -1294,6 +1310,13 @@ export class SessionController {
         await commitRunCheckpoint(this.attached.sink, this.attached.runId).catch(() => undefined);
       }
       await this.detach();
+      if (this.closeEdgeCompositionOnClose) {
+        try {
+          await this.edgeSnapshotProvider?.close?.();
+        } catch {
+          // Provider shutdown must not strand the durable Session close.
+        }
+      }
       this.status = "closed";
       this.publishState();
       this.listeners.clear();
@@ -1689,6 +1712,11 @@ export class SessionController {
       ) {
         attached.processJobs = await this.createProcessJobManager(attached.runId);
       }
+      const edgeProjection = await captureEdgeTurnSnapshot(
+        this.edgeSnapshotProvider,
+        this.edgeSnapshot,
+        turn.controller.signal,
+      );
       const tools = [...(this.deps.tools ?? createWorkspaceTools({
         allowWrite: turnCapabilities.allowWrite,
         allowShell: turnCapabilities.allowShell || workspaceSandbox !== undefined,
@@ -1706,7 +1734,7 @@ export class SessionController {
           ? {}
           : { webSearchProvider: this.deps.webSearchProvider }),
         protectedPaths: [this.dataDir],
-      })), ...materializeWorkspaceEdgeTools(this.edgeSnapshot)];
+      })), ...materializeWorkspaceEdgeTools(edgeProjection.edgeSnapshot)];
       if (attached.policy.tetoEnabled) {
         tools.push(createAdviceResponseTool(inbox));
         scheduler = new TetoScheduler({
@@ -1785,6 +1813,9 @@ export class SessionController {
         tools,
         clock: this.clock,
         runTokenBudget: attached.tokenBudget,
+        ...(edgeProjection.contextContributions.length === 0
+          ? {}
+          : { edgeContext: edgeProjection.contextContributions }),
         ...(this.deps.approveTool === undefined
           ? {}
           : { approve: this.deps.approveTool }),

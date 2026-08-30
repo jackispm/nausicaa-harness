@@ -45,6 +45,21 @@ export interface FukaiProjectInstruction {
   contentHash: string;
 }
 
+/** Selected edge text is untrusted context data, never host/system policy. */
+export interface FukaiEdgeContextContribution {
+  readonly sourceId: string;
+  readonly contributionId: string;
+  readonly sourceType: "skill" | "plugin";
+  readonly name: string;
+  readonly description: string;
+  readonly body: string;
+  readonly disabled?: boolean;
+  readonly selected?: boolean;
+  readonly contentHash?: string;
+  readonly precedence?: number;
+  readonly provenance?: unknown;
+}
+
 export interface FukaiBudget {
   maxInputTokens: number;
   maxConversationMessages: number;
@@ -128,6 +143,10 @@ export interface FukaiContextRequest {
   projectInstructions?: readonly FukaiProjectInstruction[];
   /** Hash-only Ledger projection plus a Store ref for exact reconstruction. */
   projectInstructionManifest?: ContextProjectInstructionsManifest;
+  /** Selected, enabled Skill/plugin text projected as bounded untrusted data. */
+  edgeContext?: readonly FukaiEdgeContextContribution[];
+  /** Explicit name for the dedicated untrusted Skill slot. */
+  skillContext?: readonly FukaiEdgeContextContribution[];
   conversationRefs: readonly FukaiConversationRef[];
   artifactSelections: readonly FukaiArtifactSelection[];
   tools: readonly ToolDefinition[];
