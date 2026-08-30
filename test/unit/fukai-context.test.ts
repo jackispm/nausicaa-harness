@@ -5,7 +5,6 @@ import { FUKAI_COMPACTION_MEDIA_TYPE } from "../../src/domain/context.js";
 import {
   ContentStoreFukaiSource,
   FukaiBudgetError,
-  FukaiCompactionError,
   FukaiContextProvider,
 } from "../../src/fukai/index.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
@@ -320,7 +319,7 @@ describe("FukaiContextProvider", () => {
     });
   });
 
-  it("rejects overlapping, duplicate, and malformed deferred conversation refs", async () => {
+  it("fails closed to bounded raw context for invalid deferred refs", async () => {
     const store = new MemoryContentAddressedStore();
     const summarized = await putMessage(store, {
       role: "user",
@@ -390,10 +389,15 @@ describe("FukaiContextProvider", () => {
       });
     };
 
-    await expect(build([summarized])).rejects.toBeInstanceOf(FukaiCompactionError);
-    await expect(build([deferred, deferred])).rejects.toBeInstanceOf(FukaiCompactionError);
-    await expect(build([{ ...deferred, byteLength: -1 }])).rejects
-      .toBeInstanceOf(FukaiCompactionError);
+    for (const refs of [[summarized], [deferred, deferred], [{ ...deferred, byteLength: -1 }]]) {
+      const view = await build(refs as readonly typeof deferred[]);
+      expect(view.messages.map((message) => message.content)).toContain("summarized message");
+      expect(view.messages.map((message) => message.content)).toContain("deferred message");
+      expect(view.messages.some((message) => message.content.includes("Fukai compaction"))).toBe(false);
+      expect(view.manifest.slots.compaction.status).toBe("stale");
+      expect(view.manifest.slots.compaction.state).toBe("bounded");
+      expect(view.truncations).toContainEqual(expect.objectContaining({ kind: "conversation-shape" }));
+    }
   });
 
   it("does not silently consume stale compaction capsules", async () => {
@@ -447,6 +451,66 @@ describe("FukaiContextProvider", () => {
     expect(view.messages).toHaveLength(0);
     expect(view.manifest.slots.compaction.status).toBe("stale");
     expect(view.manifest.slots.compaction.state).toBe("bounded");
+  });
+
+  it("fails closed when a ready capsule belongs to a changed policy", async () => {
+    const store = new MemoryContentAddressedStore();
+    const old = await putMessage(store, {
+      role: "user",
+      content: "raw policy-sensitive input",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    const summary = {
+      schemaVersion: 1 as const,
+      goal: { version: 1, statement: "goal", successCriteria: [], hardConstraints: [] },
+      decisions: ["old policy decision"],
+      verifiedResults: [],
+      openQuestions: [],
+      sourceRefs: [{ kind: "conversation" as const, ref: old }],
+    };
+    const summaryRef = await store.put(JSON.stringify(summary), FUKAI_COMPACTION_MEDIA_TYPE);
+    const view = await new FukaiContextProvider(new ContentStoreFukaiSource(store)).build({
+      runId: "run-policy-change",
+      laneId: "main",
+      laneKind: "main",
+      goal: summary.goal,
+      systemPrompt: "Main",
+      conversationRefs: [{ ref: old, sequence: 1 }],
+      artifactSelections: [],
+      tools: [],
+      upperWatermark: 2,
+      policyVersion: "policy-v2",
+      compaction: {
+        capsule: {
+          schemaVersion: 1,
+          compactionId,
+          status: "ready",
+          summaryRef,
+          sourceRefs: [{ kind: "conversation", ref: old }],
+          summaryHash: summaryRef.contentHash,
+          cursor: "offset:1",
+          upperWatermark: 1,
+          goalVersion: 1,
+          policyVersion: "policy-v1",
+          estimatedTokens: 10,
+        },
+        summary,
+      },
+      budget: {
+        maxInputTokens: 1_000,
+        maxConversationMessages: 10,
+        maxArtifacts: 0,
+        maxArtifactBytes: 0,
+        maxQueries: 10,
+      },
+    });
+
+    expect(view.messages.map((message) => message.content)).toContain("raw policy-sensitive input");
+    expect(view.messages.map((message) => message.content)).not.toContain(
+      expect.stringContaining("old policy decision"),
+    );
+    expect(view.manifest.slots.compaction.status).toBe("stale");
+    expect(view.truncations).toContainEqual(expect.objectContaining({ kind: "conversation-shape" }));
   });
 
   it("builds a deterministic context key from external refs", async () => {

@@ -124,6 +124,33 @@ describe("FukaiCompactionCoordinator recovery", () => {
     expect(setup.tokenBudget.snapshot().usedTokens).toBe(totalTokens(usage));
   });
 
+  it("does not replay provider IO when the durable compaction read fails", async () => {
+    const request = executionRequest();
+    const provider: FukaiCompactionProvider = {
+      compact: vi.fn(async (providerRequest) => selectionFor(providerRequest.compactionId)),
+    };
+    const core: FukaiCompactionCorePort = {
+      async readCompaction() {
+        throw new Error("Ledger read unavailable");
+      },
+      async readCompactionSelection() {
+        throw new Error("unreachable");
+      },
+      async commitCompaction() {
+        throw new Error("unreachable");
+      },
+    };
+    const coordinator = createFukaiCompactionCoordinator({
+      core,
+      provider,
+      ledger: new MemoryLedger(),
+      tokenBudget: new RunTokenBudget(10_000),
+    });
+
+    await expect(coordinator.execute(request)).rejects.toThrow("Ledger read unavailable");
+    expect(provider.compact).not.toHaveBeenCalled();
+  });
+
   it("derives a new identity and executes a stale repair with unchanged sources and watermark", async () => {
     const ledger = new MemoryLedger();
     const ordinaryRequest = executionRequest();
@@ -405,6 +432,41 @@ describe("FukaiCompactionCoordinator recovery", () => {
           },
         },
       });
+  });
+
+  it("treats provider usage above the compaction budget as unknown", async () => {
+    const request = executionRequest();
+    const oversized: TokenUsage = {
+      ...usage,
+      input: request.budget.maxInputTokens + 1,
+    };
+    const provider: FukaiCompactionProvider = {
+      compact: vi.fn(async (providerRequest) => ({
+        ...selectionFor(providerRequest.compactionId),
+        providerUsage: oversized,
+      })),
+    };
+    const setup = createSetup({ provider });
+
+    await expect(setup.coordinator.execute(request)).resolves.toMatchObject({
+      status: "committed",
+      reused: false,
+    });
+    expect((await setup.ledger.read()).find((event) => event.type === "fukai.compaction.completed"))
+      .toMatchObject({ payload: { usage: null } });
+    expect((await setup.ledger.read()).find((event) => event.type === "budget.charged"))
+      .toMatchObject({
+        payload: {
+          usage: {
+            input: request.budget.maxInputTokens,
+            output: request.budget.maxOutputTokens,
+            cacheRead: 0,
+            cacheWrite: 0,
+          },
+        },
+      });
+    expect(setup.tokenBudget.snapshot().usedTokens)
+      .toBe(request.budget.maxInputTokens + request.budget.maxOutputTokens);
   });
 
   it("commits completed and already charged work without double charging", async () => {

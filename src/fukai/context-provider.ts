@@ -109,15 +109,34 @@ export class FukaiContextProvider implements MainContextProvider {
       : estimateMessageTokens(activeObjectiveMessage);
     remainingTokens -= activeObjectiveTokens;
 
-    const compactionMessage = buildCompactionMessage(request.compaction, request);
+    // Compaction is an optimization over the bounded raw Inbox. If a capsule
+    // is malformed, stale, or cannot fit, discard only the optimization and
+    // continue with raw context plus a replay-visible truncation reason.
+    let compactionMessage: ConversationMessage | undefined;
+    let compactionFailure: string | undefined;
+    try {
+      compactionMessage = buildCompactionMessage(request.compaction, request);
+    } catch (error: unknown) {
+      compactionFailure = error instanceof Error ? error.message : String(error);
+      truncations.push({
+        kind: "conversation-shape",
+        detail: `Compaction capsule ignored: ${compactionFailure}`,
+      });
+    }
     const compactionTokens = compactionMessage === undefined
       ? 0
       : estimateMessageTokens(compactionMessage);
     if (compactionMessage !== undefined) {
       if (compactionTokens > remainingTokens) {
-        throw new FukaiBudgetError("Context budget cannot retain the selected compaction summary");
+        compactionFailure = "Context budget cannot retain the selected compaction summary";
+        truncations.push({
+          kind: "input-token-budget",
+          detail: `Compaction capsule ignored: ${compactionFailure}`,
+        });
+        compactionMessage = undefined;
+      } else {
+        remainingTokens -= compactionTokens;
       }
-      remainingTokens -= compactionTokens;
     }
 
     const edgeContextMessage = buildEdgeContextMessage(edgeContext, remainingTokens, truncations);
@@ -131,13 +150,14 @@ export class FukaiContextProvider implements MainContextProvider {
       remainingTokens -= edgeContextTokens;
     }
 
-    const coveredConversationRefs = compactionMessage === undefined
+    const usableCompaction = compactionMessage === undefined ? undefined : request.compaction;
+    const coveredConversationRefs = usableCompaction === undefined
       ? emptyConversationCoverage()
-      : coveredConversationCoverage(request.compaction);
+      : coveredConversationCoverage(usableCompaction, request.conversationRefs);
     const orderedConversationRefs = [...request.conversationRefs]
       .filter((item) => !isConversationCovered(item, coveredConversationRefs))
       .sort(
-        (left, right) => left.sequence - right.sequence || left.ref.id.localeCompare(right.ref.id),
+        (left, right) => left.sequence - right.sequence || compareLexical(left.ref.id, right.ref.id),
       );
     const selectedRefs = orderedConversationRefs.slice(
       Math.max(0, orderedConversationRefs.length - request.budget.maxConversationMessages),
@@ -355,6 +375,7 @@ export class FukaiContextProvider implements MainContextProvider {
       messages,
       truncations,
       projectInstructionManifest: projectInstructions.manifest,
+      compactionFailure,
     });
     const cacheKey = hashStable({
       version: 1,
@@ -407,6 +428,7 @@ interface ContextManifestInput {
   messages: readonly ConversationMessage[];
   truncations: readonly FukaiTruncation[];
   projectInstructionManifest: ContextProjectInstructionsManifest;
+  compactionFailure: string | undefined;
 }
 
 function buildContextManifest(input: ContextManifestInput): ContextManifest {
@@ -475,14 +497,21 @@ function buildContextManifest(input: ContextManifestInput): ContextManifest {
           messages: inboxMessages,
         }),
       ),
-      compaction: buildCompactionSlot(input.request.compaction, input.compactionMessage),
+      compaction: buildCompactionSlot(
+        input.request.compaction,
+        input.compactionMessage,
+        input.compactionFailure,
+      ),
       "lane-context": slot(
         input.selectedArtifactCount === 0
           ? "empty"
           : hasArtifactTruncation ? "bounded" : "present",
         input.selectedArtifactCount,
         input.selectedArtifactTokens,
-        hashStable({ selections: input.request.artifactSelections, evidence: evidenceText }),
+        hashStable({
+          selections: sortArtifactSelections(input.request.artifactSelections),
+          evidence: evidenceText,
+        }),
       ),
     },
     projectInstructions: structuredClone(input.projectInstructionManifest),
@@ -496,7 +525,15 @@ function buildContextManifest(input: ContextManifestInput): ContextManifest {
 function buildCompactionSlot(
   selection: FukaiCompactionSelection | undefined,
   message: ConversationMessage | undefined,
+  failure: string | undefined,
 ): ContextCompactionSlotManifest {
+  if (failure !== undefined) {
+    return {
+      ...slot("bounded", 0, 0, hashStable({ status: "stale", failure })),
+      status: "stale",
+      sourceRefs: [],
+    };
+  }
   if (selection === undefined) {
     return {
       ...slot("empty", 0, 0, hashStable({ status: "none" })),
@@ -584,17 +621,19 @@ function buildCompactionMessage(
 interface ConversationCoverage {
   directRefs: Set<string>;
   deferredRefs: Set<string>;
+  protectedRefs: Set<string>;
   throughSequence?: number;
 }
 
 function emptyConversationCoverage(): ConversationCoverage {
-  return { directRefs: new Set(), deferredRefs: new Set() };
+  return { directRefs: new Set(), deferredRefs: new Set(), protectedRefs: new Set() };
 }
 
 function coveredConversationCoverage(
-  selection: FukaiCompactionSelection | undefined,
+  selection: FukaiCompactionSelection,
+  conversationRefs: readonly FukaiConversationRef[],
 ): ConversationCoverage {
-  if (selection === undefined || selection.capsule.status !== "ready") {
+  if (selection.capsule.status !== "ready") {
     return emptyConversationCoverage();
   }
   const directRefs = new Set(selection.capsule.sourceRefs.flatMap((source) => (
@@ -603,24 +642,35 @@ function coveredConversationCoverage(
   const deferredRefs = new Set(
     (selection.capsule.deferredConversationRefs ?? []).map(artifactRefKey),
   );
+  const newest = [...conversationRefs].sort((left, right) => (
+    right.sequence - left.sequence || compareLexical(right.ref.id, left.ref.id)
+  ))[0];
+  const protectedRefs = new Set(conversationRefs.flatMap((item) => (
+    newest !== undefined
+      && (item === newest
+        || (newest.groupId !== undefined && item.groupId === newest.groupId))
+      ? [artifactRefKey(item.ref)]
+      : []
+  )));
   const hasRollForwardBase = selection.capsule.sourceRefs.some((source) => (
     source.kind === "artifact"
     && source.ref.mediaType === FUKAI_COMPACTION_MEDIA_TYPE
   ));
-  if (!hasRollForwardBase) return { directRefs, deferredRefs };
+  if (!hasRollForwardBase) return { directRefs, deferredRefs, protectedRefs };
   const cursor = /^offset:(\d+)$/.exec(selection.capsule.cursor);
   const throughSequence = cursor === null ? undefined : Number(cursor[1]);
   if (throughSequence === undefined || !Number.isSafeInteger(throughSequence)) {
-    return { directRefs, deferredRefs };
+    return { directRefs, deferredRefs, protectedRefs };
   }
-  return { directRefs, deferredRefs, throughSequence };
+  return { directRefs, deferredRefs, protectedRefs, throughSequence };
 }
 
 function isConversationCovered(
   conversationRef: FukaiConversationRef,
   coverage: ConversationCoverage,
 ): boolean {
-  if (coverage.deferredRefs.has(artifactRefKey(conversationRef.ref))) {
+  const identity = artifactRefKey(conversationRef.ref);
+  if (coverage.deferredRefs.has(identity) || coverage.protectedRefs.has(identity)) {
     return false;
   }
   return (coverage.throughSequence !== undefined
@@ -1174,7 +1224,7 @@ function sortArtifactSelections(
     if (priority !== 0) {
       return priority;
     }
-    const ref = left.ref.id.localeCompare(right.ref.id);
+    const ref = compareLexical(left.ref.id, right.ref.id);
     if (ref !== 0) {
       return ref;
     }
@@ -1258,7 +1308,7 @@ function sortValue(value: unknown): unknown {
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => compareLexical(left, right))
         .map(([key, child]) => [key, sortValue(child)]),
     );
   }

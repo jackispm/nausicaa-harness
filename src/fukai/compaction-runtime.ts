@@ -274,7 +274,7 @@ export class FukaiCompactionCoordinator {
     let selection: FukaiCompactionSelection;
     try {
       const returned = await this.#provider.compact(providerRequest(request, compactionId));
-      const providerUsage = safeUsage(this.#usageFromSelection, returned) ?? undefined;
+      const providerUsage = safeUsage(this.#usageFromSelection, returned, request) ?? undefined;
       try {
         assertProviderSelectionMatchesRequest(request, compactionId, returned);
         const verified = await this.#core.readCompactionSelection(
@@ -295,7 +295,7 @@ export class FukaiCompactionCoordinator {
       }
     } catch (error: unknown) {
       const status = providerFailureStatus(error, request.signal);
-      const usage = usageFromError(error);
+      const usage = usageFromError(error, request);
       let failed: EventEnvelope<"fukai.compaction.failed">;
       try {
         failed = await this.#append("fukai.compaction.failed", {
@@ -347,7 +347,7 @@ export class FukaiCompactionCoordinator {
       };
     }
 
-    const usage = safeUsage(this.#usageFromSelection, selection);
+    const usage = safeUsage(this.#usageFromSelection, selection, request);
     const chargedUsage = chargedUsageFor(request, usage);
     let completed: EventEnvelope<"fukai.compaction.completed">;
     try {
@@ -426,17 +426,18 @@ export class FukaiCompactionCoordinator {
     if (state.completed === undefined) {
       if (state.failed !== undefined) {
         if (state.failed.payload.usage !== null && state.charged === undefined) {
+          const recoveredUsage = chargedUsageFor(request, state.failed.payload.usage);
           await this.#appendBudgetCharge(
             request,
             compactionId,
             { attempt, attemptId },
-            state.failed.payload.usage,
+            recoveredUsage,
             state.failed.eventId,
             state.failed.correlationId,
           );
           this.#tokenBudget.reconcile(
             `fukai:${attemptId}`,
-            state.failed.payload.usage,
+            recoveredUsage,
             { alreadyAccounted: true },
           );
           return {
@@ -694,15 +695,13 @@ export class FukaiCompactionCoordinator {
     request: FukaiCompactionReadRequest,
     signal: AbortSignal | undefined,
   ): Promise<FukaiCompactionView | undefined> {
-    try {
-      return await this.#core.readCompaction({
-        ...request,
-        ...(signal === undefined ? {} : { signal }),
-      });
-    } catch (error: unknown) {
-      throwIfCallerAborted(signal);
-      return undefined;
-    }
+    // Core returns an explicit `not-found` view. Other failures are durable
+    // read failures and must escape, otherwise a restart could mistake a
+    // Ledger outage for an empty history and invoke the provider twice.
+    return this.#core.readCompaction({
+      ...request,
+      ...(signal === undefined ? {} : { signal }),
+    });
   }
 }
 
@@ -971,21 +970,26 @@ function providerFailureStatus(
 function safeUsage(
   readUsage: (selection: FukaiCompactionSelection) => TokenUsage | undefined,
   selection: FukaiCompactionSelection,
+  request: FukaiCompactionExecutionRequest,
 ): TokenUsage | null {
   try {
     const usage = readUsage(selection);
-    if (usage === undefined || !validUsage(usage)) return null;
+    if (usage === undefined || !validUsage(usage, request.budget)) return null;
     return { ...usage };
   } catch {
     return null;
   }
 }
 
-function usageFromError(error: unknown): TokenUsage | null {
+function usageFromError(
+  error: unknown,
+  request: FukaiCompactionExecutionRequest,
+): TokenUsage | null {
   if (error === null || typeof error !== "object" || !("providerUsage" in error)) {
     return null;
   }
-  return cloneUsage(error.providerUsage);
+  const usage = cloneUsage(error.providerUsage);
+  return usage !== null && validUsage(usage, request.budget) ? usage : null;
 }
 
 function cloneUsage(value: unknown): TokenUsage | null {
@@ -1014,7 +1018,7 @@ function chargedUsageFor(
   request: FukaiCompactionExecutionRequest,
   usage: TokenUsage | null,
 ): TokenUsage {
-  return usage === null
+  return usage === null || !validUsage(usage, request.budget)
     ? {
         input: request.budget.maxInputTokens,
         output: request.budget.maxOutputTokens,
@@ -1024,11 +1028,17 @@ function chargedUsageFor(
     : { ...usage };
 }
 
-function validUsage(usage: TokenUsage): boolean {
+function validUsage(
+  usage: TokenUsage,
+  budget?: Pick<FukaiCompactionExecutionRequest["budget"], "maxInputTokens" | "maxOutputTokens">,
+): boolean {
+  const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
   return [usage.input, usage.output, usage.cacheRead, usage.cacheWrite]
     .every((value) => Number.isSafeInteger(value) && value >= 0)
     && (usage.costUsd === undefined
-      || (Number.isFinite(usage.costUsd) && usage.costUsd >= 0));
+      || (Number.isFinite(usage.costUsd) && usage.costUsd >= 0))
+    && (budget === undefined
+      || (inputTokens <= budget.maxInputTokens && usage.output <= budget.maxOutputTokens));
 }
 
 function elapsed(startedAt: number, completedAt: number): number {
