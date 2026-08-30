@@ -30,7 +30,9 @@ export function collectMarkedImages<T>(
 
   const present = new Set(imageMarkerIds(text));
   const images: T[] = [];
-  for (const [id, image] of pending) {
+  // Marker ids are durable; Map insertion order is not (stash restore can
+  // reinsert an older id). Keep the persisted image array keyed by id order.
+  for (const [id, image] of [...pending.entries()].sort((left, right) => left[0] - right[0])) {
     if (present.has(id)) images.push(image);
   }
   return images;

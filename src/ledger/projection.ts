@@ -51,15 +51,18 @@ export interface InboxMessageView {
   adviceReason?: string;
 }
 
-export type InputStatus = "pending" | "delivered";
+export type InputStatus = "pending" | "delivered" | "withdrawn";
 
 export interface InputView {
   inputId: InputId;
   messageRef: ArtifactRef;
   delivery: InputDelivery;
   sequence: number;
+  revision: number;
   status: InputStatus;
   admittedAtOffset: number;
+  replacedAtOffset?: number;
+  withdrawnAtOffset?: number;
   targetTurnId?: TurnId;
   turnId?: TurnId;
   deliveredAtOffset?: number;
@@ -324,6 +327,7 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
           messageRef: cloneJson(event.payload.messageRef),
           delivery: event.payload.delivery,
           sequence: event.payload.sequence,
+          revision: 1,
           status: "pending",
           admittedAtOffset: event.globalOffset,
           ...(event.payload.targetTurnId === undefined
@@ -332,6 +336,30 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
         };
         projection.inputs.push(input);
         inputById.set(input.inputId, input);
+        break;
+      }
+      case "input.replaced": {
+        const input = inputById.get(event.payload.inputId);
+        if (input !== undefined) {
+          input.messageRef = cloneJson(event.payload.messageRef);
+          input.delivery = event.payload.delivery;
+          input.sequence = event.payload.sequence;
+          input.revision = event.payload.revision;
+          input.replacedAtOffset = event.globalOffset;
+          if (event.payload.targetTurnId === undefined) {
+            delete input.targetTurnId;
+          } else {
+            input.targetTurnId = event.payload.targetTurnId;
+          }
+        }
+        break;
+      }
+      case "input.withdrawn": {
+        const input = inputById.get(event.payload.inputId);
+        if (input !== undefined) {
+          input.status = "withdrawn";
+          input.withdrawnAtOffset = event.globalOffset;
+        }
         break;
       }
       case "input.delivered": {

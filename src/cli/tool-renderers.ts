@@ -310,6 +310,20 @@ function renderGrep(context: ToolRenderContext): ToolPresentation {
   if (context.result === undefined) return rawOrEmpty(context, callSummary);
 
   const path = stringValue(context.result.path) ?? argumentPath;
+  const matchingFiles = Array.isArray(context.result.files)
+    ? context.result.files.filter((value): value is string => typeof value === "string")
+    : undefined;
+  if (matchingFiles !== undefined) {
+    const count = integer(context.result.count) ?? matchingFiles.length;
+    const rows = matchingFiles.flatMap((file) => wrapRows(file, context.width, "output"));
+    if (rows.length === 0) rows.push(line("No matching files", "muted"));
+    if (context.result.truncated === true) rows.push(line("... more matching files", "warning"));
+    return {
+      summary: `${path} · ${count} matching file${count === 1 ? "" : "s"}${context.result.truncated === true ? " · more" : ""}`,
+      collapsed: [],
+      expanded: boundedRows(rows),
+    };
+  }
   const matches = Array.isArray(context.result.matches) ? context.result.matches : [];
   const count = integer(context.result.matchCount) ?? matches.length;
   const files = integer(context.result.filesMatched);

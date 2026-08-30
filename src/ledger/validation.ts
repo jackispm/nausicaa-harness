@@ -837,17 +837,73 @@ const payloadValidators = {
     optionalString(item.targetTurnId, `${path}.targetTurnId`);
     integer(item.sequence, `${path}.sequence`, 1);
   },
+  "input.replaced": (value, path) => {
+    const item = payloadObject(value, path, [
+      "inputId",
+      "expectedRevision",
+      "expectedMessageRef",
+      "revision",
+      "messageRef",
+      "delivery",
+      "sequence",
+    ]);
+    string(item.inputId, `${path}.inputId`, false);
+    integer(item.expectedRevision, `${path}.expectedRevision`, 1);
+    artifactRef(item.expectedMessageRef, `${path}.expectedMessageRef`);
+    integer(item.revision, `${path}.revision`, 2);
+    artifactRef(item.messageRef, `${path}.messageRef`);
+    oneOf(item.delivery, `${path}.delivery`, ["steering", "follow-up"] as const);
+    optionalString(item.targetTurnId, `${path}.targetTurnId`);
+    integer(item.sequence, `${path}.sequence`, 1);
+  },
+  "input.withdrawn": (value, path) => {
+    const item = payloadObject(value, path, [
+      "inputId",
+      "expectedRevision",
+      "expectedMessageRef",
+    ]);
+    string(item.inputId, `${path}.inputId`, false);
+    integer(item.expectedRevision, `${path}.expectedRevision`, 1);
+    artifactRef(item.expectedMessageRef, `${path}.expectedMessageRef`);
+  },
   "input.delivered": (value, path) => {
     const item = payloadObject(value, path, ["inputId", "turnId", "boundary"]);
     string(item.inputId, `${path}.inputId`, false);
     string(item.turnId, `${path}.turnId`, false);
     string(item.boundary, `${path}.boundary`, false);
+    if ((item.expectedRevision === undefined) !== (item.expectedMessageRef === undefined)) {
+      invalid(path, "both expectedRevision and expectedMessageRef, or neither");
+    }
+    if (item.expectedRevision !== undefined) {
+      integer(item.expectedRevision, `${path}.expectedRevision`, 1);
+      artifactRef(item.expectedMessageRef, `${path}.expectedMessageRef`);
+    }
   },
   "turn.started": (value, path) => {
     const item = payloadObject(value, path, ["turnId", "inputId", "ordinal"]);
     string(item.turnId, `${path}.turnId`, false);
     string(item.inputId, `${path}.inputId`, false);
     integer(item.ordinal, `${path}.ordinal`, 1);
+    if (item.boundary !== undefined) {
+      const boundary = payloadObject(
+        item.boundary,
+        `${path}.boundary`,
+        ["collaborationMode", "capabilities"],
+      );
+      oneOf(
+        boundary.collaborationMode,
+        `${path}.boundary.collaborationMode`,
+        ["default", "plan"] as const,
+      );
+      const capabilities = payloadObject(
+        boundary.capabilities,
+        `${path}.boundary.capabilities`,
+        ["allowWrite", "allowShell", "allowNetwork"],
+      );
+      boolean(capabilities.allowWrite, `${path}.boundary.capabilities.allowWrite`);
+      boolean(capabilities.allowShell, `${path}.boundary.capabilities.allowShell`);
+      boolean(capabilities.allowNetwork, `${path}.boundary.capabilities.allowNetwork`);
+    }
   },
   "turn.completed": (value, path) => {
     const item = payloadObject(value, path, ["turnId"]);

@@ -93,6 +93,122 @@ describe("interactive TUI", () => {
     }
   });
 
+  it("browses, edits, changes lane, and withdraws durable queued input", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-queue-edit-"));
+    const previousExitCode = process.exitCode;
+    let releaseFirst = (_response: ModelResponse): void => {};
+    const firstResponse = new Promise<ModelResponse>((resolve) => { releaseFirst = resolve; });
+    try {
+      const model = new ScriptedModel([
+        async () => firstResponse,
+        response("STEERING_AFTER_EDIT"),
+        response("FOLLOW_UP_AFTER_EDIT"),
+      ]);
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 3, tetoEnabled: false },
+      }, { mainModel: model, createRunId: () => "interactive-queue-edit-run" });
+      const originalSubscribe = session.subscribe.bind(session);
+      const originalPendingInputs = session.pendingInputs.bind(session);
+      let forwardRuntimeEvents = true;
+      let markInitialQueueRead = (): void => {};
+      const initialQueueRead = new Promise<void>((resolve) => { markInitialQueueRead = resolve; });
+      let pendingInputReads = 0;
+      (session as unknown as {
+        subscribe: typeof session.subscribe;
+        pendingInputs: typeof session.pendingInputs;
+      }).subscribe = (listener) => originalSubscribe((event) => {
+        if (forwardRuntimeEvents) listener(event);
+      });
+      (session as unknown as {
+        pendingInputs: typeof session.pendingInputs;
+      }).pendingInputs = async () => {
+        const pending = await originalPendingInputs();
+        pendingInputReads += 1;
+        if (pendingInputReads === 1) markInitialQueueRead();
+        return pending;
+      };
+      const terminal = new MemoryTerminal(100, 28);
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      await initialQueueRead;
+      // Force the local preview to remain stale. Alt+Up must query the durable
+      // projection itself instead of depending on event presentation timing.
+      forwardRuntimeEvents = false;
+      terminal.type("active");
+      terminal.send("\r");
+      await waitForModelCalls(model, 1);
+      terminal.type("older steering");
+      terminal.send("\r");
+      terminal.type("newer follow-up");
+      terminal.send("\x1b\r");
+      await waitForPendingInputs(session, 2);
+
+      terminal.type("untouched draft");
+      const readsBeforeBrowse = pendingInputReads;
+      terminal.send("\x1b[1;3A");
+      await waitForOutput(terminal, "editing follow-up");
+      expect(pendingInputReads).toBeGreaterThan(readsBeforeBrowse);
+      forwardRuntimeEvents = true;
+      terminal.send("\x15");
+      terminal.type("newer edited");
+      terminal.send("\r");
+      await waitForCondition(async () => {
+        const pending = await session.pendingInputs();
+        return pending.some((item) => (
+          item.text === "newer edited" && item.delivery === "steering"
+        ));
+      }, "queued input replacement");
+
+      // A successful mutation returns to the draft that was present before browsing.
+      terminal.send("\r");
+      await waitForCondition(async () => (
+        (await session.pendingInputs()).some((item) => item.text === "untouched draft")
+      ), "restored draft submission");
+
+      // The restored draft is newest; an empty submission withdraws it durably.
+      const withdrawalBrowseFrames = countOccurrences(terminal.output, "editing steering");
+      terminal.send("\x1b[1;3A");
+      await waitForCondition(
+        () => countOccurrences(terminal.output, "editing steering") > withdrawalBrowseFrames,
+        "queued input selection for withdrawal",
+      );
+      terminal.send("\x15");
+      terminal.send("\r");
+      await waitForCondition(async () => (
+        !(await session.pendingInputs()).some((item) => item.text === "untouched draft")
+      ), "queued input withdrawal");
+
+      // Alt+Enter while browsing moves the selected input to the follow-up lane.
+      const laneBrowseFrames = countOccurrences(terminal.output, "editing steering");
+      terminal.send("\x1b[1;3A");
+      await waitForCondition(
+        () => countOccurrences(terminal.output, "editing steering") > laneBrowseFrames,
+        "queued input selection for lane change",
+      );
+      terminal.send("\x1b\r");
+      await waitForCondition(async () => {
+        const pending = await session.pendingInputs();
+        return pending.some((item) => (
+          item.text === "newer edited" && item.delivery === "follow-up"
+        ));
+      }, "queued input lane change");
+
+      releaseFirst(response("ACTIVE_ANSWER"));
+      await waitForOutput(terminal, "FOLLOW_UP_AFTER_EDIT");
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      releaseFirst(response("cleanup"));
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
+    }
+  });
+
   it("admits queued Enter input before a concurrent /exit closes the session", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-queue-exit-"));
     const previousExitCode = process.exitCode;
@@ -2030,9 +2146,12 @@ function deferredClipboardImage(): {
   return { promise, resolve };
 }
 
-async function waitForCondition(predicate: () => boolean, description: string): Promise<void> {
+async function waitForCondition(
+  predicate: () => boolean | Promise<boolean>,
+  description: string,
+): Promise<void> {
   const deadline = Date.now() + 2_000;
-  while (!predicate()) {
+  while (!await predicate()) {
     if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${description}`);
     await delay(10);
   }

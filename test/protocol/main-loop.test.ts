@@ -35,6 +35,7 @@ import {
 import { projectMainExecutionRecovery } from "../../src/runtime/recovery.js";
 import { RunTokenBudget } from "../../src/runtime/run-token-budget.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
+import { createGrepTool } from "../../src/tools/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -417,6 +418,41 @@ describe("MainLoop", () => {
     expect(prompt).toContain("Tool steps emit only tools");
     expect(prompt).toContain("answer after evidence is complete");
     expect(prompt).toContain("except for an immediate risk or blocker");
+  });
+
+  it("keeps evidence guidance aligned with the visible grep schema", async () => {
+    const workspace = await temporaryDirectory();
+    const goal = { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] };
+    const run = async (tools: readonly AgentTool[], runId: string): Promise<string> => {
+      const model = new ScriptedModel([{
+        content: "done",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(1, 1),
+      }]);
+      const store = new MemoryContentAddressedStore();
+      const loop = new MainLoop({
+        model,
+        contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+        conversationStore: store,
+        eventSink: new MemoryLedger(),
+        tools,
+      });
+      await loop.run({
+        runId,
+        goal,
+        model: "demo",
+        workspace,
+        policy: policy(1),
+        initialMessage: "Inspect the repository",
+      });
+      return model.requests[0]?.systemPrompt ?? "";
+    };
+
+    await expect(run([createGrepTool()], "grep-files-prompt"))
+      .resolves.toContain("outputMode=files");
+    await expect(run([createGrepTool({}, { pagination: "legacy" })], "grep-legacy-prompt"))
+      .resolves.not.toContain("outputMode=files");
   });
 
   it("rejects malformed tool arguments before recording a tool operation", async () => {
@@ -1006,7 +1042,7 @@ describe("MainLoop", () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
     const ledger = new MemoryLedger();
-    const runTokenBudget = new RunTokenBudget(400);
+    const runTokenBudget = new RunTokenBudget(4_000);
     const controller = new AbortController();
     const model = new ScriptedModel([{
       content: "must not run",
@@ -1046,7 +1082,7 @@ describe("MainLoop", () => {
     expect(runTokenBudget.snapshot()).toMatchObject({
       usedTokens: 0,
       reservedTokens: 0,
-      availableTokens: 400,
+      availableTokens: 4_000,
       settlements: [],
     });
     expect((await ledger.read({ runId: "main-pressure-aborted" })).some((event) => (
@@ -1110,7 +1146,8 @@ describe("MainLoop", () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
     const ledger = new MemoryLedger();
-    const runTokenBudget = new RunTokenBudget(400);
+    const observedInputBudgets: number[] = [];
+    const runTokenBudget = new RunTokenBudget(4_000);
     const model = new ScriptedModel([{
       content: "done",
       toolCalls: [],
@@ -1120,7 +1157,7 @@ describe("MainLoop", () => {
     const loop = new MainLoop({
       model,
       runTokenBudget,
-      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      contextProvider: recordingContextProvider(store, observedInputBudgets),
       conversationStore: store,
       eventSink: ledger,
       tools: [],
@@ -1135,15 +1172,16 @@ describe("MainLoop", () => {
       initialMessage: "Go",
     })).resolves.toMatchObject({ completed: true, usage: tokenUsage(10, 5) });
 
+    expect(observedInputBudgets).toEqual([UNKNOWN_MODEL_REQUEST_INPUT_FALLBACK_TOKENS]);
     expect(model.requests[0]?.maxOutputTokens).toBeGreaterThan(0);
-    expect(model.requests[0]?.maxOutputTokens).toBeLessThan(400);
+    expect(model.requests[0]?.maxOutputTokens).toBeLessThan(4_000);
     expect(runTokenBudget.snapshot()).toMatchObject({
       usedTokens: 15,
       reservedTokens: 0,
-      availableTokens: 385,
+      availableTokens: 3_985,
       settlements: [{
         id: "main-budget-run:lane:main:legacy:step:1:provider:attempt:1",
-        reservedTokens: 400,
+        reservedTokens: 4_000,
         actualTokens: 15,
       }],
     });
@@ -1199,7 +1237,7 @@ describe("MainLoop", () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
     const ledger = new MemoryLedger();
-    const runTokenBudget = new RunTokenBudget(400);
+    const runTokenBudget = new RunTokenBudget(4_000);
     const loop = new MainLoop({
       model: new ScriptedModel([new Error("provider unavailable")]),
       runTokenBudget,
@@ -1220,7 +1258,7 @@ describe("MainLoop", () => {
     expect(runTokenBudget.snapshot()).toMatchObject({
       usedTokens: 0,
       reservedTokens: 0,
-      availableTokens: 400,
+      availableTokens: 4_000,
       settlements: [],
     });
   });
@@ -1229,7 +1267,7 @@ describe("MainLoop", () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
     const ledger = new MemoryLedger();
-    const runTokenBudget = new RunTokenBudget(400);
+    const runTokenBudget = new RunTokenBudget(4_000);
     const failure = Object.assign(new Error("provider returned an error response"), {
       providerUsage: tokenUsage(9, 3),
     });
@@ -1254,7 +1292,7 @@ describe("MainLoop", () => {
     expect(runTokenBudget.snapshot()).toMatchObject({
       usedTokens: 12,
       reservedTokens: 0,
-      availableTokens: 388,
+      availableTokens: 3_988,
     });
     const events = await ledger.read({ runId: "main-budget-metered-failure" });
     expect(events.filter((event) => event.type === "budget.charged"))

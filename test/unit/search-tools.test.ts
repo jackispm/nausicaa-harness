@@ -170,6 +170,107 @@ describe("workspace search tools", () => {
     });
   });
 
+  it("returns stable deduplicated matching-file pages without line-result noise", async () => {
+    const workspace = await temporaryDirectory("nausicaa-grep-files-");
+    await mkdir(path.join(workspace, "src"));
+    await writeFile(path.join(workspace, "src", "z.ts"), "hit z\nhit z again");
+    await writeFile(path.join(workspace, "src", "a.ts"), "HIT a\nhit a again");
+    await writeFile(path.join(workspace, "src", "m.ts"), "miss");
+    await writeFile(path.join(workspace, "ignored.md"), "hit docs");
+
+    const tool = createGrepTool();
+    const firstResult = await tool.execute({
+      pattern: "hit",
+      glob: "**/*.ts",
+      ignoreCase: true,
+      outputMode: "files",
+      limit: 1,
+    }, context(workspace));
+    const first = JSON.parse(firstResult.content) as {
+      files: string[];
+      count: number;
+      truncated: boolean;
+      nextCursor?: string;
+    };
+
+    expect(firstResult.isError).toBe(false);
+    expect(first).toMatchObject({
+      files: ["src/a.ts"],
+      count: 1,
+      truncated: true,
+    });
+    expect(first.nextCursor).toEqual(expect.any(String));
+
+    const continued = await tool.execute({
+      pattern: "hit",
+      glob: "**/*.ts",
+      ignoreCase: true,
+      outputMode: "files",
+      limit: 2,
+      cursor: first.nextCursor,
+    }, context(workspace));
+
+    expect(continued.isError).toBe(false);
+    expect(JSON.parse(continued.content)).toEqual({
+      path: ".",
+      pattern: "hit",
+      files: ["src/z.ts"],
+      count: 1,
+      truncated: false,
+    });
+  });
+
+  it("keeps files-mode cursors separate from the default line-match query", async () => {
+    const workspace = await temporaryDirectory("nausicaa-grep-files-cursor-");
+    await writeFile(path.join(workspace, "a.ts"), "hit");
+    await writeFile(path.join(workspace, "b.ts"), "hit");
+    const tool = createGrepTool();
+    const first = await tool.execute({
+      pattern: "hit",
+      outputMode: "files",
+      limit: 1,
+    }, context(workspace));
+    const cursor = (JSON.parse(first.content) as { nextCursor: string }).nextCursor;
+
+    const mismatched = await tool.execute({
+      pattern: "hit",
+      limit: 1,
+      cursor,
+    }, context(workspace));
+
+    expect(mismatched.isError).toBe(true);
+    expect(JSON.parse(mismatched.content).error).toMatch(/does not match this grep query/);
+  });
+
+  it("rejects a files-mode cursor when its anchor was deleted or stopped matching", async () => {
+    for (const mutation of ["delete", "replace"] as const) {
+      const workspace = await temporaryDirectory(`nausicaa-grep-files-stale-${mutation}-`);
+      const anchorPath = path.join(workspace, "a.ts");
+      await writeFile(anchorPath, "hit");
+      await writeFile(path.join(workspace, "b.ts"), "hit");
+      const tool = createGrepTool();
+      const first = await tool.execute({
+        pattern: "hit",
+        outputMode: "files",
+        limit: 1,
+      }, context(workspace));
+      const cursor = (JSON.parse(first.content) as { nextCursor: string }).nextCursor;
+
+      if (mutation === "delete") await rm(anchorPath);
+      else await writeFile(anchorPath, "miss");
+      const continued = await tool.execute({
+        pattern: "hit",
+        outputMode: "files",
+        limit: 1,
+        cursor,
+      }, context(workspace));
+
+      expect(continued.isError).toBe(true);
+      expect(JSON.parse(continued.content).error)
+        .toMatch(/grep cursor no longer matches the workspace/);
+    }
+  });
+
   it("rejects malformed, tampered, cross-tool, and query-mismatched cursors", async () => {
     const workspace = await temporaryDirectory("nausicaa-search-cursor-");
     await writeFile(path.join(workspace, "a.ts"), "hit");

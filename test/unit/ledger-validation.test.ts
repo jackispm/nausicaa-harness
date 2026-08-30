@@ -136,8 +136,37 @@ const validPayloads = {
     targetTurnId: "turn-1",
     sequence: 1,
   },
-  "input.delivered": { inputId: "input-1", turnId: "turn-1", boundary: "safe-step" },
-  "turn.started": { turnId: "turn-1", inputId: "input-1", ordinal: 1 },
+  "input.replaced": {
+    inputId: "input-1",
+    expectedRevision: 1,
+    expectedMessageRef: artifact,
+    revision: 2,
+    messageRef: { ...artifact, id: "artifact-2" },
+    delivery: "steering",
+    targetTurnId: "turn-1",
+    sequence: 1,
+  },
+  "input.withdrawn": {
+    inputId: "input-1",
+    expectedRevision: 2,
+    expectedMessageRef: artifact,
+  },
+  "input.delivered": {
+    inputId: "input-1",
+    turnId: "turn-1",
+    boundary: "safe-step",
+    expectedRevision: 1,
+    expectedMessageRef: artifact,
+  },
+  "turn.started": {
+    turnId: "turn-1",
+    inputId: "input-1",
+    ordinal: 1,
+    boundary: {
+      collaborationMode: "default",
+      capabilities: { allowWrite: false, allowShell: false, allowNetwork: false },
+    },
+  },
   "turn.completed": { turnId: "turn-1", answerRef: artifact },
   "turn.failed": { turnId: "turn-1", error: "provider failed" },
   "turn.cancelled": { turnId: "turn-1", reason: "user", lastCommittedStep: 1 },
@@ -336,6 +365,20 @@ const invalidPayloads = {
     messageRef: artifact,
     delivery: "urgent",
     sequence: 1,
+  },
+  "input.replaced": {
+    inputId: "input-1",
+    expectedRevision: 1,
+    expectedMessageRef: artifact,
+    revision: 1,
+    messageRef: artifact,
+    delivery: "new-turn",
+    sequence: 2,
+  },
+  "input.withdrawn": {
+    inputId: "input-1",
+    expectedRevision: 0,
+    expectedMessageRef: artifact,
   },
   "input.delivered": { inputId: "input-1", turnId: "turn-1", boundary: "" },
   "turn.started": { turnId: "turn-1", inputId: "input-1", ordinal: 0 },
@@ -894,9 +937,30 @@ describe("event payload validation", () => {
     const ledger = new MemoryLedger();
     await expect(ledger.append({
       runId: "run-1",
+      turnId: "turn-1",
       laneId: "main",
       type: "turn.started",
-      payload: { turnId: "turn-1", inputId: "input-1", ordinal: 1 },
+      payload: {
+        turnId: "turn-1",
+        inputId: "input-1",
+        ordinal: 1,
+      },
+      correlationId: "correlation-1",
+      idempotencyKey: "turn-started-missing-boundary",
+    })).rejects.toThrow(/execution boundary/);
+    await expect(ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "turn.started",
+      payload: {
+        turnId: "turn-1",
+        inputId: "input-1",
+        ordinal: 1,
+        boundary: {
+          collaborationMode: "default",
+          capabilities: { allowWrite: false, allowShell: false, allowNetwork: false },
+        },
+      },
       correlationId: "correlation-1",
       idempotencyKey: "turn-started",
     })).rejects.toThrow(/requires an event turnId/);
@@ -905,7 +969,15 @@ describe("event payload validation", () => {
       turnId: "turn-2",
       laneId: "main",
       type: "turn.started",
-      payload: { turnId: "turn-1", inputId: "input-1", ordinal: 1 },
+      payload: {
+        turnId: "turn-1",
+        inputId: "input-1",
+        ordinal: 1,
+        boundary: {
+          collaborationMode: "default",
+          capabilities: { allowWrite: false, allowShell: false, allowNetwork: false },
+        },
+      },
       correlationId: "correlation-1",
       idempotencyKey: "turn-started-mismatch",
     })).rejects.toThrow(/must equal the event turnId/);

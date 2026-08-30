@@ -30,7 +30,7 @@ afterEach(async () => {
 });
 
 describe("repository evidence-closure contract", () => {
-  it("advertises closure requirements and preserves a paginated, batched evidence trace", async () => {
+  it("advertises closure requirements and preserves a files-search to batched-read trace", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-evidence-closure-"));
     roots.push(root);
     const workspace = join(root, "workspace");
@@ -67,15 +67,24 @@ describe("repository evidence-closure contract", () => {
 
     expect(model.followedTruncation).toBe(true);
     expect(model.readBatchSize).toBe(EVIDENCE_PATHS.length);
-    const listings = trace.filter((entry) => entry.name === "list_files");
-    expect(listings).toHaveLength(2);
-    expect(listings[0]?.arguments).toMatchObject({ path: ".", maxEntries: 3 });
-    expect(listings[1]?.arguments).toMatchObject({ path: ".", offset: 3, maxEntries: 3 });
+    const searches = trace.filter((entry) => entry.name === "grep");
+    expect(searches).toHaveLength(2);
+    expect(searches[0]?.arguments).toMatchObject({
+      path: ".",
+      outputMode: "files",
+      limit: 3,
+    });
+    expect(searches[1]?.arguments).toMatchObject({
+      path: ".",
+      outputMode: "files",
+      limit: 3,
+    });
 
-    const reads = trace.filter((entry) => entry.name === "read_file");
-    expect(reads).toHaveLength(EVIDENCE_PATHS.length);
-    expect(reads.every((entry) => !entry.isError)).toBe(true);
-    expect(reads.map((entry) => entry.arguments.path).sort()).toEqual(EVIDENCE_PATHS);
+    const reads = trace.filter((entry) => entry.name === "read_many");
+    expect(reads).toHaveLength(1);
+    expect(reads[0]?.isError).toBe(false);
+    expect((reads[0]?.arguments.targets as Array<{ path: string }>)
+      .map((target) => target.path).sort()).toEqual(EVIDENCE_PATHS);
   });
 });
 
@@ -86,57 +95,63 @@ class EvidenceClosureModel implements ModelPort {
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     this.requests.push(request);
-    const pages = listPages(request);
+    const pages = searchPages(request);
     if (pages.length === 0) {
-      return toolResponse([call("list-page-1", "list_files", {
+      return toolResponse([call("search-page-1", "grep", {
+        pattern: "TokenTable|configuredTokens|Token|configured tokens",
         path: ".",
-        maxEntries: 3,
+        outputMode: "files",
+        ignoreCase: true,
+        limit: 3,
       })]);
     }
 
     const latest = pages.at(-1)!;
     if (latest.truncated) {
-      if (latest.nextOffset === undefined) {
-        throw new Error("A truncated directory listing must expose nextOffset");
+      if (latest.nextCursor === undefined) {
+        throw new Error("A truncated matching-file search must expose nextCursor");
       }
       this.followedTruncation = true;
-      return toolResponse([call(`list-page-${pages.length + 1}`, "list_files", {
+      return toolResponse([call(`search-page-${pages.length + 1}`, "grep", {
+        pattern: "TokenTable|configuredTokens|Token|configured tokens",
         path: ".",
-        offset: latest.nextOffset,
-        maxEntries: 3,
+        outputMode: "files",
+        ignoreCase: true,
+        limit: 3,
+        cursor: latest.nextCursor,
       })]);
     }
 
-    const discovered = [...new Set(pages.flatMap((page) => page.entries.map((entry) => entry.path)))]
+    const discovered = [...new Set(pages.flatMap((page) => page.files))]
       .sort();
     if (!hasReadResults(request)) {
       this.readBatchSize = discovered.length;
-      return toolResponse(discovered.map((path, index) => (
-        call(`read-evidence-${index + 1}`, "read_file", { path })
-      )));
+      return toolResponse([call("read-evidence", "read_many", {
+        targets: discovered.map((path) => ({ path })),
+      })]);
     }
 
     return response("Evidence closure complete.", [], "stop");
   }
 }
 
-interface ListPage {
-  entries: Array<{ path: string }>;
+interface SearchPage {
+  files: string[];
   truncated: boolean;
-  nextOffset?: number;
+  nextCursor?: string;
 }
 
-function listPages(request: ModelRequest): ListPage[] {
+function searchPages(request: ModelRequest): SearchPage[] {
   return request.messages.flatMap((message) => {
-    if (message.role !== "tool" || message.toolName !== "list_files" || message.isError) return [];
-    const parsed = JSON.parse(message.content) as ListPage;
+    if (message.role !== "tool" || message.toolName !== "grep" || message.isError) return [];
+    const parsed = JSON.parse(message.content) as SearchPage;
     return [parsed];
   });
 }
 
 function hasReadResults(request: ModelRequest): boolean {
   return request.messages.some((message) => (
-    message.role === "tool" && message.toolName === "read_file" && !message.isError
+    message.role === "tool" && message.toolName === "read_many" && !message.isError
   ));
 }
 
@@ -151,6 +166,8 @@ function assertEvidencePrompt(prompt: string): void {
     "tests",
     "pagination",
     "truncation",
+    "outputmode=files",
+    "read_many",
     "before concluding",
   ]) {
     expect(normalized, `missing repository evidence contract: ${concept}`).toContain(concept);

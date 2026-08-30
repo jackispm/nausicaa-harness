@@ -320,10 +320,9 @@ export async function openDaemonRuntime(
       }));
       if (run.recoverableTurn !== undefined) {
         const turn = run.recoverableTurn;
-        const admitted = run.recovery.events.find((event): event is Extract<
-          RunRecoveryState["events"][number],
-          { type: "input.admitted" }
-        > => event.type === "input.admitted" && event.payload.inputId === turn.inputId);
+        const input = projectRun(run.recovery.events, run.runId).inputs.find((candidate) => (
+          candidate.inputId === turn.inputId
+        ));
         const started = run.recovery.events.find((event) => (
           event.type === "turn.started" && event.payload.turnId === turn.turnId
         ));
@@ -333,7 +332,7 @@ export async function openDaemonRuntime(
           dedupeKey: `recovered-turn:${turn.turnId}:${turn.startedAtOffset}`,
           wakeId: `recovery:${run.runId}:turn:${turn.turnId}`,
           inputId: turn.inputId,
-          ...(admitted === undefined ? {} : { payloadRef: admitted.payload.messageRef }),
+          ...(input === undefined ? {} : { payloadRef: input.messageRef }),
           ...(started === undefined ? {} : { occurredAt: started.occurredAt }),
         });
       }

@@ -194,6 +194,112 @@ describe("Ledger conformance", () => {
     }
   });
 
+  it("enforces append-only input replacement and withdrawal CAS", async () => {
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        const firstRef = {
+          id: "message-first",
+          contentHash: `sha256:${"a".repeat(64)}`,
+          mediaType: "text/plain",
+          byteLength: 5,
+        };
+        const secondRef = {
+          ...firstRef,
+          id: "message-second",
+          contentHash: `sha256:${"b".repeat(64)}`,
+        };
+        await ledger.append(input("input.admitted", {
+          inputId: "mutable-input",
+          messageRef: firstRef,
+          delivery: "follow-up",
+          sequence: 1,
+        }, { idempotencyKey: "mutable-admitted" }));
+        await ledger.append(input("input.replaced", {
+          inputId: "mutable-input",
+          expectedRevision: 1,
+          expectedMessageRef: firstRef,
+          revision: 2,
+          messageRef: secondRef,
+          delivery: "follow-up",
+          sequence: 1,
+        }, { idempotencyKey: "mutable-replaced-2" }));
+
+        await expect(ledger.append(input("input.replaced", {
+          inputId: "mutable-input",
+          expectedRevision: 1,
+          expectedMessageRef: firstRef,
+          revision: 2,
+          messageRef: secondRef,
+          delivery: "follow-up",
+          sequence: 1,
+        }, { idempotencyKey: "stale-replacement" }))).rejects.toThrow(/current revision is 2/);
+        await expect(ledger.append(input("input.replaced", {
+          inputId: "mutable-input",
+          expectedRevision: 2,
+          expectedMessageRef: firstRef,
+          revision: 3,
+          messageRef: firstRef,
+          delivery: "follow-up",
+          sequence: 1,
+        }, { idempotencyKey: "stale-message-ref" }))).rejects.toThrow(/message ref/);
+        await expect(ledger.append(input("input.replaced", {
+          inputId: "mutable-input",
+          expectedRevision: 2,
+          expectedMessageRef: secondRef,
+          revision: 4,
+          messageRef: firstRef,
+          delivery: "follow-up",
+          sequence: 1,
+        }, { idempotencyKey: "skipped-revision" }))).rejects.toThrow(/increment by one/);
+        await expect(ledger.append(input("input.replaced", {
+          inputId: "mutable-input",
+          expectedRevision: 2,
+          expectedMessageRef: secondRef,
+          revision: 3,
+          messageRef: firstRef,
+          delivery: "follow-up",
+          sequence: 2,
+        }, { idempotencyKey: "changed-sequence" }))).rejects.toThrow(/cannot change queue sequence/);
+
+        await ledger.append(input("input.withdrawn", {
+          inputId: "mutable-input",
+          expectedRevision: 2,
+          expectedMessageRef: secondRef,
+        }, { idempotencyKey: "mutable-withdrawn" }));
+        await expect(ledger.append(input("input.withdrawn", {
+          inputId: "mutable-input",
+          expectedRevision: 2,
+          expectedMessageRef: secondRef,
+        }, { idempotencyKey: "withdrawn-again" }))).rejects.toThrow(/withdraw withdrawn input/);
+
+        await ledger.append(input("input.admitted", {
+          inputId: "delivered-input",
+          messageRef: firstRef,
+          delivery: "follow-up",
+          sequence: 2,
+        }, { idempotencyKey: "delivered-admitted" }));
+        await ledger.append(input("input.delivered", {
+          inputId: "delivered-input",
+          turnId: "turn-delivered",
+          boundary: "test",
+          expectedRevision: 1,
+          expectedMessageRef: firstRef,
+        }, { turnId: "turn-delivered", idempotencyKey: "delivered-terminal" }));
+        await expect(ledger.append(input("input.replaced", {
+          inputId: "delivered-input",
+          expectedRevision: 1,
+          expectedMessageRef: firstRef,
+          revision: 2,
+          messageRef: secondRef,
+          delivery: "follow-up",
+          sequence: 2,
+        }, { idempotencyKey: "replace-delivered" }))).rejects.toThrow(/replace delivered input/);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
   it("filters reads without exposing mutable internal events", async () => {
     for (const { ledger } of await ledgerImplementations()) {
       try {

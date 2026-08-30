@@ -179,6 +179,8 @@ describe("Run recovery", () => {
           inputId,
           turnId: "turn-1",
           boundary: "safe-step:2",
+          expectedRevision: 1,
+          expectedMessageRef: ref(inputId),
         },
         causationId: admitted.eventId,
         correlationId: "turn:turn-1",

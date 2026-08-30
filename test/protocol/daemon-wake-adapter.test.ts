@@ -128,7 +128,13 @@ describe("LedgerWakeAdmissionAdapter", () => {
       turnId: "turn-1",
       laneId: "main",
       type: "input.delivered",
-      payload: { inputId: admitted.payload.inputId, turnId: "turn-1", boundary: "daemon-test" },
+      payload: {
+        inputId: admitted.payload.inputId,
+        turnId: "turn-1",
+        boundary: "daemon-test",
+        expectedRevision: 1,
+        expectedMessageRef: admitted.payload.messageRef,
+      },
       correlationId: "turn:turn-1",
       idempotencyKey: "input-delivered-1",
     });

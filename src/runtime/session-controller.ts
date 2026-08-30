@@ -9,6 +9,7 @@ import type {
   EventEnvelope,
   EventType,
   InputDelivery,
+  TurnExecutionBoundary,
 } from "../domain/events.js";
 import type { AgentTool, Clock, ModelPort } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
@@ -104,6 +105,7 @@ import {
   projectPendingAdmissions,
   projectPendingInputs,
   projectSessionTranscript,
+  type ProjectedPendingAdmission,
   readConversationArtifact,
   readToolArgumentsFromStore,
   readUserMessage,
@@ -258,6 +260,15 @@ export interface SessionSubmitResult {
   delivery: InputDelivery;
 }
 
+export interface SessionPendingInputReplacement {
+  text: string;
+  delivery: "steering" | "follow-up";
+  /** Omit to preserve current images; pass [] to clear them. */
+  images?: UserImage[];
+}
+
+export type SessionPendingInputMutationResult = "applied" | "stale";
+
 export interface SessionControllerOptions {
   workspace: string;
   dataDir: string;
@@ -328,7 +339,7 @@ interface WorkerLaneRuntime {
 }
 
 interface Admission {
-  event: Extract<AnyEvent, { type: "input.admitted" }>;
+  event: Extract<AnyEvent, { type: "input.admitted" }> | ProjectedPendingAdmission;
 }
 
 interface ActiveTurn {
@@ -366,6 +377,8 @@ export class SessionController {
   private active: ActiveTurn | undefined;
   private status: SessionControllerStatus = "detached";
   private admissionTail: Promise<void> = Promise.resolve();
+  /** Serializes pending-input transitions with delivery/promotion boundaries. */
+  private pendingInputTransitionTail: Promise<void> = Promise.resolve();
   private execution: Promise<void> | undefined;
   private closing = false;
   private closePromise: Promise<void> | undefined;
@@ -727,6 +740,147 @@ export class SessionController {
     return projectPendingInputs(attached.store, events);
   }
 
+  /** Replace one still-pending input using an append-only compare-and-swap event. */
+  async replacePendingInput(
+    inputId: string,
+    expectedRevision: number,
+    replacement: SessionPendingInputReplacement,
+  ): Promise<SessionPendingInputMutationResult> {
+    return this.runAdmission(() => this.runPendingInputTransition(async () => {
+      this.assertOpen();
+      validatePendingMutationIdentity(inputId, expectedRevision);
+      validatePendingReplacementShape(replacement);
+      if (this.attached === undefined) return "stale";
+
+      const attached = this.attached;
+      let events = await attached.ledger.read({ runId: attached.runId });
+      attached.sink.replaceCache(events);
+      let current = findPendingInput(events, inputId);
+      if (current === undefined || current.payload.revision !== expectedRevision) {
+        return "stale";
+      }
+      const expectedMessageRef = structuredClone(current.payload.messageRef);
+      const previous = await readUserMessage(attached.store, expectedMessageRef);
+      const images = replacement.images === undefined
+        ? previous.images
+        : replacement.images;
+      validateSubmit({
+        inputId,
+        text: replacement.text,
+        ...(images === undefined ? {} : { images }),
+      });
+
+      const targetTurnId = replacement.delivery === "steering"
+        ? this.active?.turnId
+        : undefined;
+      if (replacement.delivery === "steering" && targetTurnId === undefined) {
+        throw new SessionProtocolError("Steering replacement requires an active Turn");
+      }
+      const messageRef = await attached.store.put(stableJson({
+        role: "user",
+        content: replacement.text,
+        ...(images === undefined ? {} : { images: structuredClone(images) }),
+        createdAt: this.clock.now().toISOString(),
+      } satisfies ConversationMessage), MESSAGE_MEDIA_TYPE);
+
+      // Artifact IO can yield to Main's delivery boundary. Re-check before the
+      // authoritative Ledger CAS so a normal race is reported as stale.
+      events = await attached.ledger.read({ runId: attached.runId });
+      attached.sink.replaceCache(events);
+      current = findPendingInput(events, inputId);
+      if (
+        current === undefined
+        || current.payload.revision !== expectedRevision
+        || !sameArtifactRef(current.payload.messageRef, expectedMessageRef)
+        || (replacement.delivery === "steering" && this.active?.turnId !== targetTurnId)
+      ) {
+        return "stale";
+      }
+
+      try {
+        await attached.sink.append({
+          runId: attached.runId,
+          ...(targetTurnId === undefined ? {} : { turnId: targetTurnId }),
+          laneId: "main",
+          type: "input.replaced",
+          payload: {
+            inputId,
+            expectedRevision,
+            expectedMessageRef,
+            revision: expectedRevision + 1,
+            messageRef,
+            delivery: replacement.delivery,
+            ...(targetTurnId === undefined ? {} : { targetTurnId }),
+            sequence: current.payload.sequence,
+          },
+          causationId: current.eventId,
+          correlationId: `input:${inputId}`,
+          idempotencyKey: `${attached.runId}:input:${inputId}:replaced:${expectedRevision + 1}`,
+          visibility: "user",
+          occurredAt: this.clock.now().toISOString(),
+        });
+      } catch (error: unknown) {
+        if (await pendingMutationIsStale(
+          attached,
+          inputId,
+          expectedRevision,
+          expectedMessageRef,
+        )) return "stale";
+        throw new SessionProtocolError(`Unable to replace pending input ${inputId}`, {
+          cause: error,
+        });
+      }
+      this.publishState();
+      return "applied";
+    }));
+  }
+
+  /** Permanently withdraw one still-pending input without rewriting history. */
+  async withdrawPendingInput(
+    inputId: string,
+    expectedRevision: number,
+  ): Promise<SessionPendingInputMutationResult> {
+    return this.runAdmission(() => this.runPendingInputTransition(async () => {
+      this.assertOpen();
+      validatePendingMutationIdentity(inputId, expectedRevision);
+      if (this.attached === undefined) return "stale";
+
+      const attached = this.attached;
+      const events = await attached.ledger.read({ runId: attached.runId });
+      attached.sink.replaceCache(events);
+      const current = findPendingInput(events, inputId);
+      if (current === undefined || current.payload.revision !== expectedRevision) {
+        return "stale";
+      }
+      const expectedMessageRef = structuredClone(current.payload.messageRef);
+      try {
+        await attached.sink.append({
+          runId: attached.runId,
+          laneId: "main",
+          type: "input.withdrawn",
+          payload: { inputId, expectedRevision, expectedMessageRef },
+          causationId: current.eventId,
+          correlationId: `input:${inputId}`,
+          idempotencyKey: `${attached.runId}:input:${inputId}:withdrawn:${expectedRevision}`,
+          visibility: "user",
+          occurredAt: this.clock.now().toISOString(),
+        });
+      } catch (error: unknown) {
+        if (await pendingMutationIsStale(
+          attached,
+          inputId,
+          expectedRevision,
+          expectedMessageRef,
+        )) return "stale";
+        throw new SessionProtocolError(`Unable to withdraw pending input ${inputId}`, {
+          cause: error,
+        });
+      }
+      this.publishState();
+      return "applied";
+    }));
+  }
+
   /** Read and strictly validate a tool arguments artifact. */
   async readToolArguments(ref: ArtifactRef): Promise<Record<string, unknown>> {
     this.assertOpen();
@@ -889,8 +1043,10 @@ export class SessionController {
         && blockingReason(attached.sink.cachedEvents) === undefined
       ) {
         const promoted = await this.promote({ event: admitted }, "idle-submit");
-        turnId = promoted.turnId;
-        this.startExecution(promoted);
+        if (promoted !== undefined) {
+          turnId = promoted.turnId;
+          this.startExecution(promoted);
+        }
       }
       this.publishState();
       return {
@@ -954,7 +1110,7 @@ export class SessionController {
         const pending = projectPendingAdmissions(events)[0];
         if (pending !== undefined) {
           const promoted = await this.promote({ event: pending }, "resume-pending");
-          this.startExecution(promoted);
+          if (promoted !== undefined) this.startExecution(promoted);
         }
         return;
       }
@@ -1335,10 +1491,19 @@ export class SessionController {
   private async promote(
     admission: Admission,
     boundary: string,
-  ): Promise<{ turnId: string; inputId: string }> {
+  ): Promise<{ turnId: string; inputId: string } | undefined> {
+    return this.runPendingInputTransition(() => this.promotePending(admission, boundary));
+  }
+
+  private async promotePending(
+    admission: Admission,
+    boundary: string,
+  ): Promise<{ turnId: string; inputId: string } | undefined> {
     const attached = this.requireAttached();
     const inputId = admission.event.payload.inputId;
     let events = await attached.ledger.read({ runId: attached.runId });
+    const pending = findPendingInput(events, inputId);
+    if (pending === undefined) return undefined;
     let started = events.find((event): event is Extract<AnyEvent, {
       type: "turn.started";
     }> => event.type === "turn.started" && event.payload.inputId === inputId);
@@ -1349,8 +1514,13 @@ export class SessionController {
         turnId,
         laneId: "main",
         type: "turn.started",
-        payload: { turnId, inputId, ordinal: nextTurnOrdinal(events) },
-        causationId: admission.event.eventId,
+        payload: {
+          turnId,
+          inputId,
+          ordinal: nextTurnOrdinal(events),
+          boundary: this.currentTurnExecutionBoundary(),
+        },
+        causationId: pending.eventId,
         correlationId: `turn:${turnId}`,
         idempotencyKey: `${attached.runId}:turn:${turnId}:started`,
         visibility: "run",
@@ -1367,7 +1537,13 @@ export class SessionController {
         turnId,
         laneId: "main",
         type: "input.delivered",
-        payload: { inputId, turnId, boundary },
+        payload: {
+          inputId,
+          turnId,
+          boundary,
+          expectedRevision: pending.payload.revision,
+          expectedMessageRef: pending.payload.messageRef,
+        },
         causationId: started.eventId,
         correlationId: `turn:${turnId}`,
         idempotencyKey: `${attached.runId}:input:${inputId}:delivered`,
@@ -1375,6 +1551,12 @@ export class SessionController {
         occurredAt: this.clock.now().toISOString(),
       });
       events = attached.sink.cachedEvents;
+    }
+    const currentInput = projectRun(events, attached.runId).inputs.find((input) => (
+      input.inputId === inputId
+    ));
+    if (currentInput === undefined) {
+      throw new SessionProtocolError(`Input ${inputId} is missing from the Run projection`);
     }
     if (!events.some((event) =>
       event.type === "user.message" && event.payload.inputId === inputId
@@ -1386,7 +1568,7 @@ export class SessionController {
         type: "user.message",
         payload: {
           inputId,
-          messageRef: admission.event.payload.messageRef,
+          messageRef: currentInput.messageRef,
           kind: "initial",
         },
         causationId: delivered.eventId,
@@ -1435,15 +1617,21 @@ export class SessionController {
 
   private async runTurn(turn: ActiveTurn): Promise<void> {
     const attached = this.requireAttached();
-    const turnCapabilities = {
-      allowWrite: this.allowWrite,
-      allowShell: this.allowShell,
-      allowNetwork: this.allowNetwork,
-    } as const;
-    const turnCollaborationMode = this.collaborationMode;
     let scheduler: TetoScheduler | undefined;
     try {
       const events = await attached.ledger.read({ runId: attached.runId });
+      const turnStarted = events.find((event): event is Extract<AnyEvent, {
+        type: "turn.started";
+      }> => event.type === "turn.started" && event.payload.turnId === turn.turnId);
+      if (turnStarted === undefined) {
+        throw new SessionProtocolError(`Turn ${turn.turnId} is missing turn.started`);
+      }
+      const executionBoundary = restrictTurnExecutionBoundary(
+        turnStarted.payload.boundary,
+        this.currentTurnExecutionBoundary(),
+      );
+      const turnCapabilities = executionBoundary.capabilities;
+      const turnCollaborationMode = executionBoundary.collaborationMode;
       const projection = projectRun(events, attached.runId);
       if (projection.goal === undefined) {
         throw new SessionProtocolError(`Run ${attached.runId} is missing its Goal`);
@@ -1531,12 +1719,6 @@ export class SessionController {
       }
       let latestEvents = await attached.ledger.read({ runId: attached.runId });
       const recoveredMain = projectMainExecutionRecovery(latestEvents);
-      const turnStarted = events.find((event): event is Extract<AnyEvent, {
-        type: "turn.started";
-      }> => event.type === "turn.started" && event.payload.turnId === turn.turnId);
-      if (turnStarted === undefined) {
-        throw new SessionProtocolError(`Turn ${turn.turnId} is missing turn.started`);
-      }
       const preTurnConversationRefs = projectMainExecutionRecovery(
         events.filter((event) => event.globalOffset < turnStarted.globalOffset),
       ).conversationRefs;
@@ -1731,19 +1913,19 @@ export class SessionController {
     turnId: string,
     step: number,
   ): Promise<MainBoundaryMessage[]> {
+    return this.runPendingInputTransition(() => this.deliverPendingSteering(turnId, step));
+  }
+
+  private async deliverPendingSteering(
+    turnId: string,
+    step: number,
+  ): Promise<MainBoundaryMessage[]> {
     const attached = this.requireAttached();
     const events = await attached.ledger.read({ runId: attached.runId });
-    const deliveredIds = new Set(events
-      .filter((event) => event.type === "input.delivered")
-      .map((event) => event.payload.inputId));
-    const steering = events
-      .filter((event): event is Extract<AnyEvent, { type: "input.admitted" }> => (
-        event.type === "input.admitted"
-        && event.payload.delivery === "steering"
-        && event.payload.targetTurnId === turnId
-        && !deliveredIds.has(event.payload.inputId)
-      ))
-      .sort((left, right) => left.payload.sequence - right.payload.sequence);
+    const steering = projectPendingAdmissions(events).filter((event) => (
+      event.payload.delivery === "steering"
+      && event.payload.targetTurnId === turnId
+    ));
     const messages: MainBoundaryMessage[] = [];
     for (const admission of steering) {
       const delivered = await attached.sink.append({
@@ -1755,6 +1937,8 @@ export class SessionController {
           inputId: admission.payload.inputId,
           turnId,
           boundary: `safe-step:${step}`,
+          expectedRevision: admission.payload.revision,
+          expectedMessageRef: admission.payload.messageRef,
         },
         causationId: admission.eventId,
         correlationId: `turn:${turnId}`,
@@ -1762,6 +1946,15 @@ export class SessionController {
         visibility: "run",
         occurredAt: this.clock.now().toISOString(),
       });
+      const currentInput = projectRun(
+        attached.sink.cachedEvents,
+        attached.runId,
+      ).inputs.find((input) => input.inputId === admission.payload.inputId);
+      if (currentInput === undefined) {
+        throw new SessionProtocolError(
+          `Input ${admission.payload.inputId} is missing from the Run projection`,
+        );
+      }
       await attached.sink.append({
         runId: attached.runId,
         turnId,
@@ -1769,7 +1962,7 @@ export class SessionController {
         type: "user.message",
         payload: {
           inputId: admission.payload.inputId,
-          messageRef: admission.payload.messageRef,
+          messageRef: currentInput.messageRef,
           kind: "steering",
         },
         causationId: delivered.eventId,
@@ -1780,7 +1973,7 @@ export class SessionController {
       });
       const userMessage = await readUserMessage(
         attached.store,
-        admission.payload.messageRef,
+        currentInput.messageRef,
       );
       messages.push({
         kind: "steering",
@@ -1809,7 +2002,7 @@ export class SessionController {
       pending.payload.delivery === "steering"
         ? "retargeted-after-terminal"
         : "queued-after-terminal");
-    this.startExecution(promoted, previousExecution);
+    if (promoted !== undefined) this.startExecution(promoted, previousExecution);
   }
 
   private async failRunBudget(turnId: string): Promise<void> {
@@ -2070,6 +2263,23 @@ export class SessionController {
     return result;
   }
 
+  private runPendingInputTransition<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.pendingInputTransitionTail.then(operation);
+    this.pendingInputTransitionTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private currentTurnExecutionBoundary(): TurnExecutionBoundary {
+    return {
+      collaborationMode: this.collaborationMode,
+      capabilities: {
+        allowWrite: this.allowWrite,
+        allowShell: this.allowShell,
+        allowNetwork: this.allowNetwork,
+      },
+    };
+  }
+
   private publish(event: SessionRuntimeEvent): void {
     for (const listener of this.listeners) {
       try {
@@ -2281,6 +2491,33 @@ function nextInputSequence(events: readonly AnyEvent[]): number {
       : highest, 0) + 1;
 }
 
+function findPendingInput(
+  events: readonly AnyEvent[],
+  inputId: string,
+): ProjectedPendingAdmission | undefined {
+  return projectPendingAdmissions(events).find((event) => (
+    event.payload.inputId === inputId
+  ));
+}
+
+function sameArtifactRef(left: ArtifactRef, right: ArtifactRef): boolean {
+  return stableJson(left) === stableJson(right);
+}
+
+async function pendingMutationIsStale(
+  attached: AttachedRun,
+  inputId: string,
+  expectedRevision: number,
+  expectedMessageRef: ArtifactRef,
+): Promise<boolean> {
+  const events = await attached.ledger.read({ runId: attached.runId });
+  attached.sink.replaceCache(events);
+  const current = findPendingInput(events, inputId);
+  return current === undefined
+    || current.payload.revision !== expectedRevision
+    || !sameArtifactRef(current.payload.messageRef, expectedMessageRef);
+}
+
 function nextTurnOrdinal(events: readonly AnyEvent[]): number {
   return events.reduce((count, event) => count + Number(event.type === "turn.started"), 0) + 1;
 }
@@ -2463,18 +2700,16 @@ async function readTurnObjective(
   events: readonly AnyEvent[],
   turn: Pick<ActiveTurn, "turnId" | "inputId">,
 ): Promise<string> {
-  const admission = events.find((event): event is Extract<AnyEvent, {
-    type: "input.admitted";
-  }> => (
-    event.type === "input.admitted"
-    && event.payload.inputId === turn.inputId
-  ));
-  if (admission === undefined) {
+  const runId = events[0]?.runId;
+  const input = runId === undefined
+    ? undefined
+    : projectRun(events, runId).inputs.find((candidate) => candidate.inputId === turn.inputId);
+  if (input === undefined) {
     throw new SessionProtocolError(
       `Turn ${turn.turnId} is missing its admitted input ${turn.inputId}`,
     );
   }
-  const text = await readUserText(store, admission.payload.messageRef);
+  const text = await readUserText(store, input.messageRef);
   return text.trim().length === 0 ? "Analyze the attached image(s)" : text;
 }
 
@@ -2489,6 +2724,29 @@ function capabilitiesForPermissionProfile(
     case "full-access":
       return { allowWrite: true, allowShell: true, allowNetwork: true };
   }
+}
+
+function restrictTurnExecutionBoundary(
+  persisted: TurnExecutionBoundary | undefined,
+  host: TurnExecutionBoundary,
+): TurnExecutionBoundary {
+  // Schema-v1 Turns did not persist this boundary. Resume them fail-closed so
+  // a process restart cannot silently turn an old planning Turn into mutation.
+  const durable = persisted ?? {
+    collaborationMode: "plan",
+    capabilities: { allowWrite: false, allowShell: false, allowNetwork: false },
+  };
+  return {
+    collaborationMode: durable.collaborationMode === "plan"
+      || host.collaborationMode === "plan"
+      ? "plan"
+      : "default",
+    capabilities: {
+      allowWrite: durable.capabilities.allowWrite && host.capabilities.allowWrite,
+      allowShell: durable.capabilities.allowShell && host.capabilities.allowShell,
+      allowNetwork: durable.capabilities.allowNetwork && host.capabilities.allowNetwork,
+    },
+  };
 }
 
 function permissionProfileForCapabilities(capabilities: {
@@ -2619,8 +2877,15 @@ const sameFukaiCompactionPolicy = (
   && left.minimumGainTokens === right.minimumGainTokens;
 
 function validateSubmit(request: SessionSubmitRequest): void {
-  if (request.inputId.length === 0 || request.inputId.includes("\0")) {
+  if (
+    typeof request.inputId !== "string"
+    || request.inputId.length === 0
+    || request.inputId.includes("\0")
+  ) {
     throw new SessionProtocolError("inputId must be a non-empty string without NUL");
+  }
+  if (typeof request.text !== "string" || request.text.includes("\0")) {
+    throw new SessionProtocolError("Input text must be a string without NUL");
   }
   try {
     validateUserImages(request.images);
@@ -2629,6 +2894,27 @@ function validateSubmit(request: SessionSubmitRequest): void {
   }
   if (request.text.trim().length === 0 && (request.images?.length ?? 0) === 0) {
     throw new SessionProtocolError("Input text or images are required");
+  }
+}
+
+function validatePendingMutationIdentity(inputId: string, expectedRevision: number): void {
+  if (inputId.length === 0 || inputId.includes("\0")) {
+    throw new SessionProtocolError("inputId must be a non-empty string without NUL");
+  }
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+    throw new SessionProtocolError("expectedRevision must be a positive safe integer");
+  }
+  if (expectedRevision >= Number.MAX_SAFE_INTEGER) {
+    throw new SessionProtocolError("Input revision is exhausted");
+  }
+}
+
+function validatePendingReplacementShape(replacement: SessionPendingInputReplacement): void {
+  if (replacement === null || typeof replacement !== "object") {
+    throw new SessionProtocolError("Pending input replacement must be an object");
+  }
+  if (replacement.delivery !== "steering" && replacement.delivery !== "follow-up") {
+    throw new SessionProtocolError("Replacement delivery must be steering or follow-up");
   }
 }
 

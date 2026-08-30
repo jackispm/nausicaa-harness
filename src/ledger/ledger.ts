@@ -5,10 +5,11 @@ import type {
   AppendEvent,
   EventEnvelope,
   EventType,
+  InputDelivery,
 } from "../domain/events.js";
 import type { Clock } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
-import type { EventId, RunId } from "../domain/types.js";
+import type { ArtifactRef, EventId, RunId, TurnId } from "../domain/types.js";
 import { cloneJson, sha256, stableJson } from "./hash.js";
 import {
   eventTypes,
@@ -184,6 +185,21 @@ export function validateEvent(event: unknown): asserts event is AnyEvent {
         "input.admitted targetTurnId and event turnId must either both be absent or equal",
       );
     }
+    if (candidate.type === "input.replaced") {
+      const isSteering = candidate.payload.delivery === "steering";
+      if (
+        (isSteering && candidate.payload.targetTurnId === undefined)
+        || (!isSteering && candidate.payload.targetTurnId !== undefined)
+        || candidate.payload.targetTurnId !== candidate.turnId
+      ) {
+        throw new TypeError(
+          "input.replaced steering targetTurnId must equal event turnId; follow-up must omit both",
+        );
+      }
+    }
+    if (candidate.type === "input.withdrawn" && candidate.turnId !== undefined) {
+      throw new TypeError("input.withdrawn must be run-scoped");
+    }
     if (candidate.type === "message.sent") {
       validateMessageRun(candidate.payload.message, candidate.runId);
     }
@@ -206,12 +222,22 @@ interface PreparedAppend<K extends EventType> {
   duplicate: boolean;
 }
 
+interface LedgerInputState {
+  revision: number;
+  messageRef: ArtifactRef;
+  delivery: InputDelivery;
+  targetTurnId?: TurnId;
+  sequence: number;
+  status: "pending" | "delivered" | "withdrawn";
+}
+
 export class LedgerState {
   readonly #events: AnyEvent[] = [];
   readonly #idempotency = new Map<string, AnyEvent>();
   readonly #eventIds = new Set<string>();
   readonly #laneSequences = new Map<string, number>();
   readonly #inputAdmissions = new Map<string, EventEnvelope<"input.admitted">>();
+  readonly #inputStates = new Map<string, LedgerInputState>();
   readonly #inputSequences = new Map<RunId, number>();
   readonly #clock: Clock;
   readonly #createEventId: () => EventId;
@@ -332,7 +358,36 @@ export class LedgerState {
     if (stored.type === "input.admitted") {
       const inputScope = `${stored.runId}\u0000${stored.payload.inputId}`;
       this.#inputAdmissions.set(inputScope, stored);
+      this.#inputStates.set(inputScope, {
+        revision: 1,
+        messageRef: stored.payload.messageRef,
+        delivery: stored.payload.delivery,
+        ...(stored.payload.targetTurnId === undefined
+          ? {}
+          : { targetTurnId: stored.payload.targetTurnId }),
+        sequence: stored.payload.sequence,
+        status: "pending",
+      });
       this.#inputSequences.set(stored.runId, stored.payload.sequence);
+    } else if (stored.type === "input.replaced") {
+      const inputScope = `${stored.runId}\u0000${stored.payload.inputId}`;
+      const state = this.#inputStates.get(inputScope)!;
+      this.#inputStates.set(inputScope, {
+        revision: stored.payload.revision,
+        messageRef: stored.payload.messageRef,
+        delivery: stored.payload.delivery,
+        ...(stored.payload.targetTurnId === undefined
+          ? {}
+          : { targetTurnId: stored.payload.targetTurnId }),
+        sequence: stored.payload.sequence,
+        status: state.status,
+      });
+    } else if (stored.type === "input.delivered") {
+      const inputScope = `${stored.runId}\u0000${stored.payload.inputId}`;
+      this.#inputStates.get(inputScope)!.status = "delivered";
+    } else if (stored.type === "input.withdrawn") {
+      const inputScope = `${stored.runId}\u0000${stored.payload.inputId}`;
+      this.#inputStates.get(inputScope)!.status = "withdrawn";
     }
   }
 
@@ -377,11 +432,119 @@ export class LedgerState {
       }
     }
 
+    if (event.type === "input.replaced") {
+      const inputScope = `${event.runId}\u0000${event.payload.inputId}`;
+      const state = this.#inputStates.get(inputScope);
+      if (state === undefined) {
+        throw new LedgerCorruptionError(
+          `Cannot replace missing input ${event.payload.inputId}`,
+        );
+      }
+      if (state.status !== "pending") {
+        throw new LedgerCorruptionError(
+          `Cannot replace ${state.status} input ${event.payload.inputId}`,
+        );
+      }
+      if (event.payload.expectedRevision !== state.revision) {
+        throw new LedgerCorruptionError(
+          `Input ${event.payload.inputId} expected revision ${event.payload.expectedRevision}, current revision is ${state.revision}`,
+        );
+      }
+      if (stableJson(event.payload.expectedMessageRef) !== stableJson(state.messageRef)) {
+        throw new LedgerCorruptionError(
+          `Input ${event.payload.inputId} expected message ref does not match current revision`,
+        );
+      }
+      if (event.payload.revision !== state.revision + 1) {
+        throw new LedgerCorruptionError(
+          `Input ${event.payload.inputId} replacement revision must increment by one`,
+        );
+      }
+      if (event.payload.sequence !== state.sequence) {
+        throw new LedgerCorruptionError(
+          `Input ${event.payload.inputId} replacement cannot change queue sequence`,
+        );
+      }
+    }
+
+    if (event.type === "input.withdrawn") {
+      const inputScope = `${event.runId}\u0000${event.payload.inputId}`;
+      const state = this.#inputStates.get(inputScope);
+      if (state === undefined) {
+        throw new LedgerCorruptionError(
+          `Cannot withdraw missing input ${event.payload.inputId}`,
+        );
+      }
+      if (state.status !== "pending") {
+        throw new LedgerCorruptionError(
+          `Cannot withdraw ${state.status} input ${event.payload.inputId}`,
+        );
+      }
+      if (event.payload.expectedRevision !== state.revision) {
+        throw new LedgerCorruptionError(
+          `Input ${event.payload.inputId} expected revision ${event.payload.expectedRevision}, current revision is ${state.revision}`,
+        );
+      }
+      if (stableJson(event.payload.expectedMessageRef) !== stableJson(state.messageRef)) {
+        throw new LedgerCorruptionError(
+          `Input ${event.payload.inputId} expected message ref does not match current revision`,
+        );
+      }
+    }
+
+    if (event.type === "input.delivered") {
+      const inputScope = `${event.runId}\u0000${event.payload.inputId}`;
+      const state = this.#inputStates.get(inputScope);
+      if (state === undefined) {
+        throw new LedgerCorruptionError(
+          `Cannot deliver missing input ${event.payload.inputId}`,
+        );
+      }
+      if (state.status !== "pending") {
+        throw new LedgerCorruptionError(
+          `Cannot deliver ${state.status} input ${event.payload.inputId}`,
+        );
+      }
+      if (
+        event.payload.expectedRevision !== undefined
+        && event.payload.expectedRevision !== state.revision
+      ) {
+        throw new LedgerCorruptionError(
+          `Input ${event.payload.inputId} expected revision ${event.payload.expectedRevision}, current revision is ${state.revision}`,
+        );
+      }
+      if (
+        event.payload.expectedMessageRef !== undefined
+        && stableJson(event.payload.expectedMessageRef) !== stableJson(state.messageRef)
+      ) {
+        throw new LedgerCorruptionError(
+          `Input ${event.payload.inputId} expected message ref does not match current revision`,
+        );
+      }
+    }
+
   }
 
   #validateAppend(input: AppendEvent): void {
     if (!eventTypes.has(input.type)) {
       throw new LedgerError(`Unknown event type: ${String(input.type)}`);
+    }
+    if (input.type === "input.delivered") {
+      const delivery = input as AppendEvent<"input.delivered">;
+      if (
+        delivery.payload.expectedRevision === undefined
+        || delivery.payload.expectedMessageRef === undefined
+      ) {
+        throw new LedgerError(
+          "New input.delivered events require expectedRevision and expectedMessageRef",
+        );
+      }
+    }
+    if (input.type === "turn.started") {
+      const started = input as AppendEvent<"turn.started">;
+      if (started.payload.boundary === undefined) {
+        throw new LedgerError("New turn.started events require an execution boundary");
+      }
     }
     for (const [field, value] of [
       ["runId", input.runId],

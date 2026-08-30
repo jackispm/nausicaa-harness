@@ -417,7 +417,15 @@ describe("TUI components", () => {
     expect(rendered).toContain("steer");
     expect(rendered).toContain("follow-up");
     expect(rendered).toContain("package manifest");
-    expect(rendered).not.toContain("browse");
+    expect(rendered).toContain("Alt+Up browse/edit");
+
+    queue.setItems([
+      { delivery: "steering", text: "Use the package manifest first" },
+      { delivery: "follow-up", text: "Then summarize the findings", selected: true },
+    ]);
+    const editing = stripTerminalSequences(queue.render(80).join("\n"));
+    expect(editing).toContain("editing follow-up");
+    expect(editing).toContain("empty withdraw");
 
     setNausicaaColorScheme("dark");
     const dark = new NoticeBlock("dark palette").render(80).join("\n");

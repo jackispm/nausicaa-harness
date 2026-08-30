@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { AgentTool, ModelPort, ModelResponse, UserImage } from "../../src/domain/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
-import { JsonlLedger } from "../../src/ledger/index.js";
+import { computeEventContentHash, JsonlLedger } from "../../src/ledger/index.js";
 import {
   listWorkspaceRuns,
   SessionController,
@@ -627,6 +627,167 @@ describe("SessionController", () => {
     await session.close();
   });
 
+  it("keeps a persisted Plan boundary read-only after an interrupted Turn is reopened", async () => {
+    const root = await temporaryRoot();
+    const firstModel = new ScriptedModel([{
+      ...response("inspect before interruption"),
+      toolCalls: [{ id: "plan-list", name: "list_files", arguments: { path: "." } }],
+      stopReason: "toolUse",
+    }]);
+    const first = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      allowWrite: true,
+      allowShell: true,
+      allowNetwork: true,
+      collaborationMode: "plan",
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
+    }, {
+      mainModel: firstModel,
+      createRunId: () => "persisted-plan-boundary-run",
+    });
+    const admitted = await first.submit({
+      inputId: "persisted-plan-input",
+      text: "Investigate this workspace",
+    });
+    await first.waitForIdle();
+    expect(first.snapshot().blocker).toBe("step-allowance-exhausted");
+    const runId = first.snapshot().runId!;
+    const turnId = admitted.turnId!;
+    await first.close();
+
+    // Leave a provider request in-flight in the durable log. Reopening must
+    // turn it into an interrupted Turn before any new host capabilities apply.
+    const ledger = await JsonlLedger.open(join(root, "state", "runs", runId, "ledger.jsonl"));
+    const currentEvents = await ledger.read({ runId });
+    const currentWatermark = currentEvents.at(-1)?.globalOffset ?? 0;
+    await ledger.append({
+      runId,
+      turnId,
+      laneId: "main",
+      type: "turn.resumed",
+      payload: { turnId, fromStep: 2, stepAllowance: 1 },
+      correlationId: `turn:${turnId}`,
+      idempotencyKey: "test:persisted-plan:resumed",
+      visibility: "run",
+    });
+    await ledger.append({
+      runId,
+      turnId,
+      laneId: "main",
+      type: "step.started",
+      payload: { step: 2 },
+      correlationId: `turn:${turnId}`,
+      idempotencyKey: "test:persisted-plan:step",
+      visibility: "run",
+    });
+    await ledger.append({
+      runId,
+      turnId,
+      laneId: "main",
+      type: "model.requested",
+      payload: {
+        model: "scripted",
+        requestHash: "sha256:persisted-plan-interrupted",
+        contextWatermark: currentWatermark,
+      },
+      correlationId: `turn:${turnId}`,
+      idempotencyKey: "test:persisted-plan:request",
+      visibility: "run",
+    });
+    await ledger.close();
+
+    const resumedModel = new ScriptedModel([response("finished safely")]);
+    const resumed = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      // Start with the narrow host boundary, then deliberately widen it and
+      // switch out of Plan mode before resuming the old Turn.
+      collaborationMode: "default",
+      runId,
+    }, { mainModel: resumedModel });
+    expect(resumed.snapshot().blocker).toBe("turn-interrupted");
+    await resumed.selectPermissionProfile("full-access");
+    await resumed.selectCollaborationMode("default");
+    await resumed.resumeCurrent();
+    await resumed.waitForIdle();
+
+    expect(resumedModel.requests[0]?.systemPrompt).toContain("Plan mode is active");
+    const names = resumedModel.requests[0]?.tools.map((tool) => tool.name) ?? [];
+    expect(names).toContain("read_file");
+    expect(names).not.toContain("write_file");
+    expect(names).not.toContain("bash");
+    expect(names).not.toContain("process_start");
+    expect(names).not.toContain("web_fetch");
+    expect(names).not.toContain("web_search");
+    await resumed.close();
+  });
+
+  it("fails closed to Plan and read-only tools when a legacy Turn has no boundary", async () => {
+    const root = await temporaryRoot();
+    const first = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      allowWrite: true,
+      allowShell: true,
+      allowNetwork: true,
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([{
+        ...response("inspect before legacy conversion"),
+        toolCalls: [{ id: "legacy-list", name: "list_files", arguments: { path: "." } }],
+        stopReason: "toolUse",
+      }]),
+      createRunId: () => "legacy-boundary-run",
+    });
+    const admitted = await first.submit({ inputId: "legacy-input", text: "Inspect safely" });
+    await first.waitForIdle();
+    const runId = first.snapshot().runId!;
+    await first.close();
+
+    const ledgerPath = join(root, "state", "runs", runId, "ledger.jsonl");
+    const lines = (await readFile(ledgerPath, "utf8")).trimEnd().split("\n");
+    const rewritten = lines.map((line) => {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      if (event.type !== "turn.started") return line;
+      const payload = { ...(event.payload as Record<string, unknown>) };
+      delete payload.boundary;
+      const withoutHash = { ...event, payload };
+      return JSON.stringify({
+        ...withoutHash,
+        contentHash: computeEventContentHash(withoutHash as never),
+      });
+    });
+    await writeFile(ledgerPath, `${rewritten.join("\n")}\n`, "utf8");
+
+    const resumedModel = new ScriptedModel([response("legacy turn recovered safely")]);
+    const resumed = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      runId,
+      collaborationMode: "default",
+    }, { mainModel: resumedModel });
+    await resumed.selectPermissionProfile("full-access");
+    await resumed.selectCollaborationMode("default");
+    await resumed.resumeCurrent();
+    await resumed.waitForIdle();
+
+    expect(resumedModel.requests[0]?.systemPrompt).toContain("Plan mode is active");
+    const names = resumedModel.requests[0]?.tools.map((tool) => tool.name) ?? [];
+    expect(names).toContain("read_file");
+    expect(names).not.toContain("write_file");
+    expect(names).not.toContain("bash");
+    expect(names).not.toContain("process_start");
+    expect(names).not.toContain("web_fetch");
+    expect(names).not.toContain("web_search");
+    expect(admitted.turnId).toBeDefined();
+    await resumed.close();
+  });
+
   it("runs an opt-in Worker lane and delivers its result at a later Main boundary", async () => {
     const root = await temporaryRoot();
     let markWorkerStarted: (() => void) | undefined;
@@ -1081,8 +1242,10 @@ describe("SessionController", () => {
         inputId: "input-steer",
         delivery: "steering",
         text: "Use package.json instead",
+        images: [steeringImage],
         imageTypes: ["image/png"],
         sequence: 2,
+        revision: 1,
       },
     ]);
     releaseFirst?.({
@@ -1571,6 +1734,109 @@ describe("SessionController", () => {
     expect(model.requests).toHaveLength(2);
     expect(session.snapshot().status).toBe("idle");
     await session.close();
+  });
+
+  it("replaces and withdraws pending inputs with durable revisions", async () => {
+    const root = await temporaryRoot();
+    const queuedImage: UserImage = {
+      type: "image",
+      mimeType: "image/png",
+      data: Buffer.from("queued-image").toString("base64"),
+    };
+    let releaseFirst: ((response: ModelResponse) => void) | undefined;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const model = new ScriptedModel([
+      () => new Promise<ModelResponse>((resolve) => {
+        releaseFirst = resolve;
+        markStarted?.();
+      }),
+      (request) => {
+        expect(request.messages).toEqual(expect.arrayContaining([
+          expect.objectContaining({ role: "user", content: "Use the revised request" }),
+        ]));
+        expect(request.messages.some((message) => (
+          message.role === "user" && message.content === "Original queued request"
+        ))).toBe(false);
+        return response("revised answer");
+      },
+    ]);
+    const session = await openSession(root, model, "pending-mutations");
+
+    await session.submit({ inputId: "active-input", text: "Keep running" });
+    await started;
+    await session.submit({
+      inputId: "replace-input",
+      text: "Original queued request",
+      images: [queuedImage],
+      delivery: "follow-up",
+    });
+    await session.submit({
+      inputId: "withdraw-input",
+      text: "Withdraw me",
+      delivery: "follow-up",
+    });
+
+    await expect(session.replacePendingInput("replace-input", 1, {
+      text: "Use the revised request",
+      delivery: "follow-up",
+    })).resolves.toBe("applied");
+    await expect(session.replacePendingInput("replace-input", 1, {
+      text: "Stale replacement",
+      delivery: "follow-up",
+    })).resolves.toBe("stale");
+    await expect(session.pendingInputs()).resolves.toEqual([
+      {
+        inputId: "replace-input",
+        delivery: "follow-up",
+        text: "Use the revised request",
+        images: [queuedImage],
+        imageTypes: ["image/png"],
+        sequence: 2,
+        revision: 2,
+      },
+      {
+        inputId: "withdraw-input",
+        delivery: "follow-up",
+        text: "Withdraw me",
+        sequence: 3,
+        revision: 1,
+      },
+    ]);
+    await expect(session.replacePendingInput("replace-input", 2, {
+      text: "Use the revised request",
+      delivery: "follow-up",
+      images: [],
+    })).resolves.toBe("applied");
+    expect((await session.pendingInputs())[0]).toEqual({
+      inputId: "replace-input",
+      delivery: "follow-up",
+      text: "Use the revised request",
+      images: [],
+      sequence: 2,
+      revision: 3,
+    });
+    await expect(session.withdrawPendingInput("withdraw-input", 1)).resolves.toBe("applied");
+    await expect(session.withdrawPendingInput("withdraw-input", 1)).resolves.toBe("stale");
+
+    releaseFirst?.(response("first answer"));
+    await session.waitForIdle();
+    expect(model.requests).toHaveLength(2);
+    await expect(session.replacePendingInput("replace-input", 3, {
+      text: "Too late",
+      delivery: "follow-up",
+    })).resolves.toBe("stale");
+    await expect(session.pendingInputs()).resolves.toEqual([]);
+    await session.close();
+
+    const reopened = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      runId: "pending-mutations",
+    }, { mainModel: new ScriptedModel([]) });
+    await expect(reopened.pendingInputs()).resolves.toEqual([]);
+    await reopened.close();
   });
 
   it("publishes and coalesces resolutions before automatically resuming the same Turn", async () => {

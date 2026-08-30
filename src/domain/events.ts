@@ -27,6 +27,15 @@ import type {
 export type InputDelivery = "new-turn" | "steering" | "follow-up";
 export type UserMessageKind = "initial" | "steering";
 
+export interface TurnExecutionBoundary {
+  collaborationMode: "default" | "plan";
+  capabilities: {
+    allowWrite: boolean;
+    allowShell: boolean;
+    allowNetwork: boolean;
+  };
+}
+
 export type ContextTruncationKind =
   | "input-token-budget"
   | "conversation-message-limit"
@@ -67,8 +76,36 @@ export interface EventPayloadMap {
     targetTurnId?: TurnId;
     sequence: number;
   };
-  "input.delivered": { inputId: InputId; turnId: TurnId; boundary: string };
-  "turn.started": { turnId: TurnId; inputId: InputId; ordinal: number };
+  "input.replaced": {
+    inputId: InputId;
+    expectedRevision: number;
+    expectedMessageRef: ArtifactRef;
+    revision: number;
+    messageRef: ArtifactRef;
+    delivery: Exclude<InputDelivery, "new-turn">;
+    targetTurnId?: TurnId;
+    sequence: number;
+  };
+  "input.withdrawn": {
+    inputId: InputId;
+    expectedRevision: number;
+    expectedMessageRef: ArtifactRef;
+  };
+  "input.delivered": {
+    inputId: InputId;
+    turnId: TurnId;
+    boundary: string;
+    /** Present on modern transitions; omitted only for legacy replay. */
+    expectedRevision?: number;
+    expectedMessageRef?: ArtifactRef;
+  };
+  "turn.started": {
+    turnId: TurnId;
+    inputId: InputId;
+    ordinal: number;
+    /** Present on modern Turns; omitted only for legacy replay. */
+    boundary?: TurnExecutionBoundary;
+  };
   "turn.completed": { turnId: TurnId; answerRef?: ArtifactRef };
   "turn.failed": { turnId: TurnId; error: string };
   "turn.cancelled": { turnId: TurnId; reason: string; lastCommittedStep: number };

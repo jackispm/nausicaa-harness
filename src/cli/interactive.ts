@@ -18,6 +18,7 @@ import {
   listWorkspaceRuns,
   SessionController,
   type SessionRuntimeEvent,
+  type SessionPendingInput,
   type SessionSnapshot,
   type WorkspaceRunSummary,
 } from "../runtime/index.js";
@@ -55,6 +56,10 @@ import {
   type ThemeChoice,
 } from "./selectors.js";
 import { SelectorOverlay } from "./selector-component.js";
+import {
+  QueueSelection,
+  type QueueSelectionItem,
+} from "./queue-selection.js";
 import {
   ActivityLine,
   AdviceBlock,
@@ -145,7 +150,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   let responseTurnId: string | undefined;
   let presentationTail: Promise<void> = Promise.resolve();
   let transcriptGeneration = 0;
-  let queueRefreshEpoch = 0;
+  let queueSessionGeneration = 0;
+  let queueRefreshTail: Promise<void> = Promise.resolve();
+  let queueBrowseTail: Promise<void> = Promise.resolve();
+  let pendingQueueEdit: symbol | undefined;
+  let queueMutationTail: Promise<void> = Promise.resolve();
   let closing = false;
   let closed = false;
   let activeSubmission: QueuedSubmission | undefined;
@@ -161,6 +170,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     restorePreview: () => void;
   } | undefined;
   const submissionQueue: QueuedSubmission[] = [];
+  const queueSelection = new QueueSelection();
+  let pendingQueue: SessionPendingInput[] = [];
   const pastedImages = new Map<number, UserImage>();
   const promptStashes = new Map<string, PromptStash>();
   let detachedPromptStashSequence = 1;
@@ -268,23 +279,91 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     { name: "copy", description: "Copy the last assistant answer" },
     { name: "exit", description: "Exit Nausicaa" },
   ], options.session.workspace));
-  const refreshQueue = async (): Promise<void> => {
-    const epoch = ++queueRefreshEpoch;
-    try {
-      const pending = await options.session.pendingInputs();
-      if (closed || epoch !== queueRefreshEpoch) return;
-      queuePreview.setItems(pending.map((item) => ({
-        delivery: item.delivery === "new-turn" ? "follow-up" : item.delivery,
-        text: item.imageTypes === undefined
-          ? item.text
-          : `${item.text} [${item.imageTypes.length} image(s)]`,
-      })));
-      tui.requestRender();
-    } catch {
-      if (closed || epoch !== queueRefreshEpoch) return;
-      // Queue is observational. A closed or detached session simply renders no preview.
-      queuePreview.setItems([]);
+  const setEditorTextFromQueueSelection = (text: string): void => {
+    editor.setText(text);
+  };
+
+  const queueSelectionItems = (
+    pending: readonly SessionPendingInput[],
+  ): QueueSelectionItem[] => pending.map((item) => ({
+    inputId: item.inputId,
+    revision: item.revision,
+    delivery: item.delivery === "steering" ? "steering" : "follow-up",
+    text: item.text,
+    sequence: item.sequence,
+  }));
+
+  const updateQueuePreview = (): void => {
+    const selected = queueSelection.selected;
+    queuePreview.setItems(pendingQueue.map((item) => ({
+      delivery: item.delivery === "steering" ? "steering" : "follow-up",
+      text: item.imageTypes === undefined
+        ? item.text
+        : `${item.text} [${item.imageTypes.length} image(s)]`,
+      selected: selected?.inputId === item.inputId
+        && selected.revision === item.revision,
+    })));
+  };
+
+  const resetQueueSelection = (): void => {
+    queueSessionGeneration += 1;
+    queueSelection.reset();
+    pendingQueueEdit = undefined;
+    pendingQueue = [];
+    updateQueuePreview();
+  };
+
+  const restoreDroppedQueueSelection = (
+    dropped: QueueSelectionItem | undefined,
+  ): void => {
+    if (dropped === undefined || pendingQueueEdit !== undefined) return;
+    const editorText = editor.getExpandedText();
+    if (editorText === dropped.text) {
+      setEditorTextFromQueueSelection(queueSelection.reset());
+    } else {
+      // Keep the in-progress queue edit visible instead of restoring an older draft over it.
+      queueSelection.replaceDraft(editorText);
     }
+  };
+
+  const refreshQueue = (): Promise<boolean> => {
+    const generation = queueSessionGeneration;
+    const runId = options.session.snapshot().runId;
+    let applied = false;
+    const refresh = queueRefreshTail.then(async () => {
+      if (
+        closed
+        || generation !== queueSessionGeneration
+        || runId !== options.session.snapshot().runId
+      ) return;
+      try {
+        const pending = await options.session.pendingInputs();
+        if (
+          closed
+          || generation !== queueSessionGeneration
+          || runId !== options.session.snapshot().runId
+        ) return;
+        pendingQueue = pending;
+        const dropped = queueSelection.sync(queueSelectionItems(pending));
+        restoreDroppedQueueSelection(dropped);
+        updateQueuePreview();
+        tui.requestRender();
+        applied = true;
+      } catch {
+        if (
+          closed
+          || generation !== queueSessionGeneration
+          || runId !== options.session.snapshot().runId
+        ) return;
+        // Queue is observational. A closed or detached session simply renders no preview.
+        pendingQueue = [];
+        restoreDroppedQueueSelection(queueSelection.sync([]));
+        queuePreview.setItems([]);
+        tui.requestRender();
+      }
+    });
+    queueRefreshTail = refresh.then(() => undefined, () => undefined);
+    return refresh.then(() => applied);
   };
   tui.onTerminalColorSchemeChange((scheme) => {
     detectedColorScheme = scheme;
@@ -325,6 +404,163 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     appendBlock(new NoticeBlock(message, kind));
   };
 
+  const moveQueueSelection = (direction: -1 | 1, draft: string): void => {
+    const movement = queueSelection.move(
+      queueSelectionItems(pendingQueue),
+      draft,
+      direction,
+    );
+    if (movement === undefined) return;
+    setEditorTextFromQueueSelection(
+      movement.kind === "item" ? movement.item.text : movement.text,
+    );
+    updateQueuePreview();
+    tui.requestRender();
+  };
+
+  const browseQueueSelection = (direction: -1 | 1): void => {
+    const snapshot = options.session.snapshot();
+    if (queueSelection.isBrowsing && pendingQueueEdit === undefined) {
+      moveQueueSelection(direction, editor.getExpandedText());
+      void refreshQueue();
+      return;
+    }
+
+    const generation = queueSessionGeneration;
+    const runId = snapshot.runId;
+    const browse = queueBrowseTail.then(async () => {
+      // A mutation becomes durable before its local refresh/finalizer settles.
+      // Queue browsing behind that tail so a fast follow-up keypress is not lost.
+      await queueMutationTail;
+      if (
+        closed
+        || generation !== queueSessionGeneration
+        || runId !== options.session.snapshot().runId
+      ) return;
+      const browseEditorRevision = editorRevision;
+      const draft = editor.getExpandedText();
+      if (!await refreshQueue()) return;
+      if (
+        closed
+        || generation !== queueSessionGeneration
+        || runId !== options.session.snapshot().runId
+        || browseEditorRevision !== editorRevision
+        || draft !== editor.getExpandedText()
+      ) return;
+      moveQueueSelection(direction, draft);
+    });
+    queueBrowseTail = browse.then(() => undefined, () => undefined);
+  };
+
+  const queueReplacementImages = (
+    pending: SessionPendingInput,
+    text: string,
+  ): UserImage[] | undefined => {
+    const beforeMarkers = uniqueImageMarkerIds(pending.text);
+    const afterMarkers = uniqueImageMarkerIds(text);
+    if (sameNumbers(beforeMarkers, afterMarkers)) return undefined;
+    if (afterMarkers.length === 0) return [];
+
+    const available = new Map<number, UserImage>();
+    beforeMarkers.forEach((markerId, index) => {
+      const image = pending.images?.[index];
+      if (image !== undefined) available.set(markerId, image);
+    });
+    for (const [markerId, image] of pastedImages) {
+      if (!available.has(markerId)) available.set(markerId, image);
+    }
+    const missing = afterMarkers.filter((markerId) => !available.has(markerId));
+    if (missing.length > 0) {
+      throw new Error(
+        `Image attachment ${missing.slice(0, 3).map(formatImageMarker).join(", ")} is no longer available.`,
+      );
+    }
+    const images = afterMarkers.map((markerId) => structuredClone(available.get(markerId)!));
+    validateUserImages(images);
+    return images;
+  };
+
+  const enqueueQueueMutation = <T>(operation: () => Promise<T>): Promise<T> => {
+    const next = queueMutationTail.then(operation, operation);
+    queueMutationTail = next.then(() => undefined, () => undefined);
+    return next;
+  };
+
+  const applyQueueSelection = async (
+    text: string,
+    delivery: "steering" | "follow-up",
+  ): Promise<void> => {
+    if (pendingQueueEdit !== undefined) return;
+    const selected = queueSelection.selected;
+    if (selected === undefined) return;
+    const pending = pendingQueue.find((item) => (
+      item.inputId === selected.inputId && item.revision === selected.revision
+    ));
+    const submittedText = text.trim();
+    const submittedAtEditorRevision = editorRevision;
+    const generation = queueSessionGeneration;
+    const mutation = Symbol("pending-queue-edit");
+    pendingQueueEdit = mutation;
+
+    try {
+      await enqueueQueueMutation(async () => {
+        if (generation !== queueSessionGeneration) return;
+        if (pending === undefined) {
+          await refreshQueue();
+          keepStaleQueueEdit(submittedText, submittedAtEditorRevision);
+          return;
+        }
+        const replacementImages = submittedText.length === 0
+          ? undefined
+          : queueReplacementImages(pending, submittedText);
+        const status = submittedText.length === 0
+          ? await options.session.withdrawPendingInput(selected.inputId, selected.revision)
+          : await options.session.replacePendingInput(selected.inputId, selected.revision, {
+              text: submittedText,
+              delivery,
+              ...(replacementImages === undefined ? {} : { images: replacementImages }),
+            });
+        if (generation !== queueSessionGeneration) return;
+        if (status === "stale") {
+          await refreshQueue();
+          keepStaleQueueEdit(submittedText, submittedAtEditorRevision);
+          return;
+        }
+
+        const draft = queueSelection.reset();
+        if (editorRevision === submittedAtEditorRevision) {
+          setEditorTextFromQueueSelection(draft);
+        }
+        await refreshQueue();
+      });
+    } catch (error: unknown) {
+      if (generation === queueSessionGeneration) {
+        if (editorRevision === submittedAtEditorRevision) {
+          setEditorTextFromQueueSelection(submittedText);
+        }
+        appendNotice(
+          `Queued input was not changed: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+      }
+    } finally {
+      if (pendingQueueEdit === mutation) pendingQueueEdit = undefined;
+      updateQueuePreview();
+      tui.requestRender();
+    }
+  };
+
+  const keepStaleQueueEdit = (
+    text: string,
+    submittedAtEditorRevision: number,
+  ): void => {
+    queueSelection.reset();
+    if (editorRevision === submittedAtEditorRevision) {
+      setEditorTextFromQueueSelection(text);
+    }
+    appendNotice("Queued input changed before the edit; the draft was kept in the prompt.", "warning");
+  };
+
   const clearShortcutGuide = (): void => {
     if (shortcutGuide.children.length === 0) return;
     shortcutGuide.clear();
@@ -336,6 +572,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     shortcutGuide.addChild(new Markdown([
       "**Prompt**",
       "`Tab` complete paths  ·  `Alt+Enter` queue follow-up",
+      "`Alt+Up/Down` browse and edit queued input",
       "**Controls**",
       `\`${pasteImageLabel}\` paste image  ·  \`Ctrl+S\` stash prompt`,
       "`Ctrl+O` tool output  ·  `Ctrl+T` thinking",
@@ -721,6 +958,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       }
       if (
         event.type === "input.admitted"
+        || event.type === "input.replaced"
+        || event.type === "input.withdrawn"
         || event.type === "input.delivered"
         || event.type === "user.message"
       ) {
@@ -1193,6 +1432,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       return;
     }
     await options.session.attachRun(runId);
+    resetQueueSelection();
     if (promptStashScope.startsWith("<new-run:")) {
       promptStashes.delete(promptStashScope);
     }
@@ -1248,6 +1488,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             "`/cancel` cancel active Turn  ·  `/resolve <operation-id>` resolve recovery",
             "`/copy` copy the last assistant answer",
             "`/exit` close session  ·  `Alt+Enter` queue follow-up",
+            "`Alt+Up/Down` browse and edit queued input",
             `\`${pasteImageLabel}\` paste image  ·  \`Ctrl+S\` stash prompt`,
             "`Ctrl+T` thinking  ·  `Ctrl+O` tool output",
             "`Ctrl+Up/Down` jump between prompts  ·  `Ctrl+Shift+F` search transcript",
@@ -1337,6 +1578,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           break;
         case "/new":
           await options.session.newRun();
+          resetQueueSelection();
           promptStashes.delete(promptStashKey());
           promptStashScope = `<new-run:${detachedPromptStashSequence}>`;
           detachedPromptStashSequence += 1;
@@ -1465,6 +1707,17 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     images?: UserImage[],
   ): Promise<void> => {
     const value = text.trim();
+    if (queueSelection.isBrowsing && !closing) {
+      if (pendingQueueEdit !== undefined) {
+        editor.setText(text);
+        appendNotice("Queued input update is still finishing; your draft was kept.", "warning");
+        return Promise.resolve();
+      }
+      return applyQueueSelection(
+        value,
+        requestedDelivery === "follow-up" ? "follow-up" : "steering",
+      );
+    }
     const unresolvedMarkers = [...new Set(imageMarkerIds(value)
       .filter((markerId) => !pastedImages.has(markerId)))];
     if (!value.startsWith("/") && unresolvedMarkers.length > 0) {
@@ -1533,10 +1786,17 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       handlePromptStash();
       return { consume: true };
     }
+    if (matchesKey(data, "alt+up")) {
+      browseQueueSelection(-1);
+      return { consume: true };
+    }
+    if (matchesKey(data, "alt+down")) {
+      browseQueueSelection(1);
+      return { consume: true };
+    }
     if (matchesKey(data, "alt+enter")) {
       if (!closing) {
         const text = editor.getExpandedText();
-        editor.setText("");
         void submitText(text, "follow-up");
       }
       return { consume: true };
@@ -1692,4 +1952,12 @@ function createInputId(): string {
 
 export function clipboardImagePasteKey(platform: NodeJS.Platform): "alt+v" | "ctrl+v" {
   return platform === "win32" ? "alt+v" : "ctrl+v";
+}
+
+function uniqueImageMarkerIds(text: string): number[] {
+  return [...new Set(imageMarkerIds(text))].sort((left, right) => left - right);
+}
+
+function sameNumbers(left: readonly number[], right: readonly number[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }

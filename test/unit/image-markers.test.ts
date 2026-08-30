@@ -17,10 +17,10 @@ describe("image markers", () => {
       .toBe("[image #7] [image #7] [image #2]");
   });
 
-  it("collects each live image once in registry insertion order", () => {
+  it("collects each live image once in stable marker-id order", () => {
     const images = new Map([
-      [1, "first"],
       [2, "second"],
+      [1, "first"],
       [3, "deleted"],
     ]);
 

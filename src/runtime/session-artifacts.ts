@@ -1,4 +1,9 @@
-import type { AnyEvent, InputDelivery } from "../domain/events.js";
+import type {
+  AnyEvent,
+  EventEnvelope,
+  EventPayloadMap,
+  InputDelivery,
+} from "../domain/events.js";
 import type {
   ArtifactRef,
   ConversationMessage,
@@ -44,9 +49,18 @@ export interface SessionPendingInput {
   inputId: string;
   delivery: InputDelivery;
   text: string;
+  images?: UserImage[];
   imageTypes?: string[];
   sequence: number;
+  revision: number;
 }
+
+export type ProjectedPendingAdmission = Omit<
+  EventEnvelope<"input.admitted"> | EventEnvelope<"input.replaced">,
+  "payload"
+> & {
+  payload: EventPayloadMap["input.admitted"] & { revision: number };
+};
 
 /**
  * Hydrate the presentation transcript from durable event facts. This keeps
@@ -154,8 +168,12 @@ export async function projectPendingInputs(
       inputId: event.payload.inputId,
       delivery: event.payload.delivery,
       text: message.content,
+      ...(message.images === undefined
+        ? {}
+        : { images: structuredClone(message.images) }),
       ...(imageTypes.length === 0 ? {} : { imageTypes }),
       sequence: event.payload.sequence,
+      revision: event.payload.revision,
     };
   }));
 }
@@ -250,15 +268,58 @@ async function readTranscriptToolArguments(
 
 export function projectPendingAdmissions(
   events: readonly AnyEvent[],
-): Array<Extract<AnyEvent, { type: "input.admitted" }>> {
-  const delivered = new Set(events
-    .filter((event) => event.type === "input.delivered")
-    .map((event) => event.payload.inputId));
-  return events
-    .filter((event): event is Extract<AnyEvent, { type: "input.admitted" }> => (
-      event.type === "input.admitted" && !delivered.has(event.payload.inputId)
-    ))
-    .sort((left, right) => left.payload.sequence - right.payload.sequence);
+): ProjectedPendingAdmission[] {
+  const pending = new Map<string, ProjectedPendingAdmission>();
+  const ordered = [...events].sort((left, right) => left.globalOffset - right.globalOffset);
+  for (const event of ordered) {
+    if (event.type === "input.admitted") {
+      pending.set(event.payload.inputId, {
+        ...structuredClone(event),
+        payload: {
+          ...structuredClone(event.payload),
+          revision: 1,
+        },
+      });
+      continue;
+    }
+    if (event.type === "input.replaced") {
+      if (!pending.has(event.payload.inputId)) continue;
+      pending.set(event.payload.inputId, {
+        eventId: event.eventId,
+        runId: event.runId,
+        ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
+        laneId: event.laneId,
+        globalOffset: event.globalOffset,
+        laneSeq: event.laneSeq,
+        type: "input.replaced",
+        schemaVersion: event.schemaVersion,
+        occurredAt: event.occurredAt,
+        ...(event.causationId === undefined ? {} : { causationId: event.causationId }),
+        correlationId: event.correlationId,
+        idempotencyKey: event.idempotencyKey,
+        visibility: event.visibility,
+        contentHash: event.contentHash,
+        payload: {
+          inputId: event.payload.inputId,
+          messageRef: structuredClone(event.payload.messageRef),
+          delivery: event.payload.delivery,
+          ...(event.payload.targetTurnId === undefined
+            ? {}
+            : { targetTurnId: event.payload.targetTurnId }),
+          sequence: event.payload.sequence,
+          revision: event.payload.revision,
+        },
+      });
+      continue;
+    }
+    if (event.type === "input.delivered" || event.type === "input.withdrawn") {
+      pending.delete(event.payload.inputId);
+    }
+  }
+  return [...pending.values()].sort((left, right) => (
+    left.payload.sequence - right.payload.sequence
+    || left.payload.inputId.localeCompare(right.payload.inputId)
+  ));
 }
 
 function legacyTurnIdForTranscript(runId: string): string {

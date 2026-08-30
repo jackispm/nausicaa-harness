@@ -603,6 +603,24 @@ describe("tool presentation registry", () => {
     expect(text(grep.expanded)).toContain("src/a.ts:8:4  const needle = true;");
     expect(grep.expanded.map((line) => line.tone)).toEqual(["context", "output", "context"]);
 
+    const grepFiles = renderToolPresentation({
+      name: "grep",
+      arguments: { pattern: "needle", path: "src", outputMode: "files" },
+      result: {
+        path: "src",
+        pattern: "needle",
+        files: ["src/a.ts", "src/b.ts"],
+        count: 2,
+        truncated: true,
+      },
+      status: "succeeded",
+      width: 80,
+    });
+    expect(grepFiles.summary).toBe("src · 2 matching files · more");
+    expect(text(grepFiles.expanded)).toContain("src/a.ts");
+    expect(text(grepFiles.expanded)).not.toContain('"files"');
+    expect(grepFiles.expanded.at(-1)).toMatchObject({ tone: "warning" });
+
     const find = renderToolPresentation({
       name: "find",
       arguments: { pattern: "**/*.ts", path: "." },

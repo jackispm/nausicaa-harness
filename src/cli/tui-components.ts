@@ -804,6 +804,7 @@ export class NoticeBlock implements Component {
 export interface QueuePreviewItem {
   delivery: "steering" | "follow-up";
   text: string;
+  selected?: boolean;
 }
 
 export class QueuePreview implements Component {
@@ -813,10 +814,20 @@ export class QueuePreview implements Component {
   render(width: number): string[] {
     if (this.items.length === 0) return [];
     const safeWidth = Math.max(1, width);
-    const lines = [truncateToWidth(`${palette.dim("queued")}${palette.muted(" · ")}${palette.dim("Alt+Enter add follow-up")}`, safeWidth, "")];
+    const selected = this.items.find((item) => item.selected === true);
+    const heading = selected === undefined
+      ? "queued · Alt+Up browse/edit · Alt+Enter add follow-up"
+      : `editing ${selected.delivery} · Alt+↑/↓ · Enter steer · Alt+Enter follow · empty withdraw`;
+    const lines = [truncateToWidth(palette.dim(heading), safeWidth, "")];
     for (const item of this.items) {
       const label = item.delivery === "steering" ? "steer" : "follow-up";
-      lines.push(truncateToWidth(` ${palette.accent("›")} ${palette.muted(label)} ${palette.text(oneLine(terminalSafeText(item.text), Math.max(8, safeWidth - label.length - 6)))}`, safeWidth, ""));
+      const marker = item.selected ? palette.accent("●") : palette.dim("›");
+      const text = oneLine(terminalSafeText(item.text), Math.max(8, safeWidth - label.length - 6));
+      lines.push(truncateToWidth(
+        ` ${marker} ${palette.muted(label)} ${item.selected ? palette.accent(text) : palette.text(text)}`,
+        safeWidth,
+        "",
+      ));
     }
     return lines;
   }

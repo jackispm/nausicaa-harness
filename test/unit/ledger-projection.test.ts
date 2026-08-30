@@ -221,7 +221,15 @@ describe("projectRun", () => {
       sequence: 1,
     }));
     await ledger.append({
-      ...command("turn.started", { turnId: "turn-1", inputId: "input-1", ordinal: 1 }),
+      ...command("turn.started", {
+        turnId: "turn-1",
+        inputId: "input-1",
+        ordinal: 1,
+        boundary: {
+          collaborationMode: "default",
+          capabilities: { allowWrite: false, allowShell: false, allowNetwork: false },
+        },
+      }),
       turnId: "turn-1",
     });
     await ledger.append({
@@ -229,6 +237,8 @@ describe("projectRun", () => {
         inputId: "input-1",
         turnId: "turn-1",
         boundary: "turn-start",
+        expectedRevision: 1,
+        expectedMessageRef: artifact("input-1"),
       }),
       turnId: "turn-1",
     });
@@ -313,6 +323,52 @@ describe("projectRun", () => {
       lastCommittedStep: 3,
       stepAllowance: 8,
       answerRef: artifact("answer-1"),
+    });
+  });
+
+  it("projects one latest input revision and retains withdrawn history", async () => {
+    const ledger = new MemoryLedger();
+    const firstRef = artifact("queued-first");
+    const secondRef = artifact("queued-second");
+    await ledger.append(command("input.admitted", {
+      inputId: "queued-input",
+      messageRef: firstRef,
+      delivery: "follow-up",
+      sequence: 1,
+    }));
+    await ledger.append(command("input.replaced", {
+      inputId: "queued-input",
+      expectedRevision: 1,
+      expectedMessageRef: firstRef,
+      revision: 2,
+      messageRef: secondRef,
+      delivery: "follow-up",
+      sequence: 1,
+    }));
+
+    const replaced = projectRun(await ledger.read(), "run-1");
+    expect(replaced.inputs).toHaveLength(1);
+    expect(replaced.inputs[0]).toMatchObject({
+      inputId: "queued-input",
+      messageRef: secondRef,
+      revision: 2,
+      sequence: 1,
+      status: "pending",
+    });
+
+    await ledger.append(command("input.withdrawn", {
+      inputId: "queued-input",
+      expectedRevision: 2,
+      expectedMessageRef: secondRef,
+    }));
+    const withdrawn = projectRun(await ledger.read(), "run-1");
+    expect(withdrawn.inputs).toHaveLength(1);
+    expect(withdrawn.inputs[0]).toMatchObject({
+      inputId: "queued-input",
+      messageRef: secondRef,
+      revision: 2,
+      status: "withdrawn",
+      withdrawnAtOffset: 3,
     });
   });
 
