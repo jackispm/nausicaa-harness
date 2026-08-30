@@ -528,9 +528,47 @@ function buildCompactionSlot(
   failure: string | undefined,
 ): ContextCompactionSlotManifest {
   if (failure !== undefined) {
+    // A rejected optimization is still a replay-visible compaction attempt.
+    // Preserve its validated provenance so the Ledger's stale-slot contract
+    // remains valid; malformed selections fall back to an empty slot below.
+    if (selection !== undefined) {
+      try {
+        const capsule = staleCompactionCapsule(selection);
+        return {
+          ...slot(
+            "bounded",
+            1,
+            capsule.estimatedTokens,
+            hashStable({ status: "stale", capsule, failure }),
+          ),
+          status: "stale",
+          compactionId: capsule.compactionId,
+          summaryRef: structuredClone(capsule.summaryRef),
+          sourceRefs: structuredClone(capsule.sourceRefs),
+          ...(capsule.deferredConversationRefs === undefined
+            ? {}
+            : {
+                deferredConversationRefs: structuredClone(
+                  capsule.deferredConversationRefs,
+                ),
+              }),
+          ...(capsule.generation === undefined
+            ? {}
+            : { generation: structuredClone(capsule.generation) }),
+          summaryHash: capsule.summaryHash,
+          cursor: capsule.cursor,
+          upperWatermark: capsule.upperWatermark,
+          goalVersion: capsule.goalVersion,
+          policyVersion: capsule.policyVersion,
+        };
+      } catch {
+        // The selection itself is malformed; do not copy untrusted fields into
+        // a manifest that will be persisted as a Ledger event.
+      }
+    }
     return {
-      ...slot("bounded", 0, 0, hashStable({ status: "stale", failure })),
-      status: "stale",
+      ...slot("empty", 0, 0, hashStable({ status: "none", failure })),
+      status: "none",
       sourceRefs: [],
     };
   }
@@ -570,6 +608,129 @@ function buildCompactionSlot(
     goalVersion: capsule.goalVersion,
     policyVersion: capsule.policyVersion,
   };
+}
+
+/**
+ * Keep only the capsule fields that can be safely represented by a stale
+ * manifest. Optional deferred/generation fields are retained when valid, but
+ * an invalid optional field must not make the whole fallback unpersistable.
+ */
+function staleCompactionCapsule(
+  selection: FukaiCompactionSelection,
+): typeof selection.capsule {
+  const rawCapsule = selection.capsule;
+  const rawSummary = selection.summary;
+  const capsule = {
+    schemaVersion: rawCapsule.schemaVersion,
+    compactionId: rawCapsule.compactionId,
+    status: "stale" as const,
+    summaryRef: structuredClone(rawCapsule.summaryRef),
+    sourceRefs: structuredClone(rawCapsule.sourceRefs),
+    summaryHash: rawCapsule.summaryHash,
+    cursor: rawCapsule.cursor,
+    upperWatermark: rawCapsule.upperWatermark,
+    goalVersion: rawCapsule.goalVersion,
+    policyVersion: rawCapsule.policyVersion,
+    estimatedTokens: rawCapsule.estimatedTokens,
+  } as typeof rawCapsule;
+  const summary = {
+    ...structuredClone(rawSummary),
+    deferredConversationRefs: undefined,
+    generation: undefined,
+  } as unknown as typeof rawSummary;
+  delete (summary as { deferredConversationRefs?: unknown }).deferredConversationRefs;
+  delete (summary as { generation?: unknown }).generation;
+
+  // validateCompactionSelection checks the cross-object identity fields. The
+  // source-ref shape is checked here because that helper intentionally trusts
+  // refs for the normal, already-validated activation path.
+  validateCompactionSourceRefs(capsule.sourceRefs);
+
+  const optionalDeferred = rawCapsule.deferredConversationRefs;
+  const summaryDeferred = rawSummary.deferredConversationRefs;
+  if (optionalDeferred !== undefined && summaryDeferred !== undefined) {
+    const candidateCapsule = {
+      ...capsule,
+      deferredConversationRefs: structuredClone(optionalDeferred),
+    } as typeof rawCapsule;
+    const candidateSummary = {
+      ...summary,
+      deferredConversationRefs: structuredClone(summaryDeferred),
+    } as typeof rawSummary;
+    try {
+      validateCompactionSelection({ capsule: candidateCapsule, summary: candidateSummary });
+      Object.assign(capsule, { deferredConversationRefs: candidateCapsule.deferredConversationRefs });
+      Object.assign(summary, { deferredConversationRefs: candidateSummary.deferredConversationRefs });
+    } catch {
+      // Keep the core stale provenance and omit only the invalid optional refs.
+    }
+  }
+
+  const optionalGeneration = rawCapsule.generation;
+  const summaryGeneration = rawSummary.generation;
+  if (optionalGeneration !== undefined && summaryGeneration !== undefined) {
+    const candidateCapsule = {
+      ...capsule,
+      generation: structuredClone(optionalGeneration),
+    } as typeof rawCapsule;
+    const candidateSummary = {
+      ...summary,
+      generation: structuredClone(summaryGeneration),
+    } as typeof rawSummary;
+    try {
+      validateCompactionSelection({ capsule: candidateCapsule, summary: candidateSummary });
+      Object.assign(capsule, { generation: candidateCapsule.generation });
+      Object.assign(summary, { generation: candidateSummary.generation });
+    } catch {
+      // Keep the core stale provenance and omit only the invalid generation.
+    }
+  }
+
+  validateCompactionSelection({ capsule, summary });
+  return capsule;
+}
+
+function validateCompactionSourceRefs(value: unknown): asserts value is ContextSourceRef[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 128) {
+    throw new FukaiCompactionError("Fukai compaction source refs are invalid");
+  }
+  const identities = new Set<string>();
+  for (const source of value) {
+    if (source === null || typeof source !== "object" || Array.isArray(source)) {
+      throw new FukaiCompactionError("Fukai compaction source ref is invalid");
+    }
+    const candidate = source as Record<string, unknown>;
+    let identity: string;
+    if (candidate.kind === "event") {
+      if (!nonEmptySafeText(candidate.eventId) || !nonEmptySafeText(candidate.contentHash)) {
+        throw new FukaiCompactionError("Fukai event source ref is invalid");
+      }
+      identity = `event:${candidate.eventId}:${candidate.contentHash}`;
+    } else if (candidate.kind === "artifact" || candidate.kind === "conversation") {
+      const ref = candidate.ref;
+      if (ref === null || typeof ref !== "object" || Array.isArray(ref)) {
+        throw new FukaiCompactionError("Fukai artifact source ref is invalid");
+      }
+      assertArtifactRef(ref as Parameters<typeof assertArtifactRef>[0]);
+      if (!nonEmptySafeText((ref as Record<string, unknown>).mediaType)) {
+        throw new FukaiCompactionError("Fukai artifact source ref media type is invalid");
+      }
+      identity = `${candidate.kind}:${(ref as Record<string, unknown>).id}`;
+    } else {
+      throw new FukaiCompactionError("Fukai compaction source ref kind is invalid");
+    }
+    if (identities.has(identity)) {
+      throw new FukaiCompactionError("Fukai compaction source refs must be unique");
+    }
+    identities.add(identity);
+  }
+}
+
+function nonEmptySafeText(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 4_096
+    && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function slot(

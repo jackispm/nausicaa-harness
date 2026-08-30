@@ -787,7 +787,10 @@ describe("MainLoop", () => {
     ))).toBe(false);
     const requested = (await ledger.read({ runId: "main-compaction-context-fallback" }))
       .filter((event) => event.type === "model.requested");
-    expect(requested[0]?.payload.contextManifest?.slots.compaction.status).toBe("none");
+    expect(requested[0]?.payload.contextManifest?.slots.compaction).toMatchObject({
+      status: "stale",
+      sourceRefs: expect.arrayContaining([summary.sourceRefs[0]]),
+    });
   });
 
   it("checks compaction pressure at every Main request boundary without adding provider calls", async () => {
