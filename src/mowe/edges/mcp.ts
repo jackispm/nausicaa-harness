@@ -111,6 +111,7 @@ const MAX_CONTENT_BLOCKS = 1_024;
 const MAX_RESULT_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_RESULT_STRUCTURED_BYTES = 512 * 1024;
 const MAX_LIST_PAGES = 1_024;
+const MAX_HEALTH_MESSAGE_BYTES = 192;
 const DEFAULT_SCHEMA_VERSION = "2020-12";
 
 /**
@@ -212,11 +213,10 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
     throwIfAborted(context.signal);
     await this.#ensureConnected(context.signal);
     const client = this.#requireClient();
-    const tools: McpTool[] = [];
     let cursor: string | undefined;
     const visitedCursors = new Set<string>();
-    const remoteNames = new Set<string>();
-    const capabilityNames = new Set<string>();
+    const remoteNames = new Map<string, McpTool>();
+    const selectedTools = new Map<string, McpTool>();
     let pages = 0;
     this.#truncatedTools = false;
     this.#warnings = [];
@@ -252,38 +252,48 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
         throw error;
       }
       for (const tool of response.tools ?? []) {
-        if (tools.length >= this.#maxTools) {
-          this.#truncatedTools = true;
-          break;
-        }
         if (!isUsableMcpTool(tool, this.#maxSchemaBytes)) {
           this.#warnings.push(`Ignored MCP tool with invalid or oversized schema: ${safeToolName(tool)}`);
           continue;
         }
         const remoteName = tool.name;
-        if (remoteNames.has(remoteName)) {
+        const duplicate = remoteNames.get(remoteName);
+        if (duplicate !== undefined) {
+          if (compareMcpTools(tool, duplicate) < 0) {
+            remoteNames.set(remoteName, tool);
+            const projectedName = capabilityName(this.sourceId, remoteName);
+            const selected = selectedTools.get(projectedName);
+            if (selected === undefined || compareMcpTools(tool, selected) < 0) {
+              selectedTools.set(projectedName, tool);
+            }
+          }
           this.#warnings.push(`Ignored duplicate MCP tool: ${safeDiagnosticValue(remoteName)}`);
           continue;
         }
         const projectedName = capabilityName(this.sourceId, remoteName);
-        if (capabilityNames.has(projectedName)) {
+        const collision = selectedTools.get(projectedName);
+        if (collision !== undefined) {
+          if (compareMcpTools(tool, collision) < 0) selectedTools.set(projectedName, tool);
           this.#warnings.push(
             `Ignored MCP tool with colliding namespace: ${safeDiagnosticValue(remoteName)} -> ${projectedName}`,
           );
           continue;
         }
-        remoteNames.add(remoteName);
-        capabilityNames.add(projectedName);
-        tools.push(tool);
+        if (selectedTools.size >= this.#maxTools) {
+          this.#truncatedTools = true;
+          break;
+        }
+        remoteNames.set(remoteName, tool);
+        selectedTools.set(projectedName, tool);
       }
       cursor = response.nextCursor;
-    } while (cursor !== undefined && tools.length < this.#maxTools);
+    } while (cursor !== undefined && selectedTools.size < this.#maxTools);
 
-    if (cursor !== undefined && tools.length >= this.#maxTools) this.#truncatedTools = true;
+    if (cursor !== undefined && selectedTools.size >= this.#maxTools) this.#truncatedTools = true;
     this.#serverTools.clear();
     this.#toolPolicies.clear();
     const manifests: EdgeManifest[] = [];
-    for (const tool of tools.sort((left, right) => compareText(left.name, right.name))) {
+    for (const tool of [...selectedTools.values()].sort((left, right) => compareMcpTools(left, right))) {
       try {
         const policy = this.#resolvePolicy(tool);
         const manifest = this.#manifest(tool, policy);
@@ -371,7 +381,9 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
       sourceType: SOURCE_TYPE,
       status,
       checkedAt: this.#checkedAt,
-      ...(this.#lastError === undefined ? {} : { message: this.#lastError, retryAfterMs: 250 }),
+      ...(this.#lastError === undefined
+        ? {}
+        : { message: boundedText(this.#lastError, MAX_HEALTH_MESSAGE_BYTES), retryAfterMs: 250 }),
     };
   }
 
@@ -449,10 +461,15 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
         if (this.#client !== client) return;
         this.#connected = false;
         this.#transport = undefined;
+        this.#ownsClient = false;
+        this.#ownsTransport = false;
         this.#serverTools.clear();
         this.#toolPolicies.clear();
         this.#lifecycleEpoch += 1;
-        if (this.#canCreateFreshClient()) this.#client = undefined;
+        // A closed SDK client cannot be connected again. Clear it even when
+        // the caller supplied the client so a later discover cannot
+        // accidentally treat the stale transport as a live connection.
+        this.#client = undefined;
         if (!this.#closed) this.#lastError = "MCP transport closed";
         this.#checkedAt = new Date().toISOString();
       };
@@ -673,6 +690,7 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
   ): Promise<ToolResult> {
     try {
       throwIfAborted(signal);
+      if (!isRecord(arguments_)) throw new TypeError("MCP tool arguments must be an object");
       await this.#ensureConnected(signal);
       const response = await this.#requireClient().callTool(
         { name: remoteName, arguments: arguments_ },
@@ -681,7 +699,10 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
       );
       if (!hasMcpContent(response)) {
         return {
-          content: "MCP server returned a task handle; task-based execution is not supported by this edge yet",
+          content: boundedText(
+            "MCP server returned a task handle; task-based execution is not supported by this edge yet",
+            this.#maxResultBytes,
+          ),
           isError: true,
         };
       }
@@ -796,20 +817,21 @@ export function projectMcpToolResult(
   let imageBytes = 0;
   let exceededLimit = false;
   const blocks = Array.isArray(response.content) ? response.content : [];
+  if (!Array.isArray(response.content)) exceededLimit = true;
   if (blocks.length > maxBlocks) {
     unsupported += blocks.length - maxBlocks;
     exceededLimit = true;
   }
   for (const block of blocks.slice(0, maxBlocks)) {
-    if (block.type === "text") {
+    if (isTextBlock(block)) {
       const remaining = Math.max(0, maxBytes - usedBytes);
       const part = boundedText(block.text, remaining);
-      if (Buffer.byteLength(block.text) > remaining) exceededLimit = true;
+      if (Buffer.byteLength(block.text, "utf8") > remaining) exceededLimit = true;
       if (part.length > 0) text.push(part);
       usedBytes += Buffer.byteLength(part);
       continue;
     }
-    if (block.type === "image") {
+    if (isImageBlock(block)) {
       const image = { type: "image" as const, data: block.data, mimeType: block.mimeType };
       if (images.length >= MAX_USER_IMAGES) {
         unsupported += 1;
@@ -830,8 +852,13 @@ export function projectMcpToolResult(
         }
       } catch {
         unsupported += 1;
+        exceededLimit = true;
       }
       continue;
+    }
+    const rawBlock: unknown = block;
+    if (isRecord(rawBlock) && (rawBlock.type === "text" || rawBlock.type === "image")) {
+      exceededLimit = true;
     }
     unsupported += 1;
   }
@@ -873,6 +900,21 @@ function hasMcpContent(
   response: Awaited<ReturnType<Client["callTool"]>>,
 ): response is CallToolResult {
   return "content" in response && Array.isArray(response.content);
+}
+
+function isTextBlock(value: unknown): value is { type: "text"; text: string } {
+  return isRecord(value) && value.type === "text" && typeof value.text === "string";
+}
+
+function isImageBlock(value: unknown): value is { type: "image"; data: string; mimeType: string } {
+  return isRecord(value)
+    && value.type === "image"
+    && typeof value.data === "string"
+    && typeof value.mimeType === "string";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function requestOptions(signal: AbortSignal | undefined, timeout: number): {
@@ -973,6 +1015,12 @@ function compareText(left: string, right: string): number {
     if (difference !== 0) return difference;
   }
   return leftBytes.length - rightBytes.length;
+}
+
+function compareMcpTools(left: McpTool, right: McpTool): number {
+  const nameOrder = compareText(left.name, right.name);
+  if (nameOrder !== 0) return nameOrder;
+  return compareText(safeJson(left), safeJson(right));
 }
 
 function snapshotOptions(options: McpEdgeAdapterOptions): McpEdgeAdapterOptions {

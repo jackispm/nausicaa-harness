@@ -124,6 +124,45 @@ describe("Mowe MCP edge calls and result projection", () => {
     expect(result.images).toHaveLength(1);
     expect(result.content).toContain("omitted");
   });
+
+  it("fails closed for malformed content blocks", () => {
+    const result = projectMcpToolResult({
+      content: [
+        { type: "text", text: 42 } as never,
+        { type: "image", data: "not-base64", mimeType: "image/png" } as never,
+        { type: "unknown", payload: "ignored" } as never,
+      ],
+    }, { maxBytes: 96, maxBlocks: 8 });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("omitted");
+    expect(Buffer.byteLength(result.content, "utf8")).toBeLessThanOrEqual(96);
+    expect(result.images).toBeUndefined();
+  });
+
+  it("fails closed for malformed tool arguments", async () => {
+    const fixture = await callFixture({
+      result: { content: [{ type: "text", text: "unexpected" }] },
+    });
+    const adapter = createMcpEdgeAdapter({
+      sourceId: "malformed-arguments",
+      client: fixture.client,
+      transport: fixture.clientTransport,
+      provenance: { license: "MIT", author: "fixture" },
+    });
+    const [manifest] = await adapter.discover({ workspace: "." });
+    const capability = await adapter.load(manifest!, { workspace: "." });
+    const result = await capability.tool.execute(null as never, {
+      runId: "run-1",
+      workspace: ".",
+      operationId: "malformed-arguments",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/arguments must be an object/u);
+    await adapter.release({ reason: "shutdown" });
+    await fixture.server.close();
+  });
 });
 
 interface CallFixtureOptions {

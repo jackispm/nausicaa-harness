@@ -64,6 +64,27 @@ describe("Mowe MCP edge discovery", () => {
     await fixture.server.close();
   });
 
+  it("chooses the same namespace collision winner regardless of server order", async () => {
+    const first = await discoveryFixture(() => ({
+      tools: [tool("spaced", undefined, "winner:spaced"), tool(" spaced ", undefined, "winner:trimmed")],
+    }));
+    const second = await discoveryFixture(() => ({
+      tools: [tool(" spaced ", undefined, "winner:trimmed"), tool("spaced", undefined, "winner:spaced")],
+    }));
+    const adapterA = adapterFor(first, { sourceId: "stable-collision-a" });
+    const adapterB = adapterFor(second, { sourceId: "stable-collision-b" });
+
+    const [manifestA] = await adapterA.discover({ workspace: "." });
+    const [manifestB] = await adapterB.discover({ workspace: "." });
+    expect(manifestA?.description).toBe("winner:trimmed");
+    expect(manifestB?.description).toBe("winner:trimmed");
+
+    await adapterA.release({ reason: "shutdown" });
+    await adapterB.release({ reason: "shutdown" });
+    await first.server.close();
+    await second.server.close();
+  });
+
   it("bounds and sanitizes remote names in health diagnostics", async () => {
     const remoteName = `unsafe\n${"x".repeat(1_024)}`;
     const fixture = await discoveryFixture(() => ({ tools: [tool(remoteName), tool(remoteName)] }));
@@ -256,10 +277,10 @@ function adapterFor(
   });
 }
 
-function tool(name: string, annotations?: Tool["annotations"]): Tool {
+function tool(name: string, annotations?: Tool["annotations"], description = `Tool ${name}`): Tool {
   return {
     name,
-    description: `Tool ${name}`,
+    description,
     inputSchema: { type: "object", properties: {} },
     ...(annotations === undefined ? {} : { annotations }),
   };
