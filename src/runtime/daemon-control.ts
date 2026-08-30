@@ -15,6 +15,12 @@ import {
   type DaemonHostSnapshot,
   type DaemonWakeRequest,
 } from "./daemon-host.js";
+import {
+  DaemonRunObserver,
+  DaemonRunObserverProtocolError,
+  type DaemonRunObservation,
+  type DaemonRunSubscription,
+} from "./daemon-observer.js";
 import { persistedErrorText } from "./redaction.js";
 
 /** Version of the local daemon control protocol. */
@@ -22,6 +28,8 @@ export const DAEMON_CONTROL_PROTOCOL_VERSION = 1 as const;
 
 const DEFAULT_MAX_FRAME_BYTES = 256 * 1024;
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_PENDING_WRITE_BYTES = 1024 * 1024;
+const MAX_PENDING_WRITE_BYTES = 16 * 1024 * 1024;
 
 export type DaemonControlMethod =
   | "start"
@@ -57,6 +65,13 @@ export interface DaemonControlEventFrame {
   readonly event: DaemonHostEvent;
 }
 
+/** Durable Run-Ledger observation, distinct from best-effort Host events. */
+export interface DaemonControlRunEventFrame {
+  readonly version: typeof DAEMON_CONTROL_PROTOCOL_VERSION;
+  readonly kind: "run.event";
+  readonly observation: DaemonRunObservation;
+}
+
 export class DaemonControlProtocolError extends Error {
   override readonly name = "DaemonControlProtocolError";
 }
@@ -68,8 +83,12 @@ export interface DaemonControlServerOptions {
   readonly socketPath: string;
   /** Maximum JSONL request frame, including the newline. */
   readonly maxFrameBytes?: number;
+  /** Disconnect a slow client once its unsent control frames exceed this bound. */
+  readonly maxPendingWriteBytes?: number;
   /** Factory for connection-local client IDs, useful for deterministic tests. */
   readonly createClientId?: () => string;
+  /** Optional durable Run observer. Without it only Host events are available. */
+  readonly observer?: DaemonRunObserver;
 }
 
 interface BoundIdentity {
@@ -86,7 +105,12 @@ interface Connection {
   readonly socket: Socket;
   buffer: string;
   tail: Promise<void>;
+  readonly writeQueue: string[];
+  queuedWriteBytes: number;
+  writeBlocked: boolean;
   subscription?: Subscription;
+  runSubscription?: DaemonRunSubscription;
+  runSubscriptionEpoch: number;
   readonly attachedClientIds: Set<string>;
 }
 
@@ -103,7 +127,9 @@ export class DaemonControlServer {
 
   private readonly host: DaemonHost;
   private readonly maxFrameBytes: number;
+  private readonly maxPendingWriteBytes: number;
   private readonly createClientId: () => string;
+  private readonly observer: DaemonRunObserver | undefined;
   private readonly connections = new Set<Connection>();
   /** Ownership fence for caller-supplied IDs shared by attach/detach. */
   private readonly attachmentOwners = new Map<string, Connection>();
@@ -127,10 +153,19 @@ export class DaemonControlServer {
       "maxFrameBytes",
       MAX_FRAME_BYTES,
     );
+    this.maxPendingWriteBytes = positiveInteger(
+      options.maxPendingWriteBytes ?? DEFAULT_MAX_PENDING_WRITE_BYTES,
+      "maxPendingWriteBytes",
+      MAX_PENDING_WRITE_BYTES,
+    );
     this.createClientId = options.createClientId ?? (() => `client:${randomUUID()}`);
     if (typeof this.createClientId !== "function") {
       throw new DaemonControlProtocolError("createClientId must be a function");
     }
+    if (options.observer !== undefined && !(options.observer instanceof DaemonRunObserver)) {
+      throw new DaemonControlProtocolError("observer must be a DaemonRunObserver");
+    }
+    this.observer = options.observer;
   }
 
   get listening(): boolean {
@@ -229,6 +264,10 @@ export class DaemonControlServer {
       socket,
       buffer: "",
       tail: Promise.resolve(),
+      writeQueue: [],
+      queuedWriteBytes: 0,
+      writeBlocked: false,
+      runSubscriptionEpoch: 0,
       attachedClientIds: new Set(),
     };
     this.connections.add(connection);
@@ -240,7 +279,7 @@ export class DaemonControlServer {
         connection.buffer.indexOf("\n") < 0
         && Buffer.byteLength(connection.buffer, "utf8") > this.maxFrameBytes
       ) {
-        this.sendError(socket, null, "frame_too_large", "request frame exceeds the configured limit");
+        this.sendError(connection, null, "frame_too_large", "request frame exceeds the configured limit");
         socket.destroy();
         return;
       }
@@ -253,7 +292,7 @@ export class DaemonControlServer {
         if (line.length === 0) continue;
         if (Buffer.byteLength(line, "utf8") + 1 > this.maxFrameBytes) {
           this.sendError(
-            connection.socket,
+            connection,
             null,
             "frame_too_large",
             "request frame exceeds the configured limit",
@@ -267,20 +306,26 @@ export class DaemonControlServer {
           .catch(() => undefined);
       }
       if (Buffer.byteLength(connection.buffer, "utf8") > this.maxFrameBytes) {
-        this.sendError(socket, null, "frame_too_large", "request frame exceeds the configured limit");
+        this.sendError(connection, null, "frame_too_large", "request frame exceeds the configured limit");
         socket.destroy();
       }
     });
+    socket.on("drain", () => this.flushWrites(connection));
     socket.on("close", () => {
       this.releaseConnectionAttachments(connection);
       this.connections.delete(connection);
     });
     socket.on("error", () => {
+      this.releaseConnectionAttachments(connection);
       this.connections.delete(connection);
     });
   }
 
   private releaseConnectionAttachments(connection: Connection): void {
+    connection.runSubscriptionEpoch += 1;
+    connection.runSubscription?.unsubscribe();
+    delete connection.runSubscription;
+    delete connection.subscription;
     for (const clientId of connection.attachedClientIds) {
       if (this.attachmentOwners.get(clientId) !== connection) continue;
       this.attachmentOwners.delete(clientId);
@@ -294,7 +339,7 @@ export class DaemonControlServer {
     try {
       parsed = JSON.parse(line);
     } catch {
-      this.sendError(connection.socket, null, "invalid_json", "request is not valid JSON");
+      this.sendError(connection, null, "invalid_json", "request is not valid JSON");
       return;
     }
 
@@ -303,7 +348,7 @@ export class DaemonControlServer {
       request = parseRequest(parsed);
     } catch (error: unknown) {
       this.sendError(
-        connection.socket,
+        connection,
         requestId(parsed),
         "invalid_request",
         persistedErrorText(error, "invalid control request", 512),
@@ -313,7 +358,7 @@ export class DaemonControlServer {
 
     try {
       const result = await this.dispatch(connection, request);
-      this.sendResponse(connection.socket, {
+      this.sendResponse(connection, {
         version: DAEMON_CONTROL_PROTOCOL_VERSION,
         kind: "response",
         id: request.id,
@@ -324,10 +369,11 @@ export class DaemonControlServer {
       const code = error instanceof DaemonHostProtocolError
         ? "host_rejected"
         : error instanceof DaemonControlProtocolError
+          || error instanceof DaemonRunObserverProtocolError
           ? "invalid_params"
           : "command_failed";
       this.sendError(
-        connection.socket,
+        connection,
         request.id,
         code,
         persistedErrorText(error, "control command failed", 512),
@@ -391,6 +437,74 @@ export class DaemonControlServer {
         const runId = params.runId === undefined
           ? undefined
           : requiredString(params.runId, "events.subscribe.runId");
+        if (this.observer !== undefined && runId !== undefined) {
+          const cursor = params.cursor === undefined
+            ? undefined
+            : requiredString(params.cursor, "events.subscribe.cursor");
+          const limit = params.limit === undefined
+            ? undefined
+            : positiveInteger(params.limit, "events.subscribe.limit", 512);
+          const upperWatermark = params.upperWatermark === undefined
+            ? undefined
+            : nonNegativeInteger(
+                params.upperWatermark,
+                "events.subscribe.upperWatermark",
+              );
+          const generation = params.generation === undefined
+            ? undefined
+            : nonNegativeInteger(params.generation, "events.subscribe.generation");
+          const subscriptionEpoch = connection.runSubscriptionEpoch + 1;
+          connection.runSubscriptionEpoch = subscriptionEpoch;
+          connection.runSubscription?.unsubscribe();
+          delete connection.runSubscription;
+          delete connection.subscription;
+          const durable = await this.observer.subscribe(
+            {
+              runId,
+              ...(cursor === undefined ? {} : { cursor }),
+              ...(limit === undefined ? {} : { limit }),
+              ...(upperWatermark === undefined ? {} : { upperWatermark }),
+              ...(generation === undefined ? {} : { generation }),
+            },
+            (observation) => this.sendRunObservation(
+              connection,
+              subscriptionEpoch,
+              observation,
+            ),
+          );
+          if (
+            !this.connections.has(connection)
+            || connection.socket.destroyed
+            || connection.runSubscriptionEpoch !== subscriptionEpoch
+          ) {
+            durable.unsubscribe();
+            return {
+              subscribed: false,
+              runId,
+              replay: durable.replay,
+            };
+          }
+          connection.subscription = { runId };
+          connection.runSubscription = durable;
+          return {
+            subscribed: durable.subscribed,
+            runId,
+            replay: durable.replay,
+          };
+        }
+        if (
+          params.cursor !== undefined
+          || params.limit !== undefined
+          || params.upperWatermark !== undefined
+          || params.generation !== undefined
+        ) {
+          throw new DaemonControlProtocolError(
+            "events.subscribe replay parameters require a Run observer and runId",
+          );
+        }
+        connection.runSubscriptionEpoch += 1;
+        connection.runSubscription?.unsubscribe();
+        delete connection.runSubscription;
         connection.subscription = runId === undefined ? {} : { runId };
         return {
           subscribed: true,
@@ -400,11 +514,25 @@ export class DaemonControlServer {
     }
   }
 
+  private sendRunObservation(
+    connection: Connection,
+    subscriptionEpoch: number,
+    observation: DaemonRunObservation,
+  ): void {
+    if (connection.runSubscriptionEpoch !== subscriptionEpoch) return;
+    if (!this.connections.has(connection) || connection.socket.destroyed) return;
+    this.sendFrame(connection, {
+      version: DAEMON_CONTROL_PROTOCOL_VERSION,
+      kind: "run.event",
+      observation,
+    });
+  }
+
   private broadcast(event: DaemonHostEvent): void {
     for (const connection of this.connections) {
       const subscription = connection.subscription;
       if (subscription === undefined || !eventMatchesRun(event, subscription.runId)) continue;
-      this.sendFrame(connection.socket, {
+      this.sendFrame(connection, {
         version: DAEMON_CONTROL_PROTOCOL_VERSION,
         kind: "event",
         event,
@@ -412,17 +540,17 @@ export class DaemonControlServer {
     }
   }
 
-  private sendResponse(socket: Socket, response: DaemonControlResponse): void {
-    this.sendFrame(socket, response);
+  private sendResponse(connection: Connection, response: DaemonControlResponse): void {
+    this.sendFrame(connection, response);
   }
 
   private sendError(
-    socket: Socket,
+    connection: Connection,
     id: string | null,
     code: string,
     message: string,
   ): void {
-    this.sendResponse(socket, {
+    this.sendResponse(connection, {
       version: DAEMON_CONTROL_PROTOCOL_VERSION,
       kind: "response",
       id,
@@ -431,12 +559,62 @@ export class DaemonControlServer {
     });
   }
 
-  private sendFrame(socket: Socket, frame: DaemonControlResponse | DaemonControlEventFrame): void {
+  private sendFrame(
+    connection: Connection,
+    frame: DaemonControlResponse | DaemonControlEventFrame | DaemonControlRunEventFrame,
+  ): void {
+    const socket = connection.socket;
     if (socket.destroyed || !socket.writable) return;
+    let encoded: string;
     try {
-      socket.write(`${JSON.stringify(frame)}\n`);
+      encoded = `${JSON.stringify(frame)}\n`;
     } catch {
       socket.destroy();
+      return;
+    }
+    const bytes = Buffer.byteLength(encoded, "utf8");
+    if (bytes > this.maxFrameBytes) {
+      socket.destroy();
+      return;
+    }
+    if (connection.writeBlocked || connection.writeQueue.length > 0) {
+      if (socket.writableLength + connection.queuedWriteBytes + bytes > this.maxPendingWriteBytes) {
+        socket.destroy();
+        return;
+      }
+      connection.writeQueue.push(encoded);
+      connection.queuedWriteBytes += bytes;
+      return;
+    }
+    try {
+      connection.writeBlocked = !socket.write(encoded);
+      if (socket.writableLength > this.maxPendingWriteBytes) socket.destroy();
+    } catch {
+      socket.destroy();
+    }
+  }
+
+  private flushWrites(connection: Connection): void {
+    const socket = connection.socket;
+    if (socket.destroyed || !socket.writable) return;
+    connection.writeBlocked = false;
+    while (connection.writeQueue.length > 0) {
+      const encoded = connection.writeQueue.shift();
+      if (encoded === undefined) break;
+      connection.queuedWriteBytes -= Buffer.byteLength(encoded, "utf8");
+      try {
+        if (!socket.write(encoded)) {
+          connection.writeBlocked = true;
+          break;
+        }
+      } catch {
+        socket.destroy();
+        return;
+      }
+      if (socket.writableLength + connection.queuedWriteBytes > this.maxPendingWriteBytes) {
+        socket.destroy();
+        return;
+      }
     }
   }
 }
@@ -570,6 +748,13 @@ function controlPath(value: unknown): string {
 function positiveInteger(value: unknown, field: string, maximum: number): number {
   if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > maximum) {
     throw new DaemonControlProtocolError(`${field} must be a positive integer <= ${maximum}`);
+  }
+  return value as number;
+}
+
+function nonNegativeInteger(value: unknown, field: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new DaemonControlProtocolError(`${field} must be a non-negative safe integer`);
   }
   return value as number;
 }

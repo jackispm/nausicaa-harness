@@ -17,7 +17,9 @@ import type { AnyEvent } from "./domain/events.js";
 import { DEFAULT_MAIN_OUTPUT_TOKENS } from "./domain/types.js";
 import {
   DaemonControlServer,
+  DaemonRunObserver,
   executeRun,
+  FileDaemonRunEventSource,
   findLatestRunId,
   openDaemonRuntime,
   SessionController,
@@ -375,7 +377,10 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
     options.workspace,
     options.socketPath ?? resolve(options.settings.dataDir, "daemon", "control.sock"),
   );
-  const control = new DaemonControlServer({ host: daemon.host, socketPath });
+  const observer = new DaemonRunObserver({
+    source: new FileDaemonRunEventSource({ dataDir: options.settings.dataDir }),
+  });
+  const control = new DaemonControlServer({ host: daemon.host, socketPath, observer });
   let resolveShutdown!: () => void;
   const shutdown = new Promise<void>((resolvePromise) => {
     resolveShutdown = resolvePromise;

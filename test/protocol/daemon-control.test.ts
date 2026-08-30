@@ -224,6 +224,83 @@ describe("DaemonControlServer", () => {
     expect(host.snapshot().attachedClients).toBe(0);
     await host.stop();
   });
+
+  it("waits for drain and disconnects a client whose pending write queue exceeds its bound", () => {
+    const host = new DaemonHost({
+      admitWake: async (request) => ({ status: "admitted", inputId: request.wakeId ?? "input" }),
+      activate: async () => undefined,
+    });
+    const frame: DaemonControlResponse = {
+      version: 1,
+      kind: "response",
+      id: "bounded-write",
+      ok: true,
+      result: { status: "ok" },
+    };
+    const frameBytes = Buffer.byteLength(`${JSON.stringify(frame)}\n`, "utf8");
+    const control = new DaemonControlServer({
+      host,
+      socketPath: "/tmp/unused-nausicaa-control.sock",
+      maxFrameBytes: 4_096,
+      maxPendingWriteBytes: frameBytes * 2,
+    });
+    const writes: string[] = [];
+    const socketState: {
+      destroyed: boolean;
+      writable: boolean;
+      writableLength: number;
+      acceptWrites: boolean;
+      write(value: string): boolean;
+      destroy(): void;
+    } = {
+      destroyed: false,
+      writable: true,
+      writableLength: 0,
+      acceptWrites: false,
+      write(value: string): boolean {
+        writes.push(value);
+        socketState.writableLength += Buffer.byteLength(value, "utf8");
+        return socketState.acceptWrites;
+      },
+      destroy(): void {
+        socketState.destroyed = true;
+        socketState.writable = false;
+      },
+    };
+    const socket = socketState as unknown as Socket;
+    const connection = {
+      id: "test-client",
+      socket,
+      buffer: "",
+      tail: Promise.resolve(),
+      writeQueue: [],
+      queuedWriteBytes: 0,
+      writeBlocked: false,
+      attachedClientIds: new Set<string>(),
+    };
+    const transport = control as unknown as {
+      sendFrame(connection: unknown, frame: DaemonControlResponse): void;
+      flushWrites(connection: unknown): void;
+    };
+
+    transport.sendFrame(connection, frame);
+    transport.sendFrame(connection, frame);
+    expect(writes).toHaveLength(1);
+    expect(connection.writeQueue).toHaveLength(1);
+
+    socketState.acceptWrites = true;
+    socketState.writableLength = 0;
+    transport.flushWrites(connection);
+    expect(writes).toHaveLength(2);
+    expect(connection.writeQueue).toHaveLength(0);
+
+    socketState.acceptWrites = false;
+    socketState.writableLength = 0;
+    transport.sendFrame(connection, frame);
+    transport.sendFrame(connection, frame);
+    transport.sendFrame(connection, frame);
+    expect(socketState.destroyed).toBe(true);
+  });
 });
 
 type Frame = DaemonControlResponse | DaemonControlEventFrame;

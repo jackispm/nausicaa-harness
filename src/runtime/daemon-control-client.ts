@@ -5,10 +5,12 @@ import { createConnection, type Socket } from "node:net";
 import {
   DAEMON_CONTROL_PROTOCOL_VERSION,
   type DaemonControlEventFrame,
+  type DaemonControlRunEventFrame,
   type DaemonControlMethod,
   type DaemonControlRequest,
 } from "./daemon-control.js";
 import type { DaemonHostEvent } from "./daemon-host.js";
+import type { DaemonRunObservation } from "./daemon-observer.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const MAX_REQUEST_TIMEOUT_MS = 5 * 60 * 1_000;
@@ -37,6 +39,7 @@ export class DaemonControlClientError extends Error {
 }
 
 export type DaemonControlEventListener = (event: DaemonHostEvent) => void;
+export type DaemonControlRunEventListener = (observation: DaemonRunObservation) => void;
 
 interface PendingRequest {
   readonly generation: number;
@@ -59,6 +62,7 @@ export class DaemonControlClient {
   private readonly maxFrameBytes: number;
   private readonly createRequestId: () => string;
   private readonly listeners = new Set<DaemonControlEventListener>();
+  private readonly runListeners = new Set<DaemonControlRunEventListener>();
   private readonly pending = new Map<string, PendingRequest>();
   private readonly issuedRequestIds = new Set<string>();
   private socket: Socket | undefined;
@@ -257,6 +261,15 @@ export class DaemonControlClient {
     return () => this.listeners.delete(listener);
   }
 
+  /** Observe cursor-bearing Run Ledger frames. Replay pages arrive in the subscribe response. */
+  onRunEvent(listener: DaemonControlRunEventListener): () => void {
+    if (typeof listener !== "function") {
+      throw new DaemonControlClientError("invalid_listener", "Run event listener must be a function");
+    }
+    this.runListeners.add(listener);
+    return () => this.runListeners.delete(listener);
+  }
+
   /** Close the transport and reject requests which have not received a reply. */
   close(): void {
     if (this.closed) return;
@@ -323,6 +336,7 @@ export class DaemonControlClient {
       readonly result?: unknown;
       readonly error?: { readonly code?: unknown; readonly message?: unknown };
       readonly event?: DaemonControlEventFrame["event"];
+      readonly observation?: DaemonControlRunEventFrame["observation"];
     };
     if (frame.version !== DAEMON_CONTROL_PROTOCOL_VERSION) {
       this.failProtocol(socket, generation, "unsupported_version", "daemon response version is unsupported");
@@ -336,6 +350,20 @@ export class DaemonControlClient {
       for (const listener of this.listeners) {
         try {
           listener(frame.event as DaemonHostEvent);
+        } catch {
+          // Observers cannot own the transport.
+        }
+      }
+      return;
+    }
+    if (frame.kind === "run.event") {
+      if (frame.observation === undefined || typeof frame.observation !== "object") {
+        this.failProtocol(socket, generation, "invalid_frame", "daemon Run event frame is missing observation");
+        return;
+      }
+      for (const listener of this.runListeners) {
+        try {
+          listener(frame.observation as DaemonRunObservation);
         } catch {
           // Observers cannot own the transport.
         }
