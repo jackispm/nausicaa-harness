@@ -93,10 +93,10 @@ import { WorkerTaskExecutor } from "./worker-task-executor.js";
 import { shouldAdvertiseImageTools } from "./model-capabilities.js";
 import {
   freezeWorkspaceEdgeToolSnapshot,
-  materializeWorkspaceEdgeTools,
   type WorkspaceEdgeToolSnapshot,
 } from "../mowe/workspace-catalog.js";
 import {
+  appendPermittedEdgeTools,
   captureEdgeTurnSnapshot,
   type EdgeTurnSnapshotProvider,
 } from "./edge-runtime.js";
@@ -130,6 +130,8 @@ export interface RunExecutionRequest {
   edgeSnapshot?: WorkspaceEdgeToolSnapshot;
   /** Optional composition seam; captured once before Main context assembly. */
   edgeSnapshotProvider?: EdgeTurnSnapshotProvider;
+  /** Whether this one-shot activation owns and closes the provider. */
+  closeEdgeCompositionOnClose?: boolean;
   signal?: AbortSignal;
 }
 
@@ -147,6 +149,8 @@ export interface RunExecutionDeps {
   /** Embedding seam for a captured edge snapshot when request data is shared. */
   edgeSnapshot?: WorkspaceEdgeToolSnapshot;
   edgeSnapshotProvider?: EdgeTurnSnapshotProvider;
+  /** Defaults to true for backward-compatible one-shot ownership. */
+  closeEdgeCompositionOnClose?: boolean;
   /** Host approval boundary for Main tools that explicitly require approval. */
   approveTool?: MainLoopDeps["approve"];
   /** Test/embedding seam for the OS-enforced workspace Bash boundary. */
@@ -188,6 +192,9 @@ export const executeRun = async (
   const edgeSnapshot = request.edgeSnapshot === undefined && deps.edgeSnapshot === undefined
     ? undefined
     : freezeWorkspaceEdgeToolSnapshot(request.edgeSnapshot ?? deps.edgeSnapshot!);
+  const closeEdgeCompositionOnClose = request.closeEdgeCompositionOnClose
+    ?? deps.closeEdgeCompositionOnClose
+    ?? true;
   const clock = deps.clock ?? systemClock;
   const workspace = resolve(request.workspace);
   const runId = request.resumeRunId ?? (deps.createRunId ?? randomUUID)();
@@ -383,7 +390,7 @@ export const executeRun = async (
         protectedPaths: [resolve(request.dataDir)],
       });
     }
-    const tools = [...(deps.tools ?? createWorkspaceTools({
+    const baseTools = deps.tools ?? createWorkspaceTools({
       allowWrite: request.allowWrite === true,
       allowShell: hostShellEnabled || workspaceBashExecutor !== undefined,
       ...(workspaceBashExecutor === undefined
@@ -400,7 +407,8 @@ export const executeRun = async (
         ? {}
         : { webSearchProvider: deps.webSearchProvider }),
       protectedPaths: [resolve(request.dataDir)],
-    })), ...materializeWorkspaceEdgeTools(edgeProjection.edgeSnapshot)];
+    });
+    const tools: AgentTool[] = [...baseTools];
     if (auxiliaryMode === "teto") {
       if (adviceDelivery === "live") tools.push(createAdviceResponseTool(inbox));
       const tetoModel = deps.tetoModel ?? mainModel;
@@ -483,6 +491,13 @@ export const executeRun = async (
       });
       tools.push(createDelegateTaskTool({ dispatcher, store }));
     }
+    // Optional runtime capabilities are host-owned too; append edge tools only
+    // after they have been admitted so an edge cannot shadow their names.
+    const admittedTools = appendPermittedEdgeTools(tools, edgeProjection.edgeSnapshot, {
+      allowWrite: request.allowWrite === true,
+      allowShell: request.allowShell === true,
+      allowNetwork: request.allowNetwork === true,
+    });
 
     const lastModelCompletion = [...setup.events].reverse().find((event): event is Extract<
       AnyEvent,
@@ -498,7 +513,7 @@ export const executeRun = async (
       contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
       conversationStore: store,
       eventSink: sink,
-      tools,
+      tools: admittedTools,
       clock,
       runTokenBudget,
       ...(edgeProjection.contextContributions.length === 0
@@ -678,10 +693,12 @@ export const executeRun = async (
     await scheduler?.stop().catch(() => undefined);
     await workerScheduler?.stop().catch(() => undefined);
     await processJobManager?.close().catch(() => undefined);
-    try {
-      await (request.edgeSnapshotProvider ?? deps.edgeSnapshotProvider)?.close?.();
-    } catch {
-      // Edge shutdown is best effort after the durable Run boundary closes.
+    if (closeEdgeCompositionOnClose) {
+      try {
+        await (request.edgeSnapshotProvider ?? deps.edgeSnapshotProvider)?.close?.();
+      } catch {
+        // Edge shutdown is best effort after the durable Run boundary closes.
+      }
     }
     await ledger.close();
   }

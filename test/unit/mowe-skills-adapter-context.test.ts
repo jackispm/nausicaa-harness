@@ -225,6 +225,25 @@ describe("Mowe Skills contribution adapter", () => {
 
     await expect(adapter.loadContribution(summary, { workspace })).rejects.toThrow(/changed while loading/u);
   });
+
+  it("keeps an in-flight Turn summary loadable across one refresh", async () => {
+    const workspace = await temporaryRoot();
+    const firstDirectory = path.join(workspace, "skills", "first");
+    await writeSkill(firstDirectory, "First", "first\n");
+    const adapter = createSkillsEdgeAdapter({ sourceId: "snapshot-skills", roots: ["skills"] });
+
+    const oldSummary = (await adapter.discoverContributions({ workspace }))[0]!;
+    await writeSkill(path.join(workspace, "skills", "second"), "Second", "second\n");
+    await adapter.refresh?.({ workspace });
+    const refreshed = await adapter.discoverContributions({ workspace });
+
+    expect(refreshed.map((item) => item.name)).toEqual(["first", "second"]);
+    expect((await adapter.loadContribution(oldSummary, { workspace })).body).toBe("first\n");
+
+    await writeSkill(firstDirectory, "First", "other\n");
+    await expect(adapter.loadContribution(oldSummary, { workspace }))
+      .rejects.toThrow(/changed while loading/u);
+  });
 });
 
 async function temporaryRoot(): Promise<string> {

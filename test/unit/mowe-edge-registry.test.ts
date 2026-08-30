@@ -121,6 +121,126 @@ describe("Mowe edge registry", () => {
     ]));
   });
 
+  it("does not resurrect candidates after a health failure", async () => {
+    let healthCalls = 0;
+    const unstable: EdgeAdapter = {
+      sourceId: "unstable",
+      sourceType: "plugin",
+      discover: async () => [manifest("unstable", "unstable_tool")],
+      load: async (candidate) => createEdgeCapability({
+        manifest: candidate,
+        tool: tool(candidate.capabilityName),
+      }),
+      health: async () => {
+        healthCalls += 1;
+        if (healthCalls === 1) throw new Error("health probe failed");
+        return {
+          sourceId: "unstable",
+          sourceType: "plugin",
+          status: "healthy",
+          checkedAt: "2026-08-31T00:00:00.000Z",
+        };
+      },
+    };
+    const registry = new MoweEdgeRegistry({
+      adapters: [unstable, adapter("other", ["other_tool"])],
+    });
+
+    const first = await registry.refresh();
+    expect(first.catalog.has("unstable_tool")).toBe(false);
+    expect(registry.health("unstable")).toMatchObject({ health: "failed" });
+
+    const second = await registry.refreshSource("other");
+    expect(second.catalog.has("other_tool")).toBe(true);
+    expect(second.catalog.has("unstable_tool")).toBe(false);
+    expect(registry.health("unstable")).toMatchObject({ health: "failed" });
+    await registry.close();
+  });
+
+  it("does not publish candidates when health reports unavailable", async () => {
+    const registry = new MoweEdgeRegistry({
+      adapters: [{
+        sourceId: "offline",
+        sourceType: "plugin",
+        discover: async () => [manifest("offline", "offline_tool")],
+        load: async (candidate) => createEdgeCapability({
+          manifest: candidate,
+          tool: tool(candidate.capabilityName),
+        }),
+        health: async () => ({
+          sourceId: "offline",
+          sourceType: "plugin",
+          status: "unavailable",
+          checkedAt: "2026-08-31T00:00:00.000Z",
+        }),
+      }],
+    });
+
+    const snapshot = await registry.refresh();
+    expect(snapshot.catalog.has("offline_tool")).toBe(false);
+    expect(registry.health("offline")).toMatchObject({ health: "failed" });
+    await registry.close();
+  });
+
+  it("publishes completed edges when another edge exceeds its refresh deadline", async () => {
+    const hanging: EdgeAdapter = {
+      sourceId: "hanging",
+      sourceType: "plugin",
+      discover: async () => new Promise<readonly EdgeManifest[]>(() => undefined),
+      load: async (candidate) => createEdgeCapability({
+        manifest: candidate,
+        tool: tool(candidate.capabilityName),
+      }),
+    };
+    const registry = new MoweEdgeRegistry({
+      adapters: [hanging, adapter("healthy", ["healthy_tool"])],
+    });
+
+    const snapshot = await registry.refresh({ timeoutMs: 20 });
+
+    expect(snapshot.catalog.has("healthy_tool")).toBe(true);
+    expect(snapshot.catalog.has("hanging_tool")).toBe(false);
+    expect(registry.health("hanging")).toMatchObject({ health: "failed" });
+    expect(snapshot.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sourceId: "hanging",
+        code: "adapter-failed",
+        message: expect.stringMatching(/timed out/u),
+      }),
+    ]));
+    await registry.close();
+  });
+
+  it("bounds an oversized manifest inventory without hiding unrelated edges", async () => {
+    const oversized: EdgeAdapter = {
+      sourceId: "oversized",
+      sourceType: "plugin",
+      discover: async () => Array.from({ length: 4_097 }, (_, index) => (
+        manifest("oversized", `tool_${index}`)
+      )),
+      load: async (candidate) => createEdgeCapability({
+        manifest: candidate,
+        tool: tool(candidate.capabilityName),
+      }),
+    };
+    const registry = new MoweEdgeRegistry({
+      adapters: [oversized, adapter("healthy", ["healthy_tool"])],
+    });
+
+    const snapshot = await registry.refresh();
+
+    expect(snapshot.catalog.has("healthy_tool")).toBe(true);
+    expect(snapshot.catalog.has("tool_0")).toBe(false);
+    expect(snapshot.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sourceId: "oversized",
+        code: "manifest-invalid",
+        message: expect.stringMatching(/more than 4096 manifests/u),
+      }),
+    ]));
+    await registry.close();
+  });
+
   it("skips one malformed manifest without dropping valid capabilities from that edge", async () => {
     const valid = manifest("mixed", "valid_tool");
     const registry = new MoweEdgeRegistry({ adapters: [{
@@ -188,6 +308,38 @@ describe("Mowe edge registry", () => {
     ]));
     expect(active.catalog.has("one_tool")).toBe(true);
     expect(() => registry.register(adapter("later", ["later_tool"]))).toThrow(/closed/u);
+  });
+
+  it("makes concurrent close callers wait for the same adapter release", async () => {
+    let releaseCalls = 0;
+    let signalReleaseStarted!: () => void;
+    let finishRelease!: () => void;
+    const releaseStarted = new Promise<void>((resolve) => {
+      signalReleaseStarted = resolve;
+    });
+    const releaseGate = new Promise<void>((resolve) => {
+      finishRelease = resolve;
+    });
+    const registry = new MoweEdgeRegistry({
+      adapters: [{
+        ...adapter("slow-close", ["slow_tool"]),
+        release: async () => {
+          releaseCalls += 1;
+          signalReleaseStarted();
+          await releaseGate;
+        },
+      }],
+    });
+
+    const firstClose = registry.close();
+    await releaseStarted;
+    const secondClose = registry.close();
+
+    expect(secondClose).toBe(firstClose);
+    finishRelease();
+    await Promise.all([firstClose, secondClose]);
+    expect(releaseCalls).toBe(1);
+    expect(registry.health("slow-close")).toMatchObject({ health: "closed", enabled: false });
   });
 
   it("keeps edge metadata inside Mowe admission", async () => {
@@ -260,6 +412,21 @@ describe("Mowe edge registry", () => {
     expect(refreshed.catalog.has("updated")).toBe(true);
     expect(refreshed.catalog.has("first")).toBe(false);
     expect(refreshed.catalog.has("second")).toBe(true);
+  });
+
+  it("does not re-admit a disabled edge during a source-scoped refresh", async () => {
+    const registry = new MoweEdgeRegistry({
+      adapters: [adapter("disabled-edge", ["disabled_tool"]), adapter("other-edge", ["other_tool"])],
+    });
+    await registry.refresh();
+
+    registry.disable("disabled-edge");
+    const refreshed = await registry.refreshSource("other-edge");
+
+    expect(refreshed.catalog.has("other_tool")).toBe(true);
+    expect(refreshed.catalog.has("disabled_tool")).toBe(false);
+    expect(registry.health("disabled-edge")).toMatchObject({ health: "disabled", enabled: false });
+    await registry.close();
   });
 
   it("does not depend on object key order when computing a generation hash", async () => {

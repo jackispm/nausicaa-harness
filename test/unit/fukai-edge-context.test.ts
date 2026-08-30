@@ -87,4 +87,82 @@ describe("Fukai edge Skill context", () => {
       }],
     })).rejects.toThrow(/hash/i);
   });
+
+  it("rejects oversized Skill bodies before stable-prefix serialization", async () => {
+    const provider = new FukaiContextProvider(
+      new ContentStoreFukaiSource(new MemoryContentAddressedStore()),
+    );
+    const cyclicProvenance: Record<string, unknown> = {};
+    cyclicProvenance.self = cyclicProvenance;
+
+    await expect(provider.build({
+      runId: "edge-context-oversized",
+      laneId: "main",
+      laneKind: "main",
+      goal: { version: 1, statement: "review", successCriteria: [], hardConstraints: [] },
+      systemPrompt: "Main",
+      conversationRefs: [],
+      artifactSelections: [],
+      tools: [],
+      upperWatermark: 0,
+      policyVersion: "policy-v1",
+      budget: { maxInputTokens: 1000, maxConversationMessages: 0, maxArtifacts: 0, maxArtifactBytes: 0, maxQueries: 0 },
+      edgeContext: [{
+        sourceId: "skills",
+        contributionId: "oversized",
+        sourceType: "skill",
+        name: "oversized",
+        description: "oversized",
+        body: "x".repeat(64 * 1024 + 1),
+        provenance: cyclicProvenance,
+      }],
+    })).rejects.toThrow(/body exceeds the context bound/i);
+  });
+
+  it("bounds Skill descriptions before they can exceed the message budget", async () => {
+    const provider = new FukaiContextProvider(
+      new ContentStoreFukaiSource(new MemoryContentAddressedStore()),
+    );
+    const description = "d".repeat(4 * 1024);
+    const request = {
+      runId: "edge-context-description",
+      laneId: "main",
+      laneKind: "main" as const,
+      goal: { version: 1, statement: "review", successCriteria: [], hardConstraints: [] },
+      systemPrompt: "Main",
+      conversationRefs: [],
+      artifactSelections: [],
+      tools: [],
+      upperWatermark: 0,
+      policyVersion: "policy-v1",
+      budget: { maxInputTokens: 128, maxConversationMessages: 0, maxArtifacts: 0, maxArtifactBytes: 0, maxQueries: 0 },
+      edgeContext: [{
+        sourceId: "skills",
+        contributionId: "long-description",
+        sourceType: "skill" as const,
+        name: "long-description",
+        description,
+        body: "selected body",
+      }],
+    };
+
+    const view = await provider.build(request);
+    expect(view.usage.estimatedInputTokens).toBeLessThanOrEqual(request.budget.maxInputTokens);
+    expect(view.messages.some((message) => message.content.includes(description))).toBe(false);
+    expect(view.truncations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "input-token-budget" }),
+    ]));
+
+    await expect(provider.build({
+      ...request,
+      edgeContext: [{
+        sourceId: "skills",
+        contributionId: "long-description",
+        sourceType: "skill" as const,
+        name: "long-description",
+        description: `${description}x`,
+        body: "selected body",
+      }],
+    })).rejects.toThrow(/description exceeds the context bound/i);
+  });
 });

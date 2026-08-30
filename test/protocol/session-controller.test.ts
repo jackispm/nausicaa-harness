@@ -531,6 +531,10 @@ describe("SessionController", () => {
 
   it("switches future Turns between read-only, workspace, and full-access capabilities", async () => {
     const root = await temporaryRoot();
+    const edgeRead = namedTool("edge_read");
+    const edgeWrite = namedTool("edge_write");
+    const edgeExternal = namedTool("edge_external");
+    const edgeHostRead = namedTool("edge_host_read");
     const model = new ScriptedModel([
       response("workspace"),
       response("full"),
@@ -546,6 +550,16 @@ describe("SessionController", () => {
       dataDir: join(root, "state"),
       model: "scripted",
       policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
+      edgeSnapshot: {
+        generation: 1,
+        tools: [edgeRead, edgeWrite, edgeExternal, edgeHostRead],
+        metadataByName: {
+          edge_read: { effect: "read", scope: "run" },
+          edge_write: { effect: "write", scope: "workspace" },
+          edge_external: { effect: "external", scope: "run" },
+          edge_host_read: { effect: "read", scope: "host" },
+        },
+      },
     }, {
       mainModel: model,
       createRunId: () => "permission-profile-run",
@@ -571,6 +585,10 @@ describe("SessionController", () => {
     expect(workspaceTools).toContain("write_file");
     expect(workspaceTools).toContain("edit");
     expect(workspaceTools).toContain("bash");
+    expect(workspaceTools).toContain("edge_read");
+    expect(workspaceTools).toContain("edge_write");
+    expect(workspaceTools).not.toContain("edge_external");
+    expect(workspaceTools).not.toContain("edge_host_read");
     expect(workspaceTools).not.toContain("process_start");
     expect(workspaceTools).not.toContain("web_fetch");
 
@@ -581,6 +599,10 @@ describe("SessionController", () => {
     expect(fullTools).toContain("bash");
     expect(fullTools).toContain("web_fetch");
     expect(fullTools).toContain("process_start");
+    expect(fullTools).toContain("edge_read");
+    expect(fullTools).toContain("edge_write");
+    expect(fullTools).toContain("edge_external");
+    expect(fullTools).toContain("edge_host_read");
 
     await session.selectPermissionProfile("read-only");
     await session.submit({ inputId: "read-input", text: "Only inspect" });
@@ -590,6 +612,10 @@ describe("SessionController", () => {
     expect(readTools).not.toContain("write_file");
     expect(readTools).not.toContain("bash");
     expect(readTools).not.toContain("web_fetch");
+    expect(readTools).toContain("edge_read");
+    expect(readTools).not.toContain("edge_write");
+    expect(readTools).not.toContain("edge_external");
+    expect(readTools).not.toContain("edge_host_read");
     await session.close();
   });
 
@@ -2171,6 +2197,19 @@ const noopTool: AgentTool = {
     return { content: "ok", isError: false };
   },
 };
+
+function namedTool(name: string): AgentTool {
+  return {
+    definition: {
+      name,
+      description: `Test ${name}`,
+      parameters: { type: "object", additionalProperties: false },
+    },
+    async execute() {
+      return { content: name, isError: false };
+    },
+  };
+}
 
 function response(content: string): ModelResponse {
   return {

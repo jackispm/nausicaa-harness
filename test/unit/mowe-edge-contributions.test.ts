@@ -133,6 +133,30 @@ describe("Mowe context contribution bridge", () => {
     expect(loadedFromOldTurn.body).toBe("old body");
   });
 
+  it("keeps an old snapshot bound to its original adapter after replacement", async () => {
+    const oldLoad = vi.fn(async (candidate: EdgeContextContributionSummary) => ({
+      ...candidate,
+      body: "old adapter body",
+    }));
+    const newLoad = vi.fn(async (candidate: EdgeContextContributionSummary) => ({
+      ...candidate,
+      body: "new adapter body",
+    }));
+    const registry = new MoweEdgeRegistry({
+      adapters: [contributionAdapter("skills", [summary("skills", "review")], oldLoad)],
+    });
+    const first = await registry.refresh();
+
+    expect(registry.unregister("skills")).toBe(true);
+    registry.register(contributionAdapter("skills", [summary("skills", "review")], newLoad));
+    await registry.refresh();
+
+    const loaded = await registry.loadContribution(first.contextContributions[0]!, { snapshot: first });
+    expect(loaded.body).toBe("old adapter body");
+    expect(oldLoad).toHaveBeenCalledOnce();
+    expect(newLoad).not.toHaveBeenCalled();
+  });
+
   it("produces equal hashes for equivalent insertion and object-key order", async () => {
     const left = contributionAdapter("skills-host", [summary("skills-host", "same")]);
     const right = contributionAdapter("skills-host", [createEdgeContextContributionSummary({

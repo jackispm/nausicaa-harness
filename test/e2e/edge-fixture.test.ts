@@ -187,7 +187,10 @@ describe("edge integration fixture", () => {
       },
       constructors,
     });
-    const provider = createRegistryEdgeTurnSnapshotProvider(composition.registry);
+    const provider = createRegistryEdgeTurnSnapshotProvider(
+      composition.registry,
+      (summary) => (summary as { name?: string }).name === "review-code",
+    );
     const model = new ScriptedModel([
       (request) => {
         const tool = request.tools.find((candidate) => candidate.name === "mcp__fixture-mcp__lookup");

@@ -26,7 +26,9 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 
 当前没有通用 graph DSL 或插件市场；Mowe 的 `MoweCatalog` 提供窄的本地注册 seam，便于接入自定义 AgentTool，而不要求引入 Cordis 级插件运行时。
 
-生态 edge 通过 `.nausicaa/settings.json` 的 `edges` 声明接入。配置只描述来源，
+生态 edge 通过用户级 `~/.nausicaa/settings.json` 的 `edges` 声明接入。宿主也可以在显式
+信任 workspace 后加载项目级 `.nausicaa/settings.json`；当前 CLI 默认不信任项目设置。
+配置只描述来源，
 不会自行启动进程或获得权限；adapter registry 在刷新时校验 manifest，并为后续 Turn
 创建带 generation 的不可变工具快照。Main 通过 Mowe 使用快照，Worker 仍只获得固定的
 只读工具集。交互会话中的 `/edges` 只读取状态投影，不直接管理 edge 进程。

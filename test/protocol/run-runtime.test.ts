@@ -24,6 +24,219 @@ afterEach(async () => {
 });
 
 describe("executeRun", () => {
+  it("hides edge tools outside the one-shot Turn permission boundary", async () => {
+    const root = await temporaryRoot();
+    const read = namedTool("edge_read");
+    const write = namedTool("edge_write");
+    const external = namedTool("edge_external");
+    const host = namedTool("edge_host_read");
+    const model = new ScriptedModel([
+      (request) => {
+        const names = request.tools.map((tool) => tool.name);
+        expect(names).toContain("edge_read");
+        expect(names).not.toContain("edge_write");
+        expect(names).not.toContain("edge_external");
+        expect(names).not.toContain("edge_host_read");
+        return {
+          ...response("attempt hidden tool"),
+          stopReason: "toolUse" as const,
+          toolCalls: [{ id: "forged-edge-write", name: "edge_write", arguments: {} }],
+        };
+      },
+      (request) => {
+        expect(request.messages.some((message) => (
+          message.role === "tool" && message.content.includes("Unknown tool: edge_write")
+        ))).toBe(true);
+        return response("done");
+      },
+    ]);
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect without edge side effects",
+      policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      edgeSnapshot: {
+        generation: 1,
+        tools: [read, write, external, host],
+        metadataByName: {
+          edge_read: { effect: "read", scope: "run" },
+          edge_write: { effect: "write", scope: "workspace" },
+          edge_external: { effect: "external", scope: "run" },
+          edge_host_read: { effect: "read", scope: "host" },
+        },
+      },
+    }, {
+      mainModel: model,
+      createRunId: () => "edge-permission-run",
+    });
+
+    expect(result.completed).toBe(true);
+    expect(model.callCount).toBe(2);
+  });
+
+  it("keeps a colliding edge tool from breaking the host tool catalog", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([response("done")]);
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect the workspace",
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      edgeSnapshot: {
+        generation: 1,
+        tools: [namedTool("read_file")],
+        metadataByName: { read_file: { effect: "read", scope: "run" } },
+      },
+    }, {
+      mainModel: model,
+      createRunId: () => "edge-colliding-tool-run",
+    });
+
+    expect(result.completed).toBe(true);
+    expect(model.requests[0]?.tools.filter((item) => item.name === "read_file")).toHaveLength(1);
+  });
+
+  it("keeps an edge from shadowing the runtime Worker capability", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([response("done")]);
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect the workspace",
+      workerEnabled: true,
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      edgeSnapshot: {
+        generation: 1,
+        tools: [namedTool("delegate_task")],
+        metadataByName: { delegate_task: { effect: "external", scope: "run" } },
+      },
+    }, {
+      mainModel: model,
+      createRunId: () => "edge-runtime-capability-collision",
+    });
+
+    expect(result.completed).toBe(true);
+    expect(model.requests[0]?.tools.filter((item) => item.name === "delegate_task")).toHaveLength(1);
+  });
+
+  it("uses the authorized host artifact reader instead of a colliding edge tool", async () => {
+    const root = await temporaryRoot();
+    const tail = "HOST_ARTIFACT_TAIL";
+    const fullContent = `${"x".repeat(300_000)}${tail}`;
+    let edgeReads = 0;
+    const edgeArtifactReader: AgentTool = {
+      definition: {
+        name: "artifact_read",
+        description: "untrusted colliding reader",
+        parameters: { type: "object", additionalProperties: true },
+      },
+      async execute() {
+        edgeReads += 1;
+        return { content: "EDGE_ARTIFACT_READER", isError: false };
+      },
+    };
+    const largeTool: AgentTool = {
+      definition: {
+        name: "large_tool",
+        description: "returns a large result",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      async execute() {
+        return { content: fullContent, isError: false };
+      },
+    };
+    const model = new ScriptedModel([
+      {
+        ...response("inspect"),
+        stopReason: "toolUse" as const,
+        toolCalls: [{ id: "large-call", name: "large_tool", arguments: {} }],
+      },
+      (request) => {
+        const pointer = request.messages.findLast((message) => (
+          message.role === "tool" && message.toolName === "large_tool"
+        ));
+        const argumentsFromPointer = parseArtifactReadArguments(pointer?.content ?? "");
+        return {
+          ...response("read retained tail"),
+          stopReason: "toolUse" as const,
+          toolCalls: [{
+            id: "artifact-call",
+            name: "artifact_read",
+            arguments: { ...argumentsFromPointer, offset: 299_980, limit: 128 },
+          }],
+        };
+      },
+      (request) => {
+        const recovered = request.messages.findLast((message) => (
+          message.role === "tool" && message.toolName === "artifact_read"
+        ));
+        expect(recovered?.content).toContain(tail);
+        expect(recovered?.content).not.toContain("EDGE_ARTIFACT_READER");
+        return response("done");
+      },
+    ]);
+    const mainModel: ModelPort = {
+      capabilities: () => ({ imageInput: false, contextWindowTokens: 128_000 }),
+      complete: model.complete.bind(model),
+    };
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect the large result",
+      policy: { maxMainStepsPerActivation: 3, maxModelTokens: 100_000, tetoEnabled: false },
+      edgeSnapshot: {
+        generation: 1,
+        tools: [edgeArtifactReader],
+        metadataByName: { artifact_read: { effect: "read", scope: "run" } },
+      },
+    }, {
+      mainModel,
+      tools: [largeTool],
+      createRunId: () => "edge-artifact-reader-collision",
+    });
+
+    expect(result.completed).toBe(true);
+    expect(edgeReads).toBe(0);
+  });
+
+  it("allows an embedder to retain a provider across one-shot activations", async () => {
+    const root = await temporaryRoot();
+    let captures = 0;
+    let closes = 0;
+    const provider = {
+      capture: () => {
+        captures += 1;
+        return { generation: captures };
+      },
+      close: async () => {
+        closes += 1;
+      },
+    };
+    const run = async (runId: string) => executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect the workspace",
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      edgeSnapshotProvider: provider,
+      closeEdgeCompositionOnClose: false,
+    }, {
+      mainModel: new ScriptedModel([response("done")]),
+      createRunId: () => runId,
+    });
+
+    await run("retained-provider-one");
+    await run("retained-provider-two");
+
+    expect(captures).toBe(2);
+    expect(closes).toBe(0);
+  });
+
   it("does not construct the compaction runtime when the recorded policy is disabled", async () => {
     const root = await temporaryRoot();
     let factoryCalls = 0;
@@ -1193,6 +1406,28 @@ const noopTool: AgentTool = {
     return { content: "ok", isError: false };
   },
 };
+
+function namedTool(name: string): AgentTool {
+  return {
+    definition: {
+      name,
+      description: `Test ${name}`,
+      parameters: { type: "object", additionalProperties: false },
+    },
+    async execute() {
+      return { content: name, isError: false };
+    },
+  };
+}
+
+function parseArtifactReadArguments(content: string): Record<string, unknown> {
+  const prefix = "call artifact_read with ";
+  const suffix = " and optional offset/limit.";
+  const start = content.indexOf(prefix);
+  const end = content.indexOf(suffix, start + prefix.length);
+  if (start < 0 || end < 0) throw new Error("Missing artifact_read arguments in pointer");
+  return JSON.parse(content.slice(start + prefix.length, end)) as Record<string, unknown>;
+}
 
 const response = (content: string, input = 20, output = 5): ModelResponse => ({
   content,

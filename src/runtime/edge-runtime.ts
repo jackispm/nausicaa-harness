@@ -1,11 +1,23 @@
 import type { AgentTool } from "../domain/ports.js";
+import { resolveMetadata } from "../mowe/catalog.js";
+import { ARTIFACT_READ_TOOL_NAME } from "../tools/artifact-read.js";
 import type {
   EdgeProvenance,
   MoweEdgeRegistrySnapshot,
   MoweEdgeToolSnapshot,
 } from "../mowe/index.js";
-import type { WorkspaceEdgeToolSnapshot } from "../mowe/workspace-catalog.js";
+import type { MoweAgentTool, ResolvedMoweToolMetadata } from "../mowe/types.js";
+import {
+  materializeWorkspaceEdgeTools,
+  type WorkspaceEdgeToolSnapshot,
+} from "../mowe/workspace-catalog.js";
 import type { FukaiEdgeContextContribution } from "../fukai/types.js";
+
+const MAX_SELECTED_EDGE_CONTEXT_ITEMS = 16;
+const MAX_EDGE_CONTEXT_LOAD_CONCURRENCY = 4;
+const MAX_EDGE_CONTEXT_BODY_BYTES = 64 * 1024;
+const MAX_EDGE_CONTEXT_DESCRIPTION_BYTES = 4 * 1024;
+const MAX_EDGE_CONTEXT_TOTAL_BYTES = 256 * 1024;
 
 /** The small immutable view consumed by one Main activation. */
 export interface EdgeRuntimeProjection {
@@ -65,9 +77,7 @@ export interface EdgeRuntimeRegistryLike {
 /** Adapt a registry/composition to the runtime seam without exposing mutability. */
 export function createRegistryEdgeTurnSnapshotProvider(
   registry: EdgeRuntimeRegistryLike,
-  selectContext: (summary: unknown) => boolean = (summary) => (
-    isRecord(summary) && summary.disabled !== true
-  ),
+  selectContext: (summary: unknown) => boolean = () => false,
 ): EdgeTurnSnapshotProvider {
   return {
     capture: async (options) => {
@@ -75,14 +85,44 @@ export function createRegistryEdgeTurnSnapshotProvider(
       if (registry.loadContribution === undefined) return snapshot;
       const raw = asRecord(snapshot);
       const summaries = Array.isArray(raw.contextContributions)
-        ? raw.contextContributions.filter(selectContext)
+        ? raw.contextContributions
+          .filter(selectContext)
+          .sort(compareContextSummaries)
+          .slice(0, MAX_SELECTED_EDGE_CONTEXT_ITEMS)
         : [];
       if (summaries.length === 0) return snapshot;
-      const loaded = await Promise.all(summaries.map((summary) => registry.loadContribution!(
-        summary,
-        { ...(options ?? {}), snapshot },
-      )));
-      return { ...raw, contextContributions: loaded };
+      const outcomes = await loadSelectedContextContributions(
+        registry,
+        summaries,
+        snapshot,
+        options?.signal,
+      );
+      const diagnostics = outcomes.flatMap((outcome) => {
+        if (!("error" in outcome)) return [];
+        const summary = isRecord(outcome.summary) ? outcome.summary : {};
+        return [{
+          code: "context-load-failed",
+          severity: "error",
+          ...(typeof summary.sourceId === "string" ? { sourceId: summary.sourceId } : {}),
+          message: `Context contribution load failed${
+            typeof summary.name === "string" ? ` for ${summary.name}` : ""
+          }: ${errorMessage(outcome.error)}`,
+        }];
+      });
+      return {
+        ...raw,
+        contextContributions: outcomes.flatMap((outcome) => (
+          "loaded" in outcome ? [outcome.loaded] : []
+        )),
+        ...(diagnostics.length === 0
+          ? {}
+          : {
+              diagnostics: [
+                ...(Array.isArray(raw.diagnostics) ? raw.diagnostics : []),
+                ...diagnostics,
+              ],
+            }),
+      };
     },
     snapshot: () => registry.snapshot(),
     ...(registry.refresh === undefined ? {} : {
@@ -97,6 +137,49 @@ export interface EdgeRuntimeProjectionInput {
   readonly snapshot?: unknown;
   readonly enabled?: boolean;
   readonly refreshRequested?: boolean;
+}
+
+export interface EdgeRuntimeCapabilities {
+  readonly allowWrite: boolean;
+  readonly allowShell: boolean;
+  readonly allowNetwork: boolean;
+}
+
+/** Apply the current Turn boundary after host grants have admitted an edge tool. */
+export function materializePermittedEdgeTools(
+  snapshot: WorkspaceEdgeToolSnapshot | undefined,
+  capabilities: EdgeRuntimeCapabilities,
+): readonly AgentTool[] {
+  return Object.freeze(materializeWorkspaceEdgeTools(snapshot).filter((tool) => {
+    const metadata = resolveMetadata(
+      (tool as MoweAgentTool).metadata,
+      tool.definition.name.trim(),
+    );
+    return edgeToolPermitted(metadata, capabilities);
+  }));
+}
+
+/**
+ * Append edge tools without allowing an edge declaration to shadow a host
+ * tool already admitted for the same Turn. Host tools retain deterministic
+ * precedence; duplicate edge names are ignored before Mowe registration.
+ */
+export function appendPermittedEdgeTools(
+  baseTools: readonly AgentTool[],
+  snapshot: WorkspaceEdgeToolSnapshot | undefined,
+  capabilities: EdgeRuntimeCapabilities,
+): readonly AgentTool[] {
+  const names = new Set(baseTools.map((tool) => tool.definition.name.trim()));
+  const appended = materializePermittedEdgeTools(snapshot, capabilities).filter((tool) => {
+    const name = tool.definition.name.trim();
+    // MainLoop owns this run-authorized reader even though it is injected
+    // after the ordinary first-party tool assembly.
+    if (name === ARTIFACT_READ_TOOL_NAME) return false;
+    if (names.has(name)) return false;
+    names.add(name);
+    return true;
+  });
+  return Object.freeze([...baseTools, ...appended]);
 }
 
 /**
@@ -190,19 +273,6 @@ export async function captureEdgeTurnSnapshot(
         ? provider.getSnapshot()
       : fallback ?? { generation: 0 };
   if (signal?.aborted === true) throw signal.reason ?? new Error("Edge snapshot capture cancelled");
-  if (provider.capture === undefined && provider.registry !== undefined && isRecord(value)) {
-    const summaries = Array.isArray(value.contextContributions)
-      ? value.contextContributions.filter((summary: unknown) => (
-        isRecord(summary) && summary.disabled !== true
-      ))
-      : [];
-    if (summaries.length > 0 && provider.registry.loadContribution !== undefined) {
-      const loaded = await Promise.all(summaries.map((summary: unknown) => (
-        provider.registry!.loadContribution!(summary, signal === undefined ? {} : { signal })
-      )));
-      return projectEdgeRegistrySnapshot({ ...value, contextContributions: loaded });
-    }
-  }
   return projectEdgeRegistrySnapshot(value);
 }
 
@@ -246,6 +316,19 @@ function inputRefreshRequested(input: EdgeRuntimeProjectionInput | unknown, fall
   return isRecord(input) && typeof input.refreshRequested === "boolean"
     ? input.refreshRequested
     : fallback;
+}
+
+function edgeToolPermitted(
+  metadata: ResolvedMoweToolMetadata,
+  capabilities: EdgeRuntimeCapabilities,
+): boolean {
+  const fullAccess = capabilities.allowWrite
+    && capabilities.allowShell
+    && capabilities.allowNetwork;
+  if (metadata.scope === "host" && !fullAccess) return false;
+  if (metadata.effect === "write") return capabilities.allowWrite;
+  if (metadata.effect === "external") return fullAccess;
+  return true;
 }
 
 function readToolEntries(snapshot: Record<string, any>): Record<string, any>[] {
@@ -316,6 +399,116 @@ function readDiagnosticValues(value: unknown): string[] {
       ? item
       : isRecord(item) && typeof item.message === "string" ? item.message : String(item))
     : [];
+}
+
+async function loadSelectedContextContributions(
+  registry: EdgeRuntimeRegistryLike,
+  summaries: readonly unknown[],
+  snapshot: unknown,
+  signal: AbortSignal | undefined,
+): Promise<ContextLoadOutcome[]> {
+  const outcomes: ContextLoadOutcome[] = [];
+  let totalBytes = 0;
+  for (let offset = 0; offset < summaries.length; offset += MAX_EDGE_CONTEXT_LOAD_CONCURRENCY) {
+    throwIfContextLoadAborted(signal);
+    const batch = summaries.slice(offset, offset + MAX_EDGE_CONTEXT_LOAD_CONCURRENCY);
+    const loaded = await Promise.all(batch.map(async (summary): Promise<ContextLoadOutcome> => {
+      try {
+        const contribution = await registry.loadContribution!(
+          summary,
+          { ...(signal === undefined ? {} : { signal }), snapshot },
+        );
+        throwIfContextLoadAborted(signal);
+        return {
+          summary,
+          loaded: contribution,
+          byteLength: contextContributionByteLength(contribution),
+        };
+      } catch (error) {
+        if (signal?.aborted === true) throw signal.reason ?? error;
+        return { summary, error };
+      }
+    }));
+    for (const outcome of loaded) {
+      if ("error" in outcome) {
+        outcomes.push(outcome);
+        continue;
+      }
+      if (totalBytes + outcome.byteLength > MAX_EDGE_CONTEXT_TOTAL_BYTES) {
+        outcomes.push({
+          summary: outcome.summary,
+          error: new RangeError(
+            `Selected context exceeds the ${MAX_EDGE_CONTEXT_TOTAL_BYTES} byte total limit`,
+          ),
+        });
+        continue;
+      }
+      totalBytes += outcome.byteLength;
+      outcomes.push(outcome);
+    }
+  }
+  return outcomes;
+}
+
+type ContextLoadOutcome = {
+  readonly summary: unknown;
+  readonly error: unknown;
+} | {
+  readonly summary: unknown;
+  readonly loaded: unknown;
+  readonly byteLength: number;
+};
+
+function contextContributionByteLength(value: unknown): number {
+  if (!isRecord(value) || typeof value.body !== "string") {
+    throw new TypeError("Loaded context contribution must include a string body");
+  }
+  if (typeof value.description !== "string") {
+    throw new TypeError("Loaded context contribution must include a string description");
+  }
+  const bodyBytes = Buffer.byteLength(value.body, "utf8");
+  const descriptionBytes = Buffer.byteLength(value.description, "utf8");
+  if (descriptionBytes > MAX_EDGE_CONTEXT_DESCRIPTION_BYTES) {
+    throw new RangeError(
+      `Loaded context description exceeds the ${MAX_EDGE_CONTEXT_DESCRIPTION_BYTES} byte limit`,
+    );
+  }
+  if (bodyBytes > MAX_EDGE_CONTEXT_BODY_BYTES) {
+    throw new RangeError(
+      `Loaded context body exceeds the ${MAX_EDGE_CONTEXT_BODY_BYTES} byte limit`,
+    );
+  }
+  const byteLength = bodyBytes + descriptionBytes;
+  if (byteLength > MAX_EDGE_CONTEXT_TOTAL_BYTES) {
+    throw new RangeError(
+      `Loaded context exceeds the ${MAX_EDGE_CONTEXT_TOTAL_BYTES} byte total limit`,
+    );
+  }
+  return byteLength;
+}
+
+function compareContextSummaries(left: unknown, right: unknown): number {
+  return compareText(contextSummaryField(left, "sourceId"), contextSummaryField(right, "sourceId"))
+    || compareText(
+      contextSummaryField(left, "contributionId"),
+      contextSummaryField(right, "contributionId"),
+    )
+    || compareText(contextSummaryField(left, "name"), contextSummaryField(right, "name"))
+    || compareText(contextSummaryField(left, "contentHash"), contextSummaryField(right, "contentHash"));
+}
+
+function contextSummaryField(value: unknown, field: string): string {
+  return isRecord(value) && typeof value[field] === "string" ? value[field] : "";
+}
+
+function throwIfContextLoadAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw signal.reason ?? new Error("Edge context load cancelled");
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function compareText(left: string, right: string): number {

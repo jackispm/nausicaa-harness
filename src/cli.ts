@@ -462,6 +462,7 @@ const openCliEdgeRuntime = async (
     constructors: cliEdgeConstructors(),
     startupRefresh: refreshRequested || settings.edges.refreshOnStart,
   });
+  // Discovery is visible in status, but Skill bodies require an explicit host selector.
   const provider = createRegistryEdgeTurnSnapshotProvider(composition.registry);
   const configured = projectConfiguredEdgeStatus(settings.edges);
   return {

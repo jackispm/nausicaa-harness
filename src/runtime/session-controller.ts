@@ -117,10 +117,10 @@ import {
 import { SessionProtocolError } from "./session-protocol-error.js";
 import {
   freezeWorkspaceEdgeToolSnapshot,
-  materializeWorkspaceEdgeTools,
   type WorkspaceEdgeToolSnapshot,
 } from "../mowe/workspace-catalog.js";
 import {
+  appendPermittedEdgeTools,
   captureEdgeTurnSnapshot,
   type EdgeTurnSnapshotProvider,
 } from "./edge-runtime.js";
@@ -1717,7 +1717,7 @@ export class SessionController {
         this.edgeSnapshot,
         turn.controller.signal,
       );
-      const tools = [...(this.deps.tools ?? createWorkspaceTools({
+      const baseTools = this.deps.tools ?? createWorkspaceTools({
         allowWrite: turnCapabilities.allowWrite,
         allowShell: turnCapabilities.allowShell || workspaceSandbox !== undefined,
         ...(workspaceSandbox === undefined
@@ -1734,7 +1734,8 @@ export class SessionController {
           ? {}
           : { webSearchProvider: this.deps.webSearchProvider }),
         protectedPaths: [this.dataDir],
-      })), ...materializeWorkspaceEdgeTools(edgeProjection.edgeSnapshot)];
+      });
+      const tools: AgentTool[] = [...baseTools];
       if (attached.policy.tetoEnabled) {
         tools.push(createAdviceResponseTool(inbox));
         scheduler = new TetoScheduler({
@@ -1765,6 +1766,9 @@ export class SessionController {
           store: attached.store,
         }));
       }
+      // Optional runtime capabilities are host-owned too; append edge tools
+      // only after they are admitted so an edge cannot shadow their names.
+      const admittedTools = appendPermittedEdgeTools(tools, edgeProjection.edgeSnapshot, turnCapabilities);
       let latestEvents = await attached.ledger.read({ runId: attached.runId });
       const recoveredMain = projectMainExecutionRecovery(latestEvents);
       const preTurnConversationRefs = projectMainExecutionRecovery(
@@ -1810,7 +1814,7 @@ export class SessionController {
         contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(attached.store)),
         conversationStore: attached.store,
         eventSink: attached.sink,
-        tools,
+        tools: admittedTools,
         clock: this.clock,
         runTokenBudget: attached.tokenBudget,
         ...(edgeProjection.contextContributions.length === 0

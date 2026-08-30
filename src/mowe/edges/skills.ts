@@ -26,6 +26,9 @@ export const MAX_SKILL_RESOURCE_TOTAL_BYTES = 64 * 1024 * 1024;
 
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const DEFAULT_ROOTS = [".agents/skills", ".pi/skills", "skills"] as const;
+// Keep enough discovery generations for in-flight Turn snapshots to load
+// after a refresh, while bounding retained metadata for long-lived hosts.
+const SKILL_SUMMARY_HISTORY_GENERATIONS = 2;
 const SKIPPED_DIRECTORIES = new Set([
   ".git",
   ".hg",
@@ -660,7 +663,7 @@ class SkillsEdgeAdapterImpl implements SkillsEdgeAdapter {
 
   readonly #options: Readonly<SkillsEdgeAdapterOptions>;
   readonly #loader: SkillLoaderPort;
-  readonly #summaries = new Map<string, SkillSummary>();
+  readonly #summaryGenerations: Map<string, SkillSummary>[] = [];
   #cachedWorkspace: string | undefined;
   #cachedContributions: readonly SkillEdgeContextContributionSummary[] | undefined;
   #diagnostics: readonly SkillDiagnostic[] = Object.freeze([]);
@@ -712,8 +715,8 @@ class SkillsEdgeAdapterImpl implements SkillsEdgeAdapter {
         }));
       this.#cachedWorkspace = workspace;
       this.#cachedContributions = Object.freeze(contributions);
-      this.#summaries.clear();
-      for (const [id, summary] of nextSummaries) this.#summaries.set(id, summary);
+      this.#summaryGenerations.unshift(nextSummaries);
+      this.#summaryGenerations.splice(SKILL_SUMMARY_HISTORY_GENERATIONS);
       this.#diagnostics = freezeDiagnostics([...report.diagnostics, ...disabled]);
       this.#lastError = report.diagnostics
         .find((item) => item.kind === "invalid" || item.kind === "unsafe")?.message;
@@ -733,7 +736,9 @@ class SkillsEdgeAdapterImpl implements SkillsEdgeAdapter {
     this.#assertOpen();
     throwIfAborted(context.signal);
     const selected = summary !== null && typeof summary === "object"
-      ? this.#summaries.get(summary.contributionId)
+      ? this.#summaryGenerations
+        .map((generation) => generation.get(summary.contributionId))
+        .find((candidate): candidate is SkillSummary => candidate !== undefined)
       : undefined;
     if (selected === undefined) throw new SkillLoaderError("Skill contribution was not discovered by this adapter");
     validateSelectedContribution(this.sourceId, summary, selected, this.#options.provenance);
@@ -815,7 +820,7 @@ class SkillsEdgeAdapterImpl implements SkillsEdgeAdapter {
     this.#closed = true;
     this.#cachedWorkspace = undefined;
     this.#cachedContributions = undefined;
-    this.#summaries.clear();
+    this.#summaryGenerations.length = 0;
     this.#checkedAt = new Date().toISOString();
   }
 
