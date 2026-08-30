@@ -48,6 +48,8 @@ interface SubscribeResult {
   readonly subscribed: boolean;
   readonly runId: string;
   readonly replay: DaemonRunReplayResult;
+  /** Presence is part of the generation contract, even when a source omits it. */
+  readonly generationPresent: boolean;
 }
 
 /**
@@ -65,8 +67,12 @@ export class DaemonRemoteAttachment {
   private readonly reconnectDelayMs: number;
   private readonly listeners = new Set<(snapshot: DaemonRemoteAttachmentSnapshot) => void>();
   private events: AnyEvent[] = [];
+  /** Content identities for accepted offsets; duplicates must match exactly. */
+  private readonly seenEventHashes = new Map<number, string>();
   private cursorOffset = 0;
   private generation: number | undefined;
+  private generationSeen = false;
+  private generationPresent = false;
   private host: DaemonHostSnapshot | undefined;
   private status: DaemonRemoteAttachmentStatus = "connecting";
   private error: string | undefined;
@@ -76,6 +82,8 @@ export class DaemonRemoteAttachment {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private everAttached = false;
   private closed = false;
+  /** A history reset that cannot be satisfied must not spin reconnect forever. */
+  private terminalFailure = false;
   private readonly unsubscribeRun: () => void;
   private readonly unsubscribeHost: () => void;
   private readonly unsubscribeConnection: () => void;
@@ -95,7 +103,7 @@ export class DaemonRemoteAttachment {
       this.publish();
     });
     this.unsubscribeConnection = this.client.onConnection((event) => {
-      if (event.type !== "disconnected" || this.closed || !this.everAttached) return;
+      if (event.type !== "disconnected" || this.closed || this.terminalFailure || !this.everAttached) return;
       this.status = "reconnecting";
       this.error = event.error.message;
       this.publish();
@@ -122,7 +130,9 @@ export class DaemonRemoteAttachment {
       runId: this.runId,
       status: this.status,
       cursor: `offset:${this.cursorOffset}`,
-      ...(this.generation === undefined ? {} : { generation: this.generation }),
+      ...(this.generationPresent && this.generation !== undefined
+        ? { generation: this.generation }
+        : {}),
       events: this.events.map((event) => structuredClone(event)),
       ...(this.host === undefined ? {} : { host: structuredClone(this.host) }),
       ...(this.error === undefined ? {} : { error: this.error }),
@@ -171,7 +181,7 @@ export class DaemonRemoteAttachment {
   }
 
   private connectAndSubscribe(reconnecting: boolean): Promise<void> {
-    if (this.closed) {
+    if (this.closed || this.terminalFailure) {
       return Promise.reject(new DaemonControlClientError("closed", "remote attachment is closed"));
     }
     if (this.operation !== undefined) return this.operation;
@@ -194,7 +204,7 @@ export class DaemonRemoteAttachment {
     this.attachedClientId = attached.clientId;
     this.host = structuredClone(attached.snapshot);
     await this.subscribeFromCursor();
-    if (this.closed) return;
+    if (this.closed || this.terminalFailure) return;
     this.everAttached = true;
     this.status = "attached";
     this.error = undefined;
@@ -209,7 +219,9 @@ export class DaemonRemoteAttachment {
         runId: this.runId,
         cursor: requestedCursor,
         ...(upperWatermark === undefined ? {} : { upperWatermark }),
-        ...(this.generation === undefined ? {} : { generation: this.generation }),
+        ...(this.generationPresent && this.generation !== undefined
+          ? { generation: this.generation }
+          : {}),
       }));
       if (result.runId !== this.runId) {
         throw new DaemonControlClientError(
@@ -224,6 +236,11 @@ export class DaemonRemoteAttachment {
           "daemon replay did not start at the requested cursor",
         );
       }
+      this.observeGeneration(
+        result.generationPresent,
+        replay.generation,
+        replay.status === "resync_required",
+      );
       if (replay.status === "resync_required") {
         if (replay.runId !== this.runId) {
           throw new DaemonControlClientError(
@@ -232,15 +249,19 @@ export class DaemonRemoteAttachment {
           );
         }
         if (this.cursorOffset === 0 && this.events.length === 0) {
+          this.terminalFailure = true;
+          this.status = "resyncing";
+          this.error = `daemon cannot replay Run history: ${replay.reason}`;
+          this.client.close();
           throw new DaemonControlClientError(
             "resync_required",
-            `daemon cannot replay Run history: ${replay.reason}`,
+            this.error,
           );
         }
         this.status = "resyncing";
         this.events = [];
         this.cursorOffset = 0;
-        this.generation = undefined;
+        this.resetReplayIdentity();
         this.publish();
         upperWatermark = undefined;
         continue;
@@ -269,26 +290,55 @@ export class DaemonRemoteAttachment {
     if (replay.runId !== this.runId) {
       throw new DaemonControlClientError("invalid_frame", "daemon replay belongs to another Run");
     }
-    if (
-      this.generation !== undefined
-      && replay.generation !== this.generation
-    ) {
-      throw new DaemonControlClientError("invalid_frame", "daemon replay generation changed mid-stream");
-    }
     const staged = this.stageEvents(replay.events);
     if (replay.nextCursor !== `offset:${staged.cursorOffset}`) {
       throw new DaemonControlClientError("invalid_frame", "daemon replay cursor does not match its events");
     }
-    this.generation ??= replay.generation;
     this.events.push(...staged.events);
     this.cursorOffset = staged.cursorOffset;
+    this.commitEventIdentities(staged.identities);
     this.publish();
+  }
+
+  private observeGeneration(
+    present: boolean,
+    value: number | undefined,
+    allowValueChange: boolean,
+  ): void {
+    if (!this.generationSeen) {
+      this.generationSeen = true;
+      this.generationPresent = present;
+      this.generation = present ? value : undefined;
+      return;
+    }
+    if (present !== this.generationPresent) {
+      throw new DaemonControlClientError(
+        "invalid_frame",
+        "daemon replay generation presence changed mid-stream",
+      );
+    }
+    if (present && value !== this.generation && !allowValueChange) {
+      throw new DaemonControlClientError(
+        "invalid_frame",
+        "daemon replay generation changed mid-stream",
+      );
+    }
   }
 
   private handleRunObservation(observation: DaemonRunObservation): void {
     if (this.closed) return;
     if (observation.type === "event") {
-      if (observation.runId !== this.runId) return;
+      if (observation.runId !== this.runId) {
+        const error = new DaemonControlClientError(
+          "invalid_frame",
+          "daemon emitted a live event for another Run",
+        );
+        this.status = "resyncing";
+        this.error = error.message;
+        this.publish();
+        this.restartSubscription(true);
+        return;
+      }
       try {
         const staged = this.stageEvents([observation.event]);
         if (observation.cursor !== `offset:${staged.cursorOffset}`) {
@@ -299,6 +349,7 @@ export class DaemonRemoteAttachment {
         }
         this.events.push(...staged.events);
         this.cursorOffset = staged.cursorOffset;
+        this.commitEventIdentities(staged.identities);
         this.publish();
       } catch (error: unknown) {
         this.status = "resyncing";
@@ -319,8 +370,10 @@ export class DaemonRemoteAttachment {
   private stageEvents(candidates: readonly unknown[]): {
     readonly events: AnyEvent[];
     readonly cursorOffset: number;
+    readonly identities: ReadonlyMap<number, string>;
   } {
     const events: AnyEvent[] = [];
+    const identities = new Map<number, string>();
     let cursorOffset = this.cursorOffset;
     for (const candidate of candidates) {
       try {
@@ -336,26 +389,56 @@ export class DaemonRemoteAttachment {
       if (candidate.runId !== this.runId) {
         throw new DaemonControlClientError("invalid_frame", "daemon emitted an event for another Run");
       }
-      if (candidate.globalOffset <= cursorOffset) continue;
+      if (candidate.globalOffset <= cursorOffset) {
+        const knownHash = identities.get(candidate.globalOffset)
+          ?? this.seenEventHashes.get(candidate.globalOffset)
+          ?? this.events.find((event) => event.globalOffset === candidate.globalOffset)?.contentHash;
+        if (knownHash === undefined) {
+          throw new DaemonControlClientError(
+            "invalid_frame",
+            `daemon repeated an unknown event offset ${candidate.globalOffset}`,
+          );
+        }
+        if (candidate.contentHash !== knownHash) {
+          throw new DaemonControlClientError(
+            "invalid_frame",
+            `daemon emitted different content for event offset ${candidate.globalOffset}`,
+          );
+        }
+        identities.set(candidate.globalOffset, candidate.contentHash);
+        continue;
+      }
       if (candidate.globalOffset !== cursorOffset + 1) {
         throw new DaemonControlClientError("offset_gap", "daemon emitted a non-contiguous event offset");
       }
       events.push(structuredClone(candidate));
+      identities.set(candidate.globalOffset, candidate.contentHash);
       cursorOffset = candidate.globalOffset;
     }
-    return { events, cursorOffset };
+    return { events, cursorOffset, identities };
+  }
+
+  private commitEventIdentities(identities: ReadonlyMap<number, string>): void {
+    for (const [offset, hash] of identities) this.seenEventHashes.set(offset, hash);
+  }
+
+  private resetReplayIdentity(): void {
+    this.generation = undefined;
+    this.generationSeen = false;
+    this.generationPresent = false;
+    this.seenEventHashes.clear();
   }
 
   private restartSubscription(reset: boolean): void {
-    if (this.closed || this.operation !== undefined) return;
+    if (this.closed || this.terminalFailure || this.operation !== undefined) return;
     const operation = (async () => {
       if (reset) {
         this.events = [];
         this.cursorOffset = 0;
-        this.generation = undefined;
+        this.resetReplayIdentity();
       }
       await this.subscribeFromCursor();
-      if (this.closed) return;
+      if (this.closed || this.terminalFailure) return;
       this.status = "attached";
       this.error = undefined;
       this.publish();
@@ -366,6 +449,7 @@ export class DaemonRemoteAttachment {
       (error: unknown) => {
         if (this.operation === operation) this.operation = undefined;
         if (this.closed) return;
+        if (this.terminalFailure) return;
         this.status = "reconnecting";
         this.error = error instanceof Error ? error.message : String(error);
         this.publish();
@@ -375,12 +459,12 @@ export class DaemonRemoteAttachment {
   }
 
   private scheduleReconnect(): void {
-    if (this.closed || this.reconnectTimer !== undefined) return;
+    if (this.closed || this.terminalFailure || this.reconnectTimer !== undefined) return;
     const timer = setTimeout(() => {
       if (this.reconnectTimer !== timer) return;
       this.reconnectTimer = undefined;
       void this.connectAndSubscribe(true).catch((error: unknown) => {
-        if (this.closed) return;
+        if (this.closed || this.terminalFailure) return;
         this.status = "reconnecting";
         this.error = error instanceof Error ? error.message : String(error);
         this.publish();
@@ -453,7 +537,11 @@ function parseSubscribeResult(value: unknown): SubscribeResult {
     throw new DaemonControlClientError("invalid_frame", "daemon replay result must be an object");
   }
   const replay = value.replay;
+  const generationPresent = Object.prototype.hasOwnProperty.call(replay, "generation");
   const cursor = protocolCursor(replay.cursor, "replay cursor");
+  if (generationPresent && replay.generation === undefined) {
+    throw new DaemonControlClientError("invalid_frame", "replay generation cannot be undefined");
+  }
   const generation = optionalGeneration(replay.generation);
   if (replay.status === "resync_required") {
     if (
@@ -468,6 +556,7 @@ function parseSubscribeResult(value: unknown): SubscribeResult {
     return {
       subscribed: value.subscribed,
       runId,
+      generationPresent,
       replay: {
         status: "resync_required",
         runId: protocolIdentifier(replay.runId, "replay runId"),
@@ -502,6 +591,7 @@ function parseSubscribeResult(value: unknown): SubscribeResult {
   return {
     subscribed: value.subscribed,
     runId,
+    generationPresent,
     replay: {
       status: "ok",
       runId: protocolIdentifier(replay.runId, "replay runId"),

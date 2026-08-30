@@ -4,8 +4,8 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { ModelResponse } from "../../src/domain/index.js";
-import { JsonlLedger, projectRun } from "../../src/ledger/index.js";
+import type { AnyEvent, ModelResponse } from "../../src/domain/index.js";
+import { computeEventContentHash, JsonlLedger, projectRun } from "../../src/ledger/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import {
   DaemonControlServer,
@@ -14,6 +14,7 @@ import {
   DaemonRemoteAttachment,
   DaemonRemoteSession,
   DaemonRunObserver,
+  type DaemonRunObservation,
   FileDaemonRunEventSource,
   SessionController,
 } from "../../src/runtime/index.js";
@@ -215,7 +216,253 @@ describe("daemon remote attachment", () => {
       client,
     })).rejects.toMatchObject({ code: "invalid_frame" });
   });
+
+  it("does not silently accept different content at an already-seen offset", async () => {
+    const runId = "same-offset-run";
+    const first = testEvent(runId, 1, "first");
+    const different = testEvent(runId, 1, "forged");
+    let replayCount = 0;
+    let runListener: ((observation: DaemonRunObservation) => void) | undefined;
+    const client = mockedAttachmentClient((method) => {
+      if (method === "attach") return attachResult();
+      replayCount += 1;
+      return replayPage(runId, [first], 1, 0);
+    });
+    vi.spyOn(client, "onRunEvent").mockImplementation((listener) => {
+      runListener = listener;
+      return () => { runListener = undefined; };
+    });
+
+    const attachment = await DaemonRemoteAttachment.open({
+      socketPath: client.socketPath,
+      runId,
+      reconnectDelayMs: 1,
+      client,
+    });
+    expect(runListener).toBeDefined();
+    runListener?.({
+      type: "event",
+      runId,
+      cursor: "offset:1",
+      event: different,
+    });
+    await eventually(() => {
+      expect(replayCount).toBeGreaterThanOrEqual(2);
+      expect(attachment.snapshot()).toMatchObject({
+        status: "attached",
+        cursor: "offset:1",
+      });
+      expect(attachment.snapshot().events).toEqual([first]);
+    });
+    await attachment.close();
+  });
+
+  it("resyncs instead of dropping a live event for another Run", async () => {
+    const runId = "cross-run-attachment";
+    const first = testEvent(runId, 1, "first");
+    let replayCount = 0;
+    let runListener: ((observation: DaemonRunObservation) => void) | undefined;
+    const client = mockedAttachmentClient((method) => {
+      if (method === "attach") return attachResult();
+      replayCount += 1;
+      return replayPage(runId, [first], 1, 0);
+    });
+    vi.spyOn(client, "onRunEvent").mockImplementation((listener) => {
+      runListener = listener;
+      return () => { runListener = undefined; };
+    });
+
+    const attachment = await DaemonRemoteAttachment.open({
+      socketPath: client.socketPath,
+      runId,
+      reconnectDelayMs: 1,
+      client,
+    });
+    runListener?.({
+      type: "event",
+      runId: "another-run",
+      cursor: "offset:1",
+      event: testEvent("another-run", 1, "wrong Run"),
+    });
+    await eventually(() => {
+      expect(replayCount).toBeGreaterThanOrEqual(2);
+      expect(attachment.snapshot().events).toEqual([first]);
+    });
+    await attachment.close();
+  });
+
+  it("rejects generation presence changes between replay pages", async () => {
+    const runId = "generation-presence-run";
+    const first = testEvent(runId, 1, "first");
+    let page = 0;
+    const client = mockedAttachmentClient((method) => {
+      if (method === "attach") return attachResult();
+      page += 1;
+      if (page === 1) {
+        return replayPage(runId, [first], 2, 0, true, undefined);
+      }
+      return replayPage(runId, [testEvent(runId, 2, "second")], 2, 1, false, 0);
+    });
+
+    await expect(DaemonRemoteAttachment.open({
+      socketPath: client.socketPath,
+      runId,
+      client,
+    })).rejects.toMatchObject({ code: "invalid_frame" });
+  });
+
+  it("stops retrying when history cannot be reconstructed from offset zero", async () => {
+    const runId = "truncated-history-run";
+    const first = testEvent(runId, 1, "first");
+    let replayCount = 0;
+    let runListener: ((observation: DaemonRunObservation) => void) | undefined;
+    const client = mockedAttachmentClient((method, params) => {
+      if (method === "attach") return attachResult();
+      replayCount += 1;
+      const cursor = typeof params === "object" && params !== null
+        && "cursor" in params && typeof params.cursor === "string"
+        ? params.cursor
+        : "offset:0";
+      if (replayCount > 1 && cursor === "offset:0") {
+        return {
+          subscribed: false,
+          runId,
+          replay: {
+            status: "resync_required",
+            runId,
+            cursor: "offset:0",
+            firstOffset: 2,
+            watermark: 2,
+            reason: "history-truncated",
+          },
+        };
+      }
+      return replayPage(runId, [first], 1, 0);
+    });
+    vi.spyOn(client, "onRunEvent").mockImplementation((listener) => {
+      runListener = listener;
+      return () => { runListener = undefined; };
+    });
+
+    const attachment = await DaemonRemoteAttachment.open({
+      socketPath: client.socketPath,
+      runId,
+      client,
+      reconnectDelayMs: 1,
+    });
+    expect(replayCount).toBe(1);
+    runListener?.({
+      type: "resync_required",
+      result: {
+        status: "resync_required",
+        runId,
+        cursor: "offset:1",
+        firstOffset: 2,
+        watermark: 2,
+        reason: "history-truncated",
+      },
+    });
+    await eventually(() => expect(attachment.snapshot().status).toBe("resyncing"));
+    const observed = replayCount;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(replayCount).toBe(observed);
+    await attachment.close();
+  });
 });
+
+function mockedAttachmentClient(
+  handler: (method: string, params?: unknown) => unknown,
+): DaemonControlClient {
+  const client = new DaemonControlClient({ socketPath: "/tmp/nausicaa-remote-attachment-test.sock" });
+  vi.spyOn(client, "connect").mockResolvedValue(undefined);
+  vi.spyOn(client, "request").mockImplementation(async (method, params) => (
+    handler(method, params)
+  ) as never);
+  return client;
+}
+
+function attachResult(): unknown {
+  return {
+    clientId: "remote-test-client",
+    snapshot: {
+      status: "running",
+      ownerId: "remote-test-host",
+      queuedRuns: 0,
+      runningRuns: 0,
+      attachedClients: 1,
+      runs: [],
+    },
+  };
+}
+
+function replayPage(
+  runId: string,
+  events: readonly AnyEvent[],
+  watermark: number,
+  cursorOffset: number,
+  hasMore = false,
+  generation?: number,
+): unknown {
+  const nextOffset = events.at(-1)?.globalOffset ?? cursorOffset;
+  return {
+    subscribed: !hasMore,
+    runId,
+    replay: {
+      status: "ok",
+      runId,
+      cursor: `offset:${cursorOffset}`,
+      nextCursor: `offset:${nextOffset}`,
+      watermark,
+      hasMore,
+      events,
+      ...(generation === undefined ? {} : { generation }),
+    },
+  };
+}
+
+function testEvent(runId: string, globalOffset: number, statement: string): AnyEvent {
+  const content = {
+    eventId: `event-${runId}-${globalOffset}-${statement}`,
+    runId,
+    laneId: "main",
+    globalOffset,
+    laneSeq: globalOffset,
+    type: "goal.revised" as const,
+    schemaVersion: 1 as const,
+    occurredAt: "2026-08-31T00:00:00.000Z",
+    correlationId: `run:${runId}`,
+    idempotencyKey: `test:${runId}:${globalOffset}:${statement}`,
+    visibility: "run" as const,
+    payload: {
+      goal: {
+        version: globalOffset,
+        statement,
+        successCriteria: [],
+        hardConstraints: [],
+      },
+    },
+  };
+  return {
+    ...content,
+    contentHash: computeEventContentHash(content),
+  };
+}
+
+async function eventually(assertion: () => void): Promise<void> {
+  const deadline = Date.now() + 500;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      assertion();
+      return;
+    } catch (error: unknown) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+  }
+  if (lastError instanceof Error) throw lastError;
+  throw new Error("condition did not become true");
+}
 
 async function remoteFixture(name: string): Promise<{
   workspace: string;
