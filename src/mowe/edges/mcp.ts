@@ -62,6 +62,9 @@ export interface McpEdgeAdapterOptions {
   /** Inject these for offline tests or an already-managed transport. */
   readonly client?: Client;
   readonly transport?: Transport;
+  /** Override inferred ownership for embedders that manage both resources. */
+  readonly ownsClient?: boolean;
+  readonly ownsTransport?: boolean;
   /** Factories make reconnect possible after a process/transport failure. */
   readonly clientFactory?: () => Client | Promise<Client>;
   readonly transportFactory?: () => Transport | Promise<Transport>;
@@ -74,14 +77,27 @@ export interface McpEdgeAdapterOptions {
   readonly maxResultBytes?: number;
   readonly maxSchemaBytes?: number;
   readonly timeoutMs?: number;
+  /** Maximum content blocks retained from one MCP result. */
+  readonly maxResultBlocks?: number;
+  /** Maximum decoded image bytes retained from one MCP result. */
+  readonly maxResultImageBytes?: number;
+  /** Maximum structured-content JSON bytes considered for one result. */
+  readonly maxResultStructuredBytes?: number;
 }
 
 export interface McpEdgeAdapter extends EdgeAdapter {
   readonly sourceType: "mcp";
   health(): Promise<EdgeAdapterHealth>;
   release(context: EdgeReleaseContext): Promise<void>;
-  /** Reconnect only when a transport factory (or reusable client) is available. */
+  /** Reconnect only when fresh client and transport construction is available. */
   reconnect(signal?: AbortSignal): Promise<void>;
+}
+
+export interface McpResultProjectionLimits {
+  readonly maxBytes: number;
+  readonly maxBlocks?: number;
+  readonly maxImageBytes?: number;
+  readonly maxStructuredBytes?: number;
 }
 
 const SOURCE_TYPE = "mcp" as const satisfies EdgeSourceType;
@@ -92,6 +108,9 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_SAFE_TEXT = 4_096;
 const MAX_UNSUPPORTED_BLOCKS = 16;
 const MAX_CONTENT_BLOCKS = 1_024;
+const MAX_RESULT_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_RESULT_STRUCTURED_BYTES = 512 * 1024;
+const MAX_LIST_PAGES = 1_024;
 const DEFAULT_SCHEMA_VERSION = "2020-12";
 
 /**
@@ -113,12 +132,20 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
   readonly #maxResultBytes: number;
   readonly #maxSchemaBytes: number;
   readonly #timeoutMs: number;
+  readonly #maxResultBlocks: number;
+  readonly #maxResultImageBytes: number;
+  readonly #maxResultStructuredBytes: number;
   #client: Client | undefined;
   #transport: Transport | undefined;
   #initialTransport: Transport | undefined;
+  #ownsClient = false;
+  #ownsTransport = false;
   #connected = false;
   #closed = false;
   #connecting: Promise<void> | undefined;
+  #releasePromise: Promise<void> | undefined;
+  #reconnectQueue: Promise<void> = Promise.resolve();
+  #lifecycleEpoch = 0;
   #serverTools = new Map<string, McpToolRecord>();
   #toolPolicies = new Map<string, McpToolPolicy>();
   #warnings: string[] = [];
@@ -137,8 +164,13 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
       && options.clientFactory === undefined) {
       throw new TypeError("MCP adapter requires command, transport, transportFactory, or client");
     }
+    assertOptionalBoolean(options.ownsClient, "ownsClient");
+    assertOptionalBoolean(options.ownsTransport, "ownsTransport");
+    if (options.ownsClient === true && options.ownsTransport === false) {
+      assertCompatibleOwnership(options.ownsClient, options.ownsTransport);
+    }
     this.sourceId = options.sourceId;
-    this.#options = options;
+    this.#options = snapshotOptions(options);
     this.#initialTransport = options.transport;
     this.#maxTools = boundedPositiveInteger(options.maxTools, DEFAULT_MAX_TOOLS, 1_024, "maxTools");
     this.#maxResultBytes = boundedPositiveInteger(
@@ -154,22 +186,71 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
       "maxSchemaBytes",
     );
     this.#timeoutMs = boundedPositiveInteger(options.timeoutMs, DEFAULT_TIMEOUT_MS, 60 * 60 * 1000, "timeoutMs");
+    this.#maxResultBlocks = boundedPositiveInteger(
+      options.maxResultBlocks,
+      MAX_CONTENT_BLOCKS,
+      MAX_CONTENT_BLOCKS,
+      "maxResultBlocks",
+    );
+    this.#maxResultImageBytes = boundedPositiveInteger(
+      options.maxResultImageBytes,
+      Math.min(DEFAULT_MAX_RESULT_BYTES, MAX_RESULT_IMAGE_BYTES),
+      MAX_RESULT_IMAGE_BYTES,
+      "maxResultImageBytes",
+    );
+    this.#maxResultStructuredBytes = boundedPositiveInteger(
+      options.maxResultStructuredBytes,
+      Math.min(DEFAULT_MAX_RESULT_BYTES, MAX_RESULT_STRUCTURED_BYTES),
+      MAX_RESULT_STRUCTURED_BYTES,
+      "maxResultStructuredBytes",
+    );
     this.#client = options.client;
   }
 
   async discover(context: EdgeDiscoveryContext): Promise<readonly EdgeManifest[]> {
     this.#assertOpen();
+    throwIfAborted(context.signal);
     await this.#ensureConnected(context.signal);
     const client = this.#requireClient();
     const tools: McpTool[] = [];
     let cursor: string | undefined;
+    const visitedCursors = new Set<string>();
+    const remoteNames = new Set<string>();
+    const capabilityNames = new Set<string>();
+    let pages = 0;
     this.#truncatedTools = false;
     this.#warnings = [];
     do {
-      const response = await client.listTools(
-        cursor === undefined ? undefined : { cursor },
-        requestOptions(context.signal, this.#timeoutMs),
-      );
+      throwIfAborted(context.signal);
+      if (cursor !== undefined) {
+        if (visitedCursors.has(cursor)) {
+          this.#truncatedTools = true;
+          this.#warnings.push(`Stopped MCP tool pagination at repeated cursor: ${safeCursor(cursor)}`);
+          break;
+        }
+        visitedCursors.add(cursor);
+      }
+      pages += 1;
+      if (pages > MAX_LIST_PAGES) {
+        this.#truncatedTools = true;
+        this.#warnings.push(`Stopped MCP tool pagination at ${MAX_LIST_PAGES} pages`);
+        break;
+      }
+      let response: Awaited<ReturnType<Client["listTools"]>>;
+      try {
+        response = await client.listTools(
+          cursor === undefined ? undefined : { cursor },
+          requestOptions(context.signal, this.#timeoutMs),
+        );
+      } catch (error) {
+        this.#lastError = context.signal?.aborted || isAbortError(error)
+          ? "MCP tool discovery was cancelled"
+          : isTimeoutError(error)
+            ? "MCP tool discovery timed out"
+            : `MCP tool discovery failed: ${safeError(error)}`;
+        this.#checkedAt = new Date().toISOString();
+        throw error;
+      }
       for (const tool of response.tools ?? []) {
         if (tools.length >= this.#maxTools) {
           this.#truncatedTools = true;
@@ -180,14 +261,19 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
           continue;
         }
         const remoteName = tool.name;
-        if (this.#serverTools.has(remoteName) || tools.some((item) => item.name === remoteName)) {
-          this.#warnings.push(`Ignored duplicate MCP tool: ${remoteName}`);
+        if (remoteNames.has(remoteName)) {
+          this.#warnings.push(`Ignored duplicate MCP tool: ${safeDiagnosticValue(remoteName)}`);
           continue;
         }
-        if (tools.some((item) => capabilityName(this.sourceId, item.name) === capabilityName(this.sourceId, remoteName))) {
-          this.#warnings.push(`Ignored MCP tool with colliding namespace: ${remoteName}`);
+        const projectedName = capabilityName(this.sourceId, remoteName);
+        if (capabilityNames.has(projectedName)) {
+          this.#warnings.push(
+            `Ignored MCP tool with colliding namespace: ${safeDiagnosticValue(remoteName)} -> ${projectedName}`,
+          );
           continue;
         }
+        remoteNames.add(remoteName);
+        capabilityNames.add(projectedName);
         tools.push(tool);
       }
       cursor = response.nextCursor;
@@ -197,7 +283,7 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
     this.#serverTools.clear();
     this.#toolPolicies.clear();
     const manifests: EdgeManifest[] = [];
-    for (const tool of tools) {
+    for (const tool of tools.sort((left, right) => compareText(left.name, right.name))) {
       try {
         const policy = this.#resolvePolicy(tool);
         const manifest = this.#manifest(tool, policy);
@@ -212,11 +298,12 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
         this.#warnings.push(`Ignored MCP tool ${safeToolName(tool)}: ${safeError(error)}`);
       }
     }
-    this.#lastError = this.#truncatedTools
-      ? `MCP tool list truncated at ${this.#maxTools} tools`
-      : this.#warnings[0];
+    this.#warnings.sort(compareText);
+    this.#lastError = this.#warnings[0]
+      ?? (this.#truncatedTools ? `MCP tool list truncated at ${this.#maxTools} tools` : undefined);
     this.#checkedAt = new Date().toISOString();
-    return manifests;
+    manifests.sort((left, right) => compareText(left.capabilityName, right.capabilityName));
+    return Object.freeze(manifests);
   }
 
   async load(manifest: EdgeManifest, _context: EdgeLoadContext): Promise<EdgeCapability> {
@@ -253,9 +340,24 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
 
   async reconnect(signal?: AbortSignal): Promise<void> {
     this.#assertOpen();
-    await this.#disconnectTransport();
-    this.#connected = false;
-    await this.#ensureConnected(signal);
+    throwIfAborted(signal);
+    if (!this.#canCreateFreshClient() || !this.#canCreateFreshTransport()) {
+      throw new Error("MCP reconnect requires fresh client and transport factories (or a stdio command)");
+    }
+    const pending = this.#reconnectQueue.then(async () => {
+      this.#assertOpen();
+      throwIfAborted(signal);
+      this.#lifecycleEpoch += 1;
+      const connection = this.#connecting;
+      await this.#disconnectConnection();
+      await connection?.catch(() => undefined);
+      this.#serverTools.clear();
+      this.#toolPolicies.clear();
+      this.#assertOpen();
+      await this.#ensureConnected(signal);
+    });
+    this.#reconnectQueue = pending.catch(() => undefined);
+    return pending;
   }
 
   async health(): Promise<EdgeAdapterHealth> {
@@ -273,16 +375,26 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
     };
   }
 
-  async release(_context: EdgeReleaseContext): Promise<void> {
-    if (this.#closed) return;
+  release(_context: EdgeReleaseContext): Promise<void> {
+    if (this.#releasePromise !== undefined) return this.#releasePromise;
     this.#closed = true;
-    await this.#disconnectTransport();
-    this.#connected = false;
-    this.#serverTools.clear();
+    this.#lifecycleEpoch += 1;
+    const connection = this.#connecting;
+    const pending = (async () => {
+      await this.#disconnectConnection();
+      await connection?.catch(() => undefined);
+      await this.#disconnectConnection();
+      this.#connected = false;
+      this.#serverTools.clear();
+      this.#toolPolicies.clear();
+    })();
+    this.#releasePromise = pending;
+    return pending;
   }
 
   async #ensureConnected(signal?: AbortSignal): Promise<void> {
     this.#assertOpen();
+    throwIfAborted(signal);
     if (this.#connected) return;
     if (this.#connecting !== undefined) return this.#connecting;
     const pending = this.#connect(signal).finally(() => {
@@ -293,62 +405,120 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
   }
 
   async #connect(signal?: AbortSignal): Promise<void> {
-    const client = this.#client ?? await this.#newClient();
-    const transport = await this.#newTransport();
-    if (transport === undefined) {
-      // A caller may supply an already-connected SDK client. This is useful for
-      // embedding and avoids claiming ownership of a transport we did not make.
-      // Structural fakes used by offline tests may intentionally omit the
-      // transport getter; supplying a client alone means the caller owns its
-      // connection lifecycle.
-      const hasCallerConnection = !("transport" in client) || client.transport !== undefined;
-      if (this.#client !== undefined && hasCallerConnection) {
-        this.#client = client;
-        this.#connected = true;
-        return;
-      }
-      throw new Error("MCP adapter has no transport factory or stdio command");
-    }
-    this.#client = client;
-    this.#transport = transport;
-    client.onclose = () => {
-      this.#connected = false;
-      this.#transport = undefined;
-      if (!this.#closed) this.#lastError = "MCP transport closed";
-      this.#checkedAt = new Date().toISOString();
-    };
-    client.onerror = (error) => {
-      this.#lastError = `MCP transport error: ${safeError(error)}`;
-      this.#checkedAt = new Date().toISOString();
-    };
+    const epoch = this.#lifecycleEpoch;
+    throwIfAborted(signal);
+    let client: Client | undefined;
+    let transportResult: { transport: Transport | undefined; owns: boolean } | undefined;
+    let ownsClient = false;
+    let ownsTransport = false;
+    let claimedConnection = false;
     try {
+      client = this.#client ?? await this.#newClient();
+      const injectedClient = this.#options.client !== undefined && client === this.#options.client;
+      ownsClient = this.#options.ownsClient ?? !injectedClient;
+      this.#assertConnectionCurrent(epoch, signal);
+      transportResult = await this.#newTransport();
+      ownsTransport = this.#options.ownsTransport
+        ?? (transportResult.owns || !injectedClient);
+      assertCompatibleOwnership(ownsClient, ownsTransport);
+      this.#assertConnectionCurrent(epoch, signal);
+      const transport = transportResult.transport;
+      if (transport === undefined) {
+        // A supplied, already-connected client remains caller-owned.
+        const hasCallerConnection = !("transport" in client) || client.transport !== undefined;
+        if (this.#client !== undefined && hasCallerConnection) {
+          this.#client = client;
+          ownsClient = this.#options.ownsClient ?? false;
+          ownsTransport = this.#options.ownsTransport ?? ownsClient;
+          assertCompatibleOwnership(ownsClient, ownsTransport);
+          this.#ownsClient = ownsClient;
+          this.#ownsTransport = ownsTransport;
+          this.#connected = true;
+          return;
+        }
+        throw new Error("MCP adapter has no transport factory or stdio command");
+      }
+      // The SDK client assumes ownership of the attached transport. Preserve
+      // caller ownership only when the caller also supplied the client.
+      this.#client = client;
+      this.#transport = transport;
+      this.#ownsClient = ownsClient;
+      this.#ownsTransport = ownsTransport;
+      claimedConnection = true;
+      client.onclose = () => {
+        if (this.#client !== client) return;
+        this.#connected = false;
+        this.#transport = undefined;
+        this.#serverTools.clear();
+        this.#toolPolicies.clear();
+        this.#lifecycleEpoch += 1;
+        if (this.#canCreateFreshClient()) this.#client = undefined;
+        if (!this.#closed) this.#lastError = "MCP transport closed";
+        this.#checkedAt = new Date().toISOString();
+      };
+      client.onerror = (error) => {
+        if (this.#client !== client || this.#closed) return;
+        this.#lastError = `MCP transport error: ${safeError(error)}`;
+        this.#checkedAt = new Date().toISOString();
+      };
       await client.connect(transport, requestOptions(signal, this.#timeoutMs));
+      this.#assertConnectionCurrent(epoch, signal);
       this.#connected = true;
       this.#lastError = undefined;
       this.#checkedAt = new Date().toISOString();
     } catch (error) {
       this.#connected = false;
-      this.#transport = undefined;
       this.#lastError = safeError(error);
+      this.#checkedAt = new Date().toISOString();
+      const ownsClaimedConnection = claimedConnection
+        && ((client !== undefined && this.#client === client)
+          || this.#transport === transportResult?.transport);
+      if (client !== undefined && this.#client === client) this.#client = undefined;
+      if (this.#transport === transportResult?.transport) this.#transport = undefined;
+      if (ownsClaimedConnection) {
+        this.#ownsClient = false;
+        this.#ownsTransport = false;
+      }
+      if (client !== undefined
+        && transportResult?.transport !== undefined
+        && (!claimedConnection || ownsClaimedConnection)) {
+        await this.#closeResources(
+          client,
+          transportResult.transport,
+          ownsClient,
+          ownsTransport,
+        ).catch(() => undefined);
+      }
+      if (client !== undefined
+        && transportResult?.transport === undefined
+        && ownsClient
+        && (!claimedConnection || ownsClaimedConnection)) {
+        await client.close().catch(() => undefined);
+      }
       throw error;
     }
   }
 
   async #newClient(): Promise<Client> {
     if (this.#options.clientFactory !== undefined) return this.#options.clientFactory();
+    if (this.#options.client !== undefined) {
+      throw new Error("MCP reconnect requires a clientFactory after an injected client is closed");
+    }
     // A fresh client is needed when a stdio process is restarted. Client state
     // is intentionally otherwise private to this adapter.
     const { Client: SdkClient } = await import("@modelcontextprotocol/sdk/client/index.js");
     return new SdkClient({ name: "nausicaa-mowe", version: this.#options.adapterVersion ?? "0.1.0" });
   }
 
-  async #newTransport(): Promise<Transport | undefined> {
+  async #newTransport(): Promise<{ transport: Transport | undefined; owns: boolean }> {
     if (this.#initialTransport !== undefined) {
       const transport = this.#initialTransport;
       this.#initialTransport = undefined;
-      return transport;
+      return { transport, owns: false };
     }
-    if (this.#options.transportFactory !== undefined) return this.#options.transportFactory();
+    if (this.#options.transportFactory !== undefined) {
+      return { transport: await this.#options.transportFactory(), owns: true };
+    }
     if (this.#options.command !== undefined) {
       const server: StdioServerParameters = {
         command: this.#options.command,
@@ -357,19 +527,75 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
         ...(this.#options.env === undefined ? {} : { env: { ...this.#options.env } }),
         stderr: "pipe",
       };
-      return new StdioClientTransport(server);
+      return { transport: new StdioClientTransport(server), owns: true };
     }
-    return undefined;
+    return { transport: undefined, owns: false };
   }
 
-  async #disconnectTransport(): Promise<void> {
+  async #disconnectConnection(): Promise<void> {
     const client = this.#client;
+    const transport = this.#transport;
+    const ownsClient = this.#ownsClient;
+    const ownsTransport = this.#ownsTransport;
+    this.#client = undefined;
     this.#transport = undefined;
-    if (client === undefined) return;
+    this.#connected = false;
+    this.#ownsClient = false;
+    this.#ownsTransport = false;
+    if (client === undefined && transport === undefined) return;
     try {
-      await client.close();
+      // Client.close() also closes its transport. If either side was injected,
+      // avoid taking ownership of the caller's resource implicitly.
+      if (client !== undefined && transport !== undefined) {
+        await this.#closeResources(client, transport, ownsClient, ownsTransport);
+      } else if (client !== undefined && ownsClient) await client.close();
+      else if (transport !== undefined && ownsTransport) await transport.close();
     } catch (error) {
       this.#lastError = `MCP close failed: ${safeError(error)}`;
+    }
+  }
+
+  async #closeResources(
+    client: Client,
+    transport: Transport,
+    ownsClient: boolean,
+    ownsTransport: boolean,
+  ): Promise<void> {
+    if (ownsClient && ownsTransport) {
+      const attached = client.transport === transport;
+      let closeError: unknown;
+      try {
+        await client.close();
+      } catch (error) {
+        closeError = error;
+      }
+      // Client.close() normally closes its attached transport. If it failed,
+      // make a best-effort direct close so a broken client cannot leak it.
+      if (!attached || closeError !== undefined) {
+        try {
+          await transport.close();
+        } catch (error) {
+          closeError ??= error;
+        }
+      }
+      if (closeError !== undefined) throw closeError;
+      return;
+    }
+    if (ownsTransport) await transport.close();
+  }
+
+  #canCreateFreshClient(): boolean {
+    return this.#options.clientFactory !== undefined || this.#options.client === undefined;
+  }
+
+  #canCreateFreshTransport(): boolean {
+    return this.#options.transportFactory !== undefined || this.#options.command !== undefined;
+  }
+
+  #assertConnectionCurrent(epoch: number, signal?: AbortSignal): void {
+    throwIfAborted(signal);
+    if (this.#closed || epoch !== this.#lifecycleEpoch) {
+      throw new Error(`MCP edge ${this.sourceId} connection was superseded`);
     }
   }
 
@@ -409,6 +635,9 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
 
   #metadata(tool: McpTool): MoweToolMetadata {
     const policy = this.#policy(tool);
+    const timeoutMs = policy.timeoutMs === undefined
+      ? this.#timeoutMs
+      : boundedPositiveInteger(policy.timeoutMs, this.#timeoutMs, 60 * 60 * 1000, "policy.timeoutMs");
     // No MCP annotation is consulted here. Missing/untrusted host policy is
     // deliberately treated as an external, approval-gated operation.
     return {
@@ -419,7 +648,7 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
       supportsBatch: policy.supportsBatch ?? false,
       concurrencySafe: policy.concurrencySafe ?? false,
       supportsStreaming: policy.supportsStreaming ?? false,
-      timeoutMs: policy.timeoutMs ?? this.#timeoutMs,
+      timeoutMs,
       ...(policy.maxConcurrency === undefined ? {} : { maxConcurrency: policy.maxConcurrency }),
       inputKinds: policy.inputKinds ?? ["json"],
       outputKinds: policy.outputKinds ?? ["json", "text", "image"],
@@ -432,8 +661,8 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
   }
 
   #resolvePolicy(tool: McpTool): McpToolPolicy {
-    if (typeof this.#options.policy === "function") return this.#options.policy(tool) ?? {};
-    return this.#options.policy?.[tool.name] ?? {};
+    if (typeof this.#options.policy === "function") return snapshotPolicy(this.#options.policy(tool));
+    return snapshotPolicy(this.#options.policy?.[tool.name]);
   }
 
   async #execute(
@@ -456,13 +685,28 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
           isError: true,
         };
       }
-      return mcpResultToToolResult(response, this.#maxResultBytes);
-    } catch (error) {
-      if (signal?.aborted || isAbortError(error)) {
-        throw signal?.reason ?? error;
+      const result = projectMcpToolResult(response, {
+        maxBytes: this.#maxResultBytes,
+        maxBlocks: this.#maxResultBlocks,
+        maxImageBytes: this.#maxResultImageBytes,
+        maxStructuredBytes: this.#maxResultStructuredBytes,
+      });
+      if (result.isError && !response.isError) {
+        this.#lastError = `MCP tool ${safeName(remoteName)} returned content outside adapter limits`;
+        this.#checkedAt = new Date().toISOString();
       }
+      return result;
+    } catch (error) {
+      const cancelled = signal?.aborted || isAbortError(error);
+      const message = cancelled
+        ? `MCP tool ${safeName(remoteName)} was cancelled`
+        : isTimeoutError(error)
+          ? `MCP tool ${safeName(remoteName)} timed out`
+          : `MCP tool ${safeName(remoteName)} failed: ${safeError(error)}`;
+      this.#lastError = message;
+      this.#checkedAt = new Date().toISOString();
       return {
-        content: boundedText(`MCP tool ${remoteName} failed: ${safeError(error)}`, this.#maxResultBytes),
+        content: boundedText(message, this.#maxResultBytes),
         isError: true,
       };
     }
@@ -527,31 +771,62 @@ function schemaBytes(value: unknown): number {
   }
 }
 
-function mcpResultToToolResult(response: CallToolResult, maxBytes: number): ToolResult {
+export function projectMcpToolResult(
+  response: CallToolResult,
+  limits: McpResultProjectionLimits,
+): ToolResult {
+  const maxBytes = boundedPositiveInteger(limits.maxBytes, DEFAULT_MAX_RESULT_BYTES, 64 * 1024 * 1024, "maxBytes");
+  const maxBlocks = boundedPositiveInteger(limits.maxBlocks, MAX_CONTENT_BLOCKS, MAX_CONTENT_BLOCKS, "maxBlocks");
+  const maxImageBytes = boundedPositiveInteger(
+    limits.maxImageBytes,
+    Math.min(maxBytes, MAX_RESULT_IMAGE_BYTES),
+    MAX_RESULT_IMAGE_BYTES,
+    "maxImageBytes",
+  );
+  const maxStructuredBytes = boundedPositiveInteger(
+    limits.maxStructuredBytes,
+    Math.min(maxBytes, MAX_RESULT_STRUCTURED_BYTES),
+    MAX_RESULT_STRUCTURED_BYTES,
+    "maxStructuredBytes",
+  );
   const images: UserImage[] = [];
   const text: string[] = [];
   let unsupported = 0;
   let usedBytes = 0;
+  let imageBytes = 0;
+  let exceededLimit = false;
   const blocks = Array.isArray(response.content) ? response.content : [];
-  if (blocks.length > MAX_CONTENT_BLOCKS) unsupported += blocks.length - MAX_CONTENT_BLOCKS;
-  for (const block of blocks.slice(0, MAX_CONTENT_BLOCKS)) {
+  if (blocks.length > maxBlocks) {
+    unsupported += blocks.length - maxBlocks;
+    exceededLimit = true;
+  }
+  for (const block of blocks.slice(0, maxBlocks)) {
     if (block.type === "text") {
-      const part = boundedText(block.text, Math.max(0, maxBytes - usedBytes));
-      text.push(part);
+      const remaining = Math.max(0, maxBytes - usedBytes);
+      const part = boundedText(block.text, remaining);
+      if (Buffer.byteLength(block.text) > remaining) exceededLimit = true;
+      if (part.length > 0) text.push(part);
       usedBytes += Buffer.byteLength(part);
       continue;
     }
     if (block.type === "image") {
       const image = { type: "image" as const, data: block.data, mimeType: block.mimeType };
+      if (images.length >= MAX_USER_IMAGES) {
+        unsupported += 1;
+        exceededLimit = true;
+        continue;
+      }
       try {
-        if (images.length >= MAX_USER_IMAGES) throw new Error("too many images");
         validateUserImages([...images, image]);
-        const bytes = Buffer.byteLength(image.data, "base64");
-        if (usedBytes + bytes <= maxBytes) {
+        const decodedBytes = Buffer.byteLength(image.data, "base64");
+        const outputBytes = Buffer.byteLength(image.data, "utf8");
+        if (imageBytes + decodedBytes <= maxImageBytes && usedBytes + outputBytes <= maxBytes) {
           images.push(image);
-          usedBytes += bytes;
+          usedBytes += outputBytes;
+          imageBytes += decodedBytes;
         } else {
           unsupported += 1;
+          exceededLimit = true;
         }
       } catch {
         unsupported += 1;
@@ -561,17 +836,35 @@ function mcpResultToToolResult(response: CallToolResult, maxBytes: number): Tool
     unsupported += 1;
   }
   if (response.structuredContent !== undefined) {
-    const structured = boundedText(safeJson(response.structuredContent), Math.max(0, maxBytes - usedBytes));
-    if (structured.length > 0) text.push(structured);
+    const serialized = safeJson(response.structuredContent);
+    const structuredBytes = Buffer.byteLength(serialized);
+    if (structuredBytes > maxStructuredBytes) {
+      exceededLimit = true;
+      unsupported += 1;
+    } else {
+      const remaining = Math.max(0, maxBytes - usedBytes);
+      const structured = boundedText(serialized, remaining);
+      if (structuredBytes > remaining) exceededLimit = true;
+      if (structured.length > 0) {
+        text.push(structured);
+        usedBytes += Buffer.byteLength(structured);
+      }
+    }
   }
   if (unsupported > 0) {
     text.push(`[MCP omitted ${Math.min(unsupported, MAX_UNSUPPORTED_BLOCKS)} unsupported or oversized content block(s)]`);
   }
   if (text.length === 0) text.push(response.isError ? "MCP tool returned an error" : "MCP tool returned no content");
-  const imageBytes = images.reduce((total, image) => total + Buffer.byteLength(image.data, "base64"), 0);
+  const outputImageBytes = images.reduce((total, image) => total + Buffer.byteLength(image.data, "utf8"), 0);
+  const contentBudget = Math.max(0, maxBytes - outputImageBytes);
+  const joined = text.join("\n");
+  const content = boundedText(joined, contentBudget);
+  if (Buffer.byteLength(joined) > contentBudget) {
+    exceededLimit = true;
+  }
   return {
-    content: boundedText(text.join("\n"), Math.max(0, maxBytes - imageBytes)),
-    isError: response.isError === true,
+    content,
+    isError: response.isError === true || exceededLimit,
     ...(images.length === 0 ? {} : { images }),
   };
 }
@@ -634,6 +927,13 @@ function isAbortError(error: unknown): boolean {
     || error instanceof Error && error.name === "AbortError";
 }
 
+function isTimeoutError(error: unknown): boolean {
+  return error !== null
+    && typeof error === "object"
+    && "code" in error
+    && (error as { code?: unknown }).code === -32001;
+}
+
 function safeJson(value: unknown): string {
   try {
     return JSON.stringify(value) ?? "null";
@@ -648,7 +948,71 @@ function safeError(error: unknown): string {
 }
 
 function safeToolName(tool: McpTool): string {
-  return typeof tool?.name === "string" ? boundedText(tool.name, 128) : "<unknown>";
+  return typeof tool?.name === "string" ? safeDiagnosticValue(tool.name) : "<unknown>";
+}
+
+function safeName(value: string): string {
+  return safeDiagnosticValue(value);
+}
+
+function safeCursor(value: string): string {
+  return safeDiagnosticValue(value);
+}
+
+function safeDiagnosticValue(value: string): string {
+  return boundedText(value.replace(/[\u0000-\u001f\u007f]+/gu, " "), 128)
+    .replace(/[\u0000-\u001f\u007f]+/gu, " ");
+}
+
+function compareText(left: string, right: string): number {
+  const leftBytes = Buffer.from(left, "utf8");
+  const rightBytes = Buffer.from(right, "utf8");
+  const length = Math.min(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = (leftBytes[index] ?? 0) - (rightBytes[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return leftBytes.length - rightBytes.length;
+}
+
+function snapshotOptions(options: McpEdgeAdapterOptions): McpEdgeAdapterOptions {
+  const policy = typeof options.policy === "function" || options.policy === undefined
+    ? options.policy
+    : Object.freeze(Object.fromEntries(Object.entries(options.policy).map(([name, value]) => [
+        name,
+        snapshotPolicy(value),
+      ])));
+  return Object.freeze({
+    ...options,
+    ...(options.args === undefined ? {} : { args: Object.freeze([...options.args]) }),
+    ...(options.env === undefined ? {} : { env: Object.freeze({ ...options.env }) }),
+    ...(options.provenance === undefined
+      ? {}
+      : { provenance: Object.freeze({ ...options.provenance }) }),
+    ...(policy === undefined ? {} : { policy }),
+  });
+}
+
+function snapshotPolicy(policy: McpToolPolicy | undefined): McpToolPolicy {
+  if (policy === undefined) return Object.freeze({});
+  const cloned = structuredClone(policy);
+  return Object.freeze({
+    ...cloned,
+    ...(cloned.inputKinds === undefined ? {} : { inputKinds: Object.freeze([...cloned.inputKinds]) }),
+    ...(cloned.outputKinds === undefined ? {} : { outputKinds: Object.freeze([...cloned.outputKinds]) }),
+  });
+}
+
+function assertCompatibleOwnership(ownsClient: boolean, ownsTransport: boolean): void {
+  if (ownsClient && !ownsTransport) {
+    throw new TypeError("MCP client ownership requires transport ownership because the SDK closes them together");
+  }
+}
+
+function assertOptionalBoolean(value: boolean | undefined, name: string): void {
+  if (value !== undefined && typeof value !== "boolean") {
+    throw new TypeError(`${name} must be a boolean`);
+  }
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
