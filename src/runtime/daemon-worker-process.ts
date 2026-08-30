@@ -6,6 +6,8 @@ import { DaemonWorkerStdioTransport } from "./daemon-worker-transport.js";
 import type { DaemonWorkerTransport } from "./daemon-worker-protocol.js";
 import type { DaemonWorkerDescriptorPublisher } from "./daemon-worker-protocol.js";
 
+const DEFAULT_DESCRIPTOR_CLEAR_TIMEOUT_MS = 2_000;
+
 export interface DaemonWorkerProcessOptions extends Omit<DaemonWorkerClientOptions, "transport" | "transportFactory"> {
   readonly command?: string;
   readonly args: readonly string[];
@@ -30,6 +32,7 @@ export class DaemonWorkerProcess {
   private exitCode: number | null | undefined;
   private signal: NodeJS.Signals | null | undefined;
   private publishedInstanceToken: string | undefined;
+  private closePromise: Promise<void> | undefined;
 
   constructor(options: DaemonWorkerProcessOptions) {
     this.options = { ...options, args: [...options.args] };
@@ -54,33 +57,66 @@ export class DaemonWorkerProcess {
     await this.client.initialize();
     const instanceToken = this.client.snapshot.instanceToken;
     if (instanceToken !== undefined && this.options.descriptorPublisher !== undefined) {
-      await this.options.descriptorPublisher.publish({
-        version: 1,
-        runId: this.options.runId,
-        workerId: this.options.workerId,
-        leasePath: this.options.lease.leasePath,
-        fencingToken: this.options.lease.fencingToken,
-        instanceToken,
-        publishedAt: new Date().toISOString(),
-      });
+      // Retain the token before publishing so a publisher that writes and then
+      // rejects can still be asked to clear the possibly-visible descriptor.
       this.publishedInstanceToken = instanceToken;
+      try {
+        await this.options.descriptorPublisher.publish({
+          version: 1,
+          runId: this.options.runId,
+          workerId: this.options.workerId,
+          leasePath: this.options.lease.leasePath,
+          fencingToken: this.options.lease.fencingToken,
+          instanceToken,
+          publishedAt: new Date().toISOString(),
+        });
+      } catch (error: unknown) {
+        // A ready child without a discoverable descriptor is not a usable
+        // worker. Tear down the client and process before exposing the error.
+        // clear() is attempted even when publish failed midway, because an
+        // atomic publisher may have completed publication before rejecting.
+        await this.close().catch(() => undefined);
+        throw error;
+      }
     }
     return this.snapshot;
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closePromise !== undefined) return this.closePromise;
+    const operation = this.closeInternal();
+    this.closePromise = operation;
+    return operation;
+  }
+
+  private async closeInternal(): Promise<void> {
     try {
       await this.client.close();
     } finally {
       try {
         if (this.publishedInstanceToken !== undefined) {
-          await this.options.descriptorPublisher?.clear?.(this.publishedInstanceToken);
-          this.publishedInstanceToken = undefined;
+          const token = this.publishedInstanceToken;
+          try {
+            // Descriptor cleanup is best-effort at process shutdown. A
+            // broken filesystem/publisher must not keep the worker alive
+            // indefinitely, while failures that arrive before the deadline
+            // remain observable to the caller.
+            await waitBounded(
+              Promise.resolve().then(() => this.options.descriptorPublisher?.clear?.(token)),
+              this.options.cancelGraceMs ?? DEFAULT_DESCRIPTOR_CLEAR_TIMEOUT_MS,
+            );
+          } finally {
+            this.publishedInstanceToken = undefined;
+          }
         }
       } finally {
         if (this.child !== undefined && this.child.exitCode === null && this.child.signalCode === null) {
           const child = this.child;
-          child.kill();
+          try {
+            child.kill();
+          } catch {
+            // The child may have exited between the identity check and kill.
+          }
           await Promise.race([
             new Promise<void>((resolve) => child.once("exit", () => resolve())),
             new Promise<void>((resolve) => {
@@ -119,10 +155,44 @@ export class DaemonWorkerProcess {
       output: child.stdin,
       ...(this.options.maxFrameBytes === undefined ? {} : { maxFrameBytes: this.options.maxFrameBytes }),
     });
-    return this.transport;
+    const transport = this.transport;
+    transport.onClose(() => {
+      // A reconnect must spawn a fresh child after stdio has ended. Guard the
+      // assignment so a late close from an older transport cannot clear a new
+      // connection installed in the meantime.
+      if (this.transport === transport) this.transport = undefined;
+    });
+    return transport;
   }
 }
 
 export function spawnDaemonWorker(options: DaemonWorkerProcessOptions): DaemonWorkerProcess {
   return new DaemonWorkerProcess(options);
+}
+
+async function waitBounded(promise: Promise<void>, milliseconds: number): Promise<void> {
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // Keep a rejection handler attached after the timeout wins. A publisher
+  // may finish asynchronously after close has returned; that late failure is
+  // intentionally best-effort and must not become an unhandled rejection.
+  const observed = promise.then(
+    () => undefined,
+    (error: unknown) => {
+      if (timedOut) return;
+      throw error;
+    },
+  );
+  try {
+    await Promise.race([
+      observed,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, milliseconds);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    timedOut = true;
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

@@ -261,6 +261,7 @@ describe("runtime activation parity", () => {
       "web_search",
       "write_file",
       "edit",
+      "apply_patch",
       "directory_create",
       "path_copy",
       "path_move",

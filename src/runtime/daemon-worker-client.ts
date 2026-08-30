@@ -33,6 +33,7 @@ import {
   validateDaemonWorkerFrame,
   validateDaemonWorkerLease,
 } from "./daemon-worker-protocol.js";
+import { persistedErrorText } from "./redaction.js";
 
 const MAX_COMPLETED_ACTIVATIONS = 1_024;
 
@@ -110,8 +111,14 @@ interface PendingActivation {
 }
 
 interface CompletedActivation {
+  readonly commandId: string;
   readonly fingerprint: string;
   readonly receipt: DaemonWorkerActivationReceipt;
+}
+
+interface IssuedCommand {
+  readonly kind: DaemonWorkerCommand["kind"];
+  readonly activationId?: string;
 }
 
 /**
@@ -132,11 +139,13 @@ export class DaemonWorkerClient {
   private readonly initialTransport: DaemonWorkerTransport | undefined;
   private readonly transportFactory: DaemonWorkerTransportFactory | undefined;
   private transport: DaemonWorkerTransport | undefined;
+  private connectionEpoch = 0;
   private unsubscribeFrame: (() => void) | undefined;
   private unsubscribeClose: (() => void) | undefined;
   private readonly pendingCommands = new Map<string, PendingCommand<unknown>>();
   private readonly pendingActivations = new Map<string, PendingActivation>();
   private readonly completedActivations = new Map<string, CompletedActivation>();
+  private readonly issuedCommands = new Map<string, IssuedCommand>();
   private initialized = false;
   private instanceToken: string | undefined;
   private lifecycle: DaemonWorkerClientLifecycle = "disconnected";
@@ -216,7 +225,7 @@ export class DaemonWorkerClient {
     this.assertOpen();
     if (this.initialized && this.transport !== undefined) return this.snapshot;
     await this.connectTransport();
-    const commandId = this.newCommandId();
+    const commandId = this.newCommandId("initialize");
     const frame: DaemonWorkerInitializeFrame = {
       kind: "initialize",
       version: DAEMON_WORKER_PROTOCOL_VERSION,
@@ -273,7 +282,7 @@ export class DaemonWorkerClient {
     if (this.pendingActivations.size >= this.maxPendingActivations) {
       throw new DaemonWorkerProtocolError("queue_full", "worker activation queue is full", true);
     }
-    const commandId = this.newCommandId();
+    const commandId = this.newCommandId("activate", activationId);
     let resolveReceipt!: (receipt: DaemonWorkerActivationReceipt) => void;
     const promise = new Promise<DaemonWorkerActivationReceipt>((resolve) => {
       resolveReceipt = resolve;
@@ -333,7 +342,7 @@ export class DaemonWorkerClient {
     const frame: DaemonWorkerCommand = {
       kind: "cancel",
       version: DAEMON_WORKER_PROTOCOL_VERSION,
-      commandId: this.newCommandId(),
+      commandId: this.newCommandId("cancel", id),
       runId: this.runId,
       activationId: id,
       reason: boundedReason(reason),
@@ -348,7 +357,7 @@ export class DaemonWorkerClient {
     const frame: DaemonWorkerDrainFrame = {
       kind: "drain",
       version: DAEMON_WORKER_PROTOCOL_VERSION,
-      commandId: this.newCommandId(),
+      commandId: this.newCommandId("drain"),
       runId: this.runId,
     };
     const result = await this.sendAwait<DaemonWorkerCommandResultFrame>(frame, "drain");
@@ -366,7 +375,7 @@ export class DaemonWorkerClient {
     const frame: DaemonWorkerShutdownFrame = {
       kind: "shutdown",
       version: DAEMON_WORKER_PROTOCOL_VERSION,
-      commandId: this.newCommandId(),
+      commandId: this.newCommandId("shutdown"),
       runId: this.runId,
       reason: boundedReason(reason),
     };
@@ -387,6 +396,7 @@ export class DaemonWorkerClient {
     this.unsubscribeClose?.();
     this.unsubscribeFrame = undefined;
     this.unsubscribeClose = undefined;
+    this.connectionEpoch += 1;
     const transport = this.transport;
     this.transport = undefined;
     for (const activation of [...this.pendingActivations.values()]) {
@@ -397,10 +407,21 @@ export class DaemonWorkerClient {
       ));
     }
     this.rejectPendingCommands(new DaemonWorkerTransportError("closed", "worker client closed"));
-    if (transport?.close !== undefined) await transport.close();
-    this.initialized = false;
-    this.instanceToken = undefined;
-    this.lifecycle = "stopped";
+    try {
+      if (transport?.close !== undefined) {
+        // A broken child stream must not make shutdown wait forever. The
+        // transport close promise is observed even after the bound expires so
+        // a late rejection cannot become unhandled.
+        await settleWithin(
+          Promise.resolve().then(() => transport.close?.()),
+          this.cancelGraceMs,
+        );
+      }
+    } finally {
+      this.initialized = false;
+      this.instanceToken = undefined;
+      this.lifecycle = "stopped";
+    }
   }
 
   private async requireReady(): Promise<void> {
@@ -416,15 +437,29 @@ export class DaemonWorkerClient {
     const operation = (async (): Promise<void> => {
       const transport = this.initialTransport
         ?? await this.transportFactory!.connect();
+      if (this.closed) {
+        await settleWithin(
+          Promise.resolve().then(() => transport.close?.()),
+          this.cancelGraceMs,
+        );
+        throw new DaemonWorkerTransportError("closed", "worker client was closed while connecting");
+      }
+      const epoch = ++this.connectionEpoch;
       this.transport = transport;
-      this.unsubscribeFrame = transport.onFrame((frame) => this.handleFrame(frame));
-      this.unsubscribeClose = transport.onClose((error) => this.handleClose(error));
+      this.unsubscribeFrame = transport.onFrame((frame) => {
+        if (this.transport !== transport || this.connectionEpoch !== epoch) return;
+        this.handleFrame(frame);
+      });
+      this.unsubscribeClose = transport.onClose((error) => {
+        if (this.transport !== transport || this.connectionEpoch !== epoch) return;
+        this.handleClose(error, transport, epoch);
+      });
     })();
     this.connectionPromise = operation;
     try {
       await operation;
     } catch (error: unknown) {
-      this.lifecycle = "failed";
+      this.lifecycle = this.closed ? "stopped" : "failed";
       throw asError(error, "worker transport connection failed");
     } finally {
       if (this.connectionPromise === operation) this.connectionPromise = undefined;
@@ -454,6 +489,7 @@ export class DaemonWorkerClient {
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingCommands.delete(commandId);
+        this.issuedCommands.delete(commandId);
         reject(new DaemonWorkerTransportError("timeout", `worker ${kind} command timed out`));
       }, this.commandTimeoutMs);
       timer.unref?.();
@@ -469,6 +505,7 @@ export class DaemonWorkerClient {
         const pending = this.pendingCommands.get(commandId);
         if (pending === undefined) return;
         this.pendingCommands.delete(commandId);
+        this.issuedCommands.delete(commandId);
         clearTimeout(pending.timer);
         pending.reject(asError(error, "worker command failed"));
       });
@@ -536,11 +573,9 @@ export class DaemonWorkerClient {
   }
 
   private resolveReady(frame: DaemonWorkerReadyFrame): void {
+    if (!this.responseMatchesOwner(frame.commandId, "initialize")) return;
     const pending = this.pendingCommands.get(frame.commandId);
     if (pending === undefined) {
-      if (this.pendingActivationByCommandId(frame.commandId) !== undefined) {
-        this.protocolConflict("worker ready response collided with an activation command");
-      }
       return;
     }
     if (pending.kind !== "initialize") {
@@ -551,11 +586,9 @@ export class DaemonWorkerClient {
   }
 
   private resolveCommandResult(frame: DaemonWorkerCommandResultFrame): void {
+    if (!this.responseMatchesOwner(frame.commandId, frame.command, frame.activationId)) return;
     const pending = this.pendingCommands.get(frame.commandId);
     if (pending === undefined) {
-      if (this.pendingActivationByCommandId(frame.commandId) !== undefined) {
-        this.protocolConflict("worker command result collided with an activation command");
-      }
       return;
     }
     if (pending.kind !== frame.command) {
@@ -575,10 +608,7 @@ export class DaemonWorkerClient {
   }
 
   private handleAccepted(frame: DaemonWorkerAcceptedFrame): void {
-    if (this.pendingCommands.has(frame.commandId)) {
-      this.protocolConflict("worker acceptance collided with a pending command");
-      return;
-    }
+    if (!this.responseMatchesOwner(frame.commandId, "activate", frame.activationId)) return;
     const pending = this.pendingActivations.get(frame.activationId);
     if (pending === undefined || pending.settled) {
       return;
@@ -591,10 +621,7 @@ export class DaemonWorkerClient {
   }
 
   private handleTerminal(frame: DaemonWorkerActivationTerminalFrame): void {
-    if (this.pendingCommands.has(frame.commandId)) {
-      this.protocolConflict("worker terminal collided with a pending command");
-      return;
-    }
+    if (!this.responseMatchesOwner(frame.commandId, "activate", frame.activationId)) return;
     const pending = this.pendingActivations.get(frame.activationId);
     const prior = this.completedActivations.get(frame.activationId);
     const receipt = toReceipt(frame);
@@ -625,11 +652,20 @@ export class DaemonWorkerClient {
     }
     const pending = this.pendingCommands.get(frame.commandId);
     const activation = this.pendingActivationByCommandId(frame.commandId);
+    const owner = this.issuedCommands.get(frame.commandId);
+    if (owner === undefined) {
+      this.protocolConflict("worker error references an unknown command");
+      return;
+    }
     if (pending !== undefined && activation !== undefined) {
       this.protocolConflict("worker error command ID is owned by multiple pending operations");
       return;
     }
     if (activation !== undefined) {
+      if (owner.kind !== "activate" || owner.activationId !== activation.activationId) {
+        this.protocolConflict("worker error does not match the pending activation");
+        return;
+      }
       this.settleActivation(activation.activationId, {
         activationId: activation.activationId,
         runId: this.runId,
@@ -639,7 +675,12 @@ export class DaemonWorkerClient {
       return;
     }
     if (pending === undefined) return;
+    if (owner.kind !== pending.kind || owner.activationId !== pending.activationId) {
+      this.protocolConflict("worker error does not match the pending command");
+      return;
+    }
     this.pendingCommands.delete(frame.commandId);
+    this.issuedCommands.delete(frame.commandId);
     clearTimeout(pending.timer);
     pending.reject(new DaemonWorkerProtocolError(frame.code, frame.message, frame.retryable));
   }
@@ -648,12 +689,23 @@ export class DaemonWorkerClient {
     const pending = this.pendingCommands.get(commandId);
     if (pending === undefined) return;
     this.pendingCommands.delete(commandId);
+    this.issuedCommands.delete(commandId);
     clearTimeout(pending.timer);
     pending.resolve(value);
   }
 
-  private handleClose(error?: Error): void {
+  private handleClose(
+    error?: Error,
+    source?: DaemonWorkerTransport,
+    epoch?: number,
+  ): void {
     if (this.closed) return;
+    if (source !== undefined && (this.transport !== source || epoch !== this.connectionEpoch)) return;
+    this.unsubscribeFrame?.();
+    this.unsubscribeClose?.();
+    this.unsubscribeFrame = undefined;
+    this.unsubscribeClose = undefined;
+    this.connectionEpoch += 1;
     this.transport = undefined;
     this.initialized = false;
     this.instanceToken = undefined;
@@ -685,13 +737,18 @@ export class DaemonWorkerClient {
     clearTimeout(pending.timer);
     this.pendingActivations.delete(activationId);
     this.completedActivations.set(activationId, {
+      commandId: pending.commandId,
       fingerprint: pending.fingerprint,
       receipt,
     });
     while (this.completedActivations.size > MAX_COMPLETED_ACTIVATIONS) {
       const oldest = this.completedActivations.keys().next().value as string | undefined;
       if (oldest === undefined) break;
+      const evicted = this.completedActivations.get(oldest);
       this.completedActivations.delete(oldest);
+      if (evicted !== undefined && this.issuedCommands.get(evicted.commandId)?.kind === "activate") {
+        this.issuedCommands.delete(evicted.commandId);
+      }
     }
     pending.resolve(receipt);
   }
@@ -699,22 +756,54 @@ export class DaemonWorkerClient {
   private rejectPendingCommands(error: Error): void {
     for (const pending of this.pendingCommands.values()) {
       clearTimeout(pending.timer);
+      this.issuedCommands.delete(pending.commandId);
       pending.reject(error);
     }
     this.pendingCommands.clear();
   }
 
-  private newCommandId(): string {
+  private newCommandId(kind: DaemonWorkerCommand["kind"], activationId?: string): string {
     const value = this.createCommandId();
     const commandId = identifier(value, "commandId");
-    if (this.commandIdInUse(commandId)) {
-      throw new DaemonWorkerProtocolError("command_conflict", `worker command ID is already in use: ${commandId}`);
+    const prior = this.issuedCommands.get(commandId);
+    // Activation command ownership is retained through terminal replay. A
+    // reused activation ID would make a late terminal indistinguishable from
+    // a fresh command, so keep that identity reserved until its bounded
+    // completed-receipt entry is evicted.
+    if (
+      prior !== undefined
+      && (prior.kind === "activate"
+        || this.pendingCommands.has(commandId)
+        || this.pendingActivationByCommandId(commandId) !== undefined)
+    ) {
+      throw new DaemonWorkerProtocolError("command_conflict", `worker command ID was reused: ${commandId}`);
     }
+    if (prior !== undefined) this.issuedCommands.delete(commandId);
+    this.issuedCommands.set(commandId, {
+      kind,
+      ...(activationId === undefined ? {} : { activationId }),
+    });
     return commandId;
   }
 
-  private commandIdInUse(commandId: string): boolean {
-    return this.pendingCommands.has(commandId) || this.pendingActivationByCommandId(commandId) !== undefined;
+  private responseMatchesOwner(
+    commandId: string,
+    kind: DaemonWorkerCommand["kind"],
+    activationId?: string,
+  ): boolean {
+    const owner = this.issuedCommands.get(commandId);
+    const activationMatches = kind === "cancel"
+      ? activationId === undefined || owner?.activationId === activationId
+      : owner?.activationId === activationId;
+    if (
+      owner === undefined
+      || owner.kind !== kind
+      || !activationMatches
+    ) {
+      this.protocolConflict("worker response does not match the issued command");
+      return false;
+    }
+    return true;
   }
 
   private pendingActivationByCommandId(commandId: string): PendingActivation | undefined {
@@ -763,8 +852,12 @@ function uncertainReceipt(
     runId,
     status: "uncertain",
     error: {
-      code: error instanceof DaemonWorkerTransportError ? error.transportCode : "uncertain",
-      message: error instanceof Error ? error.message : "worker activation outcome is uncertain",
+      code: error instanceof DaemonWorkerTransportError
+        ? error.transportCode
+        : error instanceof DaemonWorkerProtocolError
+          ? error.code
+          : "uncertain",
+      message: persistedErrorText(error, "worker activation outcome is uncertain", 512),
     },
   };
 }
@@ -806,6 +899,16 @@ function boundedInteger(
     throw new RangeError(`${field} is outside its supported range`);
   }
   return candidate;
+}
+
+async function settleWithin<T>(promise: Promise<T>, milliseconds: number): Promise<void> {
+  await Promise.race([
+    promise.then(() => undefined, () => undefined),
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, milliseconds);
+      timer.unref?.();
+    }),
+  ]);
 }
 
 function asError(error: unknown, fallback: string): Error {

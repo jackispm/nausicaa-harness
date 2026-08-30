@@ -336,6 +336,93 @@ describe("daemon worker protocol", () => {
     await client.close();
   });
 
+  it("rejects a command ID collision across activation and cancel", async () => {
+    const [clientTransport, serverTransport] = pair();
+    const leases = new MemoryExecutionLeaseStore({ createLeaseId: () => "lease-1" });
+    const claimed = await leases.claim({ runId: "run-1", ownerId: "host", acquisitionId: "claim-1", ttlMs: 10_000 });
+    if (claimed.status !== "acquired") throw new Error("expected lease");
+    const server = new DaemonWorkerServer({
+      runId: "run-1",
+      workerId: "worker-1",
+      transport: serverTransport,
+      leaseStoreFactory: { open: async () => leases },
+      cancelGraceMs: 10,
+      runner: { activate: async () => new Promise(() => undefined) },
+    });
+    server.start();
+    let commandOrdinal = 0;
+    const client = new DaemonWorkerClient({
+      runId: "run-1",
+      workerId: "worker-1",
+      lease: { runId: "run-1", leasePath: "/unused", fencingToken: claimed.lease.fencingToken },
+      transport: clientTransport,
+      cancelGraceMs: 10,
+      createCommandId: () => commandOrdinal++ === 0 ? "initialize" : "shared-command",
+    });
+    await client.initialize();
+    const activation = client.activate({ activationId: "activation-1", wakes: [] });
+    await settled();
+    await expect(client.cancel("activation-1")).rejects.toMatchObject({ code: "command_conflict" });
+    await client.close();
+    await expect(activation).resolves.toMatchObject({ status: "uncertain" });
+    await server.close();
+  });
+
+  it("starts an admitted runner even when the accepted write never settles", async () => {
+    const transport = new FakeTransport((frame, current) => {
+      if (frame.kind === "initialize") {
+        queueMicrotask(() => current.emit({
+          kind: "ready",
+          version: 1,
+          commandId: frame.commandId,
+          runId: "run-1",
+          workerId: "worker-1",
+          instanceToken: "instance-1",
+        }));
+      }
+      if (frame.kind === "accepted") return new Promise<void>(() => undefined);
+    });
+    const leases = new MemoryExecutionLeaseStore({ createLeaseId: () => "lease-1" });
+    const claimed = await leases.claim({ runId: "run-1", ownerId: "host", acquisitionId: "claim-1", ttlMs: 10_000 });
+    if (claimed.status !== "acquired") throw new Error("expected lease");
+    let invoked = false;
+    const server = new DaemonWorkerServer({
+      runId: "run-1",
+      workerId: "worker-1",
+      transport,
+      leaseStoreFactory: { open: async () => leases },
+      cancelGraceMs: 10,
+      runner: {
+        activate: async () => {
+          invoked = true;
+          return { status: "completed" };
+        },
+      },
+    });
+    server.start();
+    transport.emit({
+      kind: "initialize",
+      version: 1,
+      commandId: "initialize",
+      runId: "run-1",
+      workerId: "worker-1",
+      lease: { runId: "run-1", leasePath: "/unused", fencingToken: claimed.lease.fencingToken },
+    });
+    await settled();
+    transport.emit({
+      kind: "activate",
+      version: 1,
+      commandId: "activate",
+      runId: "run-1",
+      activationId: "activation-1",
+      lease: { runId: "run-1", leasePath: "/unused", fencingToken: claimed.lease.fencingToken },
+      wakes: [],
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(invoked).toBe(true);
+    await server.close();
+  });
+
   it("cooperatively cancels a running activation within the worker grace period", async () => {
     const [clientTransport, serverTransport] = pair();
     const leases = new MemoryExecutionLeaseStore({ createLeaseId: () => "lease-1" });
@@ -431,6 +518,50 @@ describe("daemon worker protocol", () => {
     });
     const descriptor = await readFile(leasePath, "utf8");
     expect(descriptor).toContain('"version":1');
+  });
+
+  it("shares process close and observes a late descriptor cleanup failure", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-worker-close-"));
+    roots.push(root);
+    const leasePath = join(root, "leases.json");
+    const leases = await FileExecutionLeaseStore.open(leasePath, { createLeaseId: () => "lease-parent" });
+    const claimed = await leases.claim({ runId: "run-1", ownerId: "host", acquisitionId: "claim-1", ttlMs: 10_000 });
+    if (claimed.status !== "acquired") throw new Error("expected lease");
+    const script = [
+      "import { runDaemonWorkerStdioServer } from './src/runtime/daemon-worker-server.ts';",
+      "runDaemonWorkerStdioServer({ runId: 'run-1', workerId: 'worker-1', runner: { activate: async () => ({ status: 'completed' }) } });",
+    ].join(" ");
+    let clearCalls = 0;
+    const publisher = {
+      publish: async () => undefined,
+      clear: async () => {
+        clearCalls += 1;
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        throw new Error("late descriptor cleanup failure");
+      },
+    };
+    const worker = spawnDaemonWorker({
+      runId: "run-1",
+      workerId: "worker-1",
+      lease: { runId: "run-1", leasePath, fencingToken: claimed.lease.fencingToken },
+      args: ["--import", "tsx", "--input-type=module", "-e", script],
+      cwd: process.cwd(),
+      env: process.env,
+      cancelGraceMs: 10,
+      descriptorPublisher: publisher,
+    });
+    await worker.initialize();
+    const first = worker.close();
+    const second = worker.close();
+    expect(second).toBe(first);
+    const deadline = Symbol("close deadline");
+    const result = await Promise.race([
+      Promise.all([first, second]),
+      new Promise<typeof deadline>((resolve) => setTimeout(() => resolve(deadline), 500)),
+    ]);
+    expect(result).not.toBe(deadline);
+    await new Promise<void>((resolve) => setTimeout(resolve, 75));
+    expect(clearCalls).toBe(1);
   });
 
   it("publishes and clears descriptors atomically by instance token", async () => {

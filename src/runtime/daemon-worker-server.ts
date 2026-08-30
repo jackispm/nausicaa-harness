@@ -11,6 +11,7 @@ import type {
   DaemonWorkerAcceptedFrame,
   DaemonWorkerActivateFrame,
   DaemonWorkerActivationTerminalFrame,
+  DaemonWorkerCommand,
   DaemonWorkerCommandResultFrame,
   DaemonWorkerErrorCode,
   DaemonWorkerFrame,
@@ -23,8 +24,10 @@ import type {
 } from "./daemon-worker-protocol.js";
 import { DaemonWorkerStdioTransport } from "./daemon-worker-transport.js";
 import type { Readable, Writable } from "node:stream";
+import { persistedErrorText } from "./redaction.js";
 
 const MAX_COMPLETED_ACTIVATIONS = 1_024;
+const MAX_COMMAND_RECORDS = 4_096;
 import {
   DAEMON_WORKER_PROTOCOL_VERSION,
   DEFAULT_DAEMON_WORKER_CANCEL_GRACE_MS,
@@ -78,8 +81,21 @@ interface Activation {
   readonly frame: DaemonWorkerActivateFrame;
   readonly fingerprint: string;
   readonly controller: AbortController;
+  readonly commandIds: Set<string>;
   promise: Promise<void>;
-  terminal: boolean;
+  terminal?: DaemonWorkerActivationTerminalFrame;
+}
+
+interface CompletedActivation {
+  readonly commandId: string;
+  readonly fingerprint: string;
+  readonly terminal: DaemonWorkerActivationTerminalFrame;
+}
+
+interface CommandRecord {
+  readonly signature: string;
+  readonly kind: DaemonWorkerCommand["kind"];
+  readonly activationId?: string;
 }
 
 /**
@@ -100,7 +116,10 @@ export class DaemonWorkerServer {
   private readonly cancelGraceMs: number;
   private readonly createInstanceToken: () => string;
   private readonly activations = new Map<string, Activation>();
-  private readonly completed = new Set<string>();
+  private readonly completed = new Map<string, CompletedActivation>();
+  private readonly commandRecords = new Map<string, CommandRecord>();
+  private readonly activeCommandIds = new Set<string>();
+  private dispatchTail: Promise<void> = Promise.resolve();
   private unsubscribeFrame: (() => void) | undefined;
   private unsubscribeClose: (() => void) | undefined;
   private initialized = false;
@@ -164,12 +183,13 @@ export class DaemonWorkerServer {
   }
 
   start(): DaemonWorkerServerSnapshot {
+    if (this.closed) return this.snapshot;
     if (this.unsubscribeFrame !== undefined) return this.snapshot;
     this.unsubscribeFrame = this.transport.onFrame((value) => {
-      void this.handle(value);
+      this.enqueue(() => this.handle(value));
     });
     this.unsubscribeClose = this.transport.onClose(() => {
-      void this.shutdown("transport closed");
+      this.enqueue(() => this.shutdown("transport closed"));
     });
     return this.snapshot;
   }
@@ -184,11 +204,20 @@ export class DaemonWorkerServer {
     this.unsubscribeClose = undefined;
     for (const activation of this.activations.values()) activation.controller.abort(new Error(reason));
     await this.waitForActivations();
-    try {
-      await this.runner.close?.();
-    } finally {
-      await this.transport.close?.();
-    }
+    // Preserve runner-before-transport ordering while bounding each hook.
+    // A child must finish its own cleanup attempt before its IPC stream is
+    // torn down, but a misbehaving hook cannot hold shutdown indefinitely.
+    await settleWithin(
+      Promise.resolve().then(() => this.runner.close?.()),
+      this.cancelGraceMs,
+    );
+    await settleWithin(
+      Promise.resolve().then(() => this.transport.close?.()),
+      this.cancelGraceMs,
+    );
+    this.initialized = false;
+    this.instanceToken = undefined;
+    this.lease = undefined;
   }
 
   private async handle(value: unknown): Promise<void> {
@@ -205,22 +234,102 @@ export class DaemonWorkerServer {
       return;
     }
     try {
-      if (frame.kind === "initialize") await this.initialize(frame);
-      else {
+      if (!isDaemonWorkerCommand(frame)) {
+        await this.sendError(frame.commandId, "invalid_frame", "worker frame is not a host command", false);
+        return;
+      }
+      if (frame.kind === "initialize") {
+        this.rememberCommand(frame);
+        this.activeCommandIds.add(frame.commandId);
+        try {
+          await this.initialize(frame);
+        } finally {
+          this.activeCommandIds.delete(frame.commandId);
+          this.pruneCommandRecords();
+        }
+      } else {
         if (frame.runId !== this.runId) {
           throw new DaemonWorkerProtocolError("identity_mismatch", "worker command Run ID mismatch");
         }
-        if (frame.kind === "activate") await this.activate(frame);
-        else if (frame.kind === "cancel") await this.cancel(frame.activationId, frame.commandId, frame.reason);
-        else if (frame.kind === "drain") await this.drain(frame.commandId);
-        else if (frame.kind === "shutdown") await this.shutdown(frame.reason ?? "shutdown requested", frame.commandId);
-        else await this.sendError(frame.commandId, "invalid_frame", "worker command is not accepted from the host", false);
+        this.rememberCommand(frame);
+        this.activeCommandIds.add(frame.commandId);
+        try {
+          if (frame.kind === "activate") await this.activate(frame);
+          else if (frame.kind === "cancel") await this.cancel(frame.activationId, frame.commandId, frame.reason);
+          else if (frame.kind === "drain") await this.drain(frame.commandId);
+          else if (frame.kind === "shutdown") await this.shutdown(frame.reason ?? "shutdown requested", frame.commandId);
+        } finally {
+          this.activeCommandIds.delete(frame.commandId);
+          this.pruneCommandRecords();
+        }
       }
     } catch (error: unknown) {
       const code = error instanceof DaemonWorkerProtocolError ? error.code : "internal";
       const retryable = error instanceof DaemonWorkerProtocolError ? error.retryable : false;
       await this.sendError(frame.commandId, code, errorMessage(error), retryable);
     }
+  }
+
+  /**
+   * Transport callbacks can arrive back-to-back (notably initialize followed
+   * by activate). Keep protocol handling serialized so the handshake and
+   * command state transitions cannot overtake one another.
+   */
+  private enqueue(operation: () => Promise<void>): void {
+    this.dispatchTail = this.dispatchTail
+      .then(operation)
+      .catch(async (error: unknown) => {
+        if (this.closed) return;
+        try {
+          await this.sendError(null, "internal", errorMessage(error), false);
+        } catch {
+          // A transport failure is reported through its close callback. Do
+          // not leave an unhandled rejection on the dispatch chain.
+        }
+      });
+  }
+
+  private rememberCommand(frame: DaemonWorkerCommand): void {
+    const signature = commandSignature(frame);
+    const activationId = commandActivationId(frame);
+    const prior = this.commandRecords.get(frame.commandId);
+    if (prior !== undefined) {
+      if (
+        prior.kind !== frame.kind
+        || prior.activationId !== activationId
+        || prior.signature !== signature
+      ) {
+        throw new DaemonWorkerProtocolError("command_conflict", "worker command ID was reused with different input");
+      }
+      return;
+    }
+    const record: CommandRecord = {
+      signature,
+      kind: frame.kind,
+      ...(activationId === undefined ? {} : { activationId }),
+    };
+    this.commandRecords.set(frame.commandId, record);
+    this.pruneCommandRecords();
+  }
+
+  private pruneCommandRecords(): void {
+    while (this.commandRecords.size > MAX_COMMAND_RECORDS) {
+      const candidate = [...this.commandRecords.keys()]
+        .find((commandId) => !this.commandRecordProtected(commandId));
+      if (candidate === undefined) return;
+      this.commandRecords.delete(candidate);
+    }
+  }
+
+  private commandRecordProtected(commandId: string): boolean {
+    if (this.activeCommandIds.has(commandId)) return true;
+    for (const activation of this.activations.values()) {
+      if (activation.frame.commandId === commandId) return true;
+    }
+    for (const activation of this.completed.values()) {
+      if (activation.commandId === commandId) return true;
+    }
+    return false;
   }
 
   private async initialize(frame: DaemonWorkerInitializeFrame): Promise<void> {
@@ -259,11 +368,20 @@ export class DaemonWorkerServer {
       if (existing.fingerprint !== fingerprint) {
         throw new DaemonWorkerProtocolError("command_conflict", "activation ID was reused with different input");
       }
-      await this.sendAccepted(frame);
+      existing.commandIds.add(frame.commandId);
+      await settleWithin(this.sendAccepted(frame), this.cancelGraceMs);
+      if (existing.terminal !== undefined) {
+        await this.sendTerminalReplay(existing.terminal, frame.commandId);
+      }
       return;
     }
-    if (this.completed.has(frame.activationId)) {
-      await this.sendAccepted(frame);
+    const completed = this.completed.get(frame.activationId);
+    if (completed !== undefined) {
+      if (completed.fingerprint !== fingerprint) {
+        throw new DaemonWorkerProtocolError("command_conflict", "activation ID was reused with different input");
+      }
+      await settleWithin(this.sendAccepted(frame), this.cancelGraceMs);
+      await this.sendTerminalReplay(completed.terminal, frame.commandId);
       return;
     }
     if (this.activations.size >= this.maxPendingActivations) {
@@ -274,12 +392,21 @@ export class DaemonWorkerServer {
       frame,
       fingerprint,
       controller,
-      terminal: false,
+      commandIds: new Set([frame.commandId]),
       promise: Promise.resolve(),
     };
     this.activations.set(frame.activationId, activation);
-    activation.promise = Promise.resolve().then(() => this.runActivation(activation));
-    await this.sendAccepted(frame);
+    // Give the accepted write a bounded chance to cross the transport before
+    // scheduling the runner. A broken transport must not strand the admitted
+    // activation, but healthy transports retain accepted-before-terminal order.
+    const accepted = settleWithin(this.sendAccepted(frame), this.cancelGraceMs);
+    activation.promise = accepted.then(async () => {
+      if (this.closed || this.activations.get(frame.activationId) !== activation) {
+        this.activations.delete(frame.activationId);
+        return;
+      }
+      await this.runActivation(activation);
+    });
   }
 
   private async runActivation(activation: Activation): Promise<void> {
@@ -326,7 +453,6 @@ export class DaemonWorkerServer {
         errorMessage(error),
       );
     } finally {
-      this.markCompleted(frame.activationId);
       this.activations.delete(frame.activationId);
     }
   }
@@ -342,7 +468,15 @@ export class DaemonWorkerServer {
       throw new DaemonWorkerProtocolError("activation_unknown", "worker activation is unknown");
     }
     activation.controller.abort(new Error(reason));
-    await this.runner.cancel?.({ runId: this.runId, activationId, reason });
+    // The optional hook is advisory and may itself hang. Bound its wait so the
+    // command still reaches a terminal result within a finite grace window;
+    // the activation signal remains authoritative if the hook fails.
+    await settleWithin(
+      Promise.resolve()
+        .then(() => this.runner.cancel?.({ runId: this.runId, activationId, reason }))
+        .catch(() => undefined),
+      this.cancelGraceMs,
+    );
     const settled = await Promise.race([activation.promise.then(() => true), delay(this.cancelGraceMs).then(() => false)]);
     if (!settled) await this.sendTerminal(activation, "uncertain", "worker did not stop within cancellation grace");
     await this.sendCommandResult(commandId, "cancel", "ok", activationId);
@@ -360,8 +494,11 @@ export class DaemonWorkerServer {
     for (const activation of this.activations.values()) activation.controller.abort(new Error(reason));
     await this.waitForActivations();
     this.lifecycle = "stopped";
-    if (commandId !== undefined) await this.sendCommandResult(commandId, "shutdown", "ok");
-    await this.close(reason);
+    try {
+      if (commandId !== undefined) await this.sendCommandResult(commandId, "shutdown", "ok");
+    } finally {
+      await this.close(reason);
+    }
   }
 
   private async waitForActivations(): Promise<void> {
@@ -373,10 +510,14 @@ export class DaemonWorkerServer {
     ]);
   }
 
-  private markCompleted(activationId: string): void {
-    this.completed.add(activationId);
+  private rememberCompleted(activation: Activation, terminal: DaemonWorkerActivationTerminalFrame): void {
+    this.completed.set(activation.frame.activationId, {
+      commandId: activation.frame.commandId,
+      fingerprint: activation.fingerprint,
+      terminal,
+    });
     while (this.completed.size > MAX_COMPLETED_ACTIVATIONS) {
-      const oldest = this.completed.values().next().value as string | undefined;
+      const oldest = this.completed.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       this.completed.delete(oldest);
     }
@@ -425,17 +566,41 @@ export class DaemonWorkerServer {
     status: DaemonWorkerActivationTerminalFrame["status"],
     message?: string,
   ): Promise<void> {
-    if (activation.terminal) return;
-    activation.terminal = true;
-    await this.send({
+    if (activation.terminal !== undefined) return;
+    const terminal: DaemonWorkerActivationTerminalFrame = {
       kind: "activation.terminal",
       version: DAEMON_WORKER_PROTOCOL_VERSION,
       commandId: activation.frame.commandId,
       runId: this.runId,
       activationId: activation.frame.activationId,
       status,
-      ...(message === undefined ? {} : { error: { code: status === "uncertain" ? "cancel_timeout" : "runner_failed", message: message.slice(0, 512) } }),
-    });
+      ...(message === undefined ? {} : {
+        error: {
+          code: status === "uncertain" ? "cancel_timeout" : "runner_failed",
+          message: errorMessage(message),
+        },
+      }),
+    };
+    activation.terminal = terminal;
+    // Cache before writing to the transport so a disconnect cannot lose the
+    // terminal receipt or allow a later duplicate to execute the runner.
+    this.rememberCompleted(activation, terminal);
+    await Promise.all([...activation.commandIds].map((commandId) => this.sendTerminalReplay(terminal, commandId)));
+  }
+
+  private async sendTerminalReplay(
+    terminal: DaemonWorkerActivationTerminalFrame,
+    commandId: string,
+  ): Promise<void> {
+    try {
+      await settleWithin(
+        this.send({ ...terminal, commandId }),
+        this.cancelGraceMs,
+      );
+    } catch {
+      // The transport close path owns reconnect/uncertain handling. A failed
+      // best-effort replay must not reject the activation promise.
+    }
   }
 
   private async sendCommandResult(
@@ -463,14 +628,17 @@ export class DaemonWorkerServer {
       commandId,
       runId: this.runId,
       code,
-      message: message.slice(0, 512),
+      message: errorMessage(message),
       retryable,
     });
   }
 
   private async send(frame: DaemonWorkerFrame): Promise<void> {
     encodeDaemonWorkerFrame(frame, this.maxFrameBytes);
-    await this.transport.send(frame);
+    await awaitWithin(
+      Promise.resolve().then(() => this.transport.send(frame)),
+      this.cancelGraceMs,
+    );
   }
 }
 
@@ -515,7 +683,7 @@ function boundedInteger(value: number | undefined, fallback: number, minimum: nu
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return persistedErrorText(error, "Unknown worker error", 512).replace(/[\r\n]+/g, " ");
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -523,4 +691,59 @@ function delay(milliseconds: number): Promise<void> {
     const timer = setTimeout(resolve, milliseconds);
     timer.unref?.();
   });
+}
+
+async function settleWithin<T>(promise: Promise<T>, milliseconds: number): Promise<void> {
+  await Promise.race([
+    promise.then(() => undefined, () => undefined),
+    delay(milliseconds),
+  ]);
+}
+
+async function awaitWithin<T>(promise: Promise<T>, milliseconds: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new DaemonWorkerProtocolError("internal", "worker transport write timed out", true));
+      }, milliseconds);
+      timer.unref?.();
+      promise.then(resolve, reject);
+    });
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function isDaemonWorkerCommand(frame: DaemonWorkerFrame): frame is DaemonWorkerCommand {
+  return frame.kind === "initialize"
+    || frame.kind === "activate"
+    || frame.kind === "cancel"
+    || frame.kind === "drain"
+    || frame.kind === "shutdown";
+}
+
+function commandActivationId(frame: DaemonWorkerCommand): string | undefined {
+  return frame.kind === "activate" || frame.kind === "cancel" ? frame.activationId : undefined;
+}
+
+function commandSignature(frame: DaemonWorkerCommand): string {
+  switch (frame.kind) {
+    case "initialize":
+      return JSON.stringify({ kind: frame.kind, runId: frame.runId, workerId: frame.workerId, lease: frame.lease });
+    case "activate":
+      return JSON.stringify({
+        kind: frame.kind,
+        runId: frame.runId,
+        activationId: frame.activationId,
+        lease: frame.lease,
+        wakes: frame.wakes,
+      });
+    case "cancel":
+      return JSON.stringify({ kind: frame.kind, runId: frame.runId, activationId: frame.activationId, reason: frame.reason });
+    case "drain":
+      return JSON.stringify({ kind: frame.kind, runId: frame.runId });
+    case "shutdown":
+      return JSON.stringify({ kind: frame.kind, runId: frame.runId, reason: frame.reason });
+  }
 }

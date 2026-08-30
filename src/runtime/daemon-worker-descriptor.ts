@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 import { assertNoSymlinkComponents } from "../ledger/file-utils.js";
@@ -28,6 +28,11 @@ export class FileDaemonWorkerDescriptorPublisher implements DaemonWorkerDescript
     await assertNoSymlinkComponents(this.path);
     const parent = dirname(this.path);
     await mkdir(parent, { recursive: true, mode: 0o700 });
+    await chmod(parent, 0o700);
+    const parentInfo = await lstat(parent);
+    if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || (Number(parentInfo.mode) & 0o077) !== 0) {
+      throw new TypeError("descriptor parent directory must be private");
+    }
     const encoded = `${JSON.stringify(descriptor)}\n`;
     if (Buffer.byteLength(encoded) > MAX_DESCRIPTOR_BYTES) throw new RangeError("worker descriptor exceeds its byte limit");
     const temporary = `${this.path}.${randomUUID()}.tmp`;
@@ -44,14 +49,26 @@ export class FileDaemonWorkerDescriptorPublisher implements DaemonWorkerDescript
     if (typeof instanceToken !== "string" || instanceToken.length === 0) return;
     await assertNoSymlinkComponents(this.path);
     let current: DaemonWorkerDescriptor;
+    let initialIdentity: { dev: bigint; ino: bigint };
     try {
-      const info = await lstat(this.path);
+      const info = await lstat(this.path, { bigint: true });
       if (!info.isFile() || info.isSymbolicLink()) return;
+      if (info.size > BigInt(MAX_DESCRIPTOR_BYTES)) return;
       current = JSON.parse(await readFile(this.path, "utf8")) as DaemonWorkerDescriptor;
+      validateDescriptor(current);
+      initialIdentity = { dev: info.dev, ino: info.ino };
     } catch {
       return;
     }
     if (current.instanceToken !== instanceToken) return;
+    const beforeDelete = await lstat(this.path, { bigint: true }).catch(() => undefined);
+    if (
+      beforeDelete === undefined
+      || !beforeDelete.isFile()
+      || beforeDelete.isSymbolicLink()
+      || beforeDelete.dev !== initialIdentity.dev
+      || beforeDelete.ino !== initialIdentity.ino
+    ) return;
     await unlink(this.path).catch(() => undefined);
   }
 }
@@ -64,6 +81,7 @@ export async function readDaemonWorkerDescriptor(
   try {
     const info = await lstat(publisher.path);
     if (!info.isFile() || info.isSymbolicLink()) return undefined;
+    if (info.size > MAX_DESCRIPTOR_BYTES) return undefined;
     const descriptor = JSON.parse(await readFile(publisher.path, "utf8")) as DaemonWorkerDescriptor;
     validateDescriptor(descriptor);
     return Object.freeze({ ...descriptor });
