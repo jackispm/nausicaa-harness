@@ -124,6 +124,70 @@ describe("daemon worker protocol", () => {
     await client.shutdown();
   });
 
+  it("does not invoke a runner after its initialized lease is fenced", async () => {
+    const [clientTransport, serverTransport] = pair();
+    let leaseSequence = 0;
+    const leases = new MemoryExecutionLeaseStore({
+      createLeaseId: () => `lease-${++leaseSequence}`,
+    });
+    const claimed = await leases.claim({
+      runId: "run-1",
+      ownerId: "host",
+      acquisitionId: "claim-1",
+      ttlMs: 10_000,
+    });
+    if (claimed.status !== "acquired") throw new Error("expected lease");
+    let invoked = false;
+    const server = new DaemonWorkerServer({
+      runId: "run-1",
+      workerId: "worker-1",
+      transport: serverTransport,
+      leaseStoreFactory: { open: async () => leases },
+      runner: {
+        activate: async () => {
+          invoked = true;
+          return { status: "completed" };
+        },
+      },
+    });
+    server.start();
+    const client = new DaemonWorkerClient({
+      runId: "run-1",
+      workerId: "worker-1",
+      lease: {
+        runId: "run-1",
+        leasePath: "/unused",
+        fencingToken: claimed.lease.fencingToken,
+      },
+      transport: clientTransport,
+    });
+
+    await client.initialize();
+    await leases.release({
+      runId: claimed.lease.runId,
+      ownerId: claimed.lease.ownerId,
+      leaseId: claimed.lease.leaseId,
+      fencingToken: claimed.lease.fencingToken,
+      commandId: "release-1",
+    });
+    const successor = await leases.claim({
+      runId: "run-1",
+      ownerId: "successor",
+      acquisitionId: "claim-2",
+      ttlMs: 10_000,
+    });
+    if (successor.status !== "acquired") throw new Error("expected successor lease");
+
+    await expect(client.activate({ activationId: "fenced-activation", wakes: [] }))
+      .resolves.toMatchObject({
+        status: "cancelled",
+        error: { message: expect.stringContaining("no longer current") },
+      });
+    expect(invoked).toBe(false);
+
+    await client.shutdown();
+  });
+
   it("returns uncertain when transport closes during an activation", async () => {
     const [clientTransport, serverTransport] = pair();
     const leases = new MemoryExecutionLeaseStore({ createLeaseId: () => "lease-1" });

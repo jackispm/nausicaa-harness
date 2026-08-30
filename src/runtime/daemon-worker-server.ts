@@ -312,6 +312,9 @@ export class DaemonWorkerServer {
         assertLease,
         commitLease,
       };
+      // The runner may not call assertLease itself. Fence the execution
+      // boundary before handing it any chance to perform side effects.
+      await assertLease();
       const outcome = await this.runner.activate(context);
       const status = outcome.status;
       await this.sendTerminal(activation, status, "error" in outcome ? outcome.error : undefined);
