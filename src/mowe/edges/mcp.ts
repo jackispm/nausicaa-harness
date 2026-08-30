@@ -230,18 +230,24 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
     if (sourceTool.manifestHash !== manifest.manifestHash) {
       throw new Error(`MCP manifest changed after discovery: ${manifest.capabilityName}`);
     }
+    const metadata = this.#metadata(sourceTool.tool);
     const tool: AgentTool = {
       definition: {
         name: manifest.capabilityName,
         description: manifest.description,
         parameters: structuredClone(manifest.inputSchema),
       },
-      execute: async (arguments_, context) => this.#execute(sourceTool.tool.name, arguments_, context.signal),
+      execute: async (arguments_, context) => this.#execute(
+        sourceTool.tool.name,
+        arguments_,
+        context.signal,
+        metadata.timeoutMs,
+      ),
     };
     return createEdgeCapability({
       manifest,
       tool,
-      metadata: this.#metadata(sourceTool.tool),
+      metadata,
     });
   }
 
@@ -292,7 +298,11 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
     if (transport === undefined) {
       // A caller may supply an already-connected SDK client. This is useful for
       // embedding and avoids claiming ownership of a transport we did not make.
-      if (this.#client !== undefined && client.transport !== undefined) {
+      // Structural fakes used by offline tests may intentionally omit the
+      // transport getter; supplying a client alone means the caller owns its
+      // connection lifecycle.
+      const hasCallerConnection = !("transport" in client) || client.transport !== undefined;
+      if (this.#client !== undefined && hasCallerConnection) {
         this.#client = client;
         this.#connected = true;
         return;
@@ -426,14 +436,19 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
     return this.#options.policy?.[tool.name] ?? {};
   }
 
-  async #execute(remoteName: string, arguments_: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
+  async #execute(
+    remoteName: string,
+    arguments_: Record<string, unknown>,
+    signal?: AbortSignal,
+    timeoutMs = this.#timeoutMs,
+  ): Promise<ToolResult> {
     try {
       throwIfAborted(signal);
       await this.#ensureConnected(signal);
       const response = await this.#requireClient().callTool(
         { name: remoteName, arguments: arguments_ },
         undefined,
-        requestOptions(signal, this.#timeoutMs),
+        requestOptions(signal, timeoutMs),
       );
       if (!hasMcpContent(response)) {
         return {
