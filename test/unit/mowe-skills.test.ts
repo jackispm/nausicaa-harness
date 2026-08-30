@@ -66,7 +66,7 @@ describe("Mowe Skills edge", () => {
     await mkdir(skillDirectory, { recursive: true });
     await writeSkill(skillDirectory, "Explain release notes", "# Instructions\n\nKeep it concise.\n");
 
-    const summaries = await discoverSkills(workspace);
+    const summaries = await discoverSkills(workspace, { roots: ["skills"] });
     expect(summaries).toHaveLength(1);
     const summary = summaries[0]!;
     expect(summary.name).toBe("release-notes");
@@ -97,8 +97,8 @@ describe("Mowe Skills edge", () => {
     await writeSkill(first, "first", "first body\n");
     await writeSkill(second, "second", "second body\n");
 
-    await expect(discoverSkills(workspace)).rejects.toBeInstanceOf(SkillConflictError);
-    const report = await discoverSkillCatalog(workspace, { conflictMode: "report" });
+    await expect(discoverSkills(workspace, { roots: ["first", "second"] })).rejects.toBeInstanceOf(SkillConflictError);
+    const report = await discoverSkillCatalog(workspace, { roots: ["first", "second"], conflictMode: "report" });
     expect(report.skills.map((skill) => skill.relativePath)).toEqual([
       "first/same-skill/SKILL.md",
       "second/same-skill/SKILL.md",
@@ -109,9 +109,32 @@ describe("Mowe Skills edge", () => {
     }]);
 
     const loaded = await loadSkillFromWorkspace(workspace, "same-skill", {
+      roots: ["first", "second"],
       conflictMode: "first",
     });
     expect(loaded.body).toBe("first body\n");
+  });
+
+  it("uses bounded standard roots with deterministic precedence and normalizes disabled invocation", async () => {
+    const workspace = await temporaryRoot();
+    const project = path.join(workspace, ".agents", "skills", "shared");
+    const fallback = path.join(workspace, ".pi", "skills", "shared");
+    await mkdir(project, { recursive: true });
+    await mkdir(fallback, { recursive: true });
+    await writeSkill(project, "project", "project body\n");
+    await writeFile(path.join(project, "SKILL.md"), [
+      "---", "name: shared", "description: project", "disable-model-invocation: \"true\"", "---", "project body\n",
+    ].join("\n"));
+    await writeSkill(fallback, "fallback", "fallback body\n");
+
+    const report = await discoverSkillCatalog(workspace, { conflictMode: "report" });
+    expect(report.skills.map((skill) => skill.relativePath)).toEqual([
+      ".agents/skills/shared/SKILL.md",
+      ".pi/skills/shared/SKILL.md",
+    ]);
+    expect(report.skills[0]?.disableModelInvocation).toBe(true);
+    const selected = await loadSkillFromWorkspace(workspace, "shared");
+    expect(selected.body).toBe("project body\n");
   });
 
   it("enforces byte/depth limits and rejects symlink or workspace escapes", async () => {
@@ -119,12 +142,18 @@ describe("Mowe Skills edge", () => {
     const skillDirectory = path.join(workspace, "skills", "safe-skill");
     await mkdir(skillDirectory, { recursive: true });
     await writeSkill(skillDirectory, "safe", "body\n");
-    await expect(discoverSkills(workspace, { maxFileBytes: 4 })).rejects.toThrow(/file limit/u);
+    const oversizedReport = await discoverSkillCatalog(workspace, {
+      roots: ["skills"],
+      maxFileBytes: 4,
+      conflictMode: "report",
+    });
+    expect(oversizedReport.diagnostics.some((diagnostic) => diagnostic.kind === "invalid")).toBe(true);
 
     const outside = await temporaryRoot();
     await writeSkill(outside, "safe-skill", "outside\n");
     await symlink(outside, path.join(workspace, "linked-skill"), "dir");
-    await expect(discoverSkills(workspace)).rejects.toBeInstanceOf(SkillPathError);
+    const unsafeReport = await discoverSkillCatalog(workspace, { roots: ["."], conflictMode: "report" });
+    expect(unsafeReport.diagnostics.some((diagnostic) => diagnostic.kind === "unsafe")).toBe(true);
     await expect(discoverSkills(workspace, { roots: ["../outside"] })).rejects.toBeInstanceOf(SkillPathError);
 
     const selected = (await discoverSkills(workspace, { roots: ["skills"] }))[0]!;
@@ -138,7 +167,8 @@ describe("Mowe Skills edge", () => {
     const malformed = path.join(workspace, "skills", "broken");
     await mkdir(malformed, { recursive: true });
     await writeFile(path.join(malformed, "SKILL.md"), "---\nname: broken\n---\nbody\n");
-    await expect(discoverSkills(workspace)).rejects.toBeInstanceOf(SkillFrontmatterError);
+    const malformedReport = await discoverSkillCatalog(workspace, { roots: ["skills"], conflictMode: "report" });
+    expect(malformedReport.diagnostics.some((diagnostic) => diagnostic.kind === "invalid")).toBe(true);
     await rm(malformed, { recursive: true, force: true });
 
     const mismatch = path.join(workspace, "skills", "directory-name");
@@ -150,7 +180,8 @@ describe("Mowe Skills edge", () => {
       "---",
       "body\n",
     ].join("\n"));
-    await expect(discoverSkills(workspace)).rejects.toThrow(/does not match directory/u);
+    const mismatchReport = await discoverSkillCatalog(workspace, { roots: ["skills"], conflictMode: "report" });
+    expect(mismatchReport.diagnostics.some((diagnostic) => diagnostic.message.includes("does not match directory"))).toBe(true);
   });
 });
 

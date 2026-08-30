@@ -19,7 +19,7 @@ export const MAX_SKILL_TOTAL_BYTES = 256 * 1024 * 1024;
 export const MAX_SKILL_DEPTH = 64;
 
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
-const DEFAULT_ROOTS = ["."] as const;
+const DEFAULT_ROOTS = [".agents/skills", ".pi/skills", "skills"] as const;
 const SKIPPED_DIRECTORIES = new Set([
   ".git",
   ".hg",
@@ -83,6 +83,7 @@ export interface SkillSummary {
   readonly workspace: string;
   readonly name: string;
   readonly description: string;
+  readonly disableModelInvocation: boolean;
   /** Canonical absolute path to the directory containing SKILL.md. */
   readonly directory: string;
   /** Canonical absolute path to SKILL.md. */
@@ -140,10 +141,11 @@ export interface SkillDiscoveryReport {
 }
 
 export interface SkillDiagnostic {
-  readonly kind: "duplicate";
+  readonly kind: "duplicate" | "invalid" | "unsafe";
   readonly message: string;
-  readonly name: string;
-  readonly paths: readonly string[];
+  readonly name?: string;
+  readonly path?: string;
+  readonly paths?: readonly string[];
 }
 
 export interface SkillLoadOptions {
@@ -162,11 +164,16 @@ interface ResolvedLimits {
 export interface SkillFileIdentity {
   readonly dev: number;
   readonly ino: number;
+  readonly mtimeMs: number;
+  readonly ctimeMs: number;
 }
 
 interface InternalSummary extends SkillSummary {
   readonly identity: SkillFileIdentity;
+  readonly rootRank: number;
 }
+
+const issuedSummaries = new WeakSet<object>();
 
 /**
  * Discover skill metadata without loading instruction bodies. Every returned
@@ -177,7 +184,7 @@ export async function discoverSkills(
   options: SkillLoaderOptions = {},
 ): Promise<SkillSummary[]> {
   const report = await discoverSkillCatalog(workspace, options);
-  if (report.conflicts.length > 0 && (options.conflictMode ?? "error") === "error") {
+  if (report.conflicts.length > 0 && conflictModeForOptions(options) === "error") {
     throw new SkillConflictError(report.conflicts);
   }
   return [...report.skills];
@@ -190,15 +197,17 @@ export async function discoverSkillCatalog(
 ): Promise<SkillDiscoveryReport> {
   const limits = resolveLimits(options);
   const root = await canonicalWorkspace(workspace);
+  const usesDefaultRoots = options.roots === undefined && options.skillRoots === undefined;
   const roots = options.roots !== undefined && options.skillRoots !== undefined
     ? (() => { throw new SkillPathError("Specify only one of roots and skillRoots"); })()
     : options.roots ?? options.skillRoots ?? DEFAULT_ROOTS;
   const strictRoots = options.strictRoots ?? false;
   const candidates = new Map<string, InternalSummary>();
+  const diagnostics: SkillDiagnostic[] = [];
   let totalBytes = 0;
 
   const canonicalRoots = new Set<string>();
-  for (const requested of roots) {
+  for (const [rootRank, requested] of roots.entries()) {
     if (typeof requested !== "string" || requested.length === 0 || requested.includes("\0")) {
       throw new SkillPathError("Skill root must be a non-empty path without NUL");
     }
@@ -213,15 +222,22 @@ export async function discoverSkillCatalog(
     }
     if (canonicalRoots.has(canonical)) continue;
     canonicalRoots.add(canonical);
-    const walked = await walkSkills(root, canonical, limits, candidates, totalBytes);
+    const walked = await walkSkills(
+      root,
+      canonical,
+      limits,
+      candidates,
+      diagnostics,
+      totalBytes,
+      rootRank,
+    );
     totalBytes = walked.totalBytes;
     if (candidates.size > limits.maxSkills) {
       throw new SkillLoaderError(`Skills exceed the ${limits.maxSkills} skill limit`);
     }
   }
 
-  const sorted = [...candidates.values()].sort((left, right) =>
-    left.relativePath.localeCompare(right.relativePath));
+  const sorted = [...candidates.values()].sort(compareSummaries);
   const byName = new Map<string, InternalSummary[]>();
   for (const skill of sorted) {
     const list = byName.get(skill.name) ?? [];
@@ -237,8 +253,8 @@ export async function discoverSkillCatalog(
       paths: entries.map((entry) => entry.relativePath),
     });
   }
-  conflicts.sort((left, right) => left.name.localeCompare(right.name));
-  const mode = options.conflictMode ?? "error";
+  conflicts.sort((left, right) => compareText(left.name, right.name));
+  const mode = resolveConflictMode(options, usesDefaultRoots);
   let selected: InternalSummary[] = sorted;
   if (mode === "first" || mode === "last") {
     const winners = new Map<string, InternalSummary>();
@@ -246,16 +262,15 @@ export async function discoverSkillCatalog(
       if (mode === "first" && winners.has(skill.name)) continue;
       winners.set(skill.name, skill);
     }
-    selected = [...winners.values()].sort((left, right) =>
-      left.relativePath.localeCompare(right.relativePath));
+    selected = [...winners.values()].sort(compareSummaries);
   }
 
-  const diagnostics = conflicts.map((conflict): SkillDiagnostic => ({
+  diagnostics.push(...conflicts.map((conflict): SkillDiagnostic => ({
     kind: "duplicate",
     message: `Skill ${conflict.name} is provided by multiple paths`,
     name: conflict.name,
     paths: [...conflict.paths],
-  }));
+  })));
   return Object.freeze({
     skills: Object.freeze(selected.map(publicSummary)),
     conflicts: Object.freeze(conflicts.map((conflict) => Object.freeze({
@@ -264,7 +279,7 @@ export async function discoverSkillCatalog(
     }))),
     diagnostics: Object.freeze(diagnostics.map((diagnostic) => Object.freeze({
       ...diagnostic,
-      paths: Object.freeze([...diagnostic.paths]),
+      ...(diagnostic.paths === undefined ? {} : { paths: Object.freeze([...diagnostic.paths]) }),
     }))),
   });
 }
@@ -274,7 +289,7 @@ export async function loadSkill(
   summary: SkillSummary,
   options: SkillLoadOptions = {},
 ): Promise<LoadedSkill> {
-  if (!isSkillSummary(summary)) {
+  if (!isSkillSummary(summary) || !issuedSummaries.has(summary)) {
     throw new SkillLoaderError("A discovered SkillSummary is required");
   }
   const maxFileBytes = boundedLimit(
@@ -290,11 +305,11 @@ export async function loadSkill(
     "maxBodyBytes",
   );
   const root = await canonicalWorkspace(summary.workspace);
+  assertSummaryPaths(summary, root);
   const candidate = path.resolve(root, summary.relativePath);
   assertWithin(root, candidate);
   const file = await readSkillFile(root, candidate, maxFileBytes, maxBodyBytes);
-  if (file.identity.dev !== summary.fileIdentity.dev
-    || file.identity.ino !== summary.fileIdentity.ino) {
+  if (!sameFileIdentity(file.identity, summary.fileIdentity)) {
     throw new SkillLoaderError(`Skill changed while loading: ${summary.relativePath}`);
   }
   if (file.byteLength !== summary.byteLength) {
@@ -315,7 +330,9 @@ export async function loadSkill(
     bodyByteLength,
     contentHash: sha256(file.document),
   };
-  return Object.freeze(loaded);
+  const frozen = Object.freeze(loaded);
+  issuedSummaries.add(frozen);
+  return frozen;
 }
 
 /** Discover by name/path and load only the selected skill. */
@@ -325,7 +342,7 @@ export async function loadSkillFromWorkspace(
   options: SkillLoaderOptions & SkillLoadOptions = {},
 ): Promise<LoadedSkill> {
   const report = await discoverSkillCatalog(workspace, options);
-  if (report.conflicts.length > 0 && (options.conflictMode ?? "error") === "error") {
+  if (report.conflicts.length > 0 && conflictModeForOptions(options) === "error") {
     throw new SkillConflictError(report.conflicts);
   }
   const normalized = reference.replaceAll(path.sep, "/");
@@ -345,7 +362,9 @@ export async function loadSkillResource(
   requestedPath: string,
   options: SkillResourceLoadOptions = {},
 ): Promise<SkillResource> {
-  if (!isSkillSummary(skill)) throw new SkillLoaderError("A discovered SkillSummary is required");
+  if (!isSkillSummary(skill) || !issuedSummaries.has(skill)) {
+    throw new SkillLoaderError("A discovered SkillSummary is required");
+  }
   if (typeof requestedPath !== "string" || requestedPath.length === 0 || requestedPath.includes("\0")) {
     throw new SkillPathError("Skill resource path must be a non-empty path without NUL");
   }
@@ -356,9 +375,11 @@ export async function loadSkillResource(
     MAX_SKILL_FILE_BYTES,
     "maxBytes",
   );
+  const workspace = await canonicalWorkspace(skill.workspace);
+  assertSummaryPaths(skill, workspace);
   const candidate = path.resolve(skill.directory, requestedPath);
   assertWithin(skill.directory, candidate);
-  const canonical = await canonicalFile(skill.workspace, candidate);
+  const canonical = await canonicalFile(workspace, candidate);
   assertWithin(skill.directory, canonical);
   let initial: Stats;
   try {
@@ -380,7 +401,7 @@ export async function loadSkillResource(
     }
     const bytes = await readBounded(handle, maxBytes);
     const final = await lstat(canonical);
-    if (final.isSymbolicLink() || !final.isFile() || !sameIdentity(opened, final) || final.size !== initial.size) {
+    if (final.isSymbolicLink() || !final.isFile() || !sameFileState(opened, final)) {
       throw new SkillLoaderError(`Skill resource changed while reading: ${requestedPath}`);
     }
     const content = decodeUtf8(bytes, requestedPath);
@@ -408,7 +429,7 @@ export async function loadSelectedSkills(
   options: SkillLoaderOptions & SkillLoadOptions = {},
 ): Promise<LoadedSkill[]> {
   const report = await discoverSkillCatalog(workspace, options);
-  if (report.conflicts.length > 0 && (options.conflictMode ?? "error") === "error") {
+  if (report.conflicts.length > 0 && conflictModeForOptions(options) === "error") {
     throw new SkillConflictError(report.conflicts);
   }
   const loaded: LoadedSkill[] = [];
@@ -526,7 +547,9 @@ async function walkSkills(
   directory: string,
   limits: ResolvedLimits,
   candidates: Map<string, InternalSummary>,
+  diagnostics: SkillDiagnostic[],
   initialTotalBytes: number,
+  rootRank: number,
 ): Promise<{ totalBytes: number }> {
   let totalBytes = initialTotalBytes;
   const info = await lstat(directory);
@@ -534,27 +557,65 @@ async function walkSkills(
     throw new SkillPathError(`Skill root is not a real directory: ${directory}`);
   }
   const entries = await readdir(directory, { withFileTypes: true });
-  entries.sort((left, right) => left.name.localeCompare(right.name));
+  entries.sort((left, right) => compareText(left.name, right.name));
   const depth = path.relative(workspace, directory).split(path.sep).filter(Boolean).length;
+  const declaredSkill = entries.find((entry) => entry.name === SKILL_FILENAME);
+  if (declaredSkill !== undefined) {
+    const candidate = path.join(directory, declaredSkill.name);
+    if (declaredSkill.isSymbolicLink()) {
+      diagnostics.push(skillDiagnostic("unsafe", candidate, "Refusing symbolic-link skill file"));
+      return { totalBytes };
+    }
+    if (!declaredSkill.isFile()) {
+      diagnostics.push(skillDiagnostic("invalid", candidate, "SKILL.md is not a regular file"));
+      return { totalBytes };
+    }
+    try {
+      const summary = await readSkillSummary(workspace, candidate, limits, rootRank);
+      if (!candidates.has(summary.path)) {
+        totalBytes += summary.byteLength;
+        if (totalBytes > limits.maxTotalBytes) {
+          throw new SkillLoaderError(`Skills exceed the ${limits.maxTotalBytes} byte total limit`);
+        }
+        candidates.set(summary.path, summary);
+      }
+    } catch (error: unknown) {
+      if (isGlobalLimitError(error)) throw error;
+      diagnostics.push(skillDiagnostic(
+        error instanceof SkillPathError ? "unsafe" : "invalid",
+        candidate,
+        errorText(error),
+      ));
+    }
+    // A directory containing SKILL.md is one skill boundary. Its resources are
+    // loaded on demand and are never recursively interpreted as nested skills.
+    return { totalBytes };
+  }
   for (const entry of entries) {
     const candidate = path.join(directory, entry.name);
     if (SKIPPED_DIRECTORIES.has(entry.name)) continue;
     if (entry.isSymbolicLink()) {
-      throw new SkillPathError(`Refusing symbolic-link skill path: ${candidate}`);
-    }
-    if (entry.isFile() && entry.name === SKILL_FILENAME) {
-      const summary = await readSkillSummary(workspace, candidate, limits);
-      totalBytes += summary.byteLength;
-      if (totalBytes > limits.maxTotalBytes) {
-        throw new SkillLoaderError(`Skills exceed the ${limits.maxTotalBytes} byte total limit`);
-      }
-      candidates.set(summary.path, summary);
+      diagnostics.push(skillDiagnostic("unsafe", candidate, "Refusing symbolic-link skill path"));
       continue;
     }
     if (!entry.isDirectory()) continue;
     if (depth >= limits.maxDepth) continue;
-    const child = await canonicalDirectory(workspace, candidate);
-    const walked = await walkSkills(workspace, child, limits, candidates, totalBytes);
+    let child: string;
+    try {
+      child = await canonicalDirectory(workspace, candidate);
+    } catch (error: unknown) {
+      diagnostics.push(skillDiagnostic("unsafe", candidate, errorText(error)));
+      continue;
+    }
+    const walked = await walkSkills(
+      workspace,
+      child,
+      limits,
+      candidates,
+      diagnostics,
+      totalBytes,
+      rootRank,
+    );
     totalBytes = walked.totalBytes;
     if (candidates.size > limits.maxSkills) {
       throw new SkillLoaderError(`Skills exceed the ${limits.maxSkills} skill limit`);
@@ -567,6 +628,7 @@ async function readSkillSummary(
   workspace: string,
   candidate: string,
   limits: ResolvedLimits,
+  rootRank: number,
 ): Promise<InternalSummary> {
   const file = await readSkillPrefix(workspace, candidate, limits.maxFileBytes, limits.maxFrontmatterBytes);
   const directory = path.dirname(file.path);
@@ -582,6 +644,9 @@ async function readSkillSummary(
     workspace,
     name: file.parsed.frontmatter.name,
     description: file.parsed.frontmatter.description,
+    disableModelInvocation: normalizeDisableModelInvocation(
+      file.parsed.frontmatter["disable-model-invocation"],
+    ),
     directory,
     path: file.path,
     relativePath: path.relative(workspace, file.path).split(path.sep).join("/"),
@@ -590,6 +655,7 @@ async function readSkillSummary(
     byteLength: file.byteLength,
     fileIdentity: file.identity,
     identity: file.identity,
+    rootRank,
   });
 }
 
@@ -637,7 +703,7 @@ async function readSkillPrefix(
     }
     const parsedDocument = parseSkillDocument(prefix);
     const final = await lstat(canonical);
-    if (final.isSymbolicLink() || !final.isFile() || !sameIdentity(opened, final) || final.size !== initial.size) {
+    if (final.isSymbolicLink() || !final.isFile() || !sameFileState(opened, final)) {
       throw new SkillLoaderError(`Skill changed while reading: ${candidate}`);
     }
     return {
@@ -648,7 +714,7 @@ async function readSkillPrefix(
         frontmatterHash: sha256(stableJson(parsedDocument.frontmatter)),
       }),
       byteLength: initial.size,
-      identity: Object.freeze({ dev: opened.dev, ino: opened.ino }),
+      identity: fileIdentity(opened),
     };
   } catch (error: unknown) {
     if (error instanceof SkillLoaderError) throw error;
@@ -686,7 +752,7 @@ async function readSkillFile(
     }
     const bytes = await readBounded(handle, maxFileBytes);
     const final = await lstat(canonical);
-    if (final.isSymbolicLink() || !final.isFile() || !sameIdentity(opened, final) || final.size !== initial.size) {
+    if (final.isSymbolicLink() || !final.isFile() || !sameFileState(opened, final)) {
       throw new SkillLoaderError(`Skill changed while reading: ${candidate}`);
     }
     const document = decodeUtf8(bytes, candidate);
@@ -703,7 +769,7 @@ async function readSkillFile(
         frontmatterHash: sha256(stableJson(parsed.frontmatter)),
       }),
       byteLength: bytes.byteLength,
-      identity: Object.freeze({ dev: opened.dev, ino: opened.ino }),
+      identity: fileIdentity(opened),
     };
   } catch (error: unknown) {
     if (error instanceof SkillLoaderError) throw error;
@@ -838,11 +904,86 @@ function boundedLimit(value: number | undefined, fallback: number, maximum: numb
 }
 
 function publicSummary(summary: InternalSummary): SkillSummary {
-  const { identity: _identity, ...publicValue } = summary;
-  return Object.freeze({
+  const { identity: _identity, rootRank: _rootRank, ...publicValue } = summary;
+  const frozen = Object.freeze({
     ...publicValue,
     frontmatter: freezeFrontmatter(summary.frontmatter),
   });
+  issuedSummaries.add(frozen);
+  return frozen;
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareSummaries(left: InternalSummary, right: InternalSummary): number {
+  return left.rootRank - right.rootRank || compareText(left.relativePath, right.relativePath);
+}
+
+function resolveConflictMode(options: SkillLoaderOptions, usesDefaultRoots: boolean): SkillConflictMode {
+  // Standard roots have deterministic precedence. Explicit roots retain the
+  // caller's requested conflict behavior and ordering.
+  return options.conflictMode ?? (usesDefaultRoots ? "first" : "error");
+}
+
+function conflictModeForOptions(options: SkillLoaderOptions): SkillConflictMode {
+  return resolveConflictMode(
+    options,
+    options.roots === undefined && options.skillRoots === undefined,
+  );
+}
+
+function normalizeDisableModelInvocation(value: SkillFrontmatterValue | undefined): boolean {
+  return value === true || (typeof value === "string" && value.trim().toLowerCase() === "true");
+}
+
+function fileIdentity(stats: Pick<Stats, "dev" | "ino" | "mtimeMs" | "ctimeMs">): SkillFileIdentity {
+  return Object.freeze({
+    dev: stats.dev,
+    ino: stats.ino,
+    mtimeMs: stats.mtimeMs,
+    ctimeMs: stats.ctimeMs,
+  });
+}
+
+function sameFileState(
+  left: Pick<Stats, "dev" | "ino" | "size" | "mtimeMs" | "ctimeMs">,
+  right: Pick<Stats, "dev" | "ino" | "size" | "mtimeMs" | "ctimeMs">,
+): boolean {
+  return sameIdentity(left, right)
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+function sameFileIdentity(left: SkillFileIdentity, right: SkillFileIdentity): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+function assertSummaryPaths(summary: SkillSummary, workspace: string): void {
+  const expectedPath = path.resolve(workspace, summary.relativePath);
+  assertWithin(workspace, expectedPath);
+  if (summary.workspace !== workspace || summary.path !== expectedPath
+    || summary.directory !== path.dirname(expectedPath)) {
+    throw new SkillPathError("Skill summary paths are not canonical");
+  }
+}
+
+function skillDiagnostic(
+  kind: SkillDiagnostic["kind"],
+  candidate: string,
+  message: string,
+): SkillDiagnostic {
+  return Object.freeze({ kind, path: candidate, message });
+}
+
+function isGlobalLimitError(error: unknown): boolean {
+  return error instanceof SkillLoaderError
+    && /(?:total limit|skill limit)/u.test(error.message);
 }
 
 function isSkillSummary(value: SkillSummary): value is SkillSummary {
@@ -857,7 +998,9 @@ function isSkillSummary(value: SkillSummary): value is SkillSummary {
     && value.fileIdentity !== null
     && typeof value.fileIdentity === "object"
     && Number.isSafeInteger(value.fileIdentity.dev)
-    && Number.isSafeInteger(value.fileIdentity.ino);
+    && Number.isSafeInteger(value.fileIdentity.ino)
+    && Number.isFinite(value.fileIdentity.mtimeMs)
+    && Number.isFinite(value.fileIdentity.ctimeMs);
 }
 
 function freezeFrontmatter(value: SkillFrontmatter): Readonly<SkillFrontmatter> {
