@@ -96,6 +96,45 @@ export interface EdgeHostGrant {
 }
 
 /**
+ * A bounded, model-independent context item discovered by a Skill or plugin.
+ * Summaries intentionally omit the body so discovery remains progressive.
+ */
+export interface EdgeContextContributionSummary {
+  readonly kind: "context";
+  /** Host adapter identity, not a per-file Skill identity. */
+  readonly sourceId: string;
+  /** Stable identity inside a source, for example name + relative path. */
+  readonly contributionId: string;
+  readonly sourceType: "skill" | "plugin";
+  readonly name: string;
+  readonly description: string;
+  readonly disabled: boolean;
+  readonly contentHash?: string;
+  readonly provenance?: EdgeProvenance;
+}
+
+export interface EdgeContextContribution extends EdgeContextContributionSummary {
+  readonly body?: string;
+}
+
+export type EdgeContribution =
+  | { readonly kind: "tool"; readonly capability: EdgeCapability }
+  | EdgeContextContribution;
+
+/** Additive adapter contract for untrusted Skill/plugin context contributions. */
+export interface EdgeContributionAdapter {
+  readonly sourceId: string;
+  readonly sourceType: "skill" | "plugin";
+  discoverContributions(context: EdgeDiscoveryContext):
+    Promise<readonly EdgeContextContributionSummary[]>;
+  loadContribution(summary: EdgeContextContributionSummary, context: EdgeLoadContext):
+    Promise<EdgeContextContribution>;
+  refresh?(context: EdgeRefreshContext): Promise<void>;
+  health?(): Promise<EdgeAdapterHealth>;
+  release?(context: EdgeReleaseContext): Promise<void>;
+}
+
+/**
  * Source adapter boundary. Discovery returns only validated manifests; loading
  * performs progressive work and returns a capability pinned to that manifest.
  */

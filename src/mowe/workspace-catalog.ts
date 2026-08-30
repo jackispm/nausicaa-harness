@@ -4,6 +4,8 @@ import {
   type WorkspaceToolOptions,
 } from "../tools/index.js";
 import { annotateTool, MoweCatalog } from "./catalog.js";
+import { createEdgeContextContributionSummary } from "./edge-adapter.js";
+import type { EdgeContextContributionSummary } from "./edge-types.js";
 import type { MoweCapability, MoweToolMetadata } from "./types.js";
 
 /**
@@ -19,6 +21,8 @@ export interface WorkspaceEdgeToolSnapshot {
   /** Alias accepted from registries that call their immutable entries `entries`. */
   entries?: readonly WorkspaceEdgeCapability[];
   metadataByName?: Readonly<Record<string, MoweToolMetadata>>;
+  /** Discovered Skill/plugin summaries; never materialized as tools. */
+  contextContributions?: readonly EdgeContextContributionSummary[];
 }
 
 export interface WorkspaceEdgeCapability {
@@ -56,6 +60,13 @@ export function freezeWorkspaceEdgeToolSnapshot(
     ...(snapshot.metadataByName === undefined
       ? {}
       : { metadataByName: Object.freeze({ ...snapshot.metadataByName }) }),
+    ...(snapshot.contextContributions === undefined
+      ? {}
+      : {
+          contextContributions: Object.freeze(snapshot.contextContributions
+            .map((summary) => createEdgeContextContributionSummary(summary))
+            .sort(compareContextContributions)),
+        }),
   });
 }
 
@@ -65,7 +76,46 @@ export interface WorkspaceMoweCatalogSnapshot {
   /** Catalog used by Main for this Turn; do not mutate after construction. */
   readonly catalog: MoweCatalog;
   readonly capabilities: readonly MoweCapability[];
+  readonly contextContributions: readonly EdgeContextContributionSummary[];
 }
+
+/** The pure data view passed from an edge registry to runtime composition. */
+export interface WorkspaceEdgeProjection {
+  readonly generation: number;
+  readonly tools: readonly AgentTool[];
+  readonly contextContributions: readonly EdgeContextContributionSummary[];
+}
+
+export interface WorkspaceEdgeRegistrySnapshotLike {
+  readonly generation: number;
+  readonly tools?: readonly (AgentTool | { readonly tool: AgentTool })[];
+  readonly capabilities?: readonly { readonly tool: AgentTool }[];
+  readonly contextContributions?: readonly EdgeContextContributionSummary[];
+}
+
+/** Pure registry-snapshot to workspace tool/context projection. */
+export function projectWorkspaceEdgeSnapshot(
+  snapshot: WorkspaceEdgeRegistrySnapshotLike,
+): WorkspaceEdgeProjection {
+  if (!Number.isSafeInteger(snapshot.generation) || snapshot.generation < 0) {
+    throw new RangeError("edge snapshot generation must be a non-negative safe integer");
+  }
+  const tools = dedupeTools([
+    ...(snapshot.tools ?? []).map((entry) => isAgentTool(entry) ? entry : entry.tool),
+    ...(snapshot.capabilities ?? []).map((entry) => entry.tool),
+  ]).sort((left, right) => compareText(left.definition.name, right.definition.name));
+  const contextContributions = (snapshot.contextContributions ?? [])
+    .map((summary) => createEdgeContextContributionSummary(summary))
+    .sort(compareContextContributions);
+  return Object.freeze({
+    generation: snapshot.generation,
+    tools: Object.freeze(tools),
+    contextContributions: Object.freeze(contextContributions),
+  });
+}
+
+/** Alias for composition roots that name the source explicitly. */
+export const projectEdgeRegistrySnapshot = projectWorkspaceEdgeSnapshot;
 
 /** Attach registry metadata before passing edge tools to MainLoop/Mowe. */
 export function materializeWorkspaceEdgeTools(
@@ -138,5 +188,35 @@ export function createWorkspaceMoweCatalogSnapshot(
     generation: edgeSnapshot?.generation ?? 0,
     catalog,
     capabilities: Object.freeze(catalog.capabilities()),
+    contextContributions: Object.freeze([...(edgeSnapshot?.contextContributions ?? [])]),
   });
+}
+
+function isAgentTool(value: AgentTool | { readonly tool: AgentTool }): value is AgentTool {
+  return "definition" in value && "execute" in value;
+}
+
+function dedupeTools(tools: readonly AgentTool[]): AgentTool[] {
+  const names = new Set<string>();
+  const result: AgentTool[] = [];
+  for (const tool of tools) {
+    if (names.has(tool.definition.name)) continue;
+    names.add(tool.definition.name);
+    result.push(tool);
+  }
+  return result;
+}
+
+function compareContextContributions(
+  left: EdgeContextContributionSummary,
+  right: EdgeContextContributionSummary,
+): number {
+  return compareText(left.sourceId, right.sourceId)
+    || compareText(left.contributionId, right.contributionId)
+    || compareText(left.name, right.name)
+    || compareText(left.contentHash ?? "", right.contentHash ?? "");
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }

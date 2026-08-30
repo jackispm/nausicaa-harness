@@ -6,6 +6,9 @@ import {
   assertEdgeAdapterOwnsManifest,
   createEdgeCapability,
   createEdgeCapabilitySnapshot,
+  validateEdgeContextContribution,
+  validateEdgeContextContributionSummary,
+  MAX_EDGE_CONTEXT_CONTRIBUTIONS,
   rebindEdgeCapabilityMetadata,
   validateEdgeManifest,
 } from "./edge-adapter.js";
@@ -14,6 +17,9 @@ import type {
   EdgeAdapterHealth,
   EdgeCapability,
   EdgeCapabilitySnapshot,
+  EdgeContextContribution,
+  EdgeContextContributionSummary,
+  EdgeContributionAdapter,
   EdgeHostGrant,
   EdgeManifest,
   EdgeReleaseReason,
@@ -25,7 +31,7 @@ const EDGE_SCOPES: readonly MoweToolScope[] = ["workspace", "run", "lane", "host
 const DEFAULT_EDGE_REFRESH_TIMEOUT_MS = 60_000;
 const MAX_EDGE_REFRESH_TIMEOUT_MS = 15 * 60_000;
 
-export type MoweEdgeAdapterLike = EdgeAdapter;
+export type MoweEdgeAdapterLike = EdgeAdapter | EdgeContributionAdapter;
 export type MoweEdgeKind = EdgeSourceType;
 
 export type MoweEdgeHealth =
@@ -48,7 +54,10 @@ export interface MoweEdgeDiagnostic {
     | "tool-invalid"
     | "tool-collision"
     | "catalog-rejected"
-    | "host-grant-denied";
+    | "host-grant-denied"
+    | "context-invalid"
+    | "context-collision"
+    | "context-load-failed";
   readonly severity: MoweEdgeDiagnosticSeverity;
   readonly sourceId?: string;
   readonly toolName?: string;
@@ -86,6 +95,7 @@ export interface MoweEdgeSnapshot {
   readonly manifests: readonly EdgeManifest[];
   readonly provenance: readonly EdgeManifest["provenance"][];
   readonly tools: readonly MoweEdgeToolSnapshot[];
+  readonly contextContributions: readonly EdgeContextContributionSummary[];
   readonly diagnostics: readonly MoweEdgeDiagnostic[];
 }
 
@@ -100,12 +110,14 @@ export interface MoweEdgeRegistrySnapshot {
   readonly edges: readonly MoweEdgeSnapshot[];
   readonly tools: readonly MoweEdgeToolSnapshot[];
   readonly capabilities: readonly EdgeCapability[];
+  /** Discovered summaries only; bodies are loaded explicitly by selection. */
+  readonly contextContributions: readonly EdgeContextContributionSummary[];
   readonly diagnostics: readonly MoweEdgeDiagnostic[];
 }
 
 export interface MoweEdgeRegistryOptions {
   readonly catalog?: MoweCatalog | readonly AgentTool[];
-  readonly adapters?: readonly EdgeAdapter[];
+  readonly adapters?: readonly MoweEdgeAdapterLike[];
   readonly workspace?: string;
   /** Explicit host-owned permissions; an omitted source is quarantined. */
   readonly hostGrants?: Readonly<Record<string, EdgeHostGrant>>;
@@ -121,7 +133,7 @@ export interface MoweEdgeRefreshOptions {
 }
 
 interface RegisteredEdge {
-  readonly adapter: EdgeAdapter;
+  readonly adapter: MoweEdgeAdapterLike;
   readonly sourceId: string;
   readonly sourceType: EdgeSourceType;
   enabled: boolean;
@@ -129,6 +141,7 @@ interface RegisteredEdge {
   diagnostics: MoweEdgeDiagnostic[];
   manifests: EdgeManifest[];
   capabilities: EdgeCapability[];
+  contextContributions: EdgeContextContributionSummary[];
   adapterHealth?: EdgeAdapterHealth | undefined;
 }
 
@@ -166,14 +179,16 @@ export class MoweEdgeRegistry {
     for (const adapter of options.adapters ?? []) this.register(adapter);
   }
 
-  register(adapter: EdgeAdapter): this {
+  register(adapter: MoweEdgeAdapterLike): this {
     if (this.#closed) throw new MoweEdgeRegistryError("Edge registry is closed");
     const sourceId = normalizeSourceId(adapter.sourceId);
     if (!isSourceType(adapter.sourceType)) {
       throw new MoweEdgeRegistryError("Edge adapter sourceType must be skill, mcp, or plugin");
     }
-    if (typeof adapter.discover !== "function" || typeof adapter.load !== "function") {
-      throw new MoweEdgeRegistryError("Edge adapter must expose discover() and load()");
+    if (!isSupportedAdapter(adapter)) {
+      throw new MoweEdgeRegistryError(
+        "Edge adapter must expose discover/load or discoverContributions/loadContribution",
+      );
     }
     if (this.#edges.has(sourceId)) {
       throw new MoweEdgeRegistryError(`Duplicate edge sourceId: ${sourceId}`);
@@ -187,12 +202,13 @@ export class MoweEdgeRegistry {
       diagnostics: [],
       manifests: [],
       capabilities: [],
+      contextContributions: [],
     });
     this.#revision += 1;
     return this;
   }
 
-  registerAdapter(adapter: EdgeAdapter): this {
+  registerAdapter(adapter: MoweEdgeAdapterLike): this {
     return this.register(adapter);
   }
 
@@ -260,7 +276,7 @@ export class MoweEdgeRegistry {
 
   health(sourceId?: string): readonly MoweEdgeHealthSnapshot[] | MoweEdgeHealthSnapshot {
     const values = [...this.#edges.values()]
-      .sort((left, right) => left.sourceId.localeCompare(right.sourceId))
+      .sort((left, right) => compareText(left.sourceId, right.sourceId))
       .map((edge) => healthSnapshot(edge));
     if (sourceId !== undefined) {
       const found = values.find((item) => item.sourceId === normalizeSourceId(sourceId));
@@ -290,6 +306,56 @@ export class MoweEdgeRegistry {
     return this.refresh({ ...options, sourceIds: [target] });
   }
 
+  /**
+   * Explicitly load one selected context contribution. Discovery and snapshot
+   * publication never read contribution bodies, preserving progressive loading.
+   */
+  async loadContribution(
+    summary: EdgeContextContributionSummary,
+    context: {
+      readonly workspace?: string;
+      readonly signal?: AbortSignal;
+      /** Optional Turn snapshot so a refresh cannot invalidate selection. */
+      readonly snapshot?: MoweEdgeRegistrySnapshot;
+    } = {},
+  ): Promise<EdgeContextContribution> {
+    if (this.#closed) throw new MoweEdgeRegistryError("Edge registry is closed");
+    const validated = validateEdgeContextContributionSummary(summary);
+    const edge = this.#edges.get(normalizeSourceId(validated.sourceId));
+    if (edge === undefined || !isContributionAdapter(edge.adapter)) {
+      throw new MoweEdgeRegistryError(`Unknown context contribution sourceId: ${validated.sourceId}`);
+    }
+    if (validated.sourceType !== edge.sourceType) {
+      throw new MoweEdgeRegistryError("Context contribution sourceType does not match its adapter");
+    }
+    const captured = context.snapshot ?? this.#current;
+    const current = captured.contextContributions.find((candidate) => (
+      candidate.sourceId === validated.sourceId
+      && candidate.sourceType === validated.sourceType
+      && candidate.contributionId === validated.contributionId
+      && candidate.name === validated.name
+      && candidate.contentHash === validated.contentHash
+      && stableJson(candidate) === stableJson(validated)
+    ));
+    if (current === undefined) {
+      throw new MoweEdgeRegistryError("Context contribution is not present in the active snapshot");
+    }
+    if (validated.disabled) {
+      throw new MoweEdgeRegistryError("Disabled context contributions cannot be loaded");
+    }
+    const signal = context.signal ?? new AbortController().signal;
+    const loaded = await awaitWithSignal(
+      edge.adapter.loadContribution(
+        validated,
+        edgeContext(context.workspace ?? this.#workspace, signal),
+      ),
+      signal,
+    );
+    const contribution = validateEdgeContextContribution(loaded);
+    assertContextIdentity(current, contribution);
+    return contribution;
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
@@ -302,6 +368,7 @@ export class MoweEdgeRegistry {
     for (const edge of this.#edges.values()) {
       edge.enabled = false;
       if (edge.health !== "failed") edge.health = "closed";
+      edge.contextContributions = [];
     }
     const edges = [...this.#edges.values()].map((edge) => this.#edgeSnapshot(edge, []));
     this.#current = this.#buildSnapshot(edges, [], edges.flatMap((edge) => edge.diagnostics));
@@ -331,6 +398,7 @@ export class MoweEdgeRegistry {
             diagnostics: [] as MoweEdgeDiagnostic[],
             manifests: [] as EdgeManifest[],
             capabilities: [] as EdgeCapability[],
+            contextContributions: [] as EdgeContextContributionSummary[],
           }
         : {
             adapter: edge.adapter,
@@ -341,6 +409,7 @@ export class MoweEdgeRegistry {
             diagnostics: [...edge.diagnostics],
             manifests: [...edge.manifests],
             capabilities: [...edge.capabilities],
+            contextContributions: [...edge.contextContributions],
             ...(edge.adapterHealth === undefined ? {} : { adapterHealth: edge.adapterHealth }),
           };
     });
@@ -368,59 +437,111 @@ export class MoweEdgeRegistry {
               signal,
             );
           }
-          const manifests = await awaitWithSignal(
-            edge.adapter.discover(edgeContext(workspace, signal)),
-            signal,
-          );
-          if (!Array.isArray(manifests)) throw new MoweEdgeRegistryError("Edge discover() must return an array");
-          for (const candidate of [...manifests].sort(compareManifest)) {
-            let manifest: EdgeManifest;
-            try {
-              manifest = validateEdgeManifest(candidate);
-              // Use the identity captured at registration, not mutable adapter
-              // fields, as the ownership boundary.
-              assertEdgeAdapterOwnsManifest(
-                { sourceId: edge.sourceId, sourceType: edge.sourceType },
-                manifest,
-              );
-            } catch (error) {
-              edge.diagnostics.push(diagnostic(
-                "manifest-invalid",
-                "error",
-                edge.sourceId,
-                errorMessage(error),
-                isRecord(candidate) && typeof candidate.capabilityName === "string" ? candidate.capabilityName : undefined,
-              ));
-              continue;
-            }
-            edge.manifests.push(manifest);
-            try {
-              const loadedResult = await awaitWithSignal(
-                edge.adapter.load(manifest, edgeContext(workspace, signal)),
-                signal,
-              );
-              if (loadedResult.manifest.manifestHash !== manifest.manifestHash) {
-                throw new MoweEdgeRegistryError("Loaded capability manifest does not match discovered manifest");
+          if (isToolAdapter(edge.adapter)) {
+            const manifests = await awaitWithSignal(
+              edge.adapter.discover(edgeContext(workspace, signal)),
+              signal,
+            );
+            if (!Array.isArray(manifests)) throw new MoweEdgeRegistryError("Edge discover() must return an array");
+            for (const candidate of [...manifests].sort(compareManifest)) {
+              let manifest: EdgeManifest;
+              try {
+                manifest = validateEdgeManifest(candidate);
+                // Use the identity captured at registration, not mutable adapter
+                // fields, as the ownership boundary.
+                assertEdgeAdapterOwnsManifest(
+                  { sourceId: edge.sourceId, sourceType: edge.sourceType },
+                  manifest,
+                );
+              } catch (error) {
+                edge.diagnostics.push(diagnostic(
+                  "manifest-invalid",
+                  "error",
+                  edge.sourceId,
+                  errorMessage(error),
+                  isRecord(candidate) && typeof candidate.capabilityName === "string" ? candidate.capabilityName : undefined,
+                ));
+                continue;
               }
-              const rawCapability = createEdgeCapability({ manifest, tool: loadedResult.tool });
-              const capability = applyHostGrant(
-                rawCapability,
-                this.#hostGrants.get(edge.sourceId),
-                edge,
-              );
-              if (capability === undefined) continue;
-              const fingerprint = capabilityFingerprint(capability);
-              edge.capabilities.push(capability);
-              loaded.push({ edge, capability, fingerprint });
-            } catch (error) {
-              if (signal.aborted) return this.#current;
+              edge.manifests.push(manifest);
+              try {
+                const loadedResult = await awaitWithSignal(
+                  edge.adapter.load(manifest, edgeContext(workspace, signal)),
+                  signal,
+                );
+                if (loadedResult.manifest.manifestHash !== manifest.manifestHash) {
+                  throw new MoweEdgeRegistryError("Loaded capability manifest does not match discovered manifest");
+                }
+                const rawCapability = createEdgeCapability({ manifest, tool: loadedResult.tool });
+                const capability = applyHostGrant(
+                  rawCapability,
+                  this.#hostGrants.get(edge.sourceId),
+                  edge,
+                );
+                if (capability === undefined) continue;
+                const fingerprint = capabilityFingerprint(capability);
+                edge.capabilities.push(capability);
+                loaded.push({ edge, capability, fingerprint });
+              } catch (error) {
+                if (signal.aborted) return this.#current;
+                edge.diagnostics.push(diagnostic(
+                  "adapter-failed",
+                  "error",
+                  edge.sourceId,
+                  `Edge capability load failed: ${errorMessage(error)}`,
+                  manifest.capabilityName,
+                ));
+              }
+            }
+          }
+          if (isContributionAdapter(edge.adapter)) {
+            const summaries = await awaitWithSignal(
+              edge.adapter.discoverContributions(edgeContext(workspace, signal)),
+              signal,
+            );
+            if (!Array.isArray(summaries)) {
+              throw new MoweEdgeRegistryError("Edge discoverContributions() must return an array");
+            }
+            if (summaries.length > MAX_EDGE_CONTEXT_CONTRIBUTIONS) {
               edge.diagnostics.push(diagnostic(
-                "adapter-failed",
+                "context-invalid",
                 "error",
                 edge.sourceId,
-                `Edge capability load failed: ${errorMessage(error)}`,
-                manifest.capabilityName,
+                `Context contributions exceed the ${MAX_EDGE_CONTEXT_CONTRIBUTIONS} item limit`,
               ));
+            }
+            const seenContributionIds = new Set<string>();
+            for (const candidate of [...summaries]
+              .sort(compareContextContributions)
+              .slice(0, MAX_EDGE_CONTEXT_CONTRIBUTIONS)) {
+              try {
+                const summary = validateEdgeContextContributionSummary(candidate);
+                if (summary.sourceId !== edge.sourceId || summary.sourceType !== edge.sourceType) {
+                  throw new MoweEdgeRegistryError(
+                    `Context contribution belongs to ${summary.sourceType}:${summary.sourceId}`,
+                  );
+                }
+                if (seenContributionIds.has(summary.contributionId)) {
+                  edge.diagnostics.push(diagnostic(
+                    "context-collision",
+                    "error",
+                    edge.sourceId,
+                    `Context contribution id collides within source: ${summary.contributionId}`,
+                    summary.name,
+                  ));
+                  continue;
+                }
+                seenContributionIds.add(summary.contributionId);
+                edge.contextContributions.push(summary);
+              } catch (error) {
+                edge.diagnostics.push(diagnostic(
+                  "context-invalid",
+                  "error",
+                  edge.sourceId,
+                  errorMessage(error),
+                  contextName(candidate),
+                ));
+              }
             }
           }
           if (edge.adapter.health === undefined) {
@@ -492,6 +613,7 @@ export class MoweEdgeRegistry {
         current.diagnostics = [...edge.diagnostics];
         current.manifests = [...edge.manifests];
         current.capabilities = [...edge.capabilities];
+        current.contextContributions = [...edge.contextContributions];
         if (edge.adapterHealth === undefined) delete current.adapterHealth;
         else current.adapterHealth = edge.adapterHealth;
       }
@@ -512,6 +634,7 @@ export class MoweEdgeRegistry {
       manifests,
       provenance: manifests.map((manifest) => manifest.provenance),
       tools: [...tools.filter((tool) => tool.sourceId === edge.sourceId)],
+      contextContributions: [...edge.contextContributions],
       diagnostics: [...edge.diagnostics],
     };
   }
@@ -544,10 +667,14 @@ export class MoweEdgeRegistry {
       .map((edge) => ({
         ...edge,
         tools: edge.tools.filter((tool) => acceptedNames.has(`${tool.sourceId}\u0000${tool.name}`)),
+        contextContributions: [...edge.contextContributions].sort(compareContextContributions),
       }))
-      .sort((left, right) => left.sourceId.localeCompare(right.sourceId));
+      .sort((left, right) => compareText(left.sourceId, right.sourceId));
     const stableTools = acceptedTools.sort(compareToolSnapshots);
     const stableDiagnostics = catalogDiagnostics.sort(compareDiagnostics);
+    const stableContextContributions = stableEdges
+      .flatMap((edge) => edge.contextContributions)
+      .sort(compareContextContributions);
     const hash = sha256(stableJson({
       edges: stableEdges.map((edge) => ({
         sourceId: edge.sourceId,
@@ -556,6 +683,17 @@ export class MoweEdgeRegistry {
         health: edge.health,
         manifests: edge.manifests,
         tools: edge.tools.map((tool) => ({ name: tool.name, metadata: tool.metadata })),
+        contextContributions: edge.contextContributions.map((contribution) => ({
+          kind: contribution.kind,
+          sourceId: contribution.sourceId,
+          contributionId: contribution.contributionId,
+          sourceType: contribution.sourceType,
+          name: contribution.name,
+          description: contribution.description,
+          disabled: contribution.disabled,
+          contentHash: contribution.contentHash ?? null,
+          provenance: contribution.provenance ?? null,
+        })),
       })),
       tools: stableTools.map((tool) => ({
         name: tool.name,
@@ -585,6 +723,7 @@ export class MoweEdgeRegistry {
       edges: stableEdges,
       tools: stableTools,
       capabilities: capabilitySnapshot.capabilities,
+      contextContributions: stableContextContributions,
       diagnostics: stableDiagnostics,
     });
   }
@@ -678,9 +817,9 @@ function healthFrom(edge: RegisteredEdge, health: EdgeAdapterHealth | undefined)
 }
 
 function compareManifest(left: EdgeManifest, right: EdgeManifest): number {
-  return manifestValue(left, "capabilityName").localeCompare(manifestValue(right, "capabilityName"))
-    || manifestValue(left, "capabilityVersion").localeCompare(manifestValue(right, "capabilityVersion"))
-    || manifestValue(left, "manifestHash").localeCompare(manifestValue(right, "manifestHash"));
+  return compareText(manifestValue(left, "capabilityName"), manifestValue(right, "capabilityName"))
+    || compareText(manifestValue(left, "capabilityVersion"), manifestValue(right, "capabilityVersion"))
+    || compareText(manifestValue(left, "manifestHash"), manifestValue(right, "manifestHash"));
 }
 
 function manifestValue(value: unknown, key: "capabilityName" | "capabilityVersion" | "manifestHash"): string {
@@ -688,9 +827,9 @@ function manifestValue(value: unknown, key: "capabilityName" | "capabilityVersio
 }
 
 function compareLoaded(left: LoadedCapability, right: LoadedCapability): number {
-  return left.capability.manifest.capabilityName.localeCompare(right.capability.manifest.capabilityName)
-    || left.edge.sourceId.localeCompare(right.edge.sourceId)
-    || left.fingerprint.localeCompare(right.fingerprint);
+  return compareText(left.capability.manifest.capabilityName, right.capability.manifest.capabilityName)
+    || compareText(left.edge.sourceId, right.edge.sourceId)
+    || compareText(left.fingerprint, right.fingerprint);
 }
 
 function capabilityFingerprint(capability: EdgeCapability): string {
@@ -702,14 +841,14 @@ function capabilityFingerprint(capability: EdgeCapability): string {
 }
 
 function compareToolSnapshots(left: MoweEdgeToolSnapshot, right: MoweEdgeToolSnapshot): number {
-  return left.name.localeCompare(right.name) || left.sourceId.localeCompare(right.sourceId);
+  return compareText(left.name, right.name) || compareText(left.sourceId, right.sourceId);
 }
 
 function compareDiagnostics(left: MoweEdgeDiagnostic, right: MoweEdgeDiagnostic): number {
-  return (left.sourceId ?? "").localeCompare(right.sourceId ?? "")
-    || (left.toolName ?? "").localeCompare(right.toolName ?? "")
-    || left.code.localeCompare(right.code)
-    || left.message.localeCompare(right.message);
+  return compareText(left.sourceId ?? "", right.sourceId ?? "")
+    || compareText(left.toolName ?? "", right.toolName ?? "")
+    || compareText(left.code, right.code)
+    || compareText(left.message, right.message);
 }
 
 function diagnostic(
@@ -724,6 +863,55 @@ function diagnostic(
 
 function isSourceType(value: unknown): value is EdgeSourceType {
   return value === "skill" || value === "mcp" || value === "plugin";
+}
+
+function isToolAdapter(adapter: MoweEdgeAdapterLike): adapter is EdgeAdapter {
+  return typeof (adapter as Partial<EdgeAdapter>).discover === "function"
+    && typeof (adapter as Partial<EdgeAdapter>).load === "function";
+}
+
+function isContributionAdapter(adapter: MoweEdgeAdapterLike): adapter is EdgeContributionAdapter {
+  return typeof (adapter as Partial<EdgeContributionAdapter>).discoverContributions === "function"
+    && typeof (adapter as Partial<EdgeContributionAdapter>).loadContribution === "function";
+}
+
+function isSupportedAdapter(adapter: MoweEdgeAdapterLike): boolean {
+  return isToolAdapter(adapter) || isContributionAdapter(adapter);
+}
+
+function compareContextContributions(
+  left: unknown,
+  right: unknown,
+): number {
+  return compareText(contextValue(left, "sourceId"), contextValue(right, "sourceId"))
+    || compareText(contextValue(left, "contributionId"), contextValue(right, "contributionId"))
+    || compareText(contextValue(left, "name"), contextValue(right, "name"))
+    || compareText(contextValue(left, "contentHash"), contextValue(right, "contentHash"));
+}
+
+function contextName(value: unknown): string | undefined {
+  return isRecord(value) && typeof value.name === "string" ? value.name : undefined;
+}
+
+function contextValue(value: unknown, key: "sourceId" | "contributionId" | "name" | "contentHash"): string {
+  return isRecord(value) && typeof value[key] === "string" ? value[key] : "";
+}
+
+function assertContextIdentity(
+  summary: EdgeContextContributionSummary,
+  loaded: EdgeContextContribution,
+): void {
+  if (loaded.kind !== "context"
+    || loaded.sourceId !== summary.sourceId
+    || loaded.sourceType !== summary.sourceType
+    || loaded.contributionId !== summary.contributionId
+    || loaded.name !== summary.name
+    || loaded.description !== summary.description
+    || loaded.disabled !== summary.disabled
+    || stableJson(loaded.provenance ?? null) !== stableJson(summary.provenance ?? null)
+    || (summary.contentHash !== undefined && loaded.contentHash !== summary.contentHash)) {
+    throw new MoweEdgeRegistryError("Loaded context contribution does not match discovered summary");
+  }
 }
 
 function normalizeSourceId(value: string): string {

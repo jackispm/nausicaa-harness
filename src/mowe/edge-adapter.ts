@@ -11,6 +11,8 @@ import {
   type EdgeAdapterPhase,
   type EdgeCapability,
   type EdgeCapabilitySnapshot,
+  type EdgeContextContribution,
+  type EdgeContextContributionSummary,
   type EdgeManifest,
   type EdgeManifestInput,
   type EdgeProvenance,
@@ -29,6 +31,8 @@ export const MAX_EDGE_JSON_DEPTH = 64;
 export const MAX_EDGE_JSON_NODES = 50_000;
 const MAX_EDGE_STRING_BYTES = 64 * 1024;
 const MAX_EDGE_IDENTITY_BYTES = 512;
+export const MAX_EDGE_CONTEXT_BODY_BYTES = 4 * 1024 * 1024;
+export const MAX_EDGE_CONTEXT_CONTRIBUTIONS = 4_096;
 // Host-granted metadata is intentionally not inferred from object shape.  A
 // capability entering a public snapshot must either satisfy the manifest
 // contract strictly or be the exact object produced by the host rebind path.
@@ -128,6 +132,39 @@ export function validateEdgeManifest(value: unknown): EdgeManifest {
 /** Compute the identity of a validated manifest payload without trusting a supplied hash. */
 export function edgeManifestHash(input: EdgeManifestInput): string {
   return hashManifestPayload(normalizeManifest(input, false));
+}
+
+/** Validate and freeze a summary without loading its context body. */
+export function createEdgeContextContributionSummary(
+  input: EdgeContextContributionSummary,
+): EdgeContextContributionSummary {
+  return normalizeContextContribution(input, false);
+}
+
+/** Validate a discovered or persisted summary supplied by an untrusted edge. */
+export function validateEdgeContextContributionSummary(value: unknown): EdgeContextContributionSummary {
+  return normalizeContextContribution(value, false);
+}
+
+/** Validate and freeze one explicitly loaded context contribution. */
+export function createEdgeContextContribution(
+  input: EdgeContextContribution,
+): EdgeContextContribution {
+  return normalizeContextContribution(input, true);
+}
+
+/** Validate a loaded contribution and verify its body hash against its summary. */
+export function validateEdgeContextContribution(value: unknown): EdgeContextContribution {
+  return normalizeContextContribution(value, true);
+}
+
+/** Stable identity hash for a context contribution (body hash included when present). */
+export function edgeContextContributionHash(
+  input: EdgeContextContributionSummary | EdgeContextContribution,
+): string {
+  const hasBody = isRecord(input) && "body" in input;
+  const normalized = normalizeContextContribution(input, hasBody);
+  return sha256(stableJson(normalized));
 }
 
 /** Ensure a discovered document cannot claim another adapter's identity. */
@@ -323,6 +360,77 @@ function normalizeManifest(value: unknown, requireHash: boolean): EdgeManifestIn
   return deepFreeze(normalized);
 }
 
+function normalizeContextContribution(
+  value: unknown,
+  requireBody: boolean,
+): EdgeContextContribution | EdgeContextContributionSummary {
+  const record = asRecord(value, "context contribution");
+  const keys = [
+    "kind",
+    "sourceId",
+    "contributionId",
+    "sourceType",
+    "name",
+    "description",
+    "disabled",
+    "contentHash",
+    "provenance",
+    ...(requireBody ? ["body"] : []),
+  ];
+  assertExactKeys(record, keys, "context contribution", [
+    "contentHash",
+    "provenance",
+    ...(requireBody ? ["body"] : []),
+  ]);
+  if (record.kind !== "context") fail("context contribution.kind", "must equal context");
+  if (record.sourceType !== "skill" && record.sourceType !== "plugin") {
+    fail("context contribution.sourceType", "must be skill or plugin");
+  }
+  const contentHash = optionalContentHash(record.contentHash, "context contribution.contentHash");
+  const body = optionalBody(record.body, "context contribution.body");
+  if (body !== undefined && contentHash !== undefined && sha256(body) !== contentHash) {
+    fail("context contribution.contentHash", "does not match body");
+  }
+  const provenance = record.provenance === undefined
+    ? undefined
+    : normalizeContextProvenance(record.provenance);
+  const normalized = {
+    kind: "context" as const,
+    sourceId: requiredIdentity(record.sourceId, "context contribution.sourceId"),
+    contributionId: requiredIdentity(
+      record.contributionId,
+      "context contribution.contributionId",
+    ),
+    sourceType: record.sourceType as "skill" | "plugin",
+    name: requiredIdentity(record.name, "context contribution.name"),
+    description: requiredString(record.description, "context contribution.description"),
+    disabled: requiredBoolean(record.disabled, "context contribution.disabled"),
+    ...(body === undefined ? {} : { body }),
+    ...(contentHash === undefined
+      ? (body === undefined ? {} : { contentHash: sha256(body) })
+      : { contentHash }),
+    ...(provenance === undefined ? {} : { provenance }),
+  } satisfies EdgeContextContribution;
+  return deepFreeze(normalized);
+}
+
+function normalizeContextProvenance(value: unknown): EdgeProvenance {
+  const record = asRecord(value, "context contribution.provenance");
+  assertExactKeys(record, PROVENANCE_KEYS, "context contribution.provenance");
+  const author = optionalString(record.author, "context contribution.provenance.author");
+  const sourceUri = optionalString(record.sourceUri, "context contribution.provenance.sourceUri");
+  return deepFreeze({
+    upstreamName: requiredString(record.upstreamName, "context contribution.provenance.upstreamName"),
+    upstreamVersion: requiredIdentity(
+      record.upstreamVersion,
+      "context contribution.provenance.upstreamVersion",
+    ),
+    license: requiredString(record.license, "context contribution.provenance.license"),
+    ...(author === undefined ? {} : { author }),
+    ...(sourceUri === undefined ? {} : { sourceUri }),
+  });
+}
+
 function normalizeProvenance(value: unknown): EdgeProvenance {
   const record = asRecord(value, "manifest.provenance");
   assertExactKeys(record, PROVENANCE_KEYS, "manifest.provenance");
@@ -421,20 +529,26 @@ function hashManifestPayload(manifest: EdgeManifestInput): string {
 }
 
 function compareCapabilities(left: EdgeCapability, right: EdgeCapability): number {
-  return left.manifest.capabilityName.localeCompare(right.manifest.capabilityName)
-    || left.manifest.sourceId.localeCompare(right.manifest.sourceId);
+  return compareText(left.manifest.capabilityName, right.manifest.capabilityName)
+    || compareText(left.manifest.sourceId, right.manifest.sourceId);
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function assertExactKeys(
   record: Readonly<Record<string, unknown>>,
   expected: readonly string[],
   path: string,
+  optional: readonly string[] = ["author", "sourceUri"],
 ): void {
   const allowed = new Set(expected);
   const unknown = Object.keys(record).filter((key) => !allowed.has(key)).sort()[0];
   if (unknown !== undefined) fail(`${path}.${unknown}`, "is not supported");
+  const optionalKeys = new Set(optional);
   for (const key of expected) {
-    if (!(key in record) && key !== "author" && key !== "sourceUri") {
+    if (!(key in record) && !optionalKeys.has(key)) {
       fail(`${path}.${key}`, "is required");
     }
   }
@@ -558,6 +672,22 @@ function validateSchemaNode(value: unknown, path: string, depth: number): void {
 
 function optionalString(value: unknown, path: string): string | undefined {
   return value === undefined ? undefined : requiredString(value, path);
+}
+
+function optionalContentHash(value: unknown, path: string): string | undefined {
+  if (value === undefined) return undefined;
+  const hash = requiredString(value, path);
+  if (!HASH_PATTERN.test(hash)) fail(path, "must be a lowercase sha256 digest");
+  return hash;
+}
+
+function optionalBody(value: unknown, path: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") fail(path, "must be a string");
+  if (Buffer.byteLength(value, "utf8") > MAX_EDGE_CONTEXT_BODY_BYTES) {
+    fail(path, `must not exceed ${MAX_EDGE_CONTEXT_BODY_BYTES} UTF-8 bytes`);
+  }
+  return value;
 }
 
 function requiredBoolean(value: unknown, path: string): boolean {
