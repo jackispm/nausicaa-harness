@@ -29,7 +29,7 @@ export function permissionProfileOptions(
     {
       value: "workspace",
       label: "Workspace",
-      description: "Read and edit files inside the workspace; no shell or network",
+      description: "Read, edit, and run sandboxed Bash inside the workspace; no network",
     },
     {
       value: "full-access",

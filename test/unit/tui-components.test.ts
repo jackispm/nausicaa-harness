@@ -116,6 +116,7 @@ describe("TUI components", () => {
 
     const toolStep = new AssistantMessageBlock("I will inspect the files.", true).render(80);
     expect(toolStep.join("\n")).not.toContain("\x1b]133;");
+    expect(toolStep).toEqual([]);
 
     const empty = new AssistantMessageBlock().render(80);
     expect(empty).toEqual([]);
@@ -148,7 +149,7 @@ describe("TUI components", () => {
 
   it("shows current Main context capacity instead of cumulative usage or cache ratio", () => {
     const tray = stripTerminalSequences(new SessionTray(() => snapshot).render(100).join("\n"));
-    expect(tray).toContain("7.0k/1.0m (1%)");
+    expect(tray).toContain("7.0k/1.0m (0.7%)");
     expect(tray).toContain("read only");
     expect(tray).not.toContain("150");
     expect(tray).not.toContain("40%");
@@ -160,6 +161,13 @@ describe("TUI components", () => {
     })).render(100).join("\n"));
     expect(unknown).toContain("4.6k/?");
     expect(unknown).not.toContain("%");
+
+    const small = stripTerminalSequences(new SessionTray(() => ({
+      ...snapshot,
+      mainContextTokens: 4_600,
+      mainContextWindowTokens: 1_048_576,
+    })).render(100).join("\n"));
+    expect(small).toContain("4.6k/1.0m (0.4%)");
 
     const noRequest = stripTerminalSequences(new SessionTray(() => ({
       ...snapshot,

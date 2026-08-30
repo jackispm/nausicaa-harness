@@ -18,6 +18,7 @@ import {
 } from "../../src/runtime/session-artifacts.js";
 import type { RuntimeFukaiCompactionFactory } from "../../src/runtime/fukai-compaction-runtime.js";
 import { FileContentAddressedStore } from "../../src/store/index.js";
+import { WorkspaceCommandSandbox } from "../../src/tools/index.js";
 import { FileProcessJobRegistry } from "../../src/tools/process-jobs.js";
 
 const roots: string[] = [];
@@ -285,7 +286,9 @@ describe("SessionController", () => {
       response("third answer"),
     ];
     const model: ModelPort = {
-      capabilities: () => ({ imageInput: false, contextWindowTokens: 10 }),
+      // Keep enough response headroom while making the first large answer
+      // cross the model-window pressure threshold on a later Turn.
+      capabilities: () => ({ imageInput: false, contextWindowTokens: 4_000 }),
       async complete(request) {
         if (request.sessionId.startsWith("fukai-compaction:")) {
           return response(JSON.stringify({
@@ -303,9 +306,11 @@ describe("SessionController", () => {
       workspace: root,
       dataDir: join(root, "state"),
       model: "scripted",
+      maxOutputTokens: 100,
       fukaiCompaction: {
         ...enabledFukaiPolicy(),
         maxInputTokens: 12_000,
+        retainRatio: 0.001,
       },
       policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
     }, {
@@ -531,6 +536,11 @@ describe("SessionController", () => {
       response("full"),
       response("read only"),
     ]);
+    const workspaceCommandSandbox = new WorkspaceCommandSandbox({
+      platform: "darwin",
+      seatbeltExecutable: "/usr/bin/true",
+      probe: () => true,
+    });
     const session = await SessionController.open({
       workspace: root,
       dataDir: join(root, "state"),
@@ -539,6 +549,7 @@ describe("SessionController", () => {
     }, {
       mainModel: model,
       createRunId: () => "permission-profile-run",
+      workspaceCommandSandbox,
     });
 
     expect(session.snapshot()).toMatchObject({
@@ -555,7 +566,8 @@ describe("SessionController", () => {
     const workspaceTools = model.requests[0]?.tools.map((tool) => tool.name) ?? [];
     expect(workspaceTools).toContain("write_file");
     expect(workspaceTools).toContain("edit");
-    expect(workspaceTools).not.toContain("bash");
+    expect(workspaceTools).toContain("bash");
+    expect(workspaceTools).not.toContain("process_start");
     expect(workspaceTools).not.toContain("web_fetch");
 
     await session.selectPermissionProfile("full-access");

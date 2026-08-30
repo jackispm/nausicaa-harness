@@ -29,6 +29,7 @@ import {
 import {
   MainLoop,
   MainRunTokenBudgetExhaustedError,
+  UNKNOWN_MODEL_REQUEST_INPUT_FALLBACK_TOKENS,
   type MainStreamEvent,
 } from "../../src/runtime/main-loop.js";
 import { projectMainExecutionRecovery } from "../../src/runtime/recovery.js";
@@ -44,6 +45,273 @@ afterEach(async () => {
 });
 
 describe("MainLoop", () => {
+  it("keeps model request capacity independent from the cumulative Run budget", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const observedInputBudgets: number[] = [];
+    const scripted = new ScriptedModel([{
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const model = modelWithContextWindows(scripted, { demo: 20_000 });
+    const provider = recordingContextProvider(store, observedInputBudgets);
+    const loop = new MainLoop({
+      model,
+      runTokenBudget: new RunTokenBudget(500),
+      contextProvider: provider,
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: [],
+    });
+
+    await loop.run({
+      runId: "main-request-window-independent",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: { ...policy(1), maxModelTokens: 500 },
+      initialMessage: "Go",
+      maxOutputTokens: 2_000,
+    });
+
+    expect(observedInputBudgets).toEqual([18_000]);
+    expect(scripted.requests[0]?.maxOutputTokens).toBeLessThan(500);
+  });
+
+  it("recomputes request input capacity when the selected model changes", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const observedInputBudgets: number[] = [];
+    const scripted = new ScriptedModel([{
+      content: "inspect",
+      toolCalls: [{ id: "switch-noop", name: "noop", arguments: {} }],
+      stopReason: "toolUse",
+      usage: tokenUsage(10, 5),
+    }, {
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    let selector = "small";
+    const loop = new MainLoop({
+      model: modelWithContextWindows(scripted, { small: 12_000, large: 40_000 }),
+      resolveModel: () => selector,
+      contextProvider: recordingContextProvider(store, observedInputBudgets),
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: [noopToolForMainTest],
+      afterStep: () => { selector = "large"; },
+    });
+
+    await loop.run({
+      runId: "main-request-window-switch",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "small",
+      workspace,
+      policy: policy(2),
+      initialMessage: "Go",
+      maxOutputTokens: 2_000,
+    });
+
+    expect(observedInputBudgets).toEqual([10_000, 38_000]);
+    expect(scripted.requests.map((request) => request.model)).toEqual(["small", "large"]);
+  });
+
+  it("freezes model capabilities once for context and pressure at each boundary", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const scripted = new ScriptedModel([{
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    let capabilityCalls = 0;
+    const pressureCapacities: Array<{
+      contextWindowTokens: number | undefined;
+      inputCapacityTokens: number;
+    }> = [];
+    const model: ModelPort = {
+      capabilities() {
+        capabilityCalls += 1;
+        return {
+          imageInput: false,
+          contextWindowTokens: capabilityCalls === 1 ? 12_000 : 40_000,
+        };
+      },
+      complete: scripted.complete.bind(scripted),
+    };
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: [],
+      compactForPressure: async (context) => {
+        pressureCapacities.push({
+          contextWindowTokens: context.contextWindowTokens,
+          inputCapacityTokens: context.inputCapacityTokens,
+        });
+        return undefined;
+      },
+    });
+
+    await loop.run({
+      runId: "main-request-capability-freeze",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      maxOutputTokens: 2_000,
+    });
+
+    expect(capabilityCalls).toBe(1);
+    expect(pressureCapacities).toEqual([{
+      contextWindowTokens: 12_000,
+      inputCapacityTokens: 10_000,
+    }]);
+  });
+
+  it("uses the conservative request fallback for invalid context metadata", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const observedInputBudgets: number[] = [];
+    const scripted = new ScriptedModel([{
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const model: ModelPort = {
+      capabilities: () => ({ imageInput: false, contextWindowTokens: 0 }),
+      complete: scripted.complete.bind(scripted),
+    };
+    const loop = new MainLoop({
+      model,
+      contextProvider: recordingContextProvider(store, observedInputBudgets),
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: [],
+    });
+
+    await loop.run({
+      runId: "main-request-invalid-window-fallback",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      maxOutputTokens: 2_000,
+    });
+
+    expect(observedInputBudgets).toEqual([UNKNOWN_MODEL_REQUEST_INPUT_FALLBACK_TOKENS]);
+  });
+
+  it("rejects a model window that cannot retain one input token after output reservation", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const scripted = new ScriptedModel([{
+      content: "must not run",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(1, 1),
+    }]);
+    const loop = new MainLoop({
+      model: modelWithContextWindows(scripted, { demo: 2_000 }),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: [],
+    });
+
+    await expect(loop.run({
+      runId: "main-request-output-reservation-boundary",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      maxOutputTokens: 2_000,
+    })).rejects.toThrow("Model context window must exceed the 2000 token output reservation");
+    expect(scripted.callCount).toBe(0);
+  });
+
+  it("uses an explicit input budget only to tighten model request capacity", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const observedInputBudgets: number[] = [];
+    const scripted = new ScriptedModel(Array.from({ length: 2 }, () => ({
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    })));
+    const loop = new MainLoop({
+      model: modelWithContextWindows(scripted, { demo: 20_000 }),
+      contextProvider: recordingContextProvider(store, observedInputBudgets),
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: [],
+    });
+
+    await loop.run({
+      runId: "main-request-explicit-input-tight",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      maxOutputTokens: 2_000,
+      contextBudget: { maxInputTokens: 6_000 },
+    });
+    await loop.run({
+      runId: "main-request-explicit-input-cap",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      maxOutputTokens: 2_000,
+      contextBudget: { maxInputTokens: 50_000 },
+    });
+
+    expect(observedInputBudgets).toEqual([6_000, 18_000]);
+  });
+
+  it("rejects an invalid explicit input budget instead of silently clamping it", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const scripted = new ScriptedModel([{
+      content: "must not run",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(1, 1),
+    }]);
+    const loop = new MainLoop({
+      model: modelWithContextWindows(scripted, { demo: 20_000 }),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: [],
+    });
+
+    await expect(loop.run({
+      runId: "main-request-invalid-explicit-input",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      maxOutputTokens: 2_000,
+      contextBudget: { maxInputTokens: Number.POSITIVE_INFINITY },
+    })).rejects.toThrow("contextBudget.maxInputTokens must be a non-negative integer");
+    expect(scripted.callCount).toBe(0);
+  });
+
   it("reloads trusted project instructions at every request and records CAS identity", async () => {
     const workspace = await temporaryDirectory();
     const instructionPath = path.join(workspace, "AGENTS.md");
@@ -1738,7 +2006,7 @@ describe("MainLoop", () => {
     const store = new MemoryContentAddressedStore();
     const ledger = new MemoryLedger();
     const fullContent = `${"前缀内容 ".repeat(40_000)}END`;
-    const model = new ScriptedModel([
+    const scripted = new ScriptedModel([
       {
         content: "inspect the result",
         toolCalls: [{ id: "large-call", name: "large_tool", arguments: {} }],
@@ -1753,7 +2021,7 @@ describe("MainLoop", () => {
       },
     ]);
     const loop = new MainLoop({
-      model,
+      model: modelWithContextWindows(scripted, { demo: 128_000 }),
       contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
       conversationStore: store,
       eventSink: ledger,
@@ -1791,7 +2059,7 @@ describe("MainLoop", () => {
     expect(durable.content).not.toBe(fullContent);
     expect(durable.content).toContain("Full tool result stored as artifact");
 
-    const visibleTool = model.requests[1]?.messages.find((message) => message.role === "tool");
+    const visibleTool = scripted.requests[1]?.messages.find((message) => message.role === "tool");
     expect(visibleTool?.content).toContain("[TRUNCATED BY MAIN LOOP]");
     expect(Buffer.byteLength(visibleTool?.content ?? "", "utf8")).toBeLessThanOrEqual(256 * 1024);
     expect(visibleTool?.content).toBe(durable.content);
@@ -2101,6 +2369,35 @@ function pressureSizedContextProvider(
         },
       };
     },
+  };
+}
+
+function recordingContextProvider(
+  store: MemoryContentAddressedStore,
+  observedInputBudgets: number[],
+): MainContextProvider {
+  const provider = new FukaiContextProvider(new ContentStoreFukaiSource(store));
+  return {
+    async build(request) {
+      observedInputBudgets.push(request.budget.maxInputTokens);
+      return provider.build(request);
+    },
+  };
+}
+
+function modelWithContextWindows(
+  scripted: ScriptedModel,
+  contextWindowTokens: Readonly<Record<string, number>>,
+): ModelPort {
+  return {
+    capabilities(model) {
+      const contextWindow = contextWindowTokens[model];
+      return {
+        imageInput: false,
+        ...(contextWindow === undefined ? {} : { contextWindowTokens: contextWindow }),
+      };
+    },
+    complete: scripted.complete.bind(scripted),
   };
 }
 

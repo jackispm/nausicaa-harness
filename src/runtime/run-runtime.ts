@@ -47,6 +47,8 @@ import { IntentNavigator, ObservationFrameBuilder } from "../teto/index.js";
 import {
   createWorkspaceTools,
   ProcessJobManager,
+  WorkspaceCommandSandbox,
+  type WorkspaceCommandSandboxOptions,
   type WebFetchProvider,
   type WebSearchProvider,
 } from "../tools/index.js";
@@ -131,6 +133,10 @@ export interface RunExecutionDeps {
   webSearchProvider?: WebSearchProvider;
   /** Host approval boundary for Main tools that explicitly require approval. */
   approveTool?: MainLoopDeps["approve"];
+  /** Test/embedding seam for the OS-enforced workspace Bash boundary. */
+  createWorkspaceCommandSandbox?: (
+    options: WorkspaceCommandSandboxOptions,
+  ) => Pick<WorkspaceCommandSandbox, "availability" | "execute">;
   /** Optional explicit selector for a previously committed Fukai capsule. */
   selectCompaction?: (context: {
     runId: string;
@@ -334,15 +340,32 @@ export const executeRun = async (
       events: setup.events,
       clock,
     });
-    if (deps.tools === undefined && request.allowShell === true) {
+    const hostShellEnabled = deps.tools === undefined && request.allowShell === true;
+    const workspaceShellRequested = deps.tools === undefined
+      && request.allowWrite === true
+      && request.allowShell !== true
+      && request.allowNetwork !== true;
+    const workspaceCommandSandbox = workspaceShellRequested
+      ? (deps.createWorkspaceCommandSandbox
+          ?? ((options) => new WorkspaceCommandSandbox(options)))({
+            protectedPaths: [resolve(request.dataDir)],
+          })
+      : undefined;
+    const workspaceBashExecutor = workspaceCommandSandbox?.availability().available === true
+      ? workspaceCommandSandbox.execute
+      : undefined;
+    if (hostShellEnabled) {
       processJobManager = new ProcessJobManager({
         protectedPaths: [resolve(request.dataDir)],
       });
     }
     const tools = [...(deps.tools ?? createWorkspaceTools({
       allowWrite: request.allowWrite === true,
-      allowShell: request.allowShell === true,
-      allowProcessJobs: request.allowShell === true,
+      allowShell: hostShellEnabled || workspaceBashExecutor !== undefined,
+      ...(workspaceBashExecutor === undefined
+        ? {}
+        : { bashCommandExecutor: workspaceBashExecutor }),
+      allowProcessJobs: hostShellEnabled,
       ...(processJobManager === undefined ? {} : { processJobManager }),
       allowImages: mainAdvertisesImages,
       allowNetwork: request.allowNetwork === true,

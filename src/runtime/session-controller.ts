@@ -54,6 +54,7 @@ import {
   createWorkspaceTools,
   FileProcessJobRegistry,
   ProcessJobManager,
+  WorkspaceCommandSandbox,
   type WebFetchProvider,
   type WebSearchProvider,
 } from "../tools/index.js";
@@ -290,6 +291,8 @@ export interface SessionControllerDeps {
   /** Optional provider seams for network-backed Main tools. */
   webFetchProvider?: WebFetchProvider;
   webSearchProvider?: WebSearchProvider;
+  /** Test/embedding seam for the default workspace-confined foreground Bash. */
+  workspaceCommandSandbox?: WorkspaceCommandSandbox;
   /** Host/TUI approval boundary for Main tools that explicitly require approval. */
   approveTool?: MainLoopDeps["approve"];
   /** Test/plugin seam for the opt-in activation-scoped compaction adapter. */
@@ -346,6 +349,7 @@ export class SessionController {
   private readonly clock: Clock;
   private readonly policy: RunPolicy;
   private readonly requestedWorkerEnabled: boolean | undefined;
+  private readonly workspaceCommandSandbox: WorkspaceCommandSandbox;
   private selectedMainModel: string;
   private writeAllowed: boolean;
   private shellAllowed: boolean;
@@ -386,6 +390,8 @@ export class SessionController {
       ? undefined
       : resolve(options.processJobRegistryDir);
     this.deps = deps;
+    this.workspaceCommandSandbox = deps.workspaceCommandSandbox
+      ?? new WorkspaceCommandSandbox({ protectedPaths: [dataDir] });
     this.clock = deps.clock ?? systemClock;
     this.requestedWorkerEnabled = options.workerEnabled ?? options.policy?.workerEnabled;
     this.policy = resolveRunPolicy({
@@ -519,12 +525,7 @@ export class SessionController {
     });
   }
 
-  /**
-   * Change which first-party capabilities Main receives on its next Turn.
-   * Workspace deliberately excludes Bash because Nausicaa does not yet own an
-   * OS-level workspace sandbox; Full Access makes that host-level boundary
-   * explicit instead of hiding it behind a misleading label.
-   */
+  /** Change which first-party capabilities Main receives on its next Turn. */
   async selectPermissionProfile(
     profile: SelectableSessionPermissionProfile,
   ): Promise<SessionPermissionSelectionResult> {
@@ -1468,6 +1469,11 @@ export class SessionController {
         events,
         clock: this.clock,
       });
+      const workspaceSandbox = this.deps.tools === undefined
+        && permissionProfileForCapabilities(turnCapabilities) === "workspace"
+        && this.workspaceCommandSandbox.availability().available
+        ? this.workspaceCommandSandbox
+        : undefined;
       if (
         this.deps.tools === undefined
         && turnCapabilities.allowShell
@@ -1477,7 +1483,10 @@ export class SessionController {
       }
       const tools = [...(this.deps.tools ?? createWorkspaceTools({
         allowWrite: turnCapabilities.allowWrite,
-        allowShell: turnCapabilities.allowShell,
+        allowShell: turnCapabilities.allowShell || workspaceSandbox !== undefined,
+        ...(workspaceSandbox === undefined
+          ? {}
+          : { bashCommandExecutor: workspaceSandbox.execute }),
         allowProcessJobs: turnCapabilities.allowShell,
         ...(attached.processJobs === undefined ? {} : { processJobManager: attached.processJobs }),
         allowImages: shouldAdvertiseImageTools(model, this.model),

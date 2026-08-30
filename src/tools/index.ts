@@ -79,6 +79,16 @@ export {
   type WorkspacePathPolicy,
   WorkspacePathError,
 } from "./workspace-path.js";
+export {
+  buildBubblewrapWorkspaceArguments,
+  buildSeatbeltWorkspaceProfile,
+  createWorkspaceSandboxBashExecutor,
+  WorkspaceCommandSandbox,
+  WorkspaceCommandSandboxUnavailableError,
+  type WorkspaceCommandSandboxOptions,
+  type WorkspaceSandboxAvailability,
+  type WorkspaceSandboxBackend,
+} from "./workspace-command-sandbox.js";
 export { createWriteFileTool, writeFileTool } from "./write-file.js";
 export {
   createDuckDuckGoSearchTool,

@@ -292,7 +292,9 @@ export class SessionTray implements Component {
     const contextPercent = snapshot.mainContextTokens === null
       || snapshot.mainContextWindowTokens === null
       ? undefined
-      : Math.round((snapshot.mainContextTokens / snapshot.mainContextWindowTokens) * 100);
+      : formatTrayContextPercent(
+          (snapshot.mainContextTokens / snapshot.mainContextWindowTokens) * 100,
+        );
     const right = snapshot.mainContextTokens === null
       ? ""
       : snapshot.mainContextWindowTokens === null
@@ -570,12 +572,16 @@ export class AssistantMessageBlock implements Component {
   setThinkingExpanded(expanded: boolean): void { this.thinking.setExpanded(expanded); }
   getText(): string { return this.text; }
   hasVisibleContent(): boolean {
-    return this.text.length > 0 || this.thinking.render(1).length > 0;
+    return (!this.hasToolCalls && this.text.length > 0) || this.thinking.render(1).length > 0;
   }
 
   render(width: number): string[] {
     const thinking = this.thinking.render(width);
-    const answer = this.text.length === 0 ? [] : this.markdown.render(width);
+    // Some providers occasionally attach narration to a tool-call response.
+    // Keep it in the Ledger/model context, but do not present it as an answer.
+    const answer = this.hasToolCalls || this.text.length === 0
+      ? []
+      : this.markdown.render(width);
     const lines = fitLines([
       ...thinking,
       ...(thinking.length > 0 && answer.length > 0 ? [""] : []),
@@ -588,6 +594,11 @@ export class AssistantMessageBlock implements Component {
     this.thinking.invalidate();
     this.markdown.invalidate();
   }
+}
+
+function formatTrayContextPercent(percent: number): string {
+  if (percent > 0 && percent < 1) return percent.toFixed(1);
+  return String(Math.round(percent));
 }
 
 function markSemanticPrompt(lines: string[]): string[] {

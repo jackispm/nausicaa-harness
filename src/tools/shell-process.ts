@@ -16,6 +16,13 @@ interface ShellConfig {
   commandFromStdin?: true;
 }
 
+/** Exact executable/argv shape used by a shell or an OS sandbox wrapper. */
+export interface ShellCommandInvocation {
+  executable: string;
+  arguments: string[];
+  commandFromStdin?: true;
+}
+
 export interface ShellExecutionResult {
   stdout: ShellOutputSnapshot;
   stderr: ShellOutputSnapshot;
@@ -43,6 +50,10 @@ export async function executeShellCommand(input: {
   cwd: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Optional wrapper invocation; omitted uses the host Bash resolver. */
+  invocation?: ShellCommandInvocation;
+  /** Safe, non-secret environment overrides for the child process. */
+  env?: NodeJS.ProcessEnv;
 }): Promise<ShellExecutionResult> {
   const stdout = new ShellOutputCapture();
   const stderr = new ShellOutputCapture();
@@ -50,7 +61,7 @@ export async function executeShellCommand(input: {
     return snapshotResult(stdout, stderr, null, true, false);
   }
 
-  const shell = resolveShell();
+  const shell = input.invocation ?? resolveShell();
   const executionMarker = randomUUID();
   return await new Promise((resolve) => {
     let child: ChildProcess;
@@ -93,7 +104,7 @@ export async function executeShellCommand(input: {
         {
           cwd: input.cwd,
           detached: process.platform !== "win32",
-          env: shellEnvironment(executionMarker),
+          env: shellEnvironment(executionMarker, input.env),
           stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
           windowsHide: true,
         },
@@ -150,10 +161,14 @@ export async function executeShellCommand(input: {
 export function spawnShellCommand(input: {
   command: string;
   cwd: string;
+  /** Optional wrapper invocation; omitted uses the host Bash resolver. */
+  invocation?: ShellCommandInvocation;
+  /** Safe, non-secret environment overrides for the child process. */
+  env?: NodeJS.ProcessEnv;
 }): StartedShellProcess {
   const stdout = new ShellOutputCapture();
   const stderr = new ShellOutputCapture();
-  const shell = resolveShell();
+  const shell = input.invocation ?? resolveShell();
   const executionMarker = randomUUID();
   const commandFromStdin = shell.commandFromStdin === true;
   let child: ChildProcess;
@@ -164,7 +179,7 @@ export function spawnShellCommand(input: {
       {
         cwd: input.cwd,
         detached: process.platform !== "win32",
-        env: shellEnvironment(executionMarker),
+        env: shellEnvironment(executionMarker, input.env),
         stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
         windowsHide: true,
       },
@@ -419,15 +434,24 @@ function findOnPath(executable: string): string | undefined {
   }
 }
 
-function shellEnvironment(executionMarker: string): NodeJS.ProcessEnv {
-  const allowed = [
+const SAFE_ENVIRONMENT_KEYS = [
     "PATH", "HOME", "USER", "LOGNAME", "SHELL",
     "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM", "NO_COLOR", "FORCE_COLOR",
     "TMPDIR", "TMP", "TEMP", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT",
-  ];
+    "XDG_CACHE_HOME", "NPM_CONFIG_CACHE", "GIT_OPTIONAL_LOCKS",
+  ] as const;
+
+function shellEnvironment(
+  executionMarker: string,
+  overrides: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
-  for (const key of allowed) {
+  for (const key of SAFE_ENVIRONMENT_KEYS) {
     const value = environmentValue(key);
+    if (value !== undefined) environment[key] = value;
+  }
+  for (const key of SAFE_ENVIRONMENT_KEYS) {
+    const value = environmentValueFrom(overrides, key);
     if (value !== undefined) environment[key] = value;
   }
   environment[EXECUTION_MARKER_ENV] = executionMarker;
@@ -435,11 +459,18 @@ function shellEnvironment(executionMarker: string): NodeJS.ProcessEnv {
 }
 
 function environmentValue(key: string): string | undefined {
-  if (process.platform !== "win32") return process.env[key];
-  const actualKey = Object.keys(process.env).find(
+  return environmentValueFrom(process.env, key);
+}
+
+function environmentValueFrom(
+  source: NodeJS.ProcessEnv,
+  key: string,
+): string | undefined {
+  if (process.platform !== "win32") return source[key];
+  const actualKey = Object.keys(source).find(
     (candidate) => candidate.toLowerCase() === key.toLowerCase(),
   );
-  return actualKey === undefined ? undefined : process.env[actualKey];
+  return actualKey === undefined ? undefined : source[actualKey];
 }
 
 function asError(error: unknown): Error {

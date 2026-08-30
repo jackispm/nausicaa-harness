@@ -653,7 +653,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     try {
       const message = await options.session.readConversationMessage(ref);
       if (closed || generation !== transcriptGeneration) return;
-      if (message.role !== "assistant" || message.content.length === 0) return;
+      if (
+        message.role !== "assistant"
+        || message.content.length === 0
+        || message.toolCalls.length > 0
+      ) return;
       const key = assistantKey(ref.id, message.content);
       if (renderedAssistants.has(key)) return;
       renderedAssistants.add(key);
@@ -683,6 +687,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         return;
       }
       if (entry.role === "assistant") {
+        if (entry.hasToolCalls) return;
         renderedAssistants.add(assistantKey(entry.turnId, entry.content));
         appendAssistant(new AssistantMessageBlock(entry.content, entry.hasToolCalls));
         return;
@@ -962,13 +967,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
 
   const writeStatus = (snapshot: SessionSnapshot): void => {
     const usage = snapshot.usage;
+    const shellStatus = snapshot.permissionProfile === "workspace"
+      ? "sandboxed Bash enabled when available"
+      : snapshot.allowShell ? "host shell enabled" : "shell off";
     const text = [
       "### Session",
       `- **Workspace:** \`${snapshot.workspace}\``,
       `- **Model:** \`${snapshot.model}\``,
       `- **Run / Turn:** \`${snapshot.runId ?? "new"}\` / \`${snapshot.turnId ?? "idle"}\``,
       `- **State:** ${snapshot.status}; ${snapshot.collaborationMode} mode; Teto ${snapshot.tetoEnabled ? "on" : "off"}`,
-      `- **Permissions:** ${snapshot.permissionProfile}; ${snapshot.allowWrite ? "write enabled" : "file writes off"}; ${snapshot.allowShell ? "shell enabled" : "shell off"}; ${snapshot.allowNetwork ? "network enabled" : "network off"}`,
+      `- **Permissions:** ${snapshot.permissionProfile}; ${snapshot.allowWrite ? "write enabled" : "file writes off"}; ${shellStatus}; ${snapshot.allowNetwork ? "network enabled" : "network off"}`,
       `- **Queue / Tokens:** ${snapshot.pendingInputs} pending; ${usage.input + usage.output} used; ${usage.cacheRead} cache-read`,
       ...(snapshot.blocker === undefined ? [] : [`- **Blocked:** ${snapshot.blocker}`]),
     ].join("\n");

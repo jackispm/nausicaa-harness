@@ -9,11 +9,11 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 - 基于 [`pi-ai`](https://github.com/earendil-works/pi/tree/main/packages/ai) 接入模型与 OpenRouter，不重复实现 provider 调度。
 - 启动消息支持 Prime 风格的 `@image` 输入；图片作为 `pi-ai` 原生多模态内容传递，不维护自定义 provider 协议。
 - Main 运行有界 tool loop，并通过 Mowe 统一执行单个或批量调用。默认只读目录包含 `read_file`、`read_many`、`list_files`、`grep`、`find`、`file_info` 和四个安全 Git 查看工具（status/log/show/diff）；按需可启用 `read_image`、网络、写入、Shell 与后台进程。搜索、读取、图片、Git 和元数据结果均有大小限制。
-- 默认 `workspace` 权限还提供原子写入 `write_file`、精确替换 `edit`，以及受同一路径边界保护的 `directory_create`、`path_copy`、`path_move` 和 `path_delete`；可在 TUI 用 `/permissions read-only` 收紧。
-- `--allow-shell` 独立启用 `bash`。这是显式高权限能力：命令虽从工作区启动，但可按当前系统账号权限读写工作区外部；它不会随 `--allow-write` 自动开启，反之亦然。
+- 默认 `workspace` 权限还提供原子写入 `write_file`、精确替换 `edit`，以及受同一路径边界保护的 `directory_create`、`path_copy`、`path_move` 和 `path_delete`；macOS 或可用 bubblewrap 的 Linux 上还提供无公网、写路径限制在工作区的前台 `bash`。沙箱不可用时 Bash 会 fail closed，文件工具仍可用；也可在 TUI 用 `/permissions read-only` 收紧。
+- `--allow-shell` 独立启用宿主级 `bash` 和后台进程工具。这是显式高权限能力：命令可按当前系统账号权限读写工作区外部；它不会随 `--allow-write` 自动开启，反之亦然。
 - 在嵌入式运行时中，`allowProcessJobs` 与 `allowShell` 同时开启后提供 `process_start`、`process_status`、`process_output`、`process_kill` 和 `process_list`，用于在同一 Run 内启动、观察、读取、终止和诊断有界后台进程；Job 固定以工作区为 cwd、按 Run 隔离、输出有界并支持超时/取消。默认注册表仍为进程内模式；daemon 可按 Run 自动注入 `FileProcessJobRegistry`，持久化启动/终态快照，重启时将未绑定 OS 进程的 running 记录标为 orphaned，不假装恢复进程。普通 TUI/print 仍保持进程内注册表，避免把一次性会话状态写入磁盘。
 - `--allow-network` 启用 `web_fetch` 和批量 `web_search`。网络工具默认关闭，使用同源重定向、SSRF、响应大小、超时和取消边界；部署可通过 provider seam 替换搜索/抓取后端。
-- 工作区文件工具始终保护 `.env`、`.git`、`.nausicaa`、私钥和常见凭据路径，即使开启 `--allow-write` 也不能访问；高权限 `bash` 不受此路径策略约束。
+- 工作区文件工具和沙箱 Bash 保护 `.env*`、`.git`、`.nausicaa`、私钥和常见凭据路径；高权限宿主 `bash` 不受此路径策略约束。
 - JSONL Ledger 与内容寻址 Store 保存事实和大对象，支持 checkpoint 与 Run 恢复。
 - Teto 辅助线读取固定大小的观察帧，低频检查目标偏离、意图缺失和更优方法。
 - Advice 通过持久 Inbox 在 Main 的自然边界进入上下文，可明确接受、延后或拒绝。
@@ -26,7 +26,9 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 
 当前没有通用 graph DSL 或插件市场；Mowe 的 `MoweCatalog` 提供窄的本地注册 seam，便于接入自定义 AgentTool，而不要求引入 Cordis 级插件运行时。
 
-`read_file` 支持按行分页，`read_many` 可在共享字节预算内并发读取最多 16 个窗口；`grep` 与 `find` 在截断时返回绑定查询的续页 cursor。Git 查看工具使用固定参数、受保护路径过滤、可信可执行文件解析和有界输出，不要求开放 Shell。`write_file` 只在已有目录中写文件，不负责创建目录；`edit` 要求被替换文本唯一匹配。工作区文件工具会拒绝绝对路径、`..`、已有符号链接和受保护路径；当前威胁模型不覆盖同一系统账号下的其他进程并发替换文件系统节点。`bash` 有独立的环境变量白名单、取消/超时和有界输出，但不会继承这些文件路径限制；需要异步观察开发服务器或测试进程时，使用上述 Job 生命周期工具，而不是在 `bash` 中放任后台命令。
+`read_file` 支持按行分页，`read_many` 可在共享字节预算内并发读取最多 16 个窗口；`grep` 与 `find` 在截断时返回绑定查询的续页 cursor。Git 查看工具使用固定参数、受保护路径过滤、可信可执行文件解析和有界输出，不要求开放 Shell。`write_file` 只在已有目录中写文件，不负责创建目录；`edit` 要求被替换文本唯一匹配。工作区文件工具会拒绝绝对路径、`..`、已有符号链接和受保护路径；当前威胁模型不覆盖同一系统账号下的其他进程并发替换文件系统节点。两档 `bash` 都有独立的环境变量白名单、取消/超时和有界输出；`workspace` 档再由 Seatbelt 或 bubblewrap 限制写入、网络和进程边界，`full-access` 档则明确运行在宿主权限下。需要异步观察开发服务器或测试进程时使用 Full Access 提供的 Job 生命周期工具，而不是在前台 `bash` 中放任后台命令。
+
+`workspace` Bash 是与 Codex/DeepSeek 同类的 OS 路径沙箱，不是 copy-on-write 容器。预先存在于工作区的硬链接仍可能指向工作区外同一文件对象；Linux 的 network namespace 会隐藏常规 `/run` socket，但不能证明所有非标准路径的 Unix socket 都不可达。Nausicaa 的结构化文件工具仍拒绝硬链接。对完全不可信的仓库应使用 `read-only`，或在独立容器/VM 中运行 Nausicaa；不要把 `workspace` 当成跨用户或恶意宿主隔离。
 
 ## 本地使用
 
@@ -60,16 +62,16 @@ nausicaa -p "查看这个项目如何安装"
 nausicaa --resume <run-id>
 nausicaa --continue
 
-# 默认可以读取和修改当前工作区；Shell 与网络仍保持关闭
+# 默认可以读取、修改并在 OS 沙箱内执行当前工作区；宿主 Shell 与网络仍关闭
 nausicaa --model openrouter:openai/gpt-5-mini "修复这个项目"
 
-# 需要执行命令时单独开启高权限 Shell；它不要求也不等同于 --allow-write
+# 需要访问宿主或运行后台进程时单独开启高权限 Shell
 nausicaa --allow-shell "运行测试并分析失败原因"
 ```
 
 `@image` 用于启动消息，可重复指定；交互中按 `Ctrl+V`（Windows 为 `Alt+V`）可从剪贴板插入 Prime 风格的 `[image #N]` 标记。提交时只附带仍出现在文本中的标记，删除标记会移除附件，当前进程内通过撤销或历史恢复标记后仍可重新附带。模型必须在 `pi-ai` 模型目录中声明 `image` 输入能力；文本模型会在发起 provider 请求前给出错误。路径必须相对当前工作区，且不能穿过符号链接、硬链接、受保护目录或 `..`；支持 PNG、JPEG、GIF、WebP，按文件内容而非扩展名识别。每次最多 4 张、单张最多 3 MiB、总计最多 10 MiB，当前不会自动缩放。图片内容随 Run 持久化并可恢复；Teto 不会因此读取额外的完整主线内容。
 
-也可设置 `NAUSICAA_MODEL`，省略每次调用的 `--model`。交互会话默认使用 `workspace` 权限：可读写当前工作区，但不开放宿主 Shell 或网络。`/permissions` 可在 `read-only`、`workspace`、`full-access` 三档之间切换；`full-access` 等同于明确开放工作区写入、宿主 Shell、网络和后台进程，因此边界会直接显示在底部状态栏。`/plan [prompt]` 进入只读 Plan 模式，`/mode` 可在 Default 与 Plan 间切换。
+也可设置 `NAUSICAA_MODEL`，省略每次调用的 `--model`。交互会话默认使用 `workspace` 权限：可读写当前工作区，并可在可用的 OS 沙箱内运行前台 Bash，但不开放宿主 Shell、网络或后台进程。`/permissions` 可在 `read-only`、`workspace`、`full-access` 三档之间切换；`full-access` 等同于明确开放工作区写入、宿主 Shell、网络和后台进程，因此边界会直接显示在底部状态栏。`/plan [prompt]` 进入只读 Plan 模式，`/mode` 可在 Default 与 Plan 间切换。
 
 `/goal` 查看当前 Run 的长期目标，`/goal <statement>` 修订它；`/session` 打开当前工作区的 Run 选择器，`/session <run-id>` 可直接切换；`/copy` 将最后一条 assistant 回答复制到系统剪贴板。普通消息仍是各自 Turn 的当前任务。运行状态默认写入工作区的 `.nausicaa/`；使用 `nausicaa --resume <run-id>` 从已提交边界继续。若恢复时发现结果未知的工具操作，CLI 会打印 operation ID 和显式结算命令；确认其应按失败处理后再执行该命令，运行时不会自动重放副作用。
 

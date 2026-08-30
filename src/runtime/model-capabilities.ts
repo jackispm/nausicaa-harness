@@ -1,4 +1,17 @@
-import type { ModelPort } from "../domain/ports.js";
+import type { ModelCapabilities, ModelPort } from "../domain/ports.js";
+
+/** Read one selector's advisory capability snapshot at a request boundary. */
+export function resolveModelCapabilities(
+  model: ModelPort | undefined,
+  selector: string,
+): ModelCapabilities | undefined {
+  if (model?.capabilities === undefined) return undefined;
+  try {
+    return model.capabilities(selector);
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Decide whether a default workspace catalog should advertise image tools.
@@ -12,12 +25,7 @@ export function resolveImageInputCapability(
   model: ModelPort | undefined,
   selector: string,
 ): boolean | undefined {
-  if (model?.capabilities === undefined) return undefined;
-  try {
-    return model.capabilities(selector).imageInput;
-  } catch {
-    return undefined;
-  }
+  return resolveModelCapabilities(model, selector)?.imageInput;
 }
 
 export function shouldIncludeImageContent(

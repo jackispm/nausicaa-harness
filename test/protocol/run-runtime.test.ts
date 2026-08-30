@@ -227,6 +227,7 @@ describe("executeRun", () => {
       fukaiCompaction: {
         ...enabledFukaiPolicy(),
         maxInputTokens: 32_000,
+        retainRatio: 0.01,
       },
       policy: { maxMainStepsPerActivation: 3, maxModelTokens: 100_000, tetoEnabled: false },
     }, {
@@ -256,7 +257,7 @@ describe("executeRun", () => {
     let compactionCalls = 0;
     const observedCompactionEvents: string[] = [];
     const crashingModel: ModelPort = {
-      capabilities: () => ({ imageInput: false, contextWindowTokens: 10 }),
+      capabilities: () => ({ imageInput: false, contextWindowTokens: 2_200 }),
       async complete(request) {
         if (request.sessionId.startsWith("fukai-compaction:")) {
           compactionCalls += 1;
@@ -275,6 +276,7 @@ describe("executeRun", () => {
       model: "scripted",
       resumeRunId: first.runId,
       message: "Continue from the prior inspection",
+      maxOutputTokens: 100,
     }, {
       mainModel: crashingModel,
       tools: [noopTool],

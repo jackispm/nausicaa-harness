@@ -832,7 +832,29 @@ describe("runtime Fukai compaction pressure cadence", () => {
     });
   });
 
-  it("uses the pressure-boundary model instead of the factory model", async () => {
+  it("uses effective input capacity for pressure after reserving model output", async () => {
+    const setup = await createPressureRuntime({
+      contextWindowTokens: 5_000,
+      inputCapacityTokens: 3_000,
+      currentTokens: 2_600,
+      minimumGainTokens: 10,
+    });
+
+    const selection = await setup.runtime.compactIfNeeded?.(setup.request);
+
+    expect(pressureEvent(await setup.ledger.read())?.payload).toMatchObject({
+      contextWindowTokens: 5_000,
+      currentTokens: 2_600,
+      thresholdTokens: 2_400,
+      minimumRetainedRawTokens: 600,
+      decision: "compact",
+      reason: "pressure-threshold-reached",
+    });
+    expect(setup.model.callCount).toBe(1);
+    expect(selection?.capsule.status).toBe("ready");
+  });
+
+  it("uses frozen pressure capabilities and the boundary model", async () => {
     const factoryModel = "test/old-model";
     const requestModel = "test/new-model";
     const setup = await createPressureRuntime({
@@ -850,7 +872,7 @@ describe("runtime Fukai compaction pressure cadence", () => {
     const selection = await setup.runtime.compactIfNeeded?.(setup.request);
 
     const events = await setup.ledger.read();
-    expect(setup.capabilityQueries).toEqual([requestModel]);
+    expect(setup.capabilityQueries).toEqual([]);
     expect(pressureEvent(events)?.payload).toMatchObject({
       model: requestModel,
       contextWindowTokens: 5_000,
@@ -2031,6 +2053,7 @@ function totalTokens(value: TokenUsage): number {
 
 async function createPressureRuntime(options: {
   contextWindowTokens: number | undefined;
+  inputCapacityTokens?: number;
   contextWindowTokensByModel?: Readonly<Record<string, number | undefined>>;
   currentTokens: number;
   minimumGainTokens: number;
@@ -2126,15 +2149,25 @@ async function createPressureRuntime(options: {
       },
     },
   });
+  const requestModel = options.requestModel ?? options.factoryModel ?? "test/model";
+  const requestContextWindowTokens = options.contextWindowTokensByModel === undefined
+    ? options.contextWindowTokens
+    : options.contextWindowTokensByModel[requestModel];
   const request = {
     runId: "run-pressure",
     laneId: "main",
     goal,
-    model: options.requestModel ?? options.factoryModel ?? "test/model",
+    model: requestModel,
     policyVersion: "policy-pressure-v1",
     upperWatermark: conversationRefs.at(-1)?.sequence ?? 0,
     conversationRefs,
     estimatedInputTokens: options.currentTokens,
+    ...(requestContextWindowTokens === undefined
+      ? {}
+      : { contextWindowTokens: requestContextWindowTokens }),
+    inputCapacityTokens: options.inputCapacityTokens
+      ?? requestContextWindowTokens
+      ?? 32_768,
   } as const;
   await runtime.prepare({
     ...request,

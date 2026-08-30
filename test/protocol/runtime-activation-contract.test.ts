@@ -16,6 +16,7 @@ import type {
 import { JsonlLedger } from "../../src/ledger/index.js";
 import { ScriptedModel, type ScriptedModelStep } from "../../src/model/index.js";
 import { executeRun, SessionController } from "../../src/runtime/index.js";
+import type { WorkspaceCommandSandboxOptions } from "../../src/tools/index.js";
 
 const roots: string[] = [];
 const clock: Clock = {
@@ -35,6 +36,159 @@ afterEach(async () => {
 });
 
 describe("runtime activation parity", () => {
+  it("gives the workspace profile one sandboxed foreground Bash without jobs or network", async () => {
+    const root = await temporaryRoot();
+    const dataDir = join(root, "workspace-state");
+    const model = new ScriptedModel([{
+      ...response(""),
+      stopReason: "toolUse",
+      toolCalls: [{
+        id: "workspace-bash-call",
+        name: "bash",
+        arguments: { command: "printf workspace" },
+      }],
+    }, response("done")]);
+    let factoryCalls = 0;
+    let availabilityCalls = 0;
+    let executeCalls = 0;
+    let sandboxOptions: WorkspaceCommandSandboxOptions | undefined;
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir,
+      model: "scripted-main",
+      message: "Inspect and update this workspace",
+      policy: { tetoEnabled: false, maxMainStepsPerActivation: 2 },
+      allowWrite: true,
+      allowShell: false,
+      allowNetwork: false,
+    }, {
+      mainModel: model,
+      createWorkspaceCommandSandbox: (options) => {
+        factoryCalls += 1;
+        sandboxOptions = options;
+        return {
+          availability() {
+            availabilityCalls += 1;
+            return { available: true, backend: "macos-seatbelt" };
+          },
+          async execute(input) {
+            executeCalls += 1;
+            expect(input).toMatchObject({
+              command: "printf workspace",
+              cwd: root,
+            });
+            return shellExecution("workspace");
+          },
+        };
+      },
+    });
+
+    expect(result.completed).toBe(true);
+    expect({ factoryCalls, availabilityCalls, executeCalls }).toEqual({
+      factoryCalls: 1,
+      availabilityCalls: 1,
+      executeCalls: 1,
+    });
+    expect(sandboxOptions?.protectedPaths).toEqual([dataDir]);
+    const names = model.requests[0]?.tools.map((tool) => tool.name) ?? [];
+    expect(names).toContain("bash");
+    expect(names).toContain("write_file");
+    expect(names).not.toContain("process_start");
+    expect(names).not.toContain("web_fetch");
+  });
+
+  it("fails closed by omitting workspace Bash when the OS sandbox is unavailable", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([response("done")]);
+    let executeCalls = 0;
+
+    await executeRun({
+      workspace: root,
+      dataDir: join(root, "unavailable-state"),
+      model: "scripted-main",
+      message: "Inspect and update this workspace",
+      policy: { tetoEnabled: false, maxMainStepsPerActivation: 1 },
+      allowWrite: true,
+      allowShell: false,
+      allowNetwork: false,
+    }, {
+      mainModel: model,
+      createWorkspaceCommandSandbox: () => ({
+        availability: () => ({ available: false, reason: "no OS sandbox" }),
+        execute: async () => {
+          executeCalls += 1;
+          return shellExecution("must not run");
+        },
+      }),
+    });
+
+    const names = model.requests[0]?.tools.map((tool) => tool.name) ?? [];
+    expect(names).toContain("write_file");
+    expect(names).not.toContain("bash");
+    expect(names).not.toContain("process_start");
+    expect(executeCalls).toBe(0);
+  });
+
+  it("does not construct a workspace sandbox for read-only, custom, or host-shell tools", async () => {
+    const root = await temporaryRoot();
+    let factoryCalls = 0;
+    const failIfConstructed = () => {
+      factoryCalls += 1;
+      throw new Error("workspace sandbox must not be constructed");
+    };
+
+    const readOnlyModel = new ScriptedModel([response("read-only")]);
+    await executeRun({
+      workspace: root,
+      dataDir: join(root, "read-only-state"),
+      model: "scripted-main",
+      message: "Inspect",
+      policy: { tetoEnabled: false, maxMainStepsPerActivation: 1 },
+    }, {
+      mainModel: readOnlyModel,
+      createWorkspaceCommandSandbox: failIfConstructed,
+    });
+
+    const fullAccessModel = new ScriptedModel([response("full-access")]);
+    await executeRun({
+      workspace: root,
+      dataDir: join(root, "full-access-state"),
+      model: "scripted-main",
+      message: "Inspect",
+      policy: { tetoEnabled: false, maxMainStepsPerActivation: 1 },
+      allowWrite: true,
+      allowShell: true,
+      allowNetwork: true,
+    }, {
+      mainModel: fullAccessModel,
+      createWorkspaceCommandSandbox: failIfConstructed,
+    });
+
+    const customModel = new ScriptedModel([response("custom")]);
+    await executeRun({
+      workspace: root,
+      dataDir: join(root, "custom-state"),
+      model: "scripted-main",
+      message: "Inspect",
+      policy: { tetoEnabled: false, maxMainStepsPerActivation: 1 },
+      allowWrite: true,
+    }, {
+      mainModel: customModel,
+      tools: [noopTool],
+      createWorkspaceCommandSandbox: failIfConstructed,
+    });
+
+    expect(factoryCalls).toBe(0);
+    expect(readOnlyModel.requests[0]?.tools.map((tool) => tool.name)).not.toContain("bash");
+    expect(fullAccessModel.requests[0]?.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
+      "bash",
+      "process_start",
+      "web_fetch",
+    ]));
+    expect(customModel.requests[0]?.tools.map((tool) => tool.name)).toEqual(["noop"]);
+  });
+
   it("assembles the same observable Main request for one-shot and Session runtimes", async () => {
     const root = await temporaryRoot();
     const runId = "activation-main-contract";
@@ -295,6 +449,25 @@ function response(content: string, input = 20, output = 5): ModelResponse {
     toolCalls: [],
     stopReason: "stop",
     usage: { input, output, cacheRead: 0, cacheWrite: 0 },
+  };
+}
+
+function shellExecution(stdout: string) {
+  const output = {
+    content: stdout,
+    truncated: false,
+    truncatedBy: null,
+    totalBytes: Buffer.byteLength(stdout, "utf8"),
+    totalLines: stdout.length === 0 ? 0 : 1,
+    outputBytes: Buffer.byteLength(stdout, "utf8"),
+    outputLines: stdout.length === 0 ? 0 : 1,
+  } as const;
+  return {
+    stdout: output,
+    stderr: { ...output, content: "", totalBytes: 0, totalLines: 0, outputBytes: 0, outputLines: 0 },
+    exitCode: 0,
+    aborted: false,
+    timedOut: false,
   };
 }
 

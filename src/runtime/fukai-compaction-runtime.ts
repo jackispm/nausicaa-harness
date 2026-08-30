@@ -59,6 +59,10 @@ export interface RuntimeFukaiCompactionPressureRequest
   extends RuntimeFukaiCompactionSelectRequest {
   /** Main model frozen for this provider request boundary. */
   model: string;
+  /** Frozen total model window; omitted when Main had no valid capability metadata. */
+  contextWindowTokens?: number;
+  /** Frozen Main input capacity after output reservation and explicit context limits. */
+  inputCapacityTokens: number;
   conversationRefs: readonly FukaiConversationRef[];
   estimatedInputTokens: number;
 }
@@ -254,10 +258,6 @@ export const createRuntimeFukaiCompaction: RuntimeFukaiCompactionFactory = (cont
     },
     async compactIfNeeded(request) {
       if (!prepared) return undefined;
-      const contextWindowTokens = readContextWindowTokens(
-        context.modelPort,
-        request.model,
-      );
       const previousView = await readView(request);
       const previous = previousView.status === "ready"
         ? previousView.selection
@@ -274,7 +274,7 @@ export const createRuntimeFukaiCompaction: RuntimeFukaiCompactionFactory = (cont
         ),
         0,
       );
-      if (contextWindowTokens === undefined) {
+      if (request.contextWindowTokens === undefined) {
         await appendPressureDecision(context.ledger, context.clock, request, {
           model: request.model,
           contextWindowTokens: null,
@@ -290,7 +290,7 @@ export const createRuntimeFukaiCompaction: RuntimeFukaiCompactionFactory = (cont
         return previous;
       }
       const decision = decideFukaiCompactionPressure({
-        contextWindowTokens,
+        contextWindowTokens: request.inputCapacityTokens,
         thresholdRatio,
         retainRatio,
         minimumGainTokens,
@@ -306,7 +306,7 @@ export const createRuntimeFukaiCompaction: RuntimeFukaiCompactionFactory = (cont
       if (decision.status === "skip") {
         await appendPressureDecision(context.ledger, context.clock, request, {
           model: request.model,
-          contextWindowTokens,
+          contextWindowTokens: request.contextWindowTokens,
           currentTokens: request.estimatedInputTokens,
           thresholdTokens: decision.thresholdTokens,
           minimumRetainedRawTokens: decision.minimumRetainedRawTokens,
@@ -331,7 +331,7 @@ export const createRuntimeFukaiCompaction: RuntimeFukaiCompactionFactory = (cont
       if (window === undefined) {
         await appendPressureDecision(context.ledger, context.clock, request, {
           model: request.model,
-          contextWindowTokens,
+          contextWindowTokens: request.contextWindowTokens,
           currentTokens: request.estimatedInputTokens,
           thresholdTokens: decision.thresholdTokens,
           minimumRetainedRawTokens: decision.minimumRetainedRawTokens,
@@ -351,7 +351,7 @@ export const createRuntimeFukaiCompaction: RuntimeFukaiCompactionFactory = (cont
       if (maxOutputTokens < 1) {
         await appendPressureDecision(context.ledger, context.clock, request, {
           model: request.model,
-          contextWindowTokens,
+          contextWindowTokens: request.contextWindowTokens,
           currentTokens: request.estimatedInputTokens,
           thresholdTokens: decision.thresholdTokens,
           minimumRetainedRawTokens: decision.minimumRetainedRawTokens,
@@ -365,7 +365,7 @@ export const createRuntimeFukaiCompaction: RuntimeFukaiCompactionFactory = (cont
       }
       await appendPressureDecision(context.ledger, context.clock, request, {
         model: request.model,
-        contextWindowTokens,
+        contextWindowTokens: request.contextWindowTokens,
         currentTokens: request.estimatedInputTokens,
         thresholdTokens: decision.thresholdTokens,
         minimumRetainedRawTokens: decision.minimumRetainedRawTokens,
@@ -611,18 +611,6 @@ function uncoveredRuntimeConversationRefs(
     if (direct.has(identity)) return false;
     return through === undefined || conversationRef.sequence > through;
   }).map((ref) => structuredClone(ref));
-}
-
-function readContextWindowTokens(
-  modelPort: ModelPort,
-  model: string,
-): number | undefined {
-  try {
-    const value = modelPort.capabilities?.(model)?.contextWindowTokens;
-    return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function artifactTokenUpperBound(byteLength: number): number {
