@@ -206,6 +206,26 @@ export class MemoryExecutionLeaseStore implements ExecutionLeaseStore {
     });
   }
 
+  /** Child-side variant which fences with the non-secret monotonic token. */
+  async runIfFencingTokenCurrent<T>(
+    runId: string,
+    fencingToken: number,
+    operation: () => Promise<T>,
+  ): Promise<ExecutionLeaseCommitResult<T>> {
+    const normalizedRunId = identifier(runId, "runId");
+    const normalizedToken = positiveInteger(fencingToken, "fencingToken");
+    if (typeof operation !== "function") throw new TypeError("operation must be a function");
+    return this.runExclusive(async () => {
+      const { nowMs } = this.observeTime(normalizedRunId);
+      const current = this.liveLease(normalizedRunId, nowMs);
+      if (current === undefined || current.value.fencingToken !== normalizedToken) {
+        return Object.freeze({ status: "lost" as const });
+      }
+      const value = await operation();
+      return Object.freeze({ status: "committed" as const, value });
+    });
+  }
+
   async release(input: ExecutionLeaseRelease): Promise<ExecutionLeaseReleaseResult> {
     const release = validateRelease(input);
     return this.runExclusive(() => this.releaseNow(release));

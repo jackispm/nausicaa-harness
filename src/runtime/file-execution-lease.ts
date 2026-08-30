@@ -220,6 +220,42 @@ export class FileExecutionLeaseStore implements ExecutionLeaseStore {
     });
   }
 
+  /**
+   * Child-process fence which deliberately needs no leaseId or ownerId over
+   * IPC. The fencing token is monotonic and checked under the same file lock
+   * that serializes successor claims with the complete durable operation.
+   */
+  async runIfFencingTokenCurrent<T>(
+    runId: string,
+    fencingToken: number,
+    operation: () => Promise<T>,
+  ): Promise<ExecutionLeaseCommitResult<T>> {
+    const normalizedRunId = identifier(runId, "runId");
+    const normalizedToken = positiveInteger(fencingToken, "fencingToken");
+    if (typeof operation !== "function") throw new TypeError("operation must be a function");
+    return this.#runExclusive(async () => {
+      const lock = await acquireLeaseLock(`${this.#location.path}.lock`, this.#location.parent);
+      try {
+        const state = await readSnapshot(this.#location.path);
+        const observed = observeTime(state, normalizedRunId, this.#clock);
+        const current = liveLease(state, normalizedRunId, observed.nowMs);
+        if (current === undefined || current.value.fencingToken !== normalizedToken) {
+          await writeSnapshot(this.#location, state);
+          return Object.freeze({ status: "lost" as const });
+        }
+        let value: T;
+        try {
+          value = await operation();
+        } finally {
+          await writeSnapshot(this.#location, state);
+        }
+        return Object.freeze({ status: "committed" as const, value });
+      } finally {
+        await releaseLeaseLock(lock);
+      }
+    });
+  }
+
   async release(input: ExecutionLeaseRelease): Promise<ExecutionLeaseReleaseResult> {
     const release = validateRelease(input);
     return this.#runExclusive(() => this.#withSnapshot((state) => releaseNow(
