@@ -13,6 +13,7 @@ export const DEFAULT_SKILL_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 export const DEFAULT_SKILL_MAX_FRONTMATTER_BYTES = 64 * 1024;
 export const DEFAULT_SKILL_MAX_SKILLS = 128;
 export const DEFAULT_SKILL_MAX_DEPTH = 8;
+export const MAX_SKILL_COUNT = 4_096;
 export const MAX_SKILL_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_SKILL_TOTAL_BYTES = 256 * 1024 * 1024;
 export const MAX_SKILL_DEPTH = 64;
@@ -537,6 +538,7 @@ async function walkSkills(
   const depth = path.relative(workspace, directory).split(path.sep).filter(Boolean).length;
   for (const entry of entries) {
     const candidate = path.join(directory, entry.name);
+    if (SKIPPED_DIRECTORIES.has(entry.name)) continue;
     if (entry.isSymbolicLink()) {
       throw new SkillPathError(`Refusing symbolic-link skill path: ${candidate}`);
     }
@@ -549,7 +551,7 @@ async function walkSkills(
       candidates.set(summary.path, summary);
       continue;
     }
-    if (!entry.isDirectory() || SKIPPED_DIRECTORIES.has(entry.name)) continue;
+    if (!entry.isDirectory()) continue;
     if (depth >= limits.maxDepth) continue;
     const child = await canonicalDirectory(workspace, candidate);
     const walked = await walkSkills(workspace, child, limits, candidates, totalBytes);
@@ -820,7 +822,7 @@ function resolveLimits(options: SkillLoaderOptions): ResolvedLimits {
   );
   return {
     maxDepth: boundedLimit(options.maxDepth, DEFAULT_SKILL_MAX_DEPTH, MAX_SKILL_DEPTH, "maxDepth"),
-    maxSkills: boundedLimit(options.maxSkills, DEFAULT_SKILL_MAX_SKILLS, MAX_SKILL_FILE_BYTES, "maxSkills"),
+    maxSkills: boundedLimit(options.maxSkills, DEFAULT_SKILL_MAX_SKILLS, MAX_SKILL_COUNT, "maxSkills"),
     maxFileBytes,
     maxTotalBytes: boundedLimit(options.maxTotalBytes, DEFAULT_SKILL_MAX_TOTAL_BYTES, MAX_SKILL_TOTAL_BYTES, "maxTotalBytes"),
     maxFrontmatterBytes,
