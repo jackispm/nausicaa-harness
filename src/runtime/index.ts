@@ -4,7 +4,20 @@ export * from "./fukai-compaction-runtime.js";
 export * from "./recovery.js";
 export * from "./run-policy.js";
 export * from "./run-runtime.js";
-export * from "./edge-runtime.js";
+export {
+  captureEdgeTurnSnapshot,
+  createRegistryEdgeTurnSnapshotProvider,
+  edgeStatusFromProvider,
+  projectEdgeRegistrySnapshot as projectRuntimeEdgeRegistrySnapshot,
+} from "./edge-runtime.js";
+export type {
+  EdgeRuntimeProjection,
+  EdgeRuntimeProjectionInput,
+  EdgeRuntimeRegistryLike,
+  EdgeRuntimeStatusProjection,
+  EdgeRuntimeStatusSource,
+  EdgeTurnSnapshotProvider,
+} from "./edge-runtime.js";
 export * from "./run-token-budget.js";
 export * from "./run-token-budget-recovery.js";
 export * from "./reflection-scheduler.js";

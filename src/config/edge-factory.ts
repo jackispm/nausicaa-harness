@@ -1,10 +1,10 @@
 import type { AgentTool } from "../domain/ports.js";
 import {
   MoweEdgeRegistry,
+  type MoweEdgeAdapterLike,
   type MoweEdgeRegistrySnapshot,
 } from "../mowe/edge-registry.js";
 import type {
-  EdgeAdapter,
   EdgeHostGrant,
   EdgeSourceType,
 } from "../mowe/edge-types.js";
@@ -26,7 +26,7 @@ export interface EdgeFactoryContext {
 export type EdgeAdapterConstructor = (
   source: EdgeSourceSettings,
   context: EdgeFactoryContext,
-) => EdgeAdapter | Promise<EdgeAdapter>;
+) => MoweEdgeAdapterLike | Promise<MoweEdgeAdapterLike>;
 
 export interface EdgeAdapterConstructors {
   readonly mcp?: EdgeAdapterConstructor;
@@ -90,7 +90,7 @@ export async function createConfiguredEdgeComposition(
   const edgeSettings = resolveInputEdgeSettings(options.settings);
   const diagnostics: EdgeFactoryDiagnostic[] = [];
   const plans: EdgeSourcePlan[] = [];
-  const adapters: EdgeAdapter[] = [];
+  const adapters: MoweEdgeAdapterLike[] = [];
   const constructors = options.constructors ?? {};
   const enabled = edgeSettings.enabled === true;
 

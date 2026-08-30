@@ -78,7 +78,10 @@ export function createRegistryEdgeTurnSnapshotProvider(
         ? raw.contextContributions.filter(selectContext)
         : [];
       if (summaries.length === 0) return snapshot;
-      const loaded = await Promise.all(summaries.map((summary) => registry.loadContribution!(summary, options)));
+      const loaded = await Promise.all(summaries.map((summary) => registry.loadContribution!(
+        summary,
+        { ...(options ?? {}), snapshot },
+      )));
       return { ...raw, contextContributions: loaded };
     },
     snapshot: () => registry.snapshot(),
@@ -126,12 +129,13 @@ export function projectEdgeRegistrySnapshot(
   const contextContributions = readContextContributions(raw)
     .sort((left, right) => compareText(left.sourceId, right.sourceId)
       || compareText(left.contributionId, right.contributionId));
+  const contextSummaries = readContextSummaryRecords(raw);
   const edges = readEdges(raw)
     .sort((left, right) => compareText(String(left.sourceId ?? ""), String(right.sourceId ?? "")));
   const diagnostics = readDiagnostics(raw).sort(compareText);
   const sources = edges.map((edge) => {
     const edgeTools = tools.filter((tool) => edge.sourceId === sourceIdForTool(tool, toolEntries));
-    const edgeContexts = contextContributions.filter((item) => item.sourceId === edge.sourceId);
+    const edgeContexts = contextSummaries.filter((item) => item.sourceId === edge.sourceId);
     return Object.freeze({
       sourceId: edge.sourceId,
       type: String(edge.kind ?? edge.type ?? "edge"),
@@ -139,7 +143,7 @@ export function projectEdgeRegistrySnapshot(
       ...(typeof edge.enabled === "boolean" ? { enabled: edge.enabled } : {}),
       toolCount: edgeTools.length,
       contextCount: edgeContexts.length,
-      diagnostics: Object.freeze(edge.diagnostics?.map(String) ?? []),
+      diagnostics: Object.freeze(readDiagnosticValues(edge.diagnostics)),
       provenance: Object.freeze((edge.provenance ?? []).map((item: unknown) => structuredClone(item))),
     });
   });
@@ -148,7 +152,7 @@ export function projectEdgeRegistrySnapshot(
     refreshRequested: inputRefreshRequested(input, false),
     generation,
     toolCount: tools.length,
-    contextCount: contextContributions.length,
+    contextCount: contextSummaries.length,
     diagnostics: Object.freeze([...diagnostics]),
     sources: Object.freeze(sources),
   });
@@ -283,6 +287,19 @@ function readContextContributions(snapshot: Record<string, any>): FukaiEdgeConte
   });
 }
 
+function readContextSummaryRecords(snapshot: Record<string, any>): Record<string, any>[] {
+  const raw = Array.isArray(snapshot.contextContributions)
+    ? snapshot.contextContributions
+    : Array.isArray(snapshot.context) ? snapshot.context : [];
+  return raw.filter((value: unknown): value is Record<string, any> => (
+    isRecord(value)
+    && value.kind !== "tool"
+    && value.disabled !== true
+    && typeof value.sourceId === "string"
+    && typeof value.contributionId === "string"
+  ));
+}
+
 function readEdges(snapshot: Record<string, any>): Record<string, any>[] {
   return Array.isArray(snapshot.edges)
     ? snapshot.edges.filter(isRecord)
@@ -290,8 +307,12 @@ function readEdges(snapshot: Record<string, any>): Record<string, any>[] {
 }
 
 function readDiagnostics(snapshot: Record<string, any>): string[] {
-  return Array.isArray(snapshot.diagnostics)
-    ? snapshot.diagnostics.map((item: unknown) => typeof item === "string"
+  return readDiagnosticValues(snapshot.diagnostics);
+}
+
+function readDiagnosticValues(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map((item: unknown) => typeof item === "string"
       ? item
       : isRecord(item) && typeof item.message === "string" ? item.message : String(item))
     : [];

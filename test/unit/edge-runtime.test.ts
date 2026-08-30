@@ -59,6 +59,7 @@ describe("edge runtime projection", () => {
     });
     expect(projection.tools).toHaveLength(0);
     expect(projection.contextContributions).toHaveLength(0);
+    expect(projection.status.contextCount).toBe(1);
   });
 
   it("loads summaries when a configured composition exposes its registry", async () => {

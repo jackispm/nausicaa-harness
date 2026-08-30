@@ -6,11 +6,18 @@ import { CliUsageError, parseCliArgs, usage } from "./cli/args.js";
 import { selectNewRecoveryFailures } from "./cli/daemon-recovery-reporting.js";
 import { processImageInputs } from "./cli/image-input.js";
 import { runInteractive } from "./cli/interactive.js";
-import { projectConfiguredEdgeStatus } from "./cli/edge-status.js";
 import {
+  projectConfiguredEdgeStatus,
+  projectRuntimeEdgeStatus,
+  type EdgeStatusProjection,
+} from "./cli/edge-status.js";
+import {
+  createConfiguredEdgeComposition,
   loadSettings,
   resolveSettings,
   SettingsError,
+  type ConfiguredEdgeComposition,
+  type EdgeAdapterConstructors,
   type Settings,
   type ResolvedSettings,
 } from "./config/index.js";
@@ -27,10 +34,17 @@ import {
   type DaemonRunDiscoveryFailure,
 } from "./runtime/index.js";
 import {
+  createRegistryEdgeTurnSnapshotProvider,
+  edgeStatusFromProvider,
+  type EdgeTurnSnapshotProvider,
+} from "./runtime/edge-runtime.js";
+import {
   persistedErrorText,
   stringifyRedactedJson,
 } from "./runtime/redaction.js";
 import { UnknownToolOperationError } from "./runtime/recovery.js";
+import { createMcpEdgeAdapter } from "./mowe/edges/mcp.js";
+import { createSkillsEdgeAdapter } from "./mowe/edges/skills.js";
 
 const VERSION = "0.1.0";
 
@@ -73,6 +87,7 @@ const main = async (): Promise<number> => {
   let resolvedAllowShell = false;
   let resolvedAllowNetwork = false;
   let activeRunId = options.resume;
+  let openedEdgeComposition: ConfiguredEdgeComposition | undefined;
   try {
     const settings = await loadSettings(workspace);
     const overrides: Settings = {
@@ -93,7 +108,12 @@ const main = async (): Promise<number> => {
         : { fukaiCompaction: options.fukaiCompaction }),
     };
     const resolvedSettings = resolveSettings(workspace, settings, overrides);
-    const edgeStatus = projectConfiguredEdgeStatus(resolvedSettings.edges);
+    const edgeRuntime = await openCliEdgeRuntime(
+      workspace,
+      resolvedSettings,
+      options.refreshEdges === true,
+    );
+    openedEdgeComposition = edgeRuntime.composition;
     // Keep resume semantics explicit: when neither the settings file nor the
     // CLI mentions Fukai, omit the field so a persisted Run policy wins.
     const fukaiCompaction = settings.fukaiCompaction === undefined
@@ -110,6 +130,7 @@ const main = async (): Promise<number> => {
       return await runDaemonMode({
         workspace,
         settings: resolvedSettings,
+        edgeRuntime,
         ...(fukaiCompaction === undefined ? {} : { fukaiCompaction }),
         ...(options.workerEnabled === undefined
           ? {}
@@ -126,45 +147,50 @@ const main = async (): Promise<number> => {
       const selectedRunId = options.continue
         ? await findLatestRunId(resolvedSettings.dataDir, workspace)
         : options.resume;
-      const session = await SessionController.open({
-        workspace,
-        dataDir: resolvedSettings.dataDir,
-        model: resolvedSettings.model,
-        tetoModel: resolvedSettings.tetoModel,
-        ...(fukaiCompaction === undefined ? {} : { fukaiCompaction }),
-        ...(options.workerEnabled === undefined
-          ? {}
-          : { workerEnabled: options.workerEnabled }),
-        maxOutputTokens: resolvedSettings.maxOutputTokens,
-        policy: {
-          maxMainStepsPerActivation: resolvedSettings.maxSteps,
-          maxModelTokens: resolvedSettings.maxModelTokens,
-          tetoEnabled: resolvedSettings.tetoEnabled,
-          tetoMaxOutputTokens: 64,
-          tetoTokenRatio: 0.1,
-        },
-        allowWrite: resolvedSettings.allowWrite,
-        allowShell: resolvedSettings.allowShell,
-        allowNetwork: resolvedSettings.allowNetwork,
-        ...(selectedRunId === undefined ? {} : { runId: selectedRunId }),
-      });
-      if (options.resolveOperation !== undefined) {
-        await session.resolveOperation(options.resolveOperation);
+      try {
+        const session = await SessionController.open({
+          workspace,
+          dataDir: resolvedSettings.dataDir,
+          model: resolvedSettings.model,
+          tetoModel: resolvedSettings.tetoModel,
+          ...(fukaiCompaction === undefined ? {} : { fukaiCompaction }),
+          ...(options.workerEnabled === undefined
+            ? {}
+            : { workerEnabled: options.workerEnabled }),
+          maxOutputTokens: resolvedSettings.maxOutputTokens,
+          policy: {
+            maxMainStepsPerActivation: resolvedSettings.maxSteps,
+            maxModelTokens: resolvedSettings.maxModelTokens,
+            tetoEnabled: resolvedSettings.tetoEnabled,
+            tetoMaxOutputTokens: 64,
+            tetoTokenRatio: 0.1,
+          },
+          allowWrite: resolvedSettings.allowWrite,
+          allowShell: resolvedSettings.allowShell,
+          allowNetwork: resolvedSettings.allowNetwork,
+          edgeSnapshotProvider: edgeRuntime.provider,
+          ...(selectedRunId === undefined ? {} : { runId: selectedRunId }),
+        });
+        if (options.resolveOperation !== undefined) {
+          await session.resolveOperation(options.resolveOperation);
+        }
+        return await runInteractive({
+          session,
+          edgeStatus: edgeRuntime.status,
+          ...(initialMessage === undefined ? {} : { initialMessage }),
+          ...(processedImages.images.length === 0
+            ? {}
+            : { initialImages: processedImages.images }),
+          ...(
+            initialMessage === undefined
+            && (options.resume !== undefined || (options.continue && selectedRunId !== undefined))
+              ? { resumeOnStart: true }
+              : {}
+          ),
+        });
+      } finally {
+        await edgeRuntime.composition.close().catch(() => undefined);
       }
-      return await runInteractive({
-        session,
-        edgeStatus: () => edgeStatus,
-        ...(initialMessage === undefined ? {} : { initialMessage }),
-        ...(processedImages.images.length === 0
-          ? {}
-          : { initialImages: processedImages.images }),
-        ...(
-          initialMessage === undefined
-          && (options.resume !== undefined || (options.continue && selectedRunId !== undefined))
-            ? { resumeOnStart: true }
-            : {}
-        ),
-      });
     }
     const controller = new AbortController();
     const abort = (): void => controller.abort(new Error("Interrupted by user"));
@@ -198,6 +224,7 @@ const main = async (): Promise<number> => {
         allowWrite: resolvedSettings.allowWrite,
         allowShell: resolvedSettings.allowShell,
         allowNetwork: resolvedSettings.allowNetwork,
+        edgeSnapshotProvider: edgeRuntime.provider,
         signal: controller.signal,
       }, {
         onEvent: (event: AnyEvent) => {
@@ -232,8 +259,10 @@ const main = async (): Promise<number> => {
       return result.completed ? 0 : 3;
     } finally {
       process.removeListener("SIGINT", abort);
+      await edgeRuntime.composition.close().catch(() => undefined);
     }
   } catch (error: unknown) {
+    await openedEdgeComposition?.close().catch(() => undefined);
     if (error instanceof UnknownToolOperationError && options.resume !== undefined) {
       const operationId = error.operationIds[0] ?? "<operation-id>";
       const resumeCommand = buildResumeCommand({
@@ -310,6 +339,7 @@ const writeJson = (value: unknown): void => {
 interface DaemonModeOptions {
   workspace: string;
   settings: ResolvedSettings;
+  edgeRuntime: CliEdgeRuntime;
   /** Preserve explicit startup policy when the daemon creates/resumes Runs. */
   fukaiCompaction?: ResolvedSettings["fukaiCompaction"];
   workerEnabled?: boolean;
@@ -356,6 +386,8 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
       allowWrite: options.settings.allowWrite,
       allowShell: options.settings.allowShell,
       allowNetwork: options.settings.allowNetwork,
+      edgeSnapshotProvider: options.edgeRuntime.provider,
+      closeEdgeCompositionOnClose: false,
       ...(options.settings.allowShell
         ? { processJobRegistryDir: options.settings.dataDir }
         : {}),
@@ -376,6 +408,7 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
         process.stderr.write(`Nausicaa daemon reconciliation failed: ${message}\n`);
       },
     },
+    closeEdgeComposition: options.edgeRuntime.composition.close,
   });
   const socketPath = resolve(
     options.workspace,
@@ -410,6 +443,69 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
     await daemon.stop().catch(() => undefined);
   }
 };
+
+interface CliEdgeRuntime {
+  readonly composition: ConfiguredEdgeComposition;
+  readonly provider: EdgeTurnSnapshotProvider;
+  readonly status: () => EdgeStatusProjection;
+}
+
+/** Build the production composition at the CLI boundary; config stays injectable and offline. */
+const openCliEdgeRuntime = async (
+  workspace: string,
+  settings: ResolvedSettings,
+  refreshRequested: boolean,
+): Promise<CliEdgeRuntime> => {
+  const composition = await createConfiguredEdgeComposition({
+    workspace,
+    settings,
+    constructors: cliEdgeConstructors(),
+    startupRefresh: refreshRequested || settings.edges.refreshOnStart,
+  });
+  const provider = createRegistryEdgeTurnSnapshotProvider(composition.registry);
+  const configured = projectConfiguredEdgeStatus(settings.edges);
+  return {
+    composition,
+    provider,
+    status: () => {
+      const runtime = projectRuntimeEdgeStatus(edgeStatusFromProvider(provider, {
+        enabled: configured.enabled,
+        refreshRequested: configured.refreshRequested,
+        generation: configured.generation,
+        toolCount: configured.toolCount ?? 0,
+        contextCount: configured.contextCount ?? 0,
+        diagnostics: configured.diagnostics ?? [],
+        sources: [],
+      }));
+      return {
+        ...runtime,
+        enabled: settings.edges.enabled,
+        refreshRequested: refreshRequested || settings.edges.refreshOnStart,
+        diagnostics: Object.freeze([
+          ...(runtime.diagnostics ?? []),
+          ...composition.diagnostics.map((diagnostic) => (
+            diagnostic.sourceId === undefined
+              ? `${diagnostic.code}: ${diagnostic.message}`
+              : `${diagnostic.sourceId}: ${diagnostic.code}: ${diagnostic.message}`
+          )),
+        ]),
+      };
+    },
+  };
+};
+
+const cliEdgeConstructors = (): EdgeAdapterConstructors => ({
+  mcp: (source, context) => createMcpEdgeAdapter({
+    sourceId: source.sourceId,
+    ...(source.command === undefined ? {} : { command: source.command }),
+    ...(source.args === undefined ? {} : { args: source.args }),
+    cwd: context.workspace,
+  }),
+  skill: (source) => createSkillsEdgeAdapter({
+    sourceId: source.sourceId,
+    roots: [source.location ?? "skills"],
+  }),
+});
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 
