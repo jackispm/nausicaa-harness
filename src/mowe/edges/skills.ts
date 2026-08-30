@@ -469,7 +469,7 @@ export function parseSkillDocument(document: string): ParsedSkillDocument {
   let closing = -1;
   for (let index = 1; index < lines.length; index += 1) {
     const line = lines[index]?.replace(/\r$/u, "") ?? "";
-    if (line === "---" || line === "...") {
+    if (/^(?:---|\.\.\.)\s*$/u.test(line)) {
       closing = index;
       break;
     }
@@ -756,7 +756,7 @@ function findFrontmatterClosingLine(document: string): number {
   if (lines[0]?.replace(/\r$/u, "") !== "---") return -1;
   for (let index = 1; index < lines.length; index += 1) {
     const line = lines[index]?.replace(/\r$/u, "") ?? "";
-    if (line === "---" || line === "...") return index;
+    if (/^(?:---|\.\.\.)\s*$/u.test(line)) return index;
   }
   return -1;
 }
