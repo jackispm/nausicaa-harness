@@ -35,3 +35,4 @@ export * from "./edge-adapter.js";
 export * from "./edge-registry.js";
 export * from "./edges/skills.js";
 export * from "./edges/mcp.js";
+export * from "./skills-selection.js";

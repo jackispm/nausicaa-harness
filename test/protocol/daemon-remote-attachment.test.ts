@@ -368,6 +368,69 @@ describe("daemon remote attachment", () => {
     expect(replayCount).toBe(observed);
     await attachment.close();
   });
+
+  it("fails closed on a malformed live resync observation", async () => {
+    const runId = "malformed-live-resync";
+    let runListener: ((observation: DaemonRunObservation) => void) | undefined;
+    const client = mockedAttachmentClient((method) => {
+      if (method === "attach") return attachResult();
+      return replayPage(runId, [], 0, 0);
+    });
+    vi.spyOn(client, "onRunEvent").mockImplementation((listener) => {
+      runListener = listener;
+      return () => { runListener = undefined; };
+    });
+    const attachment = await DaemonRemoteAttachment.open({
+      socketPath: client.socketPath,
+      runId,
+      client,
+    });
+
+    runListener?.({
+      type: "resync_required",
+      result: null as never,
+    });
+    await eventually(() => {
+      expect(attachment.snapshot()).toMatchObject({ status: "resyncing" });
+      expect(attachment.snapshot().error).toMatch(/resync result is invalid/u);
+    });
+    await attachment.close();
+  });
+
+  it("does not clear replay state for a cross-Run resync observation", async () => {
+    const runId = "cross-run-resync";
+    const first = testEvent(runId, 1, "first");
+    let runListener: ((observation: DaemonRunObservation) => void) | undefined;
+    const client = mockedAttachmentClient((method) => {
+      if (method === "attach") return attachResult();
+      return replayPage(runId, [first], 1, 0);
+    });
+    vi.spyOn(client, "onRunEvent").mockImplementation((listener) => {
+      runListener = listener;
+      return () => { runListener = undefined; };
+    });
+    const attachment = await DaemonRemoteAttachment.open({
+      socketPath: client.socketPath,
+      runId,
+      client,
+    });
+    runListener?.({
+      type: "resync_required",
+      result: {
+        status: "resync_required",
+        runId: "other-run",
+        cursor: "offset:1",
+        firstOffset: 1,
+        watermark: 1,
+        reason: "offset-gap",
+      } as never,
+    });
+    await eventually(() => {
+      expect(attachment.snapshot().status).toBe("resyncing");
+      expect(attachment.snapshot().events).toEqual([first]);
+    });
+    await attachment.close();
+  });
 });
 
 function mockedAttachmentClient(

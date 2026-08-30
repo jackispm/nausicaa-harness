@@ -9,10 +9,12 @@ import type {
   DaemonObserverCursor,
   DaemonRunObservation,
   DaemonRunReplayResult,
+  DaemonRunResyncRequired,
 } from "./daemon-observer.js";
 
 const DEFAULT_RECONNECT_DELAY_MS = 250;
 const MAX_RECONNECT_DELAY_MS = 30_000;
+const MAX_OBSERVATION_ERROR_BYTES = 512;
 
 export type DaemonRemoteAttachmentStatus =
   | "connecting"
@@ -325,8 +327,15 @@ export class DaemonRemoteAttachment {
     }
   }
 
-  private handleRunObservation(observation: DaemonRunObservation): void {
+  private handleRunObservation(value: unknown): void {
     if (this.closed) return;
+    let observation: DaemonRunObservation;
+    try {
+      observation = parseRunObservation(value, this.runId);
+    } catch (error: unknown) {
+      this.failTerminal(error);
+      return;
+    }
     if (observation.type === "event") {
       if (observation.runId !== this.runId) {
         const error = new DaemonControlClientError(
@@ -365,6 +374,17 @@ export class DaemonRemoteAttachment {
       : observation.error;
     this.publish();
     this.restartSubscription(observation.type === "resync_required");
+  }
+
+  private failTerminal(error: unknown): void {
+    if (this.closed || this.terminalFailure) return;
+    this.terminalFailure = true;
+    this.status = "resyncing";
+    this.error = error instanceof Error ? error.message : String(error);
+    this.publish();
+    // A malformed live frame is not recoverable from the current protocol
+    // stream. Closing prevents an attacker from driving an endless retry loop.
+    this.client.close();
   }
 
   private stageEvents(candidates: readonly unknown[]): {
@@ -526,6 +546,108 @@ function parseAttachResult(value: unknown): AttachResult {
     throw new DaemonControlClientError("invalid_frame", "daemon attach snapshot is invalid");
   }
   return { clientId, snapshot: structuredClone(snapshot) };
+}
+
+function parseRunObservation(value: unknown, expectedRunId: string): DaemonRunObservation {
+  if (!isRecord(value) || typeof value.type !== "string") {
+    throw new DaemonControlClientError("invalid_frame", "daemon Run observation is invalid");
+  }
+  if (value.type === "event") {
+    const runId = observationIdentifier(value.runId, "observation runId");
+    const cursor = protocolCursor(value.cursor, "observation cursor");
+    try {
+      validateEvent(value.event);
+    } catch (error: unknown) {
+      throw new DaemonControlClientError(
+        "invalid_frame",
+        `daemon live event is invalid: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const event = value.event as AnyEvent;
+    if (event.runId !== runId) {
+      throw new DaemonControlClientError("invalid_frame", "daemon live event Run ID mismatch");
+    }
+    // Keep a well-formed cross-Run event visible to the attachment handler;
+    // it will force a bounded replay resync instead of silently dropping it.
+    return { type: "event", runId, cursor, event };
+  }
+  if (value.type === "resync_required") {
+    const result = parseRunResyncRequired(value.result);
+    if (result.runId !== expectedRunId) {
+      throw new DaemonControlClientError(
+        "invalid_frame",
+        "daemon resync request belongs to another Run",
+      );
+    }
+    return { type: "resync_required", result };
+  }
+  if (value.type === "source_error") {
+    const runId = observationIdentifier(value.runId, "source error runId");
+    if (runId !== expectedRunId) {
+      throw new DaemonControlClientError(
+        "invalid_frame",
+        "daemon source error belongs to another Run",
+      );
+    }
+    const cursor = protocolCursor(value.cursor, "source error cursor");
+    if (!boundedObservationError(value.error)) {
+      throw new DaemonControlClientError("invalid_frame", "daemon source error is invalid");
+    }
+    return { type: "source_error", runId, cursor, error: value.error };
+  }
+  throw new DaemonControlClientError(
+    "invalid_frame",
+    `daemon Run observation type is unsupported: ${value.type}`,
+  );
+}
+
+function parseRunResyncRequired(value: unknown): DaemonRunResyncRequired {
+  if (!isRecord(value) || value.status !== "resync_required") {
+    throw new DaemonControlClientError("invalid_frame", "daemon resync result is invalid");
+  }
+  const generationPresent = Object.prototype.hasOwnProperty.call(value, "generation");
+  if (generationPresent && value.generation === undefined) {
+    throw new DaemonControlClientError("invalid_frame", "daemon resync generation cannot be undefined");
+  }
+  const runId = observationIdentifier(value.runId, "resync runId");
+  const cursor = protocolCursor(value.cursor, "resync cursor");
+  if (!nonNegativeInteger(value.firstOffset) || !nonNegativeInteger(value.watermark)) {
+    throw new DaemonControlClientError("invalid_frame", "daemon resync offsets are invalid");
+  }
+  if (value.reason !== "cursor-ahead"
+    && value.reason !== "history-truncated"
+    && value.reason !== "offset-gap") {
+    throw new DaemonControlClientError("invalid_frame", "daemon resync reason is invalid");
+  }
+  const generation = optionalGeneration(value.generation);
+  return {
+    status: "resync_required",
+    runId,
+    cursor,
+    firstOffset: value.firstOffset,
+    watermark: value.watermark,
+    ...(generation === undefined ? {} : { generation }),
+    reason: value.reason,
+  };
+}
+
+function observationIdentifier(value: unknown, field: string): string {
+  const identifier = protocolIdentifier(value, field);
+  if (
+    identifier.length > 512
+    || /[\u0000-\u001f\u007f]/u.test(identifier)
+    || /[\\/]/u.test(identifier)
+  ) {
+    throw new DaemonControlClientError("invalid_frame", `${field} is invalid`);
+  }
+  return identifier;
+}
+
+function boundedObservationError(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= MAX_OBSERVATION_ERROR_BYTES
+    && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function parseSubscribeResult(value: unknown): SubscribeResult {

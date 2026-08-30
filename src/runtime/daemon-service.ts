@@ -384,8 +384,9 @@ export class DaemonServiceManager {
     if (this.#restartPromise !== undefined) pendingStarts.push(this.#restartPromise);
     const operation = (async () => {
       let stopError: unknown;
+      let stopStatus: DaemonServiceStatus | undefined;
       try {
-        await this.stop();
+        stopStatus = await this.stop();
       } catch (error: unknown) {
         stopError = error;
       }
@@ -393,6 +394,12 @@ export class DaemonServiceManager {
       // for it to observe the closed state before completing close().
       await Promise.allSettled(pendingStarts);
       if (stopError !== undefined) throw stopError;
+      if (stopStatus?.state === "failed") {
+        throw new DaemonServiceError(
+          stopStatus.error.code,
+          stopStatus.error.message,
+        );
+      }
       if (this.#childObservers.size > 0) {
         await withTimeout(
           Promise.allSettled([...this.#childObservers]),
@@ -490,6 +497,10 @@ export class DaemonServiceManager {
         }
         return failedStatus(failure("spawn_failed", "spawn adapter returned an invalid child handle"));
       }
+      // Consume the child promise immediately. The lifecycle observer is
+      // attached after descriptor publication, but a rejected spawn handle
+      // must never become an unhandled rejection during that gap.
+      void child.exited.catch(() => undefined);
 
       const processIdentity = await this.#waitForProcessIdentity(child.pid);
       if (processIdentity.status !== "running") {
@@ -905,6 +916,10 @@ export class DaemonServiceManager {
     if (probe.status !== "unavailable") {
       return probe.status === "error" ? "unknown" : "live";
     }
+    // Without an injected identity-bound remover, a pathname unlink cannot
+    // make the lstat check and deletion atomic. Fail closed instead of
+    // risking removal of a replacement socket.
+    if (this.#dependencies.removeSocket === undefined) return "unknown";
     const removed = await this.#removeSocket(initial.identity);
     if (removed === "removed" || removed === "absent") return removed;
     return removed === "replaced" ? "live" : "unknown";

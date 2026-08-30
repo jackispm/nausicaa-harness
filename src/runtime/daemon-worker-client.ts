@@ -11,6 +11,7 @@ import type {
   DaemonWorkerFrame,
   DaemonWorkerInitializeFrame,
   DaemonWorkerLeaseIdentity,
+  DaemonWorkerReadyFrame,
   DaemonWorkerRunnerOutcome,
   DaemonWorkerShutdownFrame,
   DaemonWorkerTransport,
@@ -108,6 +109,11 @@ interface PendingActivation {
   readonly timer: ReturnType<typeof setTimeout>;
 }
 
+interface CompletedActivation {
+  readonly fingerprint: string;
+  readonly receipt: DaemonWorkerActivationReceipt;
+}
+
 /**
  * Client for one detached Run worker. The client is transport-only: it never
  * owns a Ledger and it never passes an execution-lease closure across IPC.
@@ -130,7 +136,7 @@ export class DaemonWorkerClient {
   private unsubscribeClose: (() => void) | undefined;
   private readonly pendingCommands = new Map<string, PendingCommand<unknown>>();
   private readonly pendingActivations = new Map<string, PendingActivation>();
-  private readonly completedActivations = new Map<string, DaemonWorkerActivationReceipt>();
+  private readonly completedActivations = new Map<string, CompletedActivation>();
   private initialized = false;
   private instanceToken: string | undefined;
   private lifecycle: DaemonWorkerClientLifecycle = "disconnected";
@@ -258,7 +264,12 @@ export class DaemonWorkerClient {
       return existing.promise;
     }
     const completed = this.completedActivations.get(activationId);
-    if (completed !== undefined) return completed;
+    if (completed !== undefined) {
+      if (completed.fingerprint !== fingerprint) {
+        throw new DaemonWorkerProtocolError("command_conflict", "activation ID was reused with different input");
+      }
+      return completed.receipt;
+    }
     if (this.pendingActivations.size >= this.maxPendingActivations) {
       throw new DaemonWorkerProtocolError("queue_full", "worker activation queue is full", true);
     }
@@ -449,7 +460,7 @@ export class DaemonWorkerClient {
       this.pendingCommands.set(commandId, {
         commandId,
         kind,
-        ...(frame.kind === "activate" ? { activationId: frame.activationId } : {}),
+        ...(frame.kind === "activate" || frame.kind === "cancel" ? { activationId: frame.activationId } : {}),
         resolve: resolve as (value: unknown) => void,
         reject,
         timer,
@@ -512,7 +523,7 @@ export class DaemonWorkerClient {
         this.failConnection(new DaemonWorkerProtocolError("identity_mismatch", "worker ready Run ID mismatch"));
         return;
       }
-      this.resolveCommand(frame.commandId, frame);
+      this.resolveReady(frame);
       return;
     }
     if (frame.kind === "command.result") {
@@ -520,36 +531,84 @@ export class DaemonWorkerClient {
         this.failConnection(new DaemonWorkerProtocolError("identity_mismatch", "worker command result Run ID mismatch"));
         return;
       }
-      this.resolveCommand(frame.commandId, frame);
+      this.resolveCommandResult(frame);
     }
+  }
+
+  private resolveReady(frame: DaemonWorkerReadyFrame): void {
+    const pending = this.pendingCommands.get(frame.commandId);
+    if (pending === undefined) {
+      if (this.pendingActivationByCommandId(frame.commandId) !== undefined) {
+        this.protocolConflict("worker ready response collided with an activation command");
+      }
+      return;
+    }
+    if (pending.kind !== "initialize") {
+      this.protocolConflict("worker ready response does not match the pending command kind");
+      return;
+    }
+    this.completeCommand(frame.commandId, frame);
+  }
+
+  private resolveCommandResult(frame: DaemonWorkerCommandResultFrame): void {
+    const pending = this.pendingCommands.get(frame.commandId);
+    if (pending === undefined) {
+      if (this.pendingActivationByCommandId(frame.commandId) !== undefined) {
+        this.protocolConflict("worker command result collided with an activation command");
+      }
+      return;
+    }
+    if (pending.kind !== frame.command) {
+      this.protocolConflict("worker command result does not match the pending command kind");
+      return;
+    }
+    if (pending.kind === "cancel") {
+      if (frame.activationId !== undefined && frame.activationId !== pending.activationId) {
+        this.protocolConflict("worker cancellation result activation does not match the pending command");
+        return;
+      }
+    } else if (frame.activationId !== undefined) {
+      this.protocolConflict("worker command result has an unexpected activation");
+      return;
+    }
+    this.completeCommand(frame.commandId, frame);
   }
 
   private handleAccepted(frame: DaemonWorkerAcceptedFrame): void {
+    if (this.pendingCommands.has(frame.commandId)) {
+      this.protocolConflict("worker acceptance collided with a pending command");
+      return;
+    }
     const pending = this.pendingActivations.get(frame.activationId);
-    if (pending === undefined || pending.settled) return;
+    if (pending === undefined || pending.settled) {
+      return;
+    }
     if (pending.commandId !== frame.commandId) {
-      this.failConnection(new DaemonWorkerProtocolError("command_conflict", "worker acceptance command does not match activation"));
+      this.protocolConflict("worker acceptance command does not match activation");
       return;
     }
     pending.accepted = true;
-    this.resolveCommand(frame.commandId, frame);
   }
 
   private handleTerminal(frame: DaemonWorkerActivationTerminalFrame): void {
+    if (this.pendingCommands.has(frame.commandId)) {
+      this.protocolConflict("worker terminal collided with a pending command");
+      return;
+    }
     const pending = this.pendingActivations.get(frame.activationId);
     const prior = this.completedActivations.get(frame.activationId);
     const receipt = toReceipt(frame);
     if (prior !== undefined) {
-      // Duplicate terminal frames are harmless; a conflicting second terminal
-      // is ignored so the client never exposes two outcomes for one activation.
+      if (!sameReceipt(prior.receipt, receipt)) {
+        this.protocolConflict("worker replayed a conflicting activation terminal");
+      }
       return;
     }
     if (pending === undefined) {
-      this.completedActivations.set(frame.activationId, receipt);
       return;
     }
     if (pending.commandId !== frame.commandId) {
-      this.failConnection(new DaemonWorkerProtocolError("command_conflict", "worker terminal command does not match activation"));
+      this.protocolConflict("worker terminal command does not match activation");
       return;
     }
     this.settleActivation(frame.activationId, receipt);
@@ -565,29 +624,19 @@ export class DaemonWorkerClient {
       return;
     }
     const pending = this.pendingCommands.get(frame.commandId);
-    if (pending?.activationId !== undefined) {
-      this.pendingCommands.delete(frame.commandId);
-      clearTimeout(pending.timer);
-      this.settleActivation(pending.activationId, {
-        activationId: pending.activationId,
+    const activation = this.pendingActivationByCommandId(frame.commandId);
+    if (pending !== undefined && activation !== undefined) {
+      this.protocolConflict("worker error command ID is owned by multiple pending operations");
+      return;
+    }
+    if (activation !== undefined) {
+      this.settleActivation(activation.activationId, {
+        activationId: activation.activationId,
         runId: this.runId,
         status: "failed",
         error: { code: frame.code, message: frame.message },
       });
       return;
-    }
-    if (pending === undefined) {
-      const activation = [...this.pendingActivations.values()]
-        .find((candidate) => candidate.commandId === frame.commandId);
-      if (activation !== undefined) {
-        this.settleActivation(activation.activationId, {
-          activationId: activation.activationId,
-          runId: this.runId,
-          status: "failed",
-          error: { code: frame.code, message: frame.message },
-        });
-        return;
-      }
     }
     if (pending === undefined) return;
     this.pendingCommands.delete(frame.commandId);
@@ -595,7 +644,7 @@ export class DaemonWorkerClient {
     pending.reject(new DaemonWorkerProtocolError(frame.code, frame.message, frame.retryable));
   }
 
-  private resolveCommand(commandId: string, value: unknown): void {
+  private completeCommand(commandId: string, value: unknown): void {
     const pending = this.pendingCommands.get(commandId);
     if (pending === undefined) return;
     this.pendingCommands.delete(commandId);
@@ -609,10 +658,12 @@ export class DaemonWorkerClient {
     this.initialized = false;
     this.instanceToken = undefined;
     if (this.lifecycle !== "failed") this.lifecycle = "disconnected";
-    const transportError = new DaemonWorkerTransportError(
-      "disconnected",
-      error?.message === undefined ? "worker transport disconnected" : `worker transport disconnected: ${error.message}`,
-    );
+    const transportError = error instanceof DaemonWorkerProtocolError
+      ? error
+      : new DaemonWorkerTransportError(
+        "disconnected",
+        error?.message === undefined ? "worker transport disconnected" : `worker transport disconnected: ${error.message}`,
+      );
     for (const activation of [...this.pendingActivations.values()]) {
       this.settleActivation(activation.activationId, uncertainReceipt(this.runId, activation.activationId, transportError));
     }
@@ -627,14 +678,16 @@ export class DaemonWorkerClient {
   private settleActivation(activationId: string, receipt: DaemonWorkerActivationReceipt): void {
     const pending = this.pendingActivations.get(activationId);
     if (pending === undefined) {
-      this.completedActivations.set(activationId, receipt);
       return;
     }
     if (pending.settled) return;
     pending.settled = true;
     clearTimeout(pending.timer);
     this.pendingActivations.delete(activationId);
-    this.completedActivations.set(activationId, receipt);
+    this.completedActivations.set(activationId, {
+      fingerprint: pending.fingerprint,
+      receipt,
+    });
     while (this.completedActivations.size > MAX_COMPLETED_ACTIVATIONS) {
       const oldest = this.completedActivations.keys().next().value as string | undefined;
       if (oldest === undefined) break;
@@ -653,7 +706,24 @@ export class DaemonWorkerClient {
 
   private newCommandId(): string {
     const value = this.createCommandId();
-    return identifier(value, "commandId");
+    const commandId = identifier(value, "commandId");
+    if (this.commandIdInUse(commandId)) {
+      throw new DaemonWorkerProtocolError("command_conflict", `worker command ID is already in use: ${commandId}`);
+    }
+    return commandId;
+  }
+
+  private commandIdInUse(commandId: string): boolean {
+    return this.pendingCommands.has(commandId) || this.pendingActivationByCommandId(commandId) !== undefined;
+  }
+
+  private pendingActivationByCommandId(commandId: string): PendingActivation | undefined {
+    return [...this.pendingActivations.values()]
+      .find((candidate) => !candidate.settled && candidate.commandId === commandId);
+  }
+
+  private protocolConflict(message: string): void {
+    this.failConnection(new DaemonWorkerProtocolError("command_conflict", message));
   }
 
   private assertOpen(): void {
@@ -674,6 +744,13 @@ function toReceipt(frame: DaemonWorkerActivationTerminalFrame): DaemonWorkerActi
     status: frame.status,
     ...(frame.error === undefined ? {} : { error: frame.error }),
   };
+}
+
+function sameReceipt(
+  left: DaemonWorkerActivationReceipt,
+  right: DaemonWorkerActivationReceipt,
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function uncertainReceipt(

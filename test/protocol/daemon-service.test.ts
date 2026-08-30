@@ -626,6 +626,45 @@ describe("detached daemon service lifecycle", () => {
     ])).resolves.toBe("closed");
   });
 
+  it("does not report close success when the structured stop result is failed", async () => {
+    const host = new FakeServiceHost();
+    const manager = await openService(host);
+    await manager.start();
+    host.inspect = async (pid) => pid === process.pid
+      ? { status: "running", processStartId: "manager-process-start" }
+      : { status: "inaccessible", error: new Error("EPERM") };
+
+    await expect(manager.close()).rejects.toMatchObject({
+      code: "identity_unverifiable",
+    });
+  });
+
+  it("refuses default pathname socket deletion without an atomic remover", async () => {
+    const host = new FakeServiceHost();
+    const socketIdentity: DaemonServiceSocketIdentity = { device: "1", inode: "99", mode: 0o140600 };
+    let socketPresent = false;
+    const manager = await openService(host, {
+      dependencies: {
+        ...host.dependencies,
+        inspectSocket: async () => socketPresent
+          ? { status: "socket", identity: socketIdentity }
+          : { status: "absent" },
+      },
+    });
+    await manager.start();
+    const old = await readDescriptor(manager);
+    socketPresent = true;
+    host.processes.delete(old.pid);
+    host.probe = async () => ({ status: "unavailable" });
+
+    await expect(manager.start()).resolves.toMatchObject({
+      state: "failed",
+      error: { code: "socket_liveness_unknown" },
+    });
+    expect(host.spawnRequests).toHaveLength(1);
+    expect(socketPresent).toBe(true);
+  });
+
   it("fails closed on process inspection permission errors without signaling by PID", async () => {
     const host = new FakeServiceHost();
     host.inspect = async (pid) => pid === process.pid
