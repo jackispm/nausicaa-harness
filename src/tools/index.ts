@@ -24,6 +24,11 @@ export {
   type RunArtifactHandle,
 } from "./artifact-read.js";
 export { createEditFileTool, editFileTool } from "./edit-file.js";
+export {
+  APPLY_PATCH_MOWE_METADATA,
+  applyPatchTool,
+  createApplyPatchTool,
+} from "./apply-patch.js";
 export { createFindTool, findTool } from "./find.js";
 export {
   createFileInfoTool,
@@ -136,6 +141,7 @@ export {
 import type { AgentTool } from "../domain/ports.js";
 import { createBashTool, type BashCommandExecutor } from "./bash.js";
 import { createEditFileTool } from "./edit-file.js";
+import { createApplyPatchTool } from "./apply-patch.js";
 import { createFindTool } from "./find.js";
 import { createFileInfoTool } from "./file-info.js";
 import { createGrepTool } from "./grep.js";
@@ -216,7 +222,7 @@ export function createWorkspaceTools(options: WorkspaceToolOptions = {}): AgentT
     tools.push(createWebFetchTool(fetchProvider), createWebSearchTool(searchProvider));
   }
   if (options.allowWrite === true) {
-    tools.push(createWriteFileTool(policy), createEditFileTool(policy));
+    tools.push(createWriteFileTool(policy), createEditFileTool(policy), createApplyPatchTool(policy));
     // A write-enabled product surface includes the complete workspace
     // mutation set. Legacy/evaluation callers can explicitly narrow it with
     // allowPathOperations: false.

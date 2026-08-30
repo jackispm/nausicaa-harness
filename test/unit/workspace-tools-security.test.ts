@@ -56,7 +56,7 @@ describe("workspace tool path security", () => {
     expect(createWorkspaceTools({ allowWrite: true }).map((tool) => tool.definition.name))
       .toEqual([
         "read_file", "read_many", "list_files", "grep", "find", "file_info",
-        "git_status", "git_log", "git_show", "git_diff", "write_file", "edit",
+        "git_status", "git_log", "git_show", "git_diff", "write_file", "edit", "apply_patch",
         "directory_create", "path_copy", "path_move", "path_delete",
       ]);
     expect(createWorkspaceTools({ allowShell: true }).map((tool) => tool.definition.name))
@@ -79,6 +79,7 @@ describe("workspace tool path security", () => {
         "git_diff",
         "write_file",
         "edit",
+        "apply_patch",
         "directory_create",
         "path_copy",
         "path_move",
