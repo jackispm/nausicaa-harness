@@ -51,11 +51,13 @@ import {
   parsePermissionProfile,
   parseThemeChoice,
   permissionProfileOptions,
+  skillSelectorOptions,
   themeSelectorOptions,
   type SelectorOption,
   type ThemeChoice,
 } from "./selectors.js";
 import { SelectorOverlay } from "./selector-component.js";
+import type { EdgeSelectionController, EdgeSelectionSnapshot } from "./edge-selection.js";
 import {
   QueueSelection,
   type QueueSelectionItem,
@@ -66,6 +68,7 @@ import {
   AssistantMessageBlock,
   BrandSplashHeader,
   ContextUsageBlock,
+  EdgeSkillPickerSummary,
   getNausicaaColorScheme,
   nausicaaEditorTheme,
   nausicaaMarkdownTheme,
@@ -105,6 +108,8 @@ export interface InteractiveOptions {
   modelChoices?: readonly string[];
   /** Read-only edge status projection supplied by the host/CLI. */
   edgeStatus?: () => EdgeStatusProjection;
+  /** Optional host-injected Skill selection seam. */
+  edgeSelection?: EdgeSelectionController;
 }
 
 interface QueuedSubmission {
@@ -233,7 +238,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider([
     { name: "help", description: "Show commands" },
     { name: "status", description: "Show session state" },
-    { name: "edges", description: "Show configured edge sources" },
+    { name: "edges", description: "Show configured edge sources and refresh" },
+    { name: "skills", description: "Inspect and select Skills for the next Turn", argumentHint: "[refresh|select|deselect]" },
     { name: "context", description: "Show context capacity and cumulative lane usage" },
     { name: "usage", description: "Alias for /context" },
     {
@@ -1230,11 +1236,44 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       `- **Permissions:** ${snapshot.permissionProfile}; ${snapshot.allowWrite ? "write enabled" : "file writes off"}; ${shellStatus}; ${snapshot.allowNetwork ? "network enabled" : "network off"}`,
       `- **Queue / Tokens:** ${snapshot.pendingInputs} pending; ${usage.input + usage.output} used; ${usage.cacheRead} cache-read`,
       ...(snapshot.blocker === undefined ? [] : [`- **Blocked:** ${snapshot.blocker}`]),
-      ...(options.edgeStatus === undefined
+      ...(options.edgeStatus === undefined && options.edgeSelection === undefined
         ? []
-        : [`- **Edges:** ${options.edgeStatus().enabled ? "enabled" : "off"}; generation ${options.edgeStatus().generation}; ${options.edgeStatus().sources.length} source(s)`]),
+        : (() => {
+            const edge = readEdgeStatus();
+            return [`- **Edges:** ${edge.enabled ? "enabled" : "off"}; generation ${edge.generation}; ${edge.sources.length} source(s); ${edge.discoveredSkills?.length ?? 0} Skill(s)`];
+          })()),
     ].join("\n");
     appendBlock(new Markdown(text, 1, 0, nausicaaMarkdownTheme));
+  };
+
+  const readEdgeSelection = (): EdgeSelectionSnapshot | undefined => options.edgeSelection?.snapshot();
+
+  const readEdgeStatus = (): EdgeStatusProjection => {
+    const base = options.edgeStatus?.() ?? {
+      enabled: options.edgeSelection !== undefined,
+      refreshRequested: false,
+      generation: 0,
+      sources: [],
+      toolCount: 0,
+      contextCount: 0,
+      diagnostics: [],
+    } satisfies EdgeStatusProjection;
+    const selection = readEdgeSelection();
+    if (selection === undefined) return base;
+    const provenance = selection.provenance;
+    return {
+      ...base,
+      generation: selection.generation,
+      contextCount: Math.max(base.contextCount ?? 0, selection.skills.length),
+      diagnostics: Object.freeze([...new Set([...(base.diagnostics ?? []), ...selection.diagnostics])]),
+      discoveredSkills: Object.freeze([...selection.skills]),
+      skills: Object.freeze([...selection.skills]),
+      selectedSkillIds: Object.freeze([...selection.selectedSkillIds]),
+      stale: selection.stale,
+      refreshing: selection.refreshing,
+      ...(selection.health === undefined ? {} : { health: selection.health }),
+      provenance: Object.freeze(provenance),
+    };
   };
 
   const readModelOptions = () => modelSelectorOptions(
@@ -1486,6 +1525,81 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     mountSelector(selector);
   };
 
+  const refreshEdgeSelection = async (): Promise<void> => {
+    const controller = options.edgeSelection;
+    if (controller === undefined) {
+      appendNotice("Edge refresh is unavailable: the host did not provide a selection controller.", "warning");
+      return;
+    }
+    const before = controller.snapshot();
+    const pending = controller.refresh();
+    tui.requestRender(true);
+    const refreshed = await pending;
+    if (refreshed.stale) {
+      appendNotice(
+        `Edge refresh was cancelled or failed; showing stale generation ${before.generation}.`,
+        "warning",
+      );
+    } else {
+      appendNotice(`Edges refreshed at generation ${refreshed.generation}.`, "success");
+    }
+    tui.requestRender(true);
+  };
+
+  const applySkillSelection = async (values: readonly string[]): Promise<void> => {
+    const controller = options.edgeSelection;
+    if (controller === undefined) return;
+    const wanted = new Set(values);
+    const snapshot = controller.snapshot();
+    try {
+      for (const skill of snapshot.skills) {
+        if (skill.disabled) continue;
+        const selected = wanted.has(skill.id);
+        if (selected && !skill.selected) await controller.selectSkill(skill.id);
+        if (!selected && skill.selected) await controller.deselectSkill(skill.id);
+      }
+      const count = controller.snapshot().selectedSkillIds.length;
+      appendNotice(`${count} Skill(s) selected for the next Turn.`, "success");
+      tui.requestRender(true);
+    } catch (error: unknown) {
+      appendNotice(
+        `Skills were not changed: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    }
+  };
+
+  const showSkillsSelector = (): void => {
+    const controller = options.edgeSelection;
+    if (controller === undefined) {
+      appendBlock(new Markdown(formatEdgeStatus(readEdgeStatus()), 1, 0, nausicaaMarkdownTheme));
+      appendNotice("Skill selection is unavailable: the host did not provide a selection controller.", "warning");
+      return;
+    }
+    const snapshot = controller.snapshot();
+    appendBlock(new EdgeSkillPickerSummary(() => controller.snapshot()));
+    if (snapshot.skills.length === 0) {
+      appendNotice(snapshot.stale ? "No fresh Skills; the displayed edge snapshot is stale." : "No Skills discovered.", "info");
+      return;
+    }
+    const selector = new SelectorOverlay({
+      title: "Skills",
+      subtitle: snapshot.stale
+        ? "Stale snapshot. Space toggles metadata-only Skills; Enter applies to the next Turn."
+        : "Space toggles metadata-only Skills; Enter applies to the next Turn.",
+      options: skillSelectorOptions(snapshot.skills),
+      multiSelect: true,
+      selectedValues: snapshot.selectedSkillIds,
+      onSelect: () => {},
+      onConfirm: (values) => {
+        closeSelector(false);
+        void applySkillSelection(values);
+      },
+      onCancel: () => closeSelector(true),
+    });
+    mountSelector(selector);
+  };
+
   const handleCommand = async (
     commandLine: string,
     commandImages?: readonly UserImage[],
@@ -1497,7 +1611,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           appendBlock(new Markdown([
             "### Commands",
             "`/status` session details  ·  `/context` context and cumulative usage",
-            "`/edges` configured edge sources and registry generation",
+            "`/edges [refresh]` configured edge sources, Skills, and registry generation",
+            "`/skills [refresh|select <id>|deselect <id>]` next-Turn Skill context",
             "`/usage` alias for `/context`  ·  `/goal [statement]` show or revise Goal",
             "`/session [run-id]` switch saved Run  ·  `/new` new Run",
             "`/permissions [profile]` capability boundary  ·  `/plan [prompt]` enter Plan mode",
@@ -1518,19 +1633,33 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           writeStatus(options.session.snapshot());
           break;
         case "/edges":
-          if (argument.length > 0) throw new Error("Usage: /edges");
-          appendBlock(new Markdown(
-            formatEdgeStatus(options.edgeStatus?.() ?? {
-              enabled: false,
-              refreshRequested: false,
-              generation: 0,
-              sources: [],
-            }),
-            1,
-            0,
-            nausicaaMarkdownTheme,
-          ));
+          if (argument === "refresh") {
+            await refreshEdgeSelection();
+            break;
+          }
+          if (argument.length > 0) throw new Error("Usage: /edges [refresh]");
+          appendBlock(new Markdown(formatEdgeStatus(readEdgeStatus()), 1, 0, nausicaaMarkdownTheme));
           break;
+        case "/skills": {
+          const parts = argument.split(/\s+/u).filter(Boolean);
+          const action = parts[0] ?? "show";
+          if (action === "refresh" && parts.length === 1) {
+            await refreshEdgeSelection();
+            break;
+          }
+          if (action === "show" && parts.length === 1) {
+            showSkillsSelector();
+            break;
+          }
+          const controller = options.edgeSelection;
+          if ((action === "select" || action === "deselect") && parts.length === 2 && controller !== undefined) {
+            if (action === "select") await controller.selectSkill(parts[1]!);
+            else await controller.deselectSkill(parts[1]!);
+            appendNotice(`Skill ${parts[1]} ${action === "select" ? "selected" : "deselected"} for the next Turn.`, "success");
+            break;
+          }
+          throw new Error("Usage: /skills [refresh|select <id>|deselect <id>]");
+        }
         case "/context":
         case "/usage":
           if (argument.length > 0) throw new Error("Usage: /context");
@@ -1835,6 +1964,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       return { consume: true };
     }
     if (isInterrupt) {
+      if (options.edgeSelection?.snapshot().refreshing === true) {
+        options.edgeSelection.cancelRefresh();
+        appendNotice("Cancelling edge refresh; the previous snapshot remains available.", "warning");
+        return { consume: true };
+      }
       if (
         options.session.snapshot().status === "running"
         || options.session.snapshot().status === "cancelling"

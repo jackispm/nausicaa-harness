@@ -23,6 +23,8 @@ import {
   renderToolPresentation,
   type ToolPresentationLine,
 } from "./tool-renderers.js";
+import type { EdgeStatusProjection } from "./edge-status.js";
+import type { EdgeSelectionSnapshot } from "./edge-selection.js";
 
 const ESC = "\x1b[";
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -796,6 +798,51 @@ export class NoticeBlock implements Component {
           ? palette.error
           : palette.info;
     return [truncateToWidth(` ${color("│")} ${this.message}`, Math.max(1, width), "")];
+  }
+
+  invalidate(): void {}
+}
+
+/** Compact edge health/status projection used outside the transcript. */
+export class EdgeStatusBlock implements Component {
+  constructor(private readonly readStatus: EdgeStatusProjection | (() => EdgeStatusProjection)) {}
+
+  render(width: number): string[] {
+    const status = typeof this.readStatus === "function" ? this.readStatus() : this.readStatus;
+    const safeWidth = Math.max(1, width);
+    const state = status.enabled ? "enabled" : "off";
+    const lines = [
+      palette.strong("Edges"),
+      `${palette.dim("state")} ${state} · ${palette.dim("generation")} ${status.generation} · ${status.toolCount ?? 0} tools · ${status.contextCount ?? 0} contexts`,
+      ...(status.refreshing === true ? [palette.warning("refreshing…") ] : []),
+      ...(status.stale === true ? [palette.warning("stale snapshot; refresh was cancelled or failed")] : []),
+      ...((status.sources ?? []).map((source) => (
+        `${palette.muted(terminalSafeText(source.sourceId))} · ${terminalSafeText(source.health ?? source.status)} · ${source.toolCount ?? 0} tools · ${source.contextCount ?? 0} contexts`
+      ))),
+      ...((status.discoveredSkills ?? status.skills ?? []).map((skill) => (
+        `${skill.selected ? palette.accent("●") : palette.dim("○")} ${palette.text(terminalSafeText(skill.name))} · ${skill.disabled ? palette.warning("disabled") : skill.selected ? palette.success("next Turn") : palette.muted("available")}`
+      ))),
+      ...((status.diagnostics ?? []).map((diagnostic) => palette.warning(`! ${terminalSafeText(diagnostic)}`))),
+    ];
+    return fitLines(lines, safeWidth);
+  }
+
+  invalidate(): void {}
+}
+
+/** Read-only metadata summary shown above the interactive Skills picker. */
+export class EdgeSkillPickerSummary implements Component {
+  constructor(private readonly readSnapshot: EdgeSelectionSnapshot | (() => EdgeSelectionSnapshot)) {}
+
+  render(width: number): string[] {
+    const snapshot = typeof this.readSnapshot === "function" ? this.readSnapshot() : this.readSnapshot;
+    const safeWidth = Math.max(1, width);
+    const lines = [
+      `${palette.strong("Skills")} · generation ${snapshot.generation}${snapshot.stale ? " · stale" : ""}`,
+      snapshot.skills.length === 0 ? palette.muted("No Skills discovered") : `${snapshot.skills.length} discovered · ${snapshot.selectedSkillIds.length} selected for next Turn`,
+      ...(snapshot.diagnostics.length > 0 ? snapshot.diagnostics.map((item) => palette.warning(`! ${terminalSafeText(item)}`)) : []),
+    ];
+    return fitLines(lines, safeWidth);
   }
 
   invalidate(): void {}

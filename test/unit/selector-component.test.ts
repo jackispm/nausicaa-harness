@@ -80,4 +80,31 @@ describe("SelectorOverlay", () => {
       expect(visibleWidth(stripTerminalSequences(line))).toBeLessThanOrEqual(width);
     }
   });
+
+  it("supports confirm/cancel for metadata-only multi-selects", () => {
+    const selected: string[][] = [];
+    let cancelled = 0;
+    const overlay = new SelectorOverlay({
+      title: "Skills",
+      multiSelect: true,
+      selectedValues: [options[0].value],
+      options: options.map((option, index) => ({ ...option, disabled: index === 2 })),
+      onSelect: () => {},
+      onConfirm: (values) => selected.push([...values]),
+      onCancel: () => { cancelled += 1; },
+    });
+    expect(overlay.getSelectedValues()).toEqual([options[0].value]);
+    overlay.handleInput("\x1b[B");
+    overlay.handleInput(" ");
+    expect(overlay.getSelectedValues()).toEqual([options[0].value, options[1].value]);
+    overlay.handleInput("\r");
+    expect(selected).toEqual([[options[0].value, options[1].value]]);
+    overlay.handleInput("\x1b");
+    expect(cancelled).toBe(1);
+    for (const width of [4, 20, 80]) {
+      for (const line of overlay.render(width)) {
+        expect(visibleWidth(stripTerminalSequences(line))).toBeLessThanOrEqual(width);
+      }
+    }
+  });
 });

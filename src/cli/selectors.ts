@@ -1,4 +1,4 @@
-import { fuzzyFilter } from "@earendil-works/pi-tui";
+import { fuzzyFilter, stripTerminalSequences } from "@earendil-works/pi-tui";
 
 import { normalizeModelSelector as normalizeRuntimeModelSelector } from "../model/index.js";
 import type {
@@ -14,6 +14,7 @@ export interface SelectorOption {
   value: string;
   label: string;
   description?: string;
+  disabled?: boolean;
 }
 
 export type ThemeChoice = "auto" | "light" | "dark";
@@ -153,4 +154,33 @@ export function normalizeModelSelector(value: string): string {
   } catch {
     throw new Error("/model expects a non-empty model selector without spaces");
   }
+}
+
+export interface SkillSelectorInput {
+  readonly id: string;
+  readonly name: string;
+  readonly description?: string;
+  readonly sourceId?: string;
+  readonly selected: boolean;
+  readonly disabled: boolean;
+}
+
+/** Add compact selection/disabled state without exposing Skill bodies. */
+export function skillSelectorOptions(
+  skills: readonly SkillSelectorInput[],
+): SelectorOption[] {
+  return skills.map((skill) => ({
+    value: skill.id,
+    label: `${skill.selected ? "[x]" : "[ ]"} ${terminalSafeSelectorText(skill.name)}`,
+    description: [
+      skill.disabled ? "disabled" : skill.selected ? "selected for next Turn" : "available",
+      skill.sourceId,
+      skill.description === undefined ? undefined : terminalSafeSelectorText(skill.description),
+    ].filter((value): value is string => value !== undefined && value.length > 0).join(" · "),
+    disabled: skill.disabled,
+  }));
+}
+
+function terminalSafeSelectorText(value: string): string {
+  return stripTerminalSequences(value).replace(/[\u0000-\u001f\u007f]/g, "");
 }

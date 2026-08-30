@@ -28,6 +28,10 @@ export interface SelectorOverlayOptions {
   onSelect: (value: string) => void;
   onCancel: () => void;
   onPreview?: (value: string) => void;
+  /** Optional multi-select mode used by the Skills picker. */
+  multiSelect?: boolean;
+  selectedValues?: readonly string[];
+  onConfirm?: (values: readonly string[]) => void;
 }
 
 const SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
@@ -54,6 +58,9 @@ export class SelectorOverlay extends Container implements Focusable {
   private readonly onSelect: (value: string) => void;
   private readonly onCancel: () => void;
   private readonly onPreview: ((value: string) => void) | undefined;
+  private readonly multiSelect: boolean;
+  private readonly onConfirm: ((values: readonly string[]) => void) | undefined;
+  private readonly selectedValues = new Set<string>();
   private _focused = false;
 
   constructor(options: SelectorOverlayOptions) {
@@ -63,6 +70,9 @@ export class SelectorOverlay extends Container implements Focusable {
     this.onSelect = options.onSelect;
     this.onCancel = options.onCancel;
     this.onPreview = options.onPreview;
+    this.multiSelect = options.multiSelect === true;
+    this.onConfirm = options.onConfirm;
+    for (const value of options.selectedValues ?? []) this.selectedValues.add(value);
     this.allOptions = [...options.options];
     this.filteredOptions = this.allOptions;
 
@@ -88,7 +98,9 @@ export class SelectorOverlay extends Container implements Focusable {
   private createList(options: readonly SelectorOption[]): SelectList {
     const items: SelectItem[] = options.map((option) => ({
       value: option.value,
-      label: option.label,
+      label: this.multiSelect
+        ? `[${this.selectedValues.has(option.value) ? "x" : " "}] ${option.label.replace(/^\[[ x]\]\s*/u, "")}`
+        : option.label,
       ...(option.description === undefined ? {} : { description: option.description }),
     }));
     const list = new SelectList(
@@ -97,7 +109,16 @@ export class SelectorOverlay extends Container implements Focusable {
       SELECT_LIST_THEME,
       SELECT_LIST_LAYOUT,
     );
-    list.onSelect = (item) => this.onSelect(item.value);
+    list.onSelect = (item) => {
+      const option = this.allOptions.find((candidate) => candidate.value === item.value);
+      if (option?.disabled === true) return;
+      if (this.multiSelect) {
+        this.selectedValues.add(item.value);
+        this.onConfirm?.(this.getSelectedValues());
+      } else {
+        this.onSelect(item.value);
+      }
+    };
     list.onCancel = () => this.onCancel();
     list.onSelectionChange = (item) => this.onPreview?.(item.value);
     return list;
@@ -145,10 +166,31 @@ export class SelectorOverlay extends Container implements Focusable {
     return this.list.getSelectedItem()?.value;
   }
 
+  getSelectedValues(): readonly string[] {
+    return Object.freeze(this.allOptions
+      .filter((option) => this.selectedValues.has(option.value))
+      .map((option) => option.value));
+  }
+
   handleInput(data: string): void {
     const keybindings = getKeybindings();
     if (keybindings.matches(data, "tui.select.pageUp")) {
       this.movePage(-1);
+      return;
+    }
+    if (this.multiSelect && (data === " " || data === "\t")) {
+      const value = this.getSelectedValue();
+      const option = this.allOptions.find((candidate) => candidate.value === value);
+      if (value !== undefined && option?.disabled !== true) {
+        if (this.selectedValues.has(value)) this.selectedValues.delete(value);
+        else this.selectedValues.add(value);
+        this.replaceList(this.search.getValue());
+        this.onPreview?.(value);
+      }
+      return;
+    }
+    if (this.multiSelect && keybindings.matches(data, "tui.select.confirm")) {
+      this.onConfirm?.(this.getSelectedValues());
       return;
     }
     if (keybindings.matches(data, "tui.select.pageDown")) {
@@ -186,7 +228,13 @@ export class SelectorOverlay extends Container implements Focusable {
       truncateToWidth("Search", safeWidth, ""),
       ...this.search.render(safeWidth),
       ...this.list.render(safeWidth),
-      truncateToWidth("  Up/Down navigate | Enter select | Esc cancel", safeWidth, ""),
+      truncateToWidth(
+        this.multiSelect
+          ? "  Up/Down navigate | Space toggle | Enter confirm | Esc cancel"
+          : "  Up/Down navigate | Enter select | Esc cancel",
+        safeWidth,
+        "",
+      ),
     );
     return lines.map((line) => truncateToWidth(line, safeWidth, ""));
   }

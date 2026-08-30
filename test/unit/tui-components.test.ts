@@ -12,6 +12,8 @@ import {
   AssistantMessageBlock,
   BrandSplashHeader,
   ContextUsageBlock,
+  EdgeStatusBlock,
+  EdgeSkillPickerSummary,
   NoticeBlock,
   QueuePreview,
   SessionTray,
@@ -23,6 +25,8 @@ import {
   setNausicaaColorScheme,
   terminalSafeText,
 } from "../../src/cli/tui-components.js";
+import type { EdgeSelectionSnapshot } from "../../src/cli/edge-selection.js";
+import type { EdgeStatusProjection } from "../../src/cli/edge-status.js";
 import type {
   SessionContextOverview,
   SessionSnapshot,
@@ -73,6 +77,13 @@ describe("TUI components", () => {
       tool,
       new AdviceBlock("The current approach may miss the stated intent.", "Re-read the goal.", 0.82),
       new NoticeBlock("Waiting for operator input.", "warning"),
+      new EdgeStatusBlock({
+        enabled: true,
+        refreshRequested: false,
+        generation: 3,
+        sources: [],
+        discoveredSkills: [],
+      } satisfies EdgeStatusProjection),
     ];
 
     for (const width of [1, 2, 4, 20, 80]) {
@@ -82,6 +93,46 @@ describe("TUI components", () => {
         }
       }
     }
+  });
+
+  it("projects edge health and Skill selection in narrow and wide trays", () => {
+    const discoveredSkills = [{
+      id: "skills:review",
+      sourceId: "skills",
+      contributionId: "review",
+      name: "review",
+      description: "Review source",
+      disabled: false,
+      selected: true,
+    }] as const;
+    const status: EdgeStatusProjection = {
+      enabled: true,
+      refreshRequested: false,
+      generation: 8,
+      sources: [{ sourceId: "skills", type: "skill", status: "configured", health: "healthy" }],
+      discoveredSkills,
+      stale: true,
+      diagnostics: ["stale refresh"],
+    };
+    const snapshot: EdgeSelectionSnapshot = {
+      generation: 8,
+      skills: discoveredSkills,
+      selectedSkillIds: ["skills:review"],
+      sources: [],
+      provenance: [],
+      diagnostics: ["stale refresh"],
+      stale: true,
+      refreshing: false,
+    };
+    for (const width of [4, 20, 120]) {
+      const statusLines = new EdgeStatusBlock(status).render(width);
+      const skillLines = new EdgeSkillPickerSummary(snapshot).render(width);
+      for (const line of [...statusLines, ...skillLines]) {
+        expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+      }
+    }
+    expect(stripTerminalSequences(new EdgeStatusBlock(status).render(120).join("\n"))).toContain("generation 8");
+    expect(stripTerminalSequences(new EdgeSkillPickerSummary(snapshot).render(120).join("\n"))).toContain("selected for next Turn");
   });
 
   it("renders semantic labels instead of raw bracketed logs", () => {
