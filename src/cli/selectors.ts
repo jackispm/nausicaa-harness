@@ -6,6 +6,7 @@ import type {
   SessionCollaborationMode,
   SessionPermissionProfile,
 } from "../runtime/index.js";
+import type { WorkspaceSandboxAvailability } from "../tools/index.js";
 
 /** Small helpers for Prime-style command selectors. */
 
@@ -19,6 +20,7 @@ export type ThemeChoice = "auto" | "light" | "dark";
 
 export function permissionProfileOptions(
   current: SessionPermissionProfile,
+  workspaceBashAvailability?: WorkspaceSandboxAvailability,
 ): SelectorOption[] {
   return [
     {
@@ -29,7 +31,7 @@ export function permissionProfileOptions(
     {
       value: "workspace",
       label: "Workspace",
-      description: "Read, edit, and run sandboxed Bash inside the workspace; no network",
+      description: workspacePermissionDescription(workspaceBashAvailability),
     },
     {
       value: "full-access",
@@ -40,6 +42,18 @@ export function permissionProfileOptions(
     ...option,
     ...(option.value === current ? { description: `${option.description} (current)` } : {}),
   }));
+}
+
+function workspacePermissionDescription(
+  availability: WorkspaceSandboxAvailability | undefined,
+): string {
+  if (availability === undefined) {
+    return "Read and edit inside the workspace; sandboxed Bash is capability-dependent; no network";
+  }
+  if (availability.available) {
+    return `Read, edit, and run sandboxed Bash inside the workspace (${availability.backend}); no network`;
+  }
+  return `Read and edit inside the workspace; sandboxed Bash unavailable: ${availability.reason}; no network`;
 }
 
 export function parsePermissionProfile(

@@ -44,12 +44,23 @@ describe("Prime-style CLI selectors", () => {
   });
 
   it("provides Codex-style permission profiles without conflating Plan mode", () => {
-    expect(permissionProfileOptions("workspace").map((option) => option.value)).toEqual([
+    const available = permissionProfileOptions("workspace", {
+      available: true,
+      backend: "macos-seatbelt",
+    });
+    expect(available.map((option) => option.value)).toEqual([
       "read-only",
       "workspace",
       "full-access",
     ]);
-    expect(permissionProfileOptions("workspace")[1]?.description).toContain("current");
+    expect(available[1]?.description).toContain("macos-seatbelt");
+    expect(available[1]?.description).toContain("current");
+    const unavailable = permissionProfileOptions("read-only", {
+      available: false,
+      reason: "sandbox probe failed",
+    });
+    expect(unavailable[1]?.description).toContain("sandboxed Bash unavailable");
+    expect(unavailable[1]?.description).toContain("sandbox probe failed");
     expect(parsePermissionProfile(" FULL-ACCESS ")).toBe("full-access");
     expect(() => parsePermissionProfile("plan")).toThrow(/read-only.*workspace.*full-access/);
 

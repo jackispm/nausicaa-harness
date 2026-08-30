@@ -56,6 +56,7 @@ import {
   FileProcessJobRegistry,
   ProcessJobManager,
   WorkspaceCommandSandbox,
+  type WorkspaceSandboxAvailability,
   type WebFetchProvider,
   type WebSearchProvider,
 } from "../tools/index.js";
@@ -193,6 +194,8 @@ export interface SessionSnapshot {
   allowWrite: boolean;
   allowShell: boolean;
   allowNetwork: boolean;
+  /** Actual OS confinement capability behind the workspace permission profile. */
+  workspaceBashAvailability: WorkspaceSandboxAvailability;
   pendingInputs: number;
   lastCommittedStep: number;
   /** Latest durable Fukai input estimate for the selected Main model, or null before its next request. */
@@ -622,6 +625,9 @@ export class SessionController {
       allowWrite: this.allowWrite,
       allowShell: this.allowShell,
       allowNetwork: this.allowNetwork,
+      workspaceBashAvailability: structuredClone(
+        this.workspaceCommandSandbox.availability(),
+      ),
       pendingInputs: pending.length,
       lastCommittedStep: this.active === undefined
         ? 0

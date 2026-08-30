@@ -555,6 +555,10 @@ describe("SessionController", () => {
     expect(session.snapshot()).toMatchObject({
       permissionProfile: "read-only",
       collaborationMode: "default",
+      workspaceBashAvailability: {
+        available: true,
+        backend: "macos-seatbelt",
+      },
     });
     await expect(session.selectPermissionProfile("workspace")).resolves.toMatchObject({
       previousProfile: "read-only",
@@ -586,6 +590,32 @@ describe("SessionController", () => {
     expect(readTools).not.toContain("write_file");
     expect(readTools).not.toContain("bash");
     expect(readTools).not.toContain("web_fetch");
+    await session.close();
+  });
+
+  it("reports why workspace Bash is unavailable without widening the boundary", async () => {
+    const root = await temporaryRoot();
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      allowWrite: true,
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([]),
+      workspaceCommandSandbox: new WorkspaceCommandSandbox({ platform: "win32" }),
+    });
+
+    expect(session.snapshot()).toMatchObject({
+      permissionProfile: "workspace",
+      allowWrite: true,
+      allowShell: false,
+      allowNetwork: false,
+      workspaceBashAvailability: {
+        available: false,
+        reason: "Workspace Bash has no OS sandbox backend for win32",
+      },
+    });
     await session.close();
   });
 

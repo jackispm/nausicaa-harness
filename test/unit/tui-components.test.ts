@@ -41,6 +41,10 @@ const snapshot: SessionSnapshot = {
   allowWrite: false,
   allowShell: false,
   allowNetwork: false,
+  workspaceBashAvailability: {
+    available: true,
+    backend: "macos-seatbelt",
+  },
   pendingInputs: 2,
   lastCommittedStep: 3,
   mainContextTokens: 7_000,

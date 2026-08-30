@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { Terminal } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, type Terminal } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -27,6 +27,7 @@ import {
   type SessionRuntimeEvent,
 } from "../../src/runtime/index.js";
 import { FileContentAddressedStore } from "../../src/store/index.js";
+import { WorkspaceCommandSandbox } from "../../src/tools/index.js";
 
 const TINY_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
@@ -1274,6 +1275,54 @@ describe("interactive TUI", () => {
     },
   );
 
+  it("shows the exact workspace Bash failure in status and permissions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-sandbox-diagnostic-"));
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        allowWrite: true,
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([]),
+        workspaceCommandSandbox: new WorkspaceCommandSandbox({ platform: "win32" }),
+      });
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("/status");
+      terminal.send("\r");
+      await waitForOutput(terminal, "sandboxed Bash unavailable");
+      expect(normalizeTerminalOutput(terminal.output))
+        .toContain("no OS sandbox backend for win32");
+
+      const permissionsOutputStart = terminal.output.length;
+      terminal.type("/permissions");
+      terminal.send("\r");
+      await waitForCondition(
+        () => normalizeTerminalOutput(terminal.output.slice(permissionsOutputStart))
+          .includes("no OS sandbox backend for win32"),
+        "workspace Bash diagnostic in permission selector",
+      );
+      const permissionsOutput = normalizeTerminalOutput(
+        terminal.output.slice(permissionsOutputStart),
+      );
+      expect(permissionsOutput).toContain("sandboxed Bash unavailable");
+      expect(permissionsOutput).toContain("no OS sandbox backend for win32");
+
+      terminal.send("\x1b");
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses Prime-style focused selectors to switch Main and restores editor focus", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-selectors-"));
     const terminal = new MemoryTerminal(100, 28);
@@ -2124,6 +2173,10 @@ async function waitForPendingInputs(session: SessionController, expected: number
 
 function countOccurrences(value: string, expected: string): number {
   return value.split(expected).length - 1;
+}
+
+function normalizeTerminalOutput(value: string): string {
+  return stripTerminalSequences(value).replace(/\s+/g, " ");
 }
 
 function exitFrame(output: string): string {

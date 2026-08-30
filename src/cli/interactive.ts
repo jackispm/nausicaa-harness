@@ -247,7 +247,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       description: "Change the tool capability boundary",
       argumentHint: "[read-only|workspace|full-access]",
       getArgumentCompletions: (prefix) => commandArgumentCompletions(
-        permissionProfileOptions(options.session.snapshot().permissionProfile),
+        permissionProfileOptions(
+          options.session.snapshot().permissionProfile,
+          options.session.snapshot().workspaceBashAvailability,
+        ),
         prefix,
       ),
     },
@@ -1207,7 +1210,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   const writeStatus = (snapshot: SessionSnapshot): void => {
     const usage = snapshot.usage;
     const shellStatus = snapshot.permissionProfile === "workspace"
-      ? "sandboxed Bash enabled when available"
+      ? snapshot.workspaceBashAvailability.available
+        ? `sandboxed Bash enabled (${snapshot.workspaceBashAvailability.backend})`
+        : `sandboxed Bash unavailable: ${snapshot.workspaceBashAvailability.reason}`
       : snapshot.allowShell ? "host shell enabled" : "shell off";
     const text = [
       "### Session",
@@ -1328,7 +1333,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const selector = new SelectorOverlay({
       title: "Permissions",
       subtitle: "Choose the capability boundary for future tool calls.",
-      options: permissionProfileOptions(current),
+      options: permissionProfileOptions(
+        current,
+        options.session.snapshot().workspaceBashAvailability,
+      ),
       current,
       onSelect: (value) => {
         closeSelector(false);
