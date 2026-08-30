@@ -50,6 +50,7 @@ function activation(
     wakes: [{ runId: "run-1", source: "system", dedupeKey: "wake-1" }],
     lease: lease(),
     signal: new AbortController().signal,
+    commitLease: async <T>(operation: () => Promise<T>): Promise<T> => operation(),
     ...overrides,
   };
 }
@@ -94,12 +95,15 @@ describe("daemon runtime composition", () => {
     await activate(activation());
 
     expect(createSession).toHaveBeenCalledOnce();
-    expect(createSession).toHaveBeenCalledWith(expect.objectContaining({
-      workspace: "/workspace",
-      dataDir: "/state",
-      model: "scripted",
-      runId: "run-1",
-    }), {});
+    expect(createSession).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspace: "/workspace",
+        dataDir: "/state",
+        model: "scripted",
+        runId: "run-1",
+      }),
+      expect.objectContaining({ commitExecutionLease: expect.any(Function) }),
+    );
     expect(session.resumeCurrent).toHaveBeenCalledOnce();
     expect(session.waitForIdle).toHaveBeenCalledOnce();
     expect(session.close).toHaveBeenCalledOnce();
@@ -152,6 +156,18 @@ describe("daemon runtime composition", () => {
     expect(assertLease).toHaveBeenCalledOnce();
     expect(commitCalls).toBe(1);
     expect(createSession).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed before opening a daemon session without atomic commit authority", async () => {
+    const createSession = vi.fn<DaemonSessionFactory>(async () => sessionDouble());
+    const activate = createDaemonSessionActivator({
+      session: { workspace: "/workspace", dataDir: "/state", model: "scripted" },
+      createSession,
+    });
+    const { commitLease: _missingCommitLease, ...request } = activation();
+
+    await expect(activate(request)).rejects.toThrow(/commitLease/u);
+    expect(createSession).not.toHaveBeenCalled();
   });
 
   it("composes per-Run Ledger wake admission with the Session activation seam", async () => {

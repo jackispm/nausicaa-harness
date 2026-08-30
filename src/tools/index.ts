@@ -5,6 +5,24 @@ export {
   type BashCommandExecutor,
   type BashToolOptions,
 } from "./bash.js";
+export {
+  artifactReadPointer,
+  createArtifactReadTool,
+  runArtifactHandle,
+  ARTIFACT_READ_POINTER_PREFIX,
+  ARTIFACT_READ_TOOL_NAME,
+  DEFAULT_ARTIFACT_READ_BYTES,
+  MAX_ARTIFACT_READ_BYTES,
+  MAX_ARTIFACT_SOURCE_BYTES,
+  ARTIFACT_READ_CACHE_MAX_BYTES,
+  ARTIFACT_READ_CACHE_MAX_ENTRIES,
+  ARTIFACT_READ_IN_FLIGHT_MAX_BYTES,
+  ARTIFACT_READ_IN_FLIGHT_MAX_ENTRIES,
+  RunArtifactAuthorization,
+  type ArtifactReadStore,
+  type ArtifactReadCacheOptions,
+  type RunArtifactHandle,
+} from "./artifact-read.js";
 export { createEditFileTool, editFileTool } from "./edit-file.js";
 export { createFindTool, findTool } from "./find.js";
 export {

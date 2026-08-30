@@ -112,6 +112,13 @@ function artifactRef(value: unknown, path: string): asserts value is ArtifactRef
   integer(item.byteLength, `${path}.byteLength`);
 }
 
+function sourceArtifactRef(value: unknown, path: string): asserts value is ArtifactRef {
+  artifactRef(value, path);
+  if (!/^sha256:[0-9a-f]{64}$/.test(value.contentHash)) {
+    invalid(`${path}.contentHash`, "a SHA-256 digest");
+  }
+}
+
 function usage(value: unknown, path: string): asserts value is TokenUsage {
   const item = record(value, path);
   integer(item.input, `${path}.input`);
@@ -1083,6 +1090,7 @@ const payloadValidators = {
     string(item.name, `${path}.name`, false);
     artifactRef(item.resultRef, `${path}.resultRef`);
     if (item.contextRef !== undefined) artifactRef(item.contextRef, `${path}.contextRef`);
+    if (item.sourceArtifactRef !== undefined) sourceArtifactRef(item.sourceArtifactRef, `${path}.sourceArtifactRef`);
   },
   "tool.failed": (value, path) => {
     const item = payloadObject(value, path, [
@@ -1098,6 +1106,7 @@ const payloadValidators = {
     string(item.error, `${path}.error`);
     artifactRef(item.resultRef, `${path}.resultRef`);
     if (item.contextRef !== undefined) artifactRef(item.contextRef, `${path}.contextRef`);
+    if (item.sourceArtifactRef !== undefined) sourceArtifactRef(item.sourceArtifactRef, `${path}.sourceArtifactRef`);
     if (item.resolution !== undefined) {
       oneOf(item.resolution, `${path}.resolution`, ["operator"] as const);
     }

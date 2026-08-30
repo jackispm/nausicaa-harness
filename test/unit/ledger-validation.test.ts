@@ -830,6 +830,28 @@ describe("event payload validation", () => {
     expect(() => validateEventPayload("user.message", { messageRef: artifact })).not.toThrow();
   });
 
+  it("validates optional source artifacts on terminal tool events", () => {
+    for (const type of ["tool.succeeded", "tool.failed"] as const) {
+      const payload = validPayloads[type];
+      expect(() => validateEventPayload(type, payload)).not.toThrow();
+      expect(() => validateEventPayload(type, {
+        ...payload,
+        sourceArtifactRef: artifact,
+      })).not.toThrow();
+      expect(() => validateEventPayload(type, {
+        ...payload,
+        sourceArtifactRef: {
+          ...artifact,
+          contentHash: 123,
+        },
+      })).toThrow(/sourceArtifactRef\.contentHash/);
+      expect(() => validateEventPayload(type, {
+        ...payload,
+        sourceArtifactRef: null,
+      })).toThrow(/sourceArtifactRef/);
+    }
+  });
+
   it("accepts legacy and current model failure payloads", () => {
     expect(() => validateEventPayload("model.failed", {
       model: "model-1",

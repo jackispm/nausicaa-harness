@@ -1823,6 +1823,7 @@ export class SessionController {
         policy: { ...attached.policy, maxModelTokens: remaining },
         policyVersion,
         conversationRefs: recoveredMain.conversationRefs,
+        artifactReadRefs: recoveredMain.artifactReadRefs,
         pressureEligibleConversationCount:
           recoveredMain.pressureEligibleConversationCount,
         upperWatermark: latestEvents.at(-1)?.globalOffset ?? 0,

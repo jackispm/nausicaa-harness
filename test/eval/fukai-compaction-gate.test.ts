@@ -34,7 +34,7 @@ describe("Fukai compaction offline benefit gate", () => {
       runArm(workspace, true),
     ]);
 
-    expect(control.mainRequests).toBe(4);
+    expect(control.mainRequests).toBe(8);
     expect(treatment.mainRequests).toBe(control.mainRequests);
     expect(control.compactionRequests).toBe(0);
     expect(control.events.some((event) => event.type === "fukai.compaction.pressure"))
@@ -149,6 +149,7 @@ async function runArm(workspace: string, enabled: boolean): Promise<ArmResult> {
     },
   }, {
     mainModel: model,
+    tools: [],
     clock: { now: () => new Date("2026-01-01T00:00:00.000Z") },
     createRunId: () => `fukai-gate-arm-${enabled ? "a" : "b"}`,
   });
@@ -159,6 +160,10 @@ async function runArm(workspace: string, enabled: boolean): Promise<ArmResult> {
     "Continue",
     "Checkpoint",
     "Conclude",
+    "Verify the conclusion",
+    "Review the evidence",
+    "Confirm the result",
+    "Close the task",
   ].entries()) {
     await session.submit({ inputId: `input-${index + 1}`, text });
     await session.waitForIdle();
@@ -181,7 +186,7 @@ class GateModel implements ModelPort {
   finalText = "";
 
   capabilities() {
-    return { imageInput: false, contextWindowTokens: 2_000 } as const;
+    return { imageInput: false, contextWindowTokens: 8_192 } as const;
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {

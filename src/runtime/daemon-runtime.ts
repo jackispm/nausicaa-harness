@@ -148,6 +148,14 @@ export function createDaemonSessionActivator(
     if (request.signal.aborted) {
       throw abortedActivation(request.signal);
     }
+    // A daemon activation must carry the Host's atomic fencing boundary. A
+    // Session-level commit hook cannot prove that takeover was excluded, so
+    // fail closed before opening a session when the Host omitted it.
+    if (typeof request.commitLease !== "function") {
+      throw new DaemonRuntimeActivationError(
+        "Daemon activation requires Host commitLease authority",
+      );
+    }
 
     const sessionAssert = request.assertLease;
     const sessionCommit = request.commitLease;

@@ -23,6 +23,15 @@ const SCOPES: readonly MoweToolScope[] = ["workspace", "run", "lane", "host"];
  * metadata without changing the AgentTool contract.
  */
 export const FIRST_PARTY_MOWE_METADATA: Readonly<Record<string, MoweToolMetadata>> = Object.freeze({
+  artifact_read: Object.freeze({
+    effect: "read",
+    deterministic: true,
+    supportsBatch: true,
+    concurrencySafe: true,
+    scope: "run",
+    inputKinds: ["artifact"] as const,
+    outputKinds: ["json", "text"] as const,
+  }),
   read_file: Object.freeze({
     effect: "read",
     deterministic: true,

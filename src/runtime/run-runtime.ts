@@ -540,6 +540,7 @@ export const executeRun = async (
         startStep: setup.startStep,
         upperWatermark: mainUpperWatermark,
         conversationRefs: setup.conversationRefs,
+        artifactReadRefs: setup.artifactReadRefs,
         pressureEligibleConversationCount: setup.pressureEligibleConversationCount,
         maxOutputTokens: request.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
@@ -662,6 +663,7 @@ interface RunSetup {
   upperWatermark: number;
   compactionUpperWatermark: number;
   conversationRefs: RunRecoveryState["conversationRefs"];
+  artifactReadRefs: RunRecoveryState["artifactReadRefs"];
   pressureEligibleConversationCount: number;
   events: AnyEvent[];
 }
@@ -773,6 +775,7 @@ const createNewRun = async (
     upperWatermark: await sink.ledger.watermark(),
     compactionUpperWatermark: await sink.ledger.watermark(),
     conversationRefs: [],
+    artifactReadRefs: [],
     pressureEligibleConversationCount: 0,
     events,
   };
@@ -813,6 +816,7 @@ const resumeExistingRun = async (
       0,
     ),
     conversationRefs: recovered.conversationRefs,
+    artifactReadRefs: recovered.artifactReadRefs,
     pressureEligibleConversationCount: recovered.pressureEligibleConversationCount,
     events: await sink.ledger.read({ runId: recovered.runId }),
   };

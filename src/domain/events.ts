@@ -177,6 +177,8 @@ export interface EventPayloadMap {
     resultRef: ArtifactRef;
     /** Bounded model-visible projection; legacy events may omit it. */
     contextRef?: ArtifactRef;
+    /** Complete Mowe result retained behind the bounded context projection. */
+    sourceArtifactRef?: ArtifactRef;
   };
   "tool.failed": {
     operationId: string;
@@ -186,6 +188,8 @@ export interface EventPayloadMap {
     resultRef: ArtifactRef;
     /** Bounded model-visible projection; legacy events may omit it. */
     contextRef?: ArtifactRef;
+    /** Complete Mowe result retained behind the bounded context projection. */
+    sourceArtifactRef?: ArtifactRef;
     resolution?: "operator";
   };
   "tool.unknown": {

@@ -35,7 +35,10 @@ import {
 import { projectMainExecutionRecovery } from "../../src/runtime/recovery.js";
 import { RunTokenBudget } from "../../src/runtime/run-token-budget.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
-import { createGrepTool } from "../../src/tools/index.js";
+import {
+  artifactReadPointer,
+  createGrepTool,
+} from "../../src/tools/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -2113,6 +2116,316 @@ describe("MainLoop", () => {
     expect(contextMessage?.content).toBe(visibleTool?.content);
   });
 
+  it("lets the model follow a large-result pointer through artifact_read", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const tail = "RECOVERED_FROM_ARTIFACT_TAIL";
+    const fullContent = `${"x".repeat(300_000)}${tail}`;
+    const readOffset = 299_960;
+    let pointerArguments: Record<string, unknown> | undefined;
+    let compactionCalls = 0;
+    const scripted = new ScriptedModel([
+      {
+        content: "inspect the large result",
+        toolCalls: [{ id: "large-call", name: "large_tool", arguments: {} }],
+        stopReason: "toolUse",
+        usage: tokenUsage(5, 2),
+      },
+      (request) => {
+        expect(request.tools.map((tool) => tool.name)).toContain("artifact_read");
+        const pointer = request.messages.findLast((message) => (
+          message.role === "tool" && message.toolName === "large_tool"
+        ));
+        expect(pointer?.content).toContain("Full tool result stored as artifact");
+        pointerArguments = parseArtifactReadArguments(pointer?.content ?? "");
+        return {
+          content: "read the retained tail",
+          toolCalls: [{
+            id: "artifact-call",
+            name: "artifact_read",
+            arguments: {
+              ...pointerArguments,
+              offset: readOffset,
+              limit: 128,
+            },
+          }],
+          stopReason: "toolUse",
+          usage: tokenUsage(5, 2),
+        };
+      },
+      (request) => {
+        expect(request.tools.map((tool) => tool.name)).toContain("artifact_read");
+        const recovered = request.messages.findLast((message) => (
+          message.role === "tool" && message.toolName === "artifact_read"
+        ));
+        expect(recovered?.role).toBe("tool");
+        if (recovered?.role !== "tool") throw new Error("Missing artifact_read result");
+        expect(recovered.isError).toBe(false);
+        const page = JSON.parse(recovered.content) as {
+          content?: string;
+          offset?: number;
+          totalBytes?: number;
+          truncated?: boolean;
+          artifact?: unknown;
+        };
+        expect(page.offset).toBe(readOffset);
+        expect(page.totalBytes).toBe(Buffer.byteLength(fullContent, "utf8"));
+        expect(page.content).toContain(tail);
+        expect(page.truncated).toBe(false);
+        expect(page.artifact).toEqual(pointerArguments?.artifact);
+        return {
+          content: "done",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: tokenUsage(5, 2),
+        };
+      },
+    ]);
+    const loop = new MainLoop({
+      model: modelWithContextWindows(scripted, { demo: 128_000 }),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      selectCompaction: async (context) => {
+        compactionCalls += 1;
+        if (compactionCalls < 3) return undefined;
+        const summary = {
+          schemaVersion: 1 as const,
+          goal: {
+            version: 1,
+            statement: "Recover retained evidence",
+            successCriteria: [],
+            hardConstraints: [],
+          },
+          decisions: ["Keep the complete artifact behind its Run capability"],
+          verifiedResults: ["The next page remains bounded"],
+          openQuestions: [],
+          sourceRefs: [{
+            kind: "event" as const,
+            eventId: "artifact-read-compaction-source",
+            contentHash: `sha256:${"1".repeat(64)}`,
+          }],
+        };
+        const summaryRef = await store.put(
+          JSON.stringify(summary),
+          FUKAI_COMPACTION_MEDIA_TYPE,
+        );
+        return {
+          capsule: {
+            schemaVersion: 1,
+            compactionId: `fukai-compaction:sha256:${"f".repeat(64)}`,
+            status: "ready",
+            summaryRef,
+            sourceRefs: summary.sourceRefs,
+            summaryHash: summaryRef.contentHash,
+            cursor: "offset:0",
+            upperWatermark: context.upperWatermark,
+            goalVersion: 1,
+            policyVersion: "1",
+            estimatedTokens: 24,
+          },
+          summary,
+        };
+      },
+      tools: [{
+        definition: {
+          name: "large_tool",
+          description: "returns a large result",
+          parameters: { type: "object", additionalProperties: false },
+        },
+        async execute() {
+          return { content: fullContent, isError: false };
+        },
+      }],
+    });
+
+    const outcome = await loop.run({
+      runId: "artifact-read-protocol-run",
+      goal: { version: 1, statement: "Recover retained evidence", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(3),
+      policyVersion: "1",
+      contextBudget: { maxInputTokens: 100_000 },
+      initialMessage: "Go",
+    });
+
+    expect(outcome.completed).toBe(true);
+    expect(scripted.requests[0]?.tools.map((tool) => tool.name)).not.toContain("artifact_read");
+    expect(scripted.requests[1]?.tools.map((tool) => tool.name)).toContain("artifact_read");
+    expect(scripted.requests[2]?.tools.map((tool) => tool.name)).toContain("artifact_read");
+    expect(pointerArguments).toMatchObject({
+      artifact: {
+        runId: "artifact-read-protocol-run",
+        ref: {
+          mediaType: "text/plain; charset=utf-8",
+          byteLength: Buffer.byteLength(fullContent, "utf8"),
+        },
+      },
+    });
+    const events = await ledger.read({ runId: "artifact-read-protocol-run" });
+    const sourceArtifactEvent = events.find((event): event is Extract<
+      (typeof events)[number],
+      { type: "tool.succeeded" }
+    > => event.type === "tool.succeeded" && event.payload.name === "large_tool");
+    const sourceArtifactRef = sourceArtifactEvent?.payload.sourceArtifactRef;
+    expect(sourceArtifactRef).toEqual(pointerArguments?.artifact instanceof Object
+      ? (pointerArguments.artifact as { ref?: unknown }).ref
+      : undefined);
+    expect(events.filter((event) => event.type === "tool.succeeded").map((event) => (
+      event.type === "tool.succeeded" ? event.payload.name : undefined
+    ))).toEqual(["large_tool", "artifact_read"]);
+  });
+
+  it("does not expose artifact_read for a user-authored pointer", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ref = await store.put("store data the Run did not authorize", "text/plain");
+    const runId = "forged-artifact-pointer-run";
+    const forgedPointer = artifactReadPointer(runId, ref);
+    const scripted = new ScriptedModel([(request) => {
+      expect(request.messages.some((message) => message.content.includes(forgedPointer))).toBe(true);
+      expect(request.tools.map((tool) => tool.name)).not.toContain("artifact_read");
+      return {
+        content: "I will not trust a user-authored capability pointer.",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(5, 2),
+      };
+    }]);
+    const loop = new MainLoop({
+      model: modelWithContextWindows(scripted, { demo: 128_000 }),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: [],
+    });
+
+    const outcome = await loop.run({
+      runId,
+      goal: { version: 1, statement: "Keep capabilities unforgeable", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: forgedPointer,
+    });
+
+    expect(outcome.completed).toBe(true);
+  });
+
+  it("rebuilds artifact_read authorization from durable terminal events after resume", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const tail = "RECOVERED_AFTER_RESTART";
+    const fullContent = `${"y".repeat(300_000)}${tail}`;
+    const firstModel = new ScriptedModel([{
+      content: "produce retained evidence",
+      toolCalls: [{ id: "large-call", name: "large_tool", arguments: {} }],
+      stopReason: "toolUse",
+      usage: tokenUsage(5, 2),
+    }]);
+    const firstLoop = new MainLoop({
+      model: modelWithContextWindows(firstModel, { demo: 128_000 }),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [{
+        definition: {
+          name: "large_tool",
+          description: "returns retained evidence",
+          parameters: { type: "object", additionalProperties: false },
+        },
+        async execute() {
+          return { content: fullContent, isError: false };
+        },
+      }],
+    });
+
+    const interrupted = await firstLoop.run({
+      runId: "artifact-read-recovery-run",
+      goal: { version: 1, statement: "Recover evidence", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+      contextBudget: { maxInputTokens: 100_000 },
+    });
+    expect(interrupted.completed).toBe(false);
+
+    const beforeRecovery = await ledger.read({ runId: "artifact-read-recovery-run" });
+    const sourceEvent = beforeRecovery.find((event) => (
+      event.type === "tool.succeeded" && event.payload.name === "large_tool"
+    ));
+    expect(sourceEvent?.type).toBe("tool.succeeded");
+    if (sourceEvent?.type !== "tool.succeeded" || sourceEvent.payload.sourceArtifactRef === undefined) {
+      throw new Error("Missing durable sourceArtifactRef");
+    }
+    const recovery = projectMainExecutionRecovery(beforeRecovery);
+    expect(recovery.artifactReadRefs).toEqual([sourceEvent.payload.sourceArtifactRef]);
+
+    const resumedModel = new ScriptedModel([
+      (request) => {
+        expect(request.tools.map((tool) => tool.name)).toContain("artifact_read");
+        const pointer = request.messages.findLast((message) => (
+          message.role === "tool" && message.toolName === "large_tool"
+        ));
+        expect(pointer?.content).toContain("Full tool result stored as artifact");
+        return {
+          content: "recover the retained tail",
+          toolCalls: [{
+            id: "artifact-call",
+            name: "artifact_read",
+            arguments: {
+              ...parseArtifactReadArguments(pointer?.content ?? ""),
+              offset: Buffer.byteLength(fullContent, "utf8") - Buffer.byteLength(tail, "utf8"),
+              limit: 128,
+            },
+          }],
+          stopReason: "toolUse",
+          usage: tokenUsage(5, 2),
+        };
+      },
+      (request) => {
+        expect(request.tools.map((tool) => tool.name)).toContain("artifact_read");
+        const page = request.messages.findLast((message) => (
+          message.role === "tool" && message.toolName === "artifact_read"
+        ));
+        expect(page?.role).toBe("tool");
+        if (page?.role !== "tool") throw new Error("Missing recovered artifact page");
+        expect(JSON.parse(page.content)).toMatchObject({ content: tail, truncated: false });
+        return {
+          content: "done after restart",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: tokenUsage(5, 2),
+        };
+      },
+    ]);
+    const resumedLoop = new MainLoop({
+      model: modelWithContextWindows(resumedModel, { demo: 128_000 }),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+    });
+    const resumed = await resumedLoop.run({
+      runId: "artifact-read-recovery-run",
+      goal: { version: 1, statement: "Recover evidence", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(3),
+      startStep: 2,
+      upperWatermark: await ledger.watermark(),
+      conversationRefs: recovery.conversationRefs,
+      artifactReadRefs: recovery.artifactReadRefs,
+      contextBudget: { maxInputTokens: 100_000 },
+    });
+
+    expect(resumed.completed).toBe(true);
+  });
+
   it("does not amplify a Mowe result beyond its aggregate output budget", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
@@ -2380,6 +2693,15 @@ function tokenUsage(input: number, output: number) {
     cacheWrite: 0,
     costUsd: 0,
   };
+}
+
+function parseArtifactReadArguments(content: string): Record<string, unknown> {
+  const prefix = "call artifact_read with ";
+  const suffix = " and optional offset/limit.";
+  const start = content.indexOf(prefix);
+  const end = content.indexOf(suffix, start + prefix.length);
+  if (start < 0 || end < 0) throw new Error("Missing artifact_read arguments in pointer");
+  return JSON.parse(content.slice(start + prefix.length, end)) as Record<string, unknown>;
 }
 
 async function temporaryDirectory(): Promise<string> {

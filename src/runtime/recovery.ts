@@ -26,6 +26,7 @@ export interface RunRecoveryState {
   startStep: number;
   upperWatermark: number;
   conversationRefs: FukaiConversationRef[];
+  artifactReadRefs: ArtifactRef[];
   pressureEligibleConversationCount: number;
   priorUsage: TokenUsage;
   completedAnswerRef?: ArtifactRef;
@@ -34,6 +35,7 @@ export interface RunRecoveryState {
 
 export interface MainExecutionRecoveryProjection {
   conversationRefs: FukaiConversationRef[];
+  artifactReadRefs: ArtifactRef[];
   pressureEligibleConversationCount: number;
   usage: TokenUsage;
 }
@@ -122,6 +124,7 @@ export const recoverRun = async (
     startStep: highestStep(events) + 1,
     upperWatermark: projection.run.lastOffset,
     conversationRefs: main.conversationRefs,
+    artifactReadRefs: main.artifactReadRefs,
     pressureEligibleConversationCount: main.pressureEligibleConversationCount,
     priorUsage: main.usage,
     ...(completedAnswerRef === undefined ? {} : { completedAnswerRef }),
@@ -424,12 +427,38 @@ export const projectMainExecutionRecovery = (
   const conversationRefs = recoverConversationRefs(events);
   return {
     conversationRefs,
+    artifactReadRefs: recoverArtifactReadRefs(events),
     pressureEligibleConversationCount: recoverPressureEligibleConversationCount(
       events,
       conversationRefs,
     ),
     usage: recoverMainUsage(events, chargedUsage),
   };
+};
+
+/** Complete Mowe result refs are capabilities, not model text. Recover them
+ * from terminal facts so a restarted Main can continue paging old results. */
+const recoverArtifactReadRefs = (events: readonly AnyEvent[]): ArtifactRef[] => {
+  const refs: ArtifactRef[] = [];
+  const seen = new Set<string>();
+  for (const event of events) {
+    if (
+      event.laneId !== "main"
+      || (event.type !== "tool.succeeded" && event.type !== "tool.failed")
+      || event.payload.sourceArtifactRef === undefined
+    ) continue;
+    const ref = event.payload.sourceArtifactRef;
+    const key = JSON.stringify([
+      ref.id,
+      ref.contentHash,
+      ref.mediaType,
+      ref.byteLength,
+    ]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    refs.push(structuredClone(ref));
+  }
+  return refs;
 };
 
 function recoverPressureEligibleConversationCount(
