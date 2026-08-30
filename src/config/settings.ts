@@ -10,6 +10,7 @@ import {
   MAX_MAIN_OUTPUT_TOKENS,
 } from "../domain/types.js";
 import type { FukaiCompactionPolicy } from "../domain/types.js";
+import type { MoweEffect, MoweToolScope } from "../mowe/types.js";
 
 /** Provider implementations understood by the Fukai configuration seam. */
 export type FukaiCompactionProviderCapability = FukaiCompactionPolicy["provider"];
@@ -44,19 +45,41 @@ export interface EdgeSourceSettings {
   enabled?: boolean;
 }
 
+/** Explicit host authorization for one configured edge source. */
+export interface EdgeHostGrantSettings {
+  sourceId: string;
+  effects: readonly MoweEffect[];
+  scopes: readonly MoweToolScope[];
+  allowWithoutApproval?: boolean;
+}
+
 export interface EdgeSettings {
   /** Edge loading is opt-in; disabled sources never enter a Turn snapshot. */
   enabled?: boolean;
   /** Refresh at host startup; explicit refresh remains a runtime concern. */
   refreshOnStart?: boolean;
+  /** Maximum time spent in one startup/explicit edge refresh. */
+  refreshTimeoutMs?: number;
   sources?: readonly EdgeSourceSettings[];
+  /** Declarations and grants remain separate host-owned fields. */
+  grants?: readonly EdgeHostGrantSettings[];
 }
 
 export interface ResolvedEdgeSettings {
   enabled: boolean;
   refreshOnStart: boolean;
+  refreshTimeoutMs: number;
   sources: readonly EdgeSourceSettings[];
+  grants: readonly EdgeHostGrantSettings[];
 }
+
+export const DEFAULT_EDGE_REFRESH_TIMEOUT_MS = 60_000;
+export const MAX_EDGE_REFRESH_TIMEOUT_MS = 15 * 60_000;
+export const MAX_EDGE_SOURCES = 128;
+export const MAX_EDGE_GRANTS = 128;
+export const MAX_EDGE_ARGS = 64;
+export const MAX_EDGE_STRING_BYTES = 4 * 1024;
+export const MAX_EDGE_ID_BYTES = 256;
 
 export interface ResolvedFukaiCompactionSettings extends FukaiCompactionPolicy {
   thresholdRatio: number;
@@ -147,6 +170,9 @@ export const loadSettings = async (
       ...project.edges,
       ...(user.edges?.sources !== undefined && project.edges?.sources === undefined
         ? { sources: user.edges.sources }
+        : {}),
+      ...(user.edges?.grants !== undefined && project.edges?.grants === undefined
+        ? { grants: user.edges.grants }
         : {}),
     };
   }
@@ -242,11 +268,19 @@ const readSettingsFile = async (path: string): Promise<Settings> => {
   return value as Settings;
 };
 
-const resolveEdgeSettings = (
+export const resolveEdgeSettings = (
   settings: EdgeSettings | undefined,
   overrides: EdgeSettings | undefined,
 ): ResolvedEdgeSettings => {
+  if (settings !== undefined) validateOptionalEdges(settings, "settings");
+  if (overrides !== undefined) validateOptionalEdges(overrides, "overrides");
   const merged = { ...settings, ...overrides };
+  const refreshTimeoutMs = boundedInteger(
+    merged.refreshTimeoutMs ?? DEFAULT_EDGE_REFRESH_TIMEOUT_MS,
+    "edges.refreshTimeoutMs",
+    1,
+    MAX_EDGE_REFRESH_TIMEOUT_MS,
+  );
   const sources = [...(merged.sources ?? [])].map((source) => ({
     ...source,
     ...(source.args === undefined ? {} : { args: Object.freeze([...source.args]) }),
@@ -254,7 +288,13 @@ const resolveEdgeSettings = (
   return {
     enabled: merged.enabled ?? false,
     refreshOnStart: merged.refreshOnStart ?? false,
+    refreshTimeoutMs,
     sources: Object.freeze(sources.map((source) => Object.freeze(source))),
+    grants: Object.freeze((merged.grants ?? []).map((grant) => Object.freeze({
+      ...grant,
+      effects: Object.freeze([...grant.effects]),
+      scopes: Object.freeze([...grant.scopes]),
+    }))),
   };
 };
 
@@ -263,7 +303,7 @@ const validateOptionalEdges = (value: unknown, path: string): void => {
   if (!isRecord(value)) {
     throw new SettingsError(`edges in ${path} must be a JSON object`);
   }
-  const allowed = new Set(["enabled", "refreshOnStart", "sources"]);
+  const allowed = new Set(["enabled", "refreshOnStart", "refreshTimeoutMs", "sources", "grants"]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
       throw new SettingsError(`Unknown setting edges.${key} in ${path}`);
@@ -271,9 +311,20 @@ const validateOptionalEdges = (value: unknown, path: string): void => {
   }
   validateOptionalBoolean(value.enabled, "edges.enabled", path);
   validateOptionalBoolean(value.refreshOnStart, "edges.refreshOnStart", path);
-  if (value.sources === undefined) return;
+  validateOptionalInteger(value.refreshTimeoutMs, "edges.refreshTimeoutMs", path);
+  if (typeof value.refreshTimeoutMs === "number"
+    && (value.refreshTimeoutMs < 1 || value.refreshTimeoutMs > MAX_EDGE_REFRESH_TIMEOUT_MS)) {
+    throw new SettingsError(`edges.refreshTimeoutMs in ${path} must be between 1 and ${MAX_EDGE_REFRESH_TIMEOUT_MS}`);
+  }
+  if (value.sources === undefined) {
+    validateOptionalEdgeGrants(value.grants, path);
+    return;
+  }
   if (!Array.isArray(value.sources)) {
     throw new SettingsError(`edges.sources in ${path} must be an array`);
+  }
+  if (value.sources.length > MAX_EDGE_SOURCES) {
+    throw new SettingsError(`edges.sources in ${path} exceeds ${MAX_EDGE_SOURCES} entries`);
   }
   const seen = new Set<string>();
   for (const [index, candidate] of value.sources.entries()) {
@@ -299,15 +350,7 @@ const validateOptionalEdges = (value: unknown, path: string): void => {
     if (candidate.sourceId === undefined || typeof candidate.sourceId !== "string") {
       throw new SettingsError(`${sourcePath}.sourceId is required`);
     }
-    if (candidate.sourceId.includes("\0")) {
-      throw new SettingsError(`${sourcePath}.sourceId must not contain NUL`);
-    }
-    if (candidate.sourceId.trim().length === 0) {
-      throw new SettingsError(`${sourcePath}.sourceId must not be blank`);
-    }
-    if (/[\u0000-\u001f\u007f]/u.test(candidate.sourceId)) {
-      throw new SettingsError(`${sourcePath}.sourceId must not contain control characters`);
-    }
+    validateEdgeId(candidate.sourceId, `${sourcePath}.sourceId`, path);
     if (seen.has(candidate.sourceId)) {
       throw new SettingsError(`Duplicate edge sourceId ${candidate.sourceId} in ${path}`);
     }
@@ -322,19 +365,91 @@ const validateOptionalEdges = (value: unknown, path: string): void => {
     if (candidate.type === "mcp" && (command === undefined || command.trim() === "")) {
       throw new SettingsError(`${sourcePath}.command is required for mcp sources`);
     }
+    if (candidate.type === "mcp" && location !== undefined) {
+      throw new SettingsError(`${sourcePath}.location is not allowed for mcp sources`);
+    }
     if ((candidate.type === "skill" || candidate.type === "plugin")
       && (location === undefined || location.trim() === "")) {
       throw new SettingsError(`${sourcePath}.location is required for ${candidate.type} sources`);
     }
+    if ((candidate.type === "skill" || candidate.type === "plugin")
+      && (command !== undefined || candidate.args !== undefined)) {
+      throw new SettingsError(`${sourcePath}.command/args are only allowed for mcp sources`);
+    }
+    if (location !== undefined) validateEdgeString(location, `${sourcePath}.location`, path, MAX_EDGE_STRING_BYTES);
+    if (command !== undefined) validateEdgeString(command, `${sourcePath}.command`, path, MAX_EDGE_STRING_BYTES);
     validateOptionalBoolean(candidate.enabled, `${sourcePath}.enabled`, path);
     if (candidate.args !== undefined) {
       if (!Array.isArray(candidate.args) || candidate.args.some((arg) => typeof arg !== "string")) {
         throw new SettingsError(`${sourcePath}.args must be an array of strings`);
       }
-      if (candidate.args.some((arg) => arg.includes("\0"))) {
-        throw new SettingsError(`${sourcePath}.args must not contain NUL`);
+      if (candidate.args.length > MAX_EDGE_ARGS) {
+        throw new SettingsError(`${sourcePath}.args exceeds ${MAX_EDGE_ARGS} entries`);
+      }
+      for (const [argIndex, arg] of candidate.args.entries()) {
+        validateEdgeString(arg, `${sourcePath}.args[${argIndex}]`, path, MAX_EDGE_STRING_BYTES);
       }
     }
+  }
+  validateOptionalEdgeGrants(value.grants, path);
+};
+
+const validateOptionalEdgeGrants = (value: unknown, path: string): void => {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    throw new SettingsError(`edges.grants in ${path} must be an array`);
+  }
+  if (value.length > MAX_EDGE_GRANTS) {
+    throw new SettingsError(`edges.grants in ${path} exceeds ${MAX_EDGE_GRANTS} entries`);
+  }
+  const seen = new Set<string>();
+  const effects = new Set<MoweEffect>(["read", "compute", "write", "external"]);
+  const scopes = new Set<MoweToolScope>(["workspace", "run", "lane", "host"]);
+  for (const [index, candidate] of value.entries()) {
+    const grantPath = `edges.grants[${index}] in ${path}`;
+    if (!isRecord(candidate)) throw new SettingsError(`${grantPath} must be a JSON object`);
+    const allowed = new Set(["sourceId", "effects", "scopes", "allowWithoutApproval"]);
+    for (const key of Object.keys(candidate)) {
+      if (!allowed.has(key)) throw new SettingsError(`Unknown setting ${grantPath}.${key}`);
+    }
+    if (typeof candidate.sourceId !== "string") {
+      throw new SettingsError(`${grantPath}.sourceId is required`);
+    }
+    validateEdgeId(candidate.sourceId, `${grantPath}.sourceId`, path);
+    if (seen.has(candidate.sourceId)) throw new SettingsError(`Duplicate edge grant sourceId ${candidate.sourceId} in ${path}`);
+    seen.add(candidate.sourceId);
+    validateGrantValues(candidate.effects, effects, `${grantPath}.effects`);
+    validateGrantValues(candidate.scopes, scopes, `${grantPath}.scopes`);
+    validateOptionalBoolean(candidate.allowWithoutApproval, `${grantPath}.allowWithoutApproval`, path);
+  }
+};
+
+const validateGrantValues = <T extends string>(
+  value: unknown,
+  allowed: ReadonlySet<T>,
+  name: string,
+): void => {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 8
+    || value.some((item) => typeof item !== "string" || !allowed.has(item as T))) {
+    throw new SettingsError(`${name} must be a non-empty list of supported values`);
+  }
+  if (new Set(value).size !== value.length) throw new SettingsError(`${name} must not contain duplicates`);
+};
+
+const validateEdgeString = (value: string, name: string, path: string, maxBytes: number): void => {
+  if (value.trim().length === 0) throw new SettingsError(`${name} in ${path} must not be blank`);
+  if (/[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new SettingsError(`${name} in ${path} must not contain control characters`);
+  }
+  if (Buffer.byteLength(value, "utf8") > maxBytes) {
+    throw new SettingsError(`${name} in ${path} exceeds ${maxBytes} UTF-8 bytes`);
+  }
+};
+
+const validateEdgeId = (value: string, name: string, path: string): void => {
+  validateEdgeString(value, name, path, MAX_EDGE_ID_BYTES);
+  if (/\s/u.test(value)) {
+    throw new SettingsError(`${name} in ${path} must not contain whitespace`);
   }
 };
 

@@ -317,6 +317,72 @@ describe("settings", () => {
     expect(Object.isFrozen(resolved.edges.sources[1]?.args)).toBe(true);
   });
 
+  it("loads host grants separately and bounds their authority", async () => {
+    const root = await makeRoot();
+    const home = join(root, "home");
+    await mkdir(join(home, ".nausicaa"), { recursive: true });
+    await writeFile(join(home, ".nausicaa", "settings.json"), JSON.stringify({
+      model: "openrouter:base",
+      edges: {
+        enabled: true,
+        sources: [{ sourceId: "docs", type: "mcp", command: "fake-mcp", args: ["--stdio"] }],
+        grants: [{ sourceId: "docs", effects: ["read"], scopes: ["workspace"], allowWithoutApproval: true }],
+      },
+    }));
+    const loaded = await loadSettings(join(root, "workspace"), { userHome: home });
+    const resolved = resolveSettings(join(root, "workspace"), loaded, {}, {});
+    expect(resolved.edges.grants).toEqual([{
+      sourceId: "docs",
+      effects: ["read"],
+      scopes: ["workspace"],
+      allowWithoutApproval: true,
+    }]);
+    expect(Object.isFrozen(resolved.edges.grants)).toBe(true);
+    expect(Object.isFrozen(resolved.edges.grants[0]?.effects)).toBe(true);
+  });
+
+  it("rejects unsafe source paths, stdio mismatches, and oversized declarations", async () => {
+    const root = await makeRoot();
+    const home = join(root, "home");
+    await mkdir(join(home, ".nausicaa"), { recursive: true });
+    const settingsPath = join(home, ".nausicaa", "settings.json");
+    const write = async (value: unknown) => writeFile(settingsPath, JSON.stringify({ model: "m", edges: value }));
+
+    await write({ sources: [{ sourceId: "mcp", type: "mcp", command: "fake", location: "bad" }] });
+    await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/location is not allowed/i);
+    await write({ sources: [{ sourceId: "skill", type: "skill", location: "skills", command: "fake" }] });
+    await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/command\/args are only allowed/i);
+    await write({ sources: [{ sourceId: "bad\nsource", type: "skill", location: "skills" }] });
+    await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/control characters/i);
+    await write({ sources: [{ sourceId: "bad source", type: "skill", location: "skills" }] });
+    await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/must not contain whitespace/i);
+    await write({ grants: [{ sourceId: "grant", effects: ["write", "write"], scopes: ["workspace"] }] });
+    await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/must not contain duplicates/i);
+  });
+
+  it("ignores project edge sources and grants when workspace trust is absent", async () => {
+    const root = await makeRoot();
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    await mkdir(join(home, ".nausicaa"), { recursive: true });
+    await mkdir(join(workspace, ".nausicaa"), { recursive: true });
+    await writeFile(join(home, ".nausicaa", "settings.json"), JSON.stringify({
+      model: "m",
+      edges: { grants: [{ sourceId: "user", effects: ["read"], scopes: ["run"] }] },
+    }));
+    await writeFile(join(workspace, ".nausicaa", "settings.json"), JSON.stringify({
+      edges: {
+        enabled: true,
+        sources: [{ sourceId: "project", type: "mcp", command: "fake" }],
+        grants: [{ sourceId: "project", effects: ["write"], scopes: ["host"] }],
+      },
+    }));
+    await expect(loadSettings(workspace, { userHome: home })).resolves.toMatchObject({
+      model: "m",
+      edges: { grants: [{ sourceId: "user" }] },
+    });
+  });
+
   it("deep-merges trusted edge settings while preserving user source declarations", async () => {
     const root = await makeRoot();
     const home = join(root, "home");
