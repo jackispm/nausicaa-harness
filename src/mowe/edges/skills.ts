@@ -4,6 +4,7 @@ import { lstat, open, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 
 import { sha256, stableJson } from "../../ledger/hash.js";
+import type { EdgeAdapterHealth, EdgeDiscoveryContext, EdgeLoadContext, EdgeProvenance, EdgeRefreshContext, EdgeReleaseContext } from "../edge-types.js";
 
 /** The on-disk filename used by the Agent Skills convention. */
 export const SKILL_FILENAME = "SKILL.md";
@@ -13,10 +14,15 @@ export const DEFAULT_SKILL_MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 export const DEFAULT_SKILL_MAX_FRONTMATTER_BYTES = 64 * 1024;
 export const DEFAULT_SKILL_MAX_SKILLS = 128;
 export const DEFAULT_SKILL_MAX_DEPTH = 8;
+export const DEFAULT_SKILL_MAX_RESOURCE_BYTES = 256 * 1024;
+export const DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES = 2 * 1024 * 1024;
+export const DEFAULT_SKILL_MAX_RESOURCES = 64;
 export const MAX_SKILL_COUNT = 4_096;
 export const MAX_SKILL_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_SKILL_TOTAL_BYTES = 256 * 1024 * 1024;
 export const MAX_SKILL_DEPTH = 64;
+export const MAX_SKILL_RESOURCES = 256;
+export const MAX_SKILL_RESOURCE_TOTAL_BYTES = 64 * 1024 * 1024;
 
 const NO_FOLLOW = constants.O_NOFOLLOW ?? 0;
 const DEFAULT_ROOTS = [".agents/skills", ".pi/skills", "skills"] as const;
@@ -141,7 +147,7 @@ export interface SkillDiscoveryReport {
 }
 
 export interface SkillDiagnostic {
-  readonly kind: "duplicate" | "invalid" | "unsafe";
+  readonly kind: "duplicate" | "disabled" | "invalid" | "unsafe";
   readonly message: string;
   readonly name?: string;
   readonly path?: string;
@@ -151,6 +157,69 @@ export interface SkillDiagnostic {
 export interface SkillLoadOptions {
   maxFileBytes?: number;
   maxBodyBytes?: number;
+}
+
+/**
+ * Additive context contract used by the Mowe registry.  These local aliases
+ * deliberately mirror the shared S1 shape so this edge can be built before
+ * the registry's contribution types are rebased into the worktree.
+ */
+export interface SkillEdgeContextContributionSummary {
+  readonly kind: "context";
+  readonly sourceId: string;
+  readonly contributionId: string;
+  readonly sourceType: "skill" | "plugin";
+  readonly name: string;
+  readonly description: string;
+  readonly disabled: boolean;
+  readonly contentHash?: string;
+  readonly provenance?: EdgeProvenance;
+}
+
+export interface SkillEdgeContextContribution extends SkillEdgeContextContributionSummary {
+  readonly body?: string;
+  readonly resources?: readonly SkillResource[];
+}
+
+export interface SkillContextLoadContext extends EdgeLoadContext {
+  readonly maxFileBytes?: number;
+  readonly maxBodyBytes?: number;
+  /** Explicitly selected files below the Skill directory. */
+  readonly resourcePaths?: readonly string[];
+  /** Alias accepted by callers that use the shorter resource terminology. */
+  readonly resources?: readonly string[];
+  readonly maxResourceBytes?: number;
+  readonly maxResourceTotalBytes?: number;
+  readonly maxResources?: number;
+}
+
+export interface SkillsEdgeAdapterOptions extends SkillLoaderOptions, SkillLoadOptions {
+  /** Host-owned adapter identity; never the loader's per-path sourceId. */
+  readonly sourceId: string;
+  readonly loader?: SkillLoaderPort;
+  readonly maxResourceBytes?: number;
+  readonly maxResourceTotalBytes?: number;
+  readonly maxResources?: number;
+  readonly provenance?: Partial<EdgeProvenance>;
+}
+
+export interface SkillLoaderPort {
+  discoverReport(workspace: string, options?: SkillLoaderOptions): Promise<SkillDiscoveryReport>;
+}
+
+export interface SkillsEdgeAdapter {
+  readonly sourceId: string;
+  readonly sourceType: "skill";
+  discoverContributions(context: EdgeDiscoveryContext): Promise<readonly SkillEdgeContextContributionSummary[]>;
+  loadContribution(
+    summary: SkillEdgeContextContributionSummary,
+    context: SkillContextLoadContext,
+  ): Promise<SkillEdgeContextContribution>;
+  refresh?(context: EdgeRefreshContext): Promise<void>;
+  health?(): Promise<EdgeAdapterHealth>;
+  release?(context: EdgeReleaseContext): Promise<void>;
+  /** Last discovery diagnostics, retained for host/UI projections. */
+  diagnostics(): readonly SkillDiagnostic[];
 }
 
 interface ResolvedLimits {
@@ -474,6 +543,472 @@ export class SkillsLoader {
   }
 }
 
+/** A host-safe projection of selected Skill text for Fukai/context assembly. */
+export interface SkillContextProjection {
+  readonly kind: "untrusted-context";
+  readonly trust: "untrusted";
+  readonly untrusted: true;
+  readonly sourceType: "skill";
+  readonly sourceId: string;
+  readonly contributionId: string;
+  readonly name: string;
+  readonly description: string;
+  readonly contentHash: string;
+  readonly body: string;
+  readonly text: string;
+  readonly resources: readonly SkillResource[];
+}
+
+export interface SkillContextProjectionOptions {
+  readonly maxBytes?: number;
+  readonly maxResourceBytes?: number;
+  readonly maxResources?: number;
+}
+
+export const DEFAULT_SKILL_CONTEXT_MAX_BYTES = DEFAULT_SKILL_MAX_TOTAL_BYTES;
+export const MAX_SKILL_CONTEXT_MAX_BYTES = MAX_SKILL_TOTAL_BYTES;
+
+/**
+ * Project a loaded contribution into data-only context. Disabled Skills are
+ * intentionally omitted; no Mowe effect/scope/approval/grant metadata crosses
+ * this boundary.
+ */
+export function projectSkillContext(
+  contribution: SkillEdgeContextContribution,
+  options: SkillContextProjectionOptions = {},
+): SkillContextProjection | undefined {
+  assertContributionShape(contribution);
+  if (contribution.disabled) return undefined;
+  const maxBytes = boundedLimit(
+    options.maxBytes,
+    DEFAULT_SKILL_CONTEXT_MAX_BYTES,
+    MAX_SKILL_CONTEXT_MAX_BYTES,
+    "maxBytes",
+  );
+  const maxResourceBytes = boundedLimit(
+    options.maxResourceBytes,
+    DEFAULT_SKILL_MAX_RESOURCE_BYTES,
+    MAX_SKILL_FILE_BYTES,
+    "maxResourceBytes",
+  );
+  const maxResources = boundedLimit(
+    options.maxResources,
+    DEFAULT_SKILL_MAX_RESOURCES,
+    MAX_SKILL_RESOURCES,
+    "maxResources",
+  );
+  if (!contribution.disabled && contribution.body === undefined) {
+    throw new SkillLoaderError("A loaded Skill body is required for context projection");
+  }
+  if (!contribution.disabled && contribution.contentHash === undefined) {
+    throw new SkillLoaderError("A loaded Skill content hash is required for context projection");
+  }
+  const body = contribution.body ?? "";
+  const contentHash = contribution.contentHash ?? "";
+  const sourceResources = contribution.resources ?? [];
+  if (sourceResources.length > maxResources) {
+    throw new SkillLoaderError(`Skill context contains more than ${maxResources} resources`);
+  }
+  const resources: SkillResource[] = [];
+  let totalBytes = Buffer.byteLength(body, "utf8");
+  for (const resource of sourceResources) {
+    if (resource.byteLength > maxResourceBytes
+      || Buffer.byteLength(resource.content, "utf8") !== resource.byteLength) {
+      throw new SkillLoaderError(`Skill resource ${resource.relativePath} exceeds the ${maxResourceBytes} byte projection limit`);
+    }
+    totalBytes += resource.byteLength;
+    resources.push(Object.freeze({ ...resource }));
+  }
+  if (totalBytes > maxBytes) {
+    throw new SkillLoaderError(`Skill context exceeds the ${maxBytes} byte projection limit`);
+  }
+  const text = [
+    body,
+    ...resources.map((resource) => `\n\n[Skill resource: ${resource.relativePath}]\n${resource.content}`),
+  ].join("");
+  if (Buffer.byteLength(text, "utf8") > maxBytes) {
+    throw new SkillLoaderError(`Skill context exceeds the ${maxBytes} byte projection limit`);
+  }
+  return Object.freeze({
+    kind: "untrusted-context",
+    trust: "untrusted",
+    untrusted: true,
+    sourceType: "skill",
+    sourceId: contribution.sourceId,
+    contributionId: contribution.contributionId,
+    name: contribution.name,
+    description: contribution.description,
+    contentHash,
+    body,
+    text,
+    resources: Object.freeze(resources),
+  });
+}
+
+/**
+ * Create a Skills context-contribution adapter. Discovery is metadata-only;
+ * body and resource reads happen only through loadContribution after explicit
+ * host selection.
+ */
+export function createSkillsEdgeAdapter(options: SkillsEdgeAdapterOptions): SkillsEdgeAdapter {
+  return new SkillsEdgeAdapterImpl(options);
+}
+
+class SkillsEdgeAdapterImpl implements SkillsEdgeAdapter {
+  readonly sourceType = "skill" as const;
+  readonly sourceId: string;
+
+  readonly #options: Readonly<SkillsEdgeAdapterOptions>;
+  readonly #loader: SkillLoaderPort;
+  readonly #summaries = new Map<string, SkillSummary>();
+  #cachedWorkspace: string | undefined;
+  #cachedContributions: readonly SkillEdgeContextContributionSummary[] | undefined;
+  #diagnostics: readonly SkillDiagnostic[] = Object.freeze([]);
+  #lastError: string | undefined;
+  #checkedAt = new Date(0).toISOString();
+  #closed = false;
+
+  constructor(options: SkillsEdgeAdapterOptions) {
+    validateSkillAdapterSourceId(options.sourceId);
+    this.sourceId = options.sourceId;
+    this.#options = freezeSkillAdapterOptions(options);
+    this.#loader = options.loader ?? new SkillsLoader(options);
+  }
+
+  async discoverContributions(
+    context: EdgeDiscoveryContext,
+  ): Promise<readonly SkillEdgeContextContributionSummary[]> {
+    this.#assertOpen();
+    throwIfAborted(context.signal);
+    const workspace = await awaitWithSignal(canonicalWorkspace(context.workspace), context.signal);
+    if (workspace === this.#cachedWorkspace && this.#cachedContributions !== undefined) {
+      return this.#cachedContributions;
+    }
+    try {
+      const report = await awaitWithSignal(
+        this.#loader.discoverReport(workspace, this.#loaderOptions()),
+        context.signal,
+      );
+      throwIfAborted(context.signal);
+      const nextSummaries = new Map<string, SkillSummary>();
+      const contributions = report.skills.map((summary) => {
+        const contributionId = skillContributionId(summary);
+        nextSummaries.set(contributionId, summary);
+        const contribution = skillContributionSummary(
+          this.sourceId,
+          summary,
+          contributionId,
+          this.#options.provenance,
+        );
+        return contribution;
+      });
+      const disabled = report.skills
+        .filter((skill) => skill.disableModelInvocation)
+        .map((skill): SkillDiagnostic => Object.freeze({
+          kind: "disabled",
+          name: skill.name,
+          path: skill.relativePath,
+          message: `Skill ${skill.name} disables model invocation`,
+        }));
+      this.#cachedWorkspace = workspace;
+      this.#cachedContributions = Object.freeze(contributions);
+      this.#summaries.clear();
+      for (const [id, summary] of nextSummaries) this.#summaries.set(id, summary);
+      this.#diagnostics = freezeDiagnostics([...report.diagnostics, ...disabled]);
+      this.#lastError = report.diagnostics
+        .find((item) => item.kind === "invalid" || item.kind === "unsafe")?.message;
+      this.#checkedAt = new Date().toISOString();
+      return this.#cachedContributions;
+    } catch (error) {
+      this.#lastError = errorText(error);
+      this.#checkedAt = new Date().toISOString();
+      throw error;
+    }
+  }
+
+  async loadContribution(
+    summary: SkillEdgeContextContributionSummary,
+    context: SkillContextLoadContext,
+  ): Promise<SkillEdgeContextContribution> {
+    this.#assertOpen();
+    throwIfAborted(context.signal);
+    const selected = summary !== null && typeof summary === "object"
+      ? this.#summaries.get(summary.contributionId)
+      : undefined;
+    if (selected === undefined) throw new SkillLoaderError("Skill contribution was not discovered by this adapter");
+    validateSelectedContribution(this.sourceId, summary, selected, this.#options.provenance);
+    const workspace = await awaitWithSignal(canonicalWorkspace(context.workspace), context.signal);
+    if (workspace !== selected.workspace) throw new SkillPathError("Skill contribution workspace does not match discovery");
+    const resourcePaths = selectedResourcePaths(context);
+    const limits = resolveResourceLimits(this.#options, context);
+    const loaded = await awaitWithSignal(
+      loadSkill(selected, {
+        ...(context.maxFileBytes ?? this.#options.maxFileBytes) === undefined
+          ? {}
+          : { maxFileBytes: context.maxFileBytes ?? this.#options.maxFileBytes },
+        ...(context.maxBodyBytes ?? this.#options.maxBodyBytes) === undefined
+          ? {}
+          : { maxBodyBytes: context.maxBodyBytes ?? this.#options.maxBodyBytes },
+      }),
+      context.signal,
+    );
+    const resources: SkillResource[] = [];
+    let totalBytes = 0;
+    for (const resourcePath of resourcePaths) {
+      throwIfAborted(context.signal);
+      const resource = await awaitWithSignal(
+        loadSkillResource(selected, resourcePath, { maxBytes: limits.maxBytes }),
+        context.signal,
+      );
+      totalBytes += resource.byteLength;
+      if (totalBytes > limits.maxTotalBytes) {
+        throw new SkillLoaderError(`Selected Skill resources exceed the ${limits.maxTotalBytes} byte total limit`);
+      }
+      resources.push(resource);
+    }
+    const contribution = {
+      ...skillContributionSummary(this.sourceId, selected, summary.contributionId, this.#options.provenance),
+      contentHash: sha256(loaded.body),
+      body: loaded.body,
+    };
+    // The shared EdgeContextContribution contract is intentionally strict and
+    // carries only body text. Keep selected resources available to concrete
+    // callers without making them enumerable contract fields, so S1's exact
+    // validator and registry bridge remain compatible.
+    Object.defineProperty(contribution, "resources", {
+      configurable: false,
+      enumerable: false,
+      value: Object.freeze(resources),
+      writable: false,
+    });
+    return Object.freeze(contribution) as SkillEdgeContextContribution;
+  }
+
+  async refresh(context: EdgeRefreshContext): Promise<void> {
+    this.#assertOpen();
+    throwIfAborted(context.signal);
+    this.#cachedWorkspace = undefined;
+    this.#cachedContributions = undefined;
+  }
+
+  async health(): Promise<EdgeAdapterHealth> {
+    const status = this.#closed
+      ? "closed"
+      : this.#lastError !== undefined
+        ? "degraded"
+        : this.#cachedWorkspace === undefined ? "unavailable" : "healthy";
+    return Object.freeze({
+      sourceId: this.sourceId,
+      sourceType: this.sourceType,
+      status,
+      checkedAt: this.#checkedAt,
+      ...(this.#lastError === undefined ? {} : { message: this.#lastError }),
+    });
+  }
+
+  diagnostics(): readonly SkillDiagnostic[] {
+    return this.#diagnostics;
+  }
+
+  async release(_context: EdgeReleaseContext): Promise<void> {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#cachedWorkspace = undefined;
+    this.#cachedContributions = undefined;
+    this.#summaries.clear();
+    this.#checkedAt = new Date().toISOString();
+  }
+
+  #loaderOptions(): SkillLoaderOptions {
+    const {
+      sourceId: _sourceId,
+      loader: _loader,
+      maxResourceBytes: _maxResourceBytes,
+      maxResourceTotalBytes: _maxResourceTotalBytes,
+      maxResources: _maxResources,
+      provenance: _provenance,
+      maxBodyBytes: _maxBodyBytes,
+      ...loaderOptions
+    } = this.#options;
+    return loaderOptions;
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) throw new SkillLoaderError(`Skills edge ${this.sourceId} is released`);
+  }
+}
+
+function skillContributionSummary(
+  sourceId: string,
+  summary: SkillSummary,
+  contributionId: string,
+  provenance: Partial<EdgeProvenance> | undefined,
+): SkillEdgeContextContributionSummary {
+  const normalizedProvenance = provenance === undefined ? undefined : Object.freeze({
+    upstreamName: provenance.upstreamName ?? "Agent Skills",
+    upstreamVersion: provenance.upstreamVersion ?? "SKILL.md",
+    license: provenance.license ?? "UNKNOWN",
+    ...(provenance.author === undefined ? {} : { author: provenance.author }),
+    ...(provenance.sourceUri === undefined ? {} : { sourceUri: provenance.sourceUri }),
+  });
+  const value = {
+    kind: "context" as const,
+    sourceId,
+    contributionId,
+    sourceType: "skill" as const,
+    name: summary.name,
+    description: summary.description,
+    disabled: summary.disableModelInvocation,
+    ...(normalizedProvenance === undefined ? {} : { provenance: normalizedProvenance }),
+  };
+  return Object.freeze(value);
+}
+
+function skillContributionId(summary: SkillSummary): string {
+  return `skill:${summary.name}:${sha256(stableJson({
+    relativePath: summary.relativePath,
+    frontmatterHash: summary.frontmatterHash,
+    byteLength: summary.byteLength,
+    fileIdentity: summary.fileIdentity,
+  })).slice("sha256:".length)}`;
+}
+
+function validateSelectedContribution(
+  sourceId: string,
+  contribution: SkillEdgeContextContributionSummary,
+  selected: SkillSummary,
+  provenance: Partial<EdgeProvenance> | undefined,
+): void {
+  const expectedProvenance = provenance === undefined ? undefined : {
+    upstreamName: provenance.upstreamName ?? "Agent Skills",
+    upstreamVersion: provenance.upstreamVersion ?? "SKILL.md",
+    license: provenance.license ?? "UNKNOWN",
+    ...(provenance.author === undefined ? {} : { author: provenance.author }),
+    ...(provenance.sourceUri === undefined ? {} : { sourceUri: provenance.sourceUri }),
+  };
+  if (contribution === null || typeof contribution !== "object"
+    || contribution.kind !== "context"
+    || contribution.sourceType !== "skill"
+    || contribution.sourceId !== sourceId
+    || contribution.name !== selected.name
+    || contribution.description !== selected.description
+    || contribution.disabled !== selected.disableModelInvocation
+    || contribution.contributionId !== skillContributionId(selected)) {
+    throw new SkillLoaderError("Skill contribution summary is forged or stale");
+  }
+  if (contribution.contentHash !== undefined
+    || stableJson(contribution.provenance ?? null) !== stableJson(expectedProvenance ?? null)) {
+    throw new SkillLoaderError("Skill contribution summary is forged or stale");
+  }
+}
+
+function selectedResourcePaths(context: SkillContextLoadContext): readonly string[] {
+  if (context.resourcePaths !== undefined && context.resources !== undefined) {
+    throw new SkillPathError("Specify only one of resourcePaths and resources");
+  }
+  const selected = context.resourcePaths ?? context.resources ?? [];
+  if (!Array.isArray(selected)) throw new SkillPathError("Skill resources must be an array");
+  const normalized = selected.map((value) => {
+    if (typeof value !== "string" || value.length === 0 || value.includes("\0") || path.isAbsolute(value)) {
+      throw new SkillPathError("Skill resource path must be a non-empty relative path without NUL");
+    }
+    return value;
+  });
+  if (new Set(normalized).size !== normalized.length) {
+    throw new SkillPathError("Skill resource paths must not contain duplicates");
+  }
+  return normalized;
+}
+
+function resolveResourceLimits(
+  options: SkillsEdgeAdapterOptions,
+  context: SkillContextLoadContext,
+): { readonly maxBytes: number; readonly maxTotalBytes: number; readonly maxResources: number } {
+  const maxBytes = boundedLimit(
+    context.maxResourceBytes ?? options.maxResourceBytes,
+    DEFAULT_SKILL_MAX_RESOURCE_BYTES,
+    MAX_SKILL_FILE_BYTES,
+    "maxResourceBytes",
+  );
+  const maxTotalBytes = boundedLimit(
+    context.maxResourceTotalBytes ?? options.maxResourceTotalBytes,
+    DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES,
+    MAX_SKILL_RESOURCE_TOTAL_BYTES,
+    "maxResourceTotalBytes",
+  );
+  const maxResources = boundedLimit(
+    context.maxResources ?? options.maxResources,
+    DEFAULT_SKILL_MAX_RESOURCES,
+    MAX_SKILL_RESOURCES,
+    "maxResources",
+  );
+  const selected = context.resourcePaths ?? context.resources ?? [];
+  if (selected.length > maxResources) throw new SkillLoaderError(`Selected Skills exceed the ${maxResources} resource limit`);
+  return { maxBytes, maxTotalBytes, maxResources };
+}
+
+function assertContributionShape(value: SkillEdgeContextContribution): void {
+  if (value === null || typeof value !== "object"
+    || value.kind !== "context"
+    || value.sourceType !== "skill"
+    || typeof value.sourceId !== "string"
+    || typeof value.contributionId !== "string"
+    || typeof value.name !== "string"
+    || typeof value.description !== "string"
+    || typeof value.disabled !== "boolean"
+    || (value.body !== undefined && typeof value.body !== "string")
+    || (value.contentHash !== undefined
+      && (typeof value.contentHash !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(value.contentHash)))) {
+    throw new SkillLoaderError("Invalid Skill context contribution");
+  }
+}
+
+function validateSkillAdapterSourceId(sourceId: string): void {
+  if (typeof sourceId !== "string" || sourceId.trim().length === 0 || sourceId !== sourceId.trim() || /\s/u.test(sourceId)
+    || sourceId.includes("\0") || /[\u0000-\u001f\u007f]/u.test(sourceId)) {
+    throw new SkillPathError("Skills adapter sourceId must be a non-empty printable token");
+  }
+  if (Buffer.byteLength(sourceId, "utf8") > 256) throw new SkillPathError("Skills adapter sourceId is too long");
+}
+
+function freezeSkillAdapterOptions(options: SkillsEdgeAdapterOptions): Readonly<SkillsEdgeAdapterOptions> {
+  const snapshot: Record<string, unknown> = { ...options };
+  if (options.roots !== undefined) snapshot.roots = Object.freeze([...options.roots]);
+  if (options.skillRoots !== undefined) snapshot.skillRoots = Object.freeze([...options.skillRoots]);
+  if (options.provenance !== undefined) snapshot.provenance = Object.freeze({ ...options.provenance });
+  return Object.freeze(snapshot) as Readonly<SkillsEdgeAdapterOptions>;
+}
+
+function freezeDiagnostics(diagnostics: readonly SkillDiagnostic[]): readonly SkillDiagnostic[] {
+  return Object.freeze(diagnostics.map((diagnostic) => Object.freeze({
+    ...diagnostic,
+    ...(diagnostic.paths === undefined ? {} : { paths: Object.freeze([...diagnostic.paths]) }),
+  })));
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw signal.reason ?? new Error("Operation cancelled");
+}
+
+function awaitWithSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return promise;
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason ?? new Error("Operation cancelled"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 /** Parse a complete SKILL.md document and return its validated frontmatter/body. */
 export function parseSkillDocument(document: string): ParsedSkillDocument {
   if (typeof document !== "string") {
@@ -599,7 +1134,10 @@ async function walkSkills(
       continue;
     }
     if (!entry.isDirectory()) continue;
-    if (depth >= limits.maxDepth) continue;
+    if (depth >= limits.maxDepth) {
+      diagnostics.push(skillDiagnostic("unsafe", candidate, `Skill depth exceeds the ${limits.maxDepth} directory limit`));
+      continue;
+    }
     let child: string;
     try {
       child = await canonicalDirectory(workspace, candidate);
@@ -695,12 +1233,15 @@ async function readSkillPrefix(
     }
     // Discovery only reads the bounded header. The body is loaded on demand.
     const bytes = await readPrefix(handle, Math.min(maxPrefixBytes, maxFileBytes));
-    const prefix = decodeUtf8(bytes, candidate);
-    if (findFrontmatterClosingLine(prefix) < 0) {
+    const headerEnd = frontmatterHeaderEnd(bytes);
+    if (headerEnd < 0) {
       throw new SkillFrontmatterError(
         `Skill frontmatter exceeds the ${maxPrefixBytes} byte prefix limit: ${candidate}`,
       );
     }
+    // Decode only through the closing delimiter. Body bytes are not parsed or
+    // validated until this Skill is explicitly selected for loading.
+    const prefix = decodeUtf8(bytes.subarray(0, headerEnd), candidate);
     const parsedDocument = parseSkillDocument(prefix);
     const final = await lstat(canonical);
     if (final.isSymbolicLink() || !final.isFile() || !sameFileState(opened, final)) {
@@ -816,13 +1357,28 @@ function decodeUtf8(bytes: Uint8Array, candidate: string): string {
   }
 }
 
-function findFrontmatterClosingLine(document: string): number {
-  const source = document.startsWith("\uFEFF") ? document.slice(1) : document;
-  const lines = source.split("\n");
-  if (lines[0]?.replace(/\r$/u, "") !== "---") return -1;
-  for (let index = 1; index < lines.length; index += 1) {
-    const line = lines[index]?.replace(/\r$/u, "") ?? "";
-    if (/^(?:---|\.\.\.)\s*$/u.test(line)) return index;
+function frontmatterHeaderEnd(bytes: Uint8Array): number {
+  let lineStart = 0;
+  let line = 0;
+  while (lineStart <= bytes.byteLength) {
+    let lineEnd = lineStart;
+    while (lineEnd < bytes.byteLength && bytes[lineEnd] !== 0x0a) lineEnd += 1;
+    let contentEnd = lineEnd;
+    if (contentEnd > lineStart && bytes[contentEnd - 1] === 0x0d) contentEnd -= 1;
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(lineStart, contentEnd));
+    } catch {
+      return -1;
+    }
+    if (line === 0 && content.startsWith("\uFEFF")) content = content.slice(1);
+    if (line === 0 && content !== "---") return -1;
+    if (line > 0 && /^(?:---|\.\.\.)\s*$/u.test(content)) {
+      return lineEnd < bytes.byteLength ? lineEnd + 1 : lineEnd;
+    }
+    if (lineEnd >= bytes.byteLength) break;
+    lineStart = lineEnd + 1;
+    line += 1;
   }
   return -1;
 }
