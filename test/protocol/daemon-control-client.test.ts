@@ -44,7 +44,9 @@ describe("DaemonControlClient", () => {
       })(),
     });
     const events: string[] = [];
+    const connections: string[] = [];
     const unsubscribe = client.onEvent((event) => events.push(event.type));
+    const unsubscribeConnection = client.onConnection((event) => connections.push(event.type));
 
     const beforeStart = await client.request<{ status: string }>("status");
     const start = await client.request<{ status: string }>("start");
@@ -64,9 +66,12 @@ describe("DaemonControlClient", () => {
     expect(events).toContain("wake");
     expect(events).toContain("activation.started");
     expect(events).toContain("activation.finished");
+    expect(connections).toEqual(["connected"]);
 
     unsubscribe();
     client.close();
+    expect(connections).toEqual(["connected", "closed"]);
+    unsubscribeConnection();
     await server.close();
     await host.stop();
   });

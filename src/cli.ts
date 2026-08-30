@@ -26,6 +26,8 @@ import { DEFAULT_MAIN_OUTPUT_TOKENS } from "./domain/types.js";
 import {
   DaemonControlServer,
   DaemonRunObserver,
+  DaemonRemoteAttachment,
+  DaemonRemoteSession,
   executeRun,
   FileDaemonRunEventSource,
   findLatestRunId,
@@ -45,6 +47,7 @@ import {
 import { UnknownToolOperationError } from "./runtime/recovery.js";
 import { createMcpEdgeAdapter } from "./mowe/edges/mcp.js";
 import { createSkillsEdgeAdapter } from "./mowe/edges/skills.js";
+import { runRemoteAttach } from "./cli/remote-attach.js";
 
 const VERSION = "0.1.0";
 
@@ -108,6 +111,29 @@ const main = async (): Promise<number> => {
         : { fukaiCompaction: options.fukaiCompaction }),
     };
     const resolvedSettings = resolveSettings(workspace, settings, overrides);
+    if (options.attach !== undefined) {
+      const socketPath = resolve(
+        workspace,
+        options.daemonSocket ?? resolve(resolvedSettings.dataDir, "daemon", "control.sock"),
+      );
+      const attachment = await DaemonRemoteAttachment.open({
+        socketPath,
+        runId: options.attach,
+      });
+      let session: DaemonRemoteSession | undefined;
+      try {
+        session = await DaemonRemoteSession.open({
+          attachment,
+          workspace,
+          dataDir: resolvedSettings.dataDir,
+          model: resolvedSettings.model,
+        });
+        return await runRemoteAttach({ session });
+      } finally {
+        if (session === undefined) await attachment.close().catch(() => undefined);
+        else await session.close().catch(() => undefined);
+      }
+    }
     const edgeRuntime = await openCliEdgeRuntime(
       workspace,
       resolvedSettings,

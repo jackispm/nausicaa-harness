@@ -12,6 +12,7 @@ export interface CliOptions {
   version: boolean;
   daemon: boolean;
   daemonSocket?: string;
+  attach?: string;
   mode: OutputMode;
   modeExplicit: boolean;
   continue: boolean;
@@ -113,6 +114,10 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
         break;
       case "--daemon-socket":
         options.daemonSocket = readValue(args, index, argument);
+        index += 1;
+        break;
+      case "--attach":
+        options.attach = readValue(args, index, argument);
         index += 1;
         break;
       case "--mode": {
@@ -274,8 +279,31 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   if (options.resume !== undefined && options.continue) {
     throw new CliUsageError("--resume and --continue are mutually exclusive");
   }
-  if (options.daemonSocket !== undefined && !options.daemon) {
-    throw new CliUsageError("--daemon-socket requires --daemon");
+  if (options.daemonSocket !== undefined && !options.daemon && options.attach === undefined) {
+    throw new CliUsageError("--daemon-socket requires --daemon or --attach");
+  }
+  if (options.attach !== undefined && (
+    options.daemon
+    || options.modeExplicit
+    || options.continue
+    || options.resume !== undefined
+    || options.resolveOperation !== undefined
+    || options.tetoModel !== undefined
+    || options.tetoEnabled !== undefined
+    || options.workerEnabled !== undefined
+    || options.maxSteps !== undefined
+    || options.maxOutputTokens !== undefined
+    || options.allowWrite !== undefined
+    || options.allowShell !== undefined
+    || options.allowNetwork !== undefined
+    || options.edges !== undefined
+    || options.fukaiCompaction !== undefined
+    || options.fileArgs.length > 0
+    || options.message !== undefined
+  )) {
+    throw new CliUsageError(
+      "--attach cannot be combined with task or execution options; it only accepts workspace, data-dir, model, and daemon-socket",
+    );
   }
   if (options.daemon && (
     options.modeExplicit
@@ -295,12 +323,14 @@ export const usage = `Nausicaa 0.1
 Usage:
   nausicaa [options] [@image ...] [message]
   nausicaa --daemon [options]
+  nausicaa --attach <run-id> [options]
 
 Options:
   -p, --print             Run once and print the final answer
   --json                  Emit NDJSON events and results
   --daemon                Run the long-lived daemon control host
   --daemon-socket <path>  Unix JSONL control socket (default: <data-dir>/daemon/control.sock)
+  --attach <run-id>       Attach a read-only TUI to a daemon-owned Run
   --mode <interactive|print|json>
                           Select the output mode
   --model <provider:id>   Main model, for example openrouter:openai/gpt-5-mini

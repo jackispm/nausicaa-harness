@@ -42,6 +42,32 @@ describe("parseCliArgs", () => {
       .toThrow(/cannot be combined/u);
   });
 
+  it("parses a read-only daemon attachment without enabling daemon mode", () => {
+    expect(parseCliArgs([
+      "--attach",
+      "run-7",
+      "--daemon-socket",
+      "/tmp/nausicaa-control.sock",
+    ], "/work")).toMatchObject({
+      daemon: false,
+      attach: "run-7",
+      daemonSocket: "/tmp/nausicaa-control.sock",
+      mode: "interactive",
+      modeExplicit: false,
+    });
+    expect(() => parseCliArgs(["--attach", "run-7", "task"], "/work"))
+      .toThrow(/cannot be combined/u);
+    expect(() => parseCliArgs(["--attach", "run-7", "--resume", "run-8"], "/work"))
+      .toThrow(/cannot be combined/u);
+    expect(() => parseCliArgs(["--attach", "run-7", "--daemon"], "/work"))
+      .toThrow(/cannot be combined/u);
+    expect(() => parseCliArgs(["--attach", "run-7", "--allow-write"], "/work"))
+      .toThrow(/only accepts/u);
+    expect(() => parseCliArgs(["--attach", "run-7", "--worker"], "/work"))
+      .toThrow(/only accepts/u);
+    expect(usage).toContain("--attach <run-id>");
+  });
+
   it("separates Prime-style @image operands from the task", () => {
     expect(parseCliArgs([
       "@screens/first.png",

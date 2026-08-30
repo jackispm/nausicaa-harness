@@ -30,6 +30,8 @@ export * from "./file-execution-lease.js";
 export * from "./daemon-host.js";
 export * from "./daemon-control.js";
 export * from "./daemon-control-client.js";
+export * from "./daemon-remote-attachment.js";
+export * from "./daemon-remote-session.js";
 export * from "./daemon-observer.js";
 export * from "./daemon-wake-adapter.js";
 export * from "./daemon-wake-sources.js";

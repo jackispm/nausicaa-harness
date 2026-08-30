@@ -40,6 +40,13 @@ export class DaemonControlClientError extends Error {
 
 export type DaemonControlEventListener = (event: DaemonHostEvent) => void;
 export type DaemonControlRunEventListener = (observation: DaemonRunObservation) => void;
+export type DaemonControlConnectionEvent =
+  | { readonly type: "connected" }
+  | { readonly type: "disconnected"; readonly error: Error }
+  | { readonly type: "closed" };
+export type DaemonControlConnectionListener = (
+  event: DaemonControlConnectionEvent,
+) => void;
 
 interface PendingRequest {
   readonly generation: number;
@@ -63,6 +70,7 @@ export class DaemonControlClient {
   private readonly createRequestId: () => string;
   private readonly listeners = new Set<DaemonControlEventListener>();
   private readonly runListeners = new Set<DaemonControlRunEventListener>();
+  private readonly connectionListeners = new Set<DaemonControlConnectionListener>();
   private readonly pending = new Map<string, PendingRequest>();
   private readonly issuedRequestIds = new Set<string>();
   private socket: Socket | undefined;
@@ -154,6 +162,7 @@ export class DaemonControlClient {
         clearTimeout(timer);
         this.connectReject = undefined;
         socket.off("error", onInitialError);
+        this.emitConnection({ type: "connected" });
         resolve();
       };
       const onInitialError = (error: Error): void => {
@@ -270,6 +279,18 @@ export class DaemonControlClient {
     return () => this.runListeners.delete(listener);
   }
 
+  /** Observe transport lifecycle without treating connectivity as durable Host state. */
+  onConnection(listener: DaemonControlConnectionListener): () => void {
+    if (typeof listener !== "function") {
+      throw new DaemonControlClientError(
+        "invalid_listener",
+        "connection listener must be a function",
+      );
+    }
+    this.connectionListeners.add(listener);
+    return () => this.connectionListeners.delete(listener);
+  }
+
   /** Close the transport and reject requests which have not received a reply. */
   close(): void {
     if (this.closed) return;
@@ -284,6 +305,7 @@ export class DaemonControlClient {
     this.failPending(new DaemonControlClientError("closed", "control client closed"));
     this.buffer = "";
     this.issuedRequestIds.clear();
+    this.emitConnection({ type: "closed" });
   }
 
   private read(socket: Socket, generation: number, chunk: string | Buffer): void {
@@ -406,6 +428,7 @@ export class DaemonControlClient {
     this.socketGeneration += 1;
     if (destroy && !socket.destroyed) socket.destroy();
     this.failPending(error, generation);
+    this.emitConnection({ type: "disconnected", error });
   }
 
   private failPending(error: Error, generation?: number): void {
@@ -419,6 +442,16 @@ export class DaemonControlClient {
 
   private isCurrent(socket: Socket, generation: number): boolean {
     return this.socket === socket && this.socketGeneration === generation;
+  }
+
+  private emitConnection(event: DaemonControlConnectionEvent): void {
+    for (const listener of this.connectionListeners) {
+      try {
+        listener(event);
+      } catch {
+        // Connectivity observers cannot own the transport.
+      }
+    }
   }
 }
 
