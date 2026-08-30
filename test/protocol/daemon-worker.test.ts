@@ -49,6 +49,43 @@ class PairTransport implements DaemonWorkerTransport {
   }
 }
 
+class FakeTransport implements DaemonWorkerTransport {
+  readonly sent: DaemonWorkerFrame[] = [];
+  private readonly frames = new Set<(frame: unknown) => void>();
+  private readonly closes = new Set<(error?: Error) => void>();
+  private closed = false;
+
+  constructor(
+    private readonly sendHandler: (frame: DaemonWorkerFrame, transport: FakeTransport) => void | Promise<void>,
+  ) {}
+
+  send(frame: DaemonWorkerFrame): void | Promise<void> {
+    if (this.closed) throw new Error("closed");
+    this.sent.push(frame);
+    return this.sendHandler(frame, this);
+  }
+
+  onFrame(listener: (frame: unknown) => void): () => void {
+    this.frames.add(listener);
+    return () => this.frames.delete(listener);
+  }
+
+  onClose(listener: (error?: Error) => void): () => void {
+    this.closes.add(listener);
+    return () => this.closes.delete(listener);
+  }
+
+  emit(frame: DaemonWorkerFrame): void {
+    for (const listener of this.frames) listener(frame);
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const listener of this.closes) listener();
+  }
+}
+
 function pair(): [PairTransport, PairTransport] {
   const left = new PairTransport();
   const right = new PairTransport();
@@ -216,6 +253,87 @@ describe("daemon worker protocol", () => {
     await expect(activation).resolves.toMatchObject({ status: "uncertain" });
     await server.close();
     void release;
+  });
+
+  it("settles an activation deadline even when transport send never resolves", async () => {
+    const transport = new FakeTransport((frame, current) => {
+      if (frame.kind === "initialize") {
+        queueMicrotask(() => current.emit({
+          kind: "ready",
+          version: 1,
+          commandId: frame.commandId,
+          runId: "run-1",
+          workerId: "worker-1",
+          instanceToken: "instance-1",
+        }));
+      } else if (frame.kind === "activate") {
+        return new Promise<void>(() => undefined);
+      }
+    });
+    const client = new DaemonWorkerClient({
+      runId: "run-1",
+      workerId: "worker-1",
+      lease: { runId: "run-1", leasePath: "/unused", fencingToken: 1 },
+      transport,
+      activationTimeoutMs: 20,
+    });
+
+    const activation = client.activate({ activationId: "activation-1", wakes: [] });
+    const deadline = Symbol("test deadline");
+    const result = await Promise.race([
+      activation,
+      new Promise<typeof deadline>((resolve) => setTimeout(() => resolve(deadline), 250)),
+    ]);
+    expect(result).not.toBe(deadline);
+    if (result === deadline) throw new Error("activation did not settle before the test deadline");
+    expect(result).toMatchObject({
+      status: "uncertain",
+      error: { code: "activation_timeout" },
+    });
+    await client.close();
+  });
+
+  it("rejects a generated command ID collision without replacing the pending command", async () => {
+    const transport = new FakeTransport((frame, current) => {
+      if (frame.kind === "initialize") {
+        queueMicrotask(() => current.emit({
+          kind: "ready",
+          version: 1,
+          commandId: frame.commandId,
+          runId: "run-1",
+          workerId: "worker-1",
+          instanceToken: "instance-1",
+        }));
+      }
+    });
+    const client = new DaemonWorkerClient({
+      runId: "run-1",
+      workerId: "worker-1",
+      lease: { runId: "run-1", leasePath: "/unused", fencingToken: 1 },
+      transport,
+      createCommandId: () => "duplicate-command",
+    });
+
+    await client.initialize();
+    const firstDrain = client.drain();
+    await settled();
+    await expect(client.drain()).rejects.toMatchObject({ code: "command_conflict" });
+    const drainFrame = transport.sent.find((frame) => frame.kind === "drain");
+    expect(drainFrame).toBeDefined();
+    if (drainFrame === undefined || drainFrame.kind !== "drain") {
+      throw new Error("expected a pending drain frame");
+    }
+    transport.emit({
+      kind: "command.result",
+      version: 1,
+      commandId: drainFrame.commandId,
+      runId: "run-1",
+      command: "drain",
+      status: "ok",
+      lifecycle: "draining",
+    });
+    await expect(firstDrain).resolves.toMatchObject({ lifecycle: "draining" });
+    await client.close();
   });
 
   it("cooperatively cancels a running activation within the worker grace period", async () => {

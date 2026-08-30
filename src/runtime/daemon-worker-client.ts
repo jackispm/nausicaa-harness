@@ -299,13 +299,15 @@ export class DaemonWorkerClient {
       lease: structuredClone(lease),
       wakes,
     };
-    try {
-      await this.send(frame);
-    } catch (error: unknown) {
+    // The transport is allowed to remain unresolved while the worker is still
+    // processing the activation.  The activation deadline, close handler, or
+    // terminal frame owns the receipt lifecycle; do not make the caller wait
+    // for a potentially hung send promise.
+    void this.send(frame).catch((error: unknown) => {
       if (!pending.settled) {
         this.settleActivation(activationId, uncertainReceipt(this.runId, activationId, error));
       }
-    }
+    });
     return promise;
   }
 
@@ -431,6 +433,12 @@ export class DaemonWorkerClient {
     const commandId = frame.commandId;
     if (typeof commandId !== "string") {
       return Promise.reject(new DaemonWorkerProtocolError("invalid_frame", `worker ${kind} command ID is invalid`));
+    }
+    if (this.pendingCommands.has(commandId)) {
+      return Promise.reject(new DaemonWorkerProtocolError(
+        "command_conflict",
+        `worker command ID is already pending: ${commandId}`,
+      ));
     }
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
