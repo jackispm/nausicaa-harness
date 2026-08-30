@@ -54,6 +54,11 @@ interface SubscribeResult {
   readonly generationPresent: boolean;
 }
 
+interface EventIdentity {
+  readonly offset: number;
+  readonly contentHash: string;
+}
+
 /**
  * Cursor-safe, read-only attachment to one daemon-owned Run.
  *
@@ -71,6 +76,8 @@ export class DaemonRemoteAttachment {
   private events: AnyEvent[] = [];
   /** Content identities for accepted offsets; duplicates must match exactly. */
   private readonly seenEventHashes = new Map<number, string>();
+  /** Event IDs are globally unique within a Run, regardless of offset. */
+  private readonly seenEventIds = new Map<string, EventIdentity>();
   private cursorOffset = 0;
   private generation: number | undefined;
   private generationSeen = false;
@@ -298,7 +305,7 @@ export class DaemonRemoteAttachment {
     }
     this.events.push(...staged.events);
     this.cursorOffset = staged.cursorOffset;
-    this.commitEventIdentities(staged.identities);
+    this.commitEventIdentities(staged.identities, staged.eventIds);
     this.publish();
   }
 
@@ -358,7 +365,7 @@ export class DaemonRemoteAttachment {
         }
         this.events.push(...staged.events);
         this.cursorOffset = staged.cursorOffset;
-        this.commitEventIdentities(staged.identities);
+        this.commitEventIdentities(staged.identities, staged.eventIds);
         this.publish();
       } catch (error: unknown) {
         this.status = "resyncing";
@@ -391,9 +398,11 @@ export class DaemonRemoteAttachment {
     readonly events: AnyEvent[];
     readonly cursorOffset: number;
     readonly identities: ReadonlyMap<number, string>;
+    readonly eventIds: ReadonlyMap<string, EventIdentity>;
   } {
     const events: AnyEvent[] = [];
     const identities = new Map<number, string>();
+    const eventIds = new Map<string, EventIdentity>();
     let cursorOffset = this.cursorOffset;
     for (const candidate of candidates) {
       try {
@@ -408,6 +417,28 @@ export class DaemonRemoteAttachment {
       }
       if (candidate.runId !== this.runId) {
         throw new DaemonControlClientError("invalid_frame", "daemon emitted an event for another Run");
+      }
+      let knownEventId = eventIds.get(candidate.eventId) ?? this.seenEventIds.get(candidate.eventId);
+      if (knownEventId === undefined) {
+        const knownEvent = this.events.find((event) => event.eventId === candidate.eventId);
+        if (knownEvent !== undefined) {
+          knownEventId = {
+            offset: knownEvent.globalOffset,
+            contentHash: knownEvent.contentHash,
+          };
+        }
+      }
+      if (
+        knownEventId !== undefined
+        && (
+          knownEventId.offset !== candidate.globalOffset
+          || knownEventId.contentHash !== candidate.contentHash
+        )
+      ) {
+        throw new DaemonControlClientError(
+          "invalid_frame",
+          `daemon reused event ID ${candidate.eventId} with different content or offset`,
+        );
       }
       if (candidate.globalOffset <= cursorOffset) {
         const knownHash = identities.get(candidate.globalOffset)
@@ -426,6 +457,10 @@ export class DaemonRemoteAttachment {
           );
         }
         identities.set(candidate.globalOffset, candidate.contentHash);
+        eventIds.set(candidate.eventId, {
+          offset: candidate.globalOffset,
+          contentHash: candidate.contentHash,
+        });
         continue;
       }
       if (candidate.globalOffset !== cursorOffset + 1) {
@@ -433,13 +468,21 @@ export class DaemonRemoteAttachment {
       }
       events.push(structuredClone(candidate));
       identities.set(candidate.globalOffset, candidate.contentHash);
+      eventIds.set(candidate.eventId, {
+        offset: candidate.globalOffset,
+        contentHash: candidate.contentHash,
+      });
       cursorOffset = candidate.globalOffset;
     }
-    return { events, cursorOffset, identities };
+    return { events, cursorOffset, identities, eventIds };
   }
 
-  private commitEventIdentities(identities: ReadonlyMap<number, string>): void {
+  private commitEventIdentities(
+    identities: ReadonlyMap<number, string>,
+    eventIds: ReadonlyMap<string, EventIdentity>,
+  ): void {
     for (const [offset, hash] of identities) this.seenEventHashes.set(offset, hash);
+    for (const [eventId, identity] of eventIds) this.seenEventIds.set(eventId, identity);
   }
 
   private resetReplayIdentity(): void {
@@ -447,6 +490,7 @@ export class DaemonRemoteAttachment {
     this.generationSeen = false;
     this.generationPresent = false;
     this.seenEventHashes.clear();
+    this.seenEventIds.clear();
   }
 
   private restartSubscription(reset: boolean): void {

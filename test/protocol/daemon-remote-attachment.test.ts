@@ -257,6 +257,54 @@ describe("daemon remote attachment", () => {
     await attachment.close();
   });
 
+  it("resyncs when a live event reuses an event ID at another offset", async () => {
+    const runId = "same-event-id-run";
+    const first = testEvent(runId, 1, "first");
+    const secondBase = testEvent(runId, 2, "second");
+    const { contentHash: _ignoredHash, ...secondContent } = secondBase;
+    const reusedId = {
+      ...secondContent,
+      eventId: first.eventId,
+      contentHash: computeEventContentHash({
+        ...secondContent,
+        eventId: first.eventId,
+      }),
+    };
+    let replayCount = 0;
+    let runListener: ((observation: DaemonRunObservation) => void) | undefined;
+    const client = mockedAttachmentClient((method) => {
+      if (method === "attach") return attachResult();
+      replayCount += 1;
+      return replayPage(runId, [first], 1, 0);
+    });
+    vi.spyOn(client, "onRunEvent").mockImplementation((listener) => {
+      runListener = listener;
+      return () => { runListener = undefined; };
+    });
+
+    const attachment = await DaemonRemoteAttachment.open({
+      socketPath: client.socketPath,
+      runId,
+      reconnectDelayMs: 1,
+      client,
+    });
+    runListener?.({
+      type: "event",
+      runId,
+      cursor: "offset:2",
+      event: reusedId,
+    });
+    await eventually(() => {
+      expect(replayCount).toBeGreaterThanOrEqual(2);
+      expect(attachment.snapshot()).toMatchObject({
+        status: "attached",
+        cursor: "offset:1",
+      });
+      expect(attachment.snapshot().events).toEqual([first]);
+    });
+    await attachment.close();
+  });
+
   it("resyncs instead of dropping a live event for another Run", async () => {
     const runId = "cross-run-attachment";
     const first = testEvent(runId, 1, "first");
