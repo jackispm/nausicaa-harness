@@ -1,8 +1,9 @@
 import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { StdioServerParameters } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { CallToolResult, Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { FetchLike, Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 
 import type { AgentTool, JsonSchema, ToolResult } from "../../domain/ports.js";
 import {
@@ -52,6 +53,20 @@ export type McpToolPolicyResolver = (
   tool: McpTool,
 ) => McpToolPolicy | undefined;
 
+/** Explicit, opt-in Streamable HTTP transport settings.
+ *
+ * The endpoint is never used as an adapter identity. A fake `transport` or
+ * `transportFactory` supplied through the parent options takes precedence,
+ * which keeps HTTP tests and embedders offline.
+ */
+export interface McpStreamableHttpOptions {
+  readonly endpoint: string | URL;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly sessionId?: string;
+  readonly requestInit?: RequestInit;
+  readonly fetch?: FetchLike;
+}
+
 export interface McpEdgeAdapterOptions {
   /** Stable host-owned identity. It is also used in the mcp__ namespace. */
   readonly sourceId: string;
@@ -59,6 +74,20 @@ export interface McpEdgeAdapterOptions {
   readonly args?: readonly string[];
   readonly cwd?: string;
   readonly env?: Readonly<Record<string, string>>;
+  /** Explicit opt-in for SDK Streamable HTTP. Stdio remains the default. */
+  readonly endpoint?: string | URL;
+  /** Equivalent nested spelling for embedders that keep transport settings grouped. */
+  readonly streamableHttp?: McpStreamableHttpOptions;
+  /** Alias for streamableHttp; retained as a narrow constructor seam. */
+  readonly http?: McpStreamableHttpOptions;
+  /** Additional HTTP headers; session/protocol headers remain SDK-owned. */
+  readonly headers?: Readonly<Record<string, string>>;
+  /** Initial MCP session header for an HTTP transport, never an edge identity. */
+  readonly sessionId?: string;
+  /** Injected fetch for deterministic HTTP tests; never used for stdio. */
+  readonly fetch?: FetchLike;
+  /** Base request options for an SDK-created HTTP transport. */
+  readonly requestInit?: RequestInit;
   /** Inject these for offline tests or an already-managed transport. */
   readonly client?: Client;
   readonly transport?: Transport;
@@ -129,6 +158,8 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
   readonly sourceType = SOURCE_TYPE;
 
   readonly #options: McpEdgeAdapterOptions;
+  readonly #httpOptions: McpStreamableHttpOptions | undefined;
+  readonly #diagnosticRedactions: readonly string[];
   readonly #maxTools: number;
   readonly #maxResultBytes: number;
   readonly #maxSchemaBytes: number;
@@ -158,12 +189,17 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
     if (typeof options.sourceId !== "string" || options.sourceId.trim().length === 0) {
       throw new TypeError("MCP sourceId must be a non-empty string");
     }
+    const httpOptions = normalizeHttpOptions(options);
+    if (options.command !== undefined && httpOptions !== undefined) {
+      throw new TypeError("MCP stdio command and Streamable HTTP endpoint are mutually exclusive");
+    }
     if (options.command === undefined
       && options.transport === undefined
       && options.transportFactory === undefined
       && options.client === undefined
-      && options.clientFactory === undefined) {
-      throw new TypeError("MCP adapter requires command, transport, transportFactory, or client");
+      && options.clientFactory === undefined
+      && httpOptions === undefined) {
+      throw new TypeError("MCP adapter requires command, endpoint, transport, transportFactory, or client");
     }
     assertOptionalBoolean(options.ownsClient, "ownsClient");
     assertOptionalBoolean(options.ownsTransport, "ownsTransport");
@@ -172,6 +208,8 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
     }
     this.sourceId = options.sourceId;
     this.#options = snapshotOptions(options);
+    this.#httpOptions = httpOptions === undefined ? undefined : snapshotHttpOptions(httpOptions);
+    this.#diagnosticRedactions = collectDiagnosticRedactions(this.#httpOptions);
     this.#initialTransport = options.transport;
     this.#maxTools = boundedPositiveInteger(options.maxTools, DEFAULT_MAX_TOOLS, 1_024, "maxTools");
     this.#maxResultBytes = boundedPositiveInteger(
@@ -247,7 +285,7 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
           ? "MCP tool discovery was cancelled"
           : isTimeoutError(error)
             ? "MCP tool discovery timed out"
-            : `MCP tool discovery failed: ${safeError(error)}`;
+            : `MCP tool discovery failed: ${this.#safeError(error)}`;
         this.#checkedAt = new Date().toISOString();
         throw error;
       }
@@ -271,9 +309,9 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
           continue;
         }
         const projectedName = capabilityName(this.sourceId, remoteName);
-        const collision = selectedTools.get(projectedName);
-        if (collision !== undefined) {
-          if (compareMcpTools(tool, collision) < 0) selectedTools.set(projectedName, tool);
+    const collision = selectedTools.get(projectedName);
+    if (collision !== undefined) {
+      if (compareMcpTools(tool, collision) < 0) selectedTools.set(projectedName, tool);
           this.#warnings.push(
             `Ignored MCP tool with colliding namespace: ${safeDiagnosticValue(remoteName)} -> ${projectedName}`,
           );
@@ -305,10 +343,12 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
         });
         this.#toolPolicies.set(tool.name, policy);
       } catch (error) {
-        this.#warnings.push(`Ignored MCP tool ${safeToolName(tool)}: ${safeError(error)}`);
+        this.#warnings.push(`Ignored MCP tool ${safeToolName(tool)}: ${this.#safeError(error)}`);
       }
     }
-    this.#warnings.sort(compareText);
+    this.#warnings = this.#warnings
+      .map((warning) => redactDiagnosticText(warning, this.#diagnosticRedactions))
+      .sort(compareText);
     this.#lastError = this.#warnings[0]
       ?? (this.#truncatedTools ? `MCP tool list truncated at ${this.#maxTools} tools` : undefined);
     this.#checkedAt = new Date().toISOString();
@@ -475,7 +515,7 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
       };
       client.onerror = (error) => {
         if (this.#client !== client || this.#closed) return;
-        this.#lastError = `MCP transport error: ${safeError(error)}`;
+        this.#lastError = `MCP transport error: ${this.#safeError(error)}`;
         this.#checkedAt = new Date().toISOString();
       };
       await client.connect(transport, requestOptions(signal, this.#timeoutMs));
@@ -485,7 +525,7 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
       this.#checkedAt = new Date().toISOString();
     } catch (error) {
       this.#connected = false;
-      this.#lastError = safeError(error);
+      this.#lastError = this.#safeError(error);
       this.#checkedAt = new Date().toISOString();
       const ownsClaimedConnection = claimedConnection
         && ((client !== undefined && this.#client === client)
@@ -536,6 +576,22 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
     if (this.#options.transportFactory !== undefined) {
       return { transport: await this.#options.transportFactory(), owns: true };
     }
+    if (this.#httpOptions !== undefined) {
+      const http = this.#httpOptions;
+      const endpoint = typeof http.endpoint === "string" ? new URL(http.endpoint) : new URL(http.endpoint.toString());
+      const requestInit = sanitizeRequestInit(http.requestInit, http.headers);
+      return {
+        // SDK 1.30.0's StreamableHTTP transport exposes an optional sessionId
+        // while its Transport interface marks it as required under
+        // exactOptionalPropertyTypes. The runtime contract is compatible.
+        transport: new StreamableHTTPClientTransport(endpoint, {
+          ...(requestInit === undefined ? {} : { requestInit }),
+          ...(http.fetch === undefined ? {} : { fetch: http.fetch }),
+          ...(http.sessionId === undefined ? {} : { sessionId: http.sessionId }),
+        }) as unknown as Transport,
+        owns: true,
+      };
+    }
     if (this.#options.command !== undefined) {
       const server: StdioServerParameters = {
         command: this.#options.command,
@@ -568,7 +624,7 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
       } else if (client !== undefined && ownsClient) await client.close();
       else if (transport !== undefined && ownsTransport) await transport.close();
     } catch (error) {
-      this.#lastError = `MCP close failed: ${safeError(error)}`;
+      this.#lastError = `MCP close failed: ${this.#safeError(error)}`;
     }
   }
 
@@ -606,7 +662,13 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
   }
 
   #canCreateFreshTransport(): boolean {
-    return this.#options.transportFactory !== undefined || this.#options.command !== undefined;
+    // An injected one-shot transport is deliberately not replaced by an
+    // endpoint-created network transport during reconnect. Embedders that
+    // want replacement must provide an explicit factory.
+    if (this.#options.transport !== undefined && this.#options.transportFactory === undefined) return false;
+    return this.#options.transportFactory !== undefined
+      || this.#options.command !== undefined
+      || this.#httpOptions !== undefined;
   }
 
   #assertConnectionCurrent(epoch: number, signal?: AbortSignal): void {
@@ -644,7 +706,10 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
         upstreamVersion: this.#options.provenance?.upstreamVersion ?? serverVersion,
         license: this.#options.provenance?.license ?? "UNKNOWN",
         ...(this.#options.provenance?.author === undefined ? {} : { author: this.#options.provenance.author }),
-        sourceUri: this.#options.provenance?.sourceUri ?? `mcp://${this.sourceId}`,
+        sourceUri: safeProvenanceUri(
+          this.#options.provenance?.sourceUri ?? `mcp://${this.sourceId}`,
+          this.#httpOptions?.endpoint,
+        ),
       },
     };
     return createEdgeManifest(manifest);
@@ -723,7 +788,7 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
         ? `MCP tool ${safeName(remoteName)} was cancelled`
         : isTimeoutError(error)
           ? `MCP tool ${safeName(remoteName)} timed out`
-          : `MCP tool ${safeName(remoteName)} failed: ${safeError(error)}`;
+          : `MCP tool ${safeName(remoteName)} failed: ${this.#safeError(error)}`;
       this.#lastError = message;
       this.#checkedAt = new Date().toISOString();
       return {
@@ -736,6 +801,10 @@ class McpEdgeAdapterImpl implements McpEdgeAdapter {
   #requireClient(): Client {
     if (this.#client === undefined) throw new Error("MCP client is not connected");
     return this.#client;
+  }
+
+  #safeError(error: unknown): string {
+    return safeError(error, this.#diagnosticRedactions);
   }
 
   #assertOpen(): void {
@@ -976,6 +1045,174 @@ function isTimeoutError(error: unknown): boolean {
     && (error as { code?: unknown }).code === -32001;
 }
 
+function normalizeHttpOptions(options: McpEdgeAdapterOptions): McpStreamableHttpOptions | undefined {
+  if (options.streamableHttp !== undefined && options.http !== undefined) {
+    throw new TypeError("MCP streamableHttp and http options are aliases; provide only one");
+  }
+  const nested = options.streamableHttp ?? options.http;
+  if (options.endpoint !== undefined && nested !== undefined) {
+    throw new TypeError("MCP endpoint cannot be combined with nested HTTP options");
+  }
+  const endpoint = options.endpoint ?? nested?.endpoint;
+  const hasTopLevelHttpOptions = options.headers !== undefined
+    || options.sessionId !== undefined
+    || options.fetch !== undefined
+    || options.requestInit !== undefined;
+  if (endpoint === undefined) {
+    if (hasTopLevelHttpOptions) {
+      throw new TypeError("MCP HTTP headers, sessionId, fetch, and requestInit require an endpoint");
+    }
+    return undefined;
+  }
+  const normalizedEndpoint = normalizeEndpoint(endpoint);
+  return {
+    endpoint: normalizedEndpoint,
+    ...(options.headers !== undefined
+      ? { headers: options.headers }
+      : nested?.headers === undefined ? {} : { headers: nested.headers }),
+    ...(options.sessionId !== undefined
+      ? { sessionId: options.sessionId }
+      : nested?.sessionId === undefined ? {} : { sessionId: nested.sessionId }),
+    ...(options.requestInit !== undefined
+      ? { requestInit: options.requestInit }
+      : nested?.requestInit === undefined ? {} : { requestInit: nested.requestInit }),
+    ...(options.fetch !== undefined
+      ? { fetch: options.fetch }
+      : nested?.fetch === undefined ? {} : { fetch: nested.fetch }),
+  };
+}
+
+function normalizeEndpoint(value: string | URL): URL {
+  let endpoint: URL;
+  try {
+    endpoint = new URL(value instanceof URL ? value.toString() : value);
+  } catch {
+    throw new TypeError("MCP endpoint must be a valid URL");
+  }
+  if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
+    throw new TypeError("MCP endpoint must use http or https");
+  }
+  if (endpoint.username.length > 0 || endpoint.password.length > 0) {
+    throw new TypeError("MCP endpoint must not contain embedded credentials");
+  }
+  return endpoint;
+}
+
+function snapshotHttpOptions(options: McpStreamableHttpOptions): McpStreamableHttpOptions {
+  const headers = options.headers === undefined
+    ? undefined
+    : Object.freeze({ ...options.headers });
+  const requestInit = options.requestInit === undefined
+    ? undefined
+    : snapshotRequestInit(options.requestInit);
+  return Object.freeze({
+    endpoint: new URL(options.endpoint.toString()),
+    ...(headers === undefined ? {} : { headers }),
+    ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+    ...(requestInit === undefined ? {} : { requestInit }),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+  });
+}
+
+function snapshotRequestInit(requestInit: RequestInit): RequestInit {
+  const headers = normalizeHeaders(requestInit.headers);
+  return Object.freeze({
+    ...requestInit,
+    ...(Object.keys(headers).length === 0 ? {} : { headers: Object.freeze(headers) }),
+  });
+}
+
+function sanitizeRequestInit(
+  requestInit: RequestInit | undefined,
+  extraHeaders: Readonly<Record<string, string>> | undefined,
+): RequestInit | undefined {
+  if (requestInit === undefined && extraHeaders === undefined) return undefined;
+  const headers = normalizeHeaders(requestInit?.headers);
+  for (const [name, value] of Object.entries(extraHeaders ?? {})) headers[name] = value;
+  // Protocol/session identity is owned by the SDK. A caller-provided protocol
+  // header must not override the negotiated value, and an explicit sessionId
+  // is passed via the SDK option instead of being mixed with user headers.
+  for (const name of Object.keys(headers)) {
+    const lower = name.toLowerCase();
+    if (lower === "mcp-protocol-version" || lower === "mcp-session-id") {
+      delete headers[name];
+    }
+  }
+  return {
+    ...requestInit,
+    ...(Object.keys(headers).length === 0 ? {} : { headers }),
+  };
+}
+
+type HeadersInput = NonNullable<RequestInit["headers"]>;
+
+function normalizeHeaders(headers: HeadersInput | undefined): Record<string, string> {
+  if (headers === undefined) return {};
+  if (headers instanceof Headers) {
+    return Object.fromEntries(headers.entries());
+  }
+  if (Array.isArray(headers)) {
+    const normalized: Record<string, string> = {};
+    for (const [name, value] of headers) normalized[name] = value;
+    return normalized;
+  }
+  const normalized: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (typeof value === "string") normalized[name] = value;
+  }
+  return normalized;
+}
+
+function collectDiagnosticRedactions(options: McpStreamableHttpOptions | undefined): readonly string[] {
+  if (options === undefined) return Object.freeze([]);
+  const endpoint = new URL(options.endpoint.toString());
+  const values = new Set<string>();
+  const add = (value: string | undefined) => {
+    if (value !== undefined && value.length > 0) values.add(value);
+  };
+  add(endpoint.toString());
+  add(endpoint.origin);
+  add(endpoint.host);
+  add(endpoint.hostname);
+  add(endpoint.pathname);
+  add(endpoint.search);
+  for (const [name, value] of endpoint.searchParams) {
+    add(name);
+    add(value);
+  }
+  add(endpoint.username);
+  add(endpoint.password);
+  add(options.sessionId);
+  for (const value of Object.values(options.headers ?? {})) add(value);
+  for (const value of Object.values(normalizeHeaders(options.requestInit?.headers))) add(value);
+  return Object.freeze([...values].sort((left, right) => right.length - left.length));
+}
+
+function safeProvenanceUri(value: string, endpoint: string | URL | undefined): string {
+  const sourceUri = String(value);
+  if (endpoint !== undefined) {
+    const redacted = new URL(endpoint.toString());
+    const source = tryParseUrl(sourceUri);
+    if (source !== undefined && source.host === redacted.host) return `mcp://${redacted.hostname}`;
+    if (sourceUri === redacted.toString() || sourceUri === redacted.origin) return `mcp://${redacted.hostname}`;
+  }
+  const parsed = tryParseUrl(sourceUri);
+  if (parsed === undefined) return sourceUri;
+  parsed.username = "";
+  parsed.password = "";
+  parsed.search = "";
+  parsed.hash = "";
+  return parsed.toString();
+}
+
+function tryParseUrl(value: string): URL | undefined {
+  try {
+    return new URL(value);
+  } catch {
+    return undefined;
+  }
+}
+
 function safeJson(value: unknown): string {
   try {
     return JSON.stringify(value) ?? "null";
@@ -984,9 +1221,17 @@ function safeJson(value: unknown): string {
   }
 }
 
-function safeError(error: unknown): string {
+function safeError(error: unknown, redactions: readonly string[] = []): string {
   const message = error instanceof Error ? error.message : String(error);
-  return boundedText(message.replace(/[\r\n]+/g, " "), MAX_SAFE_TEXT);
+  return boundedText(redactDiagnosticText(message, redactions).replace(/[\r\n]+/g, " "), MAX_SAFE_TEXT);
+}
+
+function redactDiagnosticText(message: string, redactions: readonly string[]): string {
+  let redacted = message;
+  for (const secret of redactions) {
+    if (secret.length > 0) redacted = redacted.replaceAll(secret, "<redacted>");
+  }
+  return redacted;
 }
 
 function safeToolName(tool: McpTool): string {
@@ -1020,6 +1265,8 @@ function compareText(left: string, right: string): number {
 function compareMcpTools(left: McpTool, right: McpTool): number {
   const nameOrder = compareText(left.name, right.name);
   if (nameOrder !== 0) return nameOrder;
+  // Duplicate remote names are malformed MCP input. Keep the winner stable
+  // even when a server happens to reorder equivalent declarations.
   return compareText(safeJson(left), safeJson(right));
 }
 
