@@ -26,6 +26,27 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 
 当前没有通用 graph DSL 或插件市场；Mowe 的 `MoweCatalog` 提供窄的本地注册 seam，便于接入自定义 AgentTool，而不要求引入 Cordis 级插件运行时。
 
+生态 edge 通过 `.nausicaa/settings.json` 的 `edges` 声明接入。配置只描述来源，
+不会自行启动进程或获得权限；adapter registry 在刷新时校验 manifest，并为后续 Turn
+创建带 generation 的不可变工具快照。Main 通过 Mowe 使用快照，Worker 仍只获得固定的
+只读工具集。交互会话中的 `/edges` 只读取状态投影，不直接管理 edge 进程。
+
+```json
+{
+  "edges": {
+    "enabled": true,
+    "refreshOnStart": true,
+    "sources": [
+      { "sourceId": "local-skills", "type": "skill", "location": "skills" },
+      { "sourceId": "review-server", "type": "mcp", "command": "fake-mcp", "args": ["--stdio"] }
+    ]
+  }
+}
+```
+
+命令行可用 `--edges`、`--no-edges` 和 `--refresh-edges` 覆盖本次启动的 edge 开关。
+`--refresh-edges` 只请求宿主刷新；没有 registry 时也不会进行网络或外部进程调用。
+
 `read_file` 支持按行分页，`read_many` 可在共享字节预算内并发读取最多 16 个窗口；`grep` 与 `find` 在截断时返回绑定查询的续页 cursor。Git 查看工具使用固定参数、受保护路径过滤、可信可执行文件解析和有界输出，不要求开放 Shell。`write_file` 只在已有目录中写文件，不负责创建目录；`edit` 要求被替换文本唯一匹配。工作区文件工具会拒绝绝对路径、`..`、已有符号链接和受保护路径；当前威胁模型不覆盖同一系统账号下的其他进程并发替换文件系统节点。两档 `bash` 都有独立的环境变量白名单、取消/超时和有界输出；`workspace` 档再由 Seatbelt 或 bubblewrap 限制写入、网络和进程边界，`full-access` 档则明确运行在宿主权限下。需要异步观察开发服务器或测试进程时使用 Full Access 提供的 Job 生命周期工具，而不是在前台 `bash` 中放任后台命令。
 
 `workspace` Bash 是与 Codex/DeepSeek 同类的 OS 路径沙箱，不是 copy-on-write 容器。预先存在于工作区的硬链接仍可能指向工作区外同一文件对象；Linux 的 network namespace 会隐藏常规 `/run` socket，但不能证明所有非标准路径的 Unix socket 都不可达。Nausicaa 的结构化文件工具仍拒绝硬链接。对完全不可信的仓库应使用 `read-only`，或在独立容器/VM 中运行 Nausicaa；不要把 `workspace` 当成跨用户或恶意宿主隔离。

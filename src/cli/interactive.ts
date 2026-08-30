@@ -80,6 +80,10 @@ import {
   setNausicaaColorScheme,
   terminalSafeText,
 } from "./tui-components.js";
+import {
+  formatEdgeStatus,
+  type EdgeStatusProjection,
+} from "./edge-status.js";
 
 export interface InteractiveOptions {
   session: SessionController;
@@ -99,6 +103,8 @@ export interface InteractiveOptions {
   clipboardTextWriter?: ClipboardTextWriter;
   /** Optional extra model candidates shown by the Prime-style `/model` selector. */
   modelChoices?: readonly string[];
+  /** Read-only edge status projection supplied by the host/CLI. */
+  edgeStatus?: () => EdgeStatusProjection;
 }
 
 interface QueuedSubmission {
@@ -227,6 +233,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider([
     { name: "help", description: "Show commands" },
     { name: "status", description: "Show session state" },
+    { name: "edges", description: "Show configured edge sources" },
     { name: "context", description: "Show context capacity and cumulative lane usage" },
     { name: "usage", description: "Alias for /context" },
     {
@@ -1223,6 +1230,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       `- **Permissions:** ${snapshot.permissionProfile}; ${snapshot.allowWrite ? "write enabled" : "file writes off"}; ${shellStatus}; ${snapshot.allowNetwork ? "network enabled" : "network off"}`,
       `- **Queue / Tokens:** ${snapshot.pendingInputs} pending; ${usage.input + usage.output} used; ${usage.cacheRead} cache-read`,
       ...(snapshot.blocker === undefined ? [] : [`- **Blocked:** ${snapshot.blocker}`]),
+      ...(options.edgeStatus === undefined
+        ? []
+        : [`- **Edges:** ${options.edgeStatus().enabled ? "enabled" : "off"}; generation ${options.edgeStatus().generation}; ${options.edgeStatus().sources.length} source(s)`]),
     ].join("\n");
     appendBlock(new Markdown(text, 1, 0, nausicaaMarkdownTheme));
   };
@@ -1487,6 +1497,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           appendBlock(new Markdown([
             "### Commands",
             "`/status` session details  ·  `/context` context and cumulative usage",
+            "`/edges` configured edge sources and registry generation",
             "`/usage` alias for `/context`  ·  `/goal [statement]` show or revise Goal",
             "`/session [run-id]` switch saved Run  ·  `/new` new Run",
             "`/permissions [profile]` capability boundary  ·  `/plan [prompt]` enter Plan mode",
@@ -1505,6 +1516,20 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           break;
         case "/status":
           writeStatus(options.session.snapshot());
+          break;
+        case "/edges":
+          if (argument.length > 0) throw new Error("Usage: /edges");
+          appendBlock(new Markdown(
+            formatEdgeStatus(options.edgeStatus?.() ?? {
+              enabled: false,
+              refreshRequested: false,
+              generation: 0,
+              sources: [],
+            }),
+            1,
+            0,
+            nausicaaMarkdownTheme,
+          ));
           break;
         case "/context":
         case "/usage":

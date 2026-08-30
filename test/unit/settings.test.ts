@@ -282,6 +282,93 @@ describe("settings", () => {
     ).allowNetwork).toBe(true);
   });
 
+  it("loads and resolves opt-in edge source declarations without starting adapters", async () => {
+    const root = await makeRoot();
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    await mkdir(join(home, ".nausicaa"), { recursive: true });
+    await writeFile(
+      join(home, ".nausicaa", "settings.json"),
+      JSON.stringify({
+        model: "openrouter:base",
+        edges: {
+          enabled: true,
+          refreshOnStart: true,
+          sources: [
+            { sourceId: "local-skills", type: "skill", location: "skills" },
+            { sourceId: "review-server", type: "mcp", command: "fake-mcp", args: ["--stdio"] },
+          ],
+        },
+      }),
+    );
+
+    const loaded = await loadSettings(workspace, { userHome: home });
+    expect(loaded.edges?.sources).toHaveLength(2);
+    const resolved = resolveSettings(workspace, loaded, {}, {});
+    expect(resolved.edges).toMatchObject({
+      enabled: true,
+      refreshOnStart: true,
+      sources: [
+        { sourceId: "local-skills", type: "skill", location: "skills" },
+        { sourceId: "review-server", type: "mcp", command: "fake-mcp", args: ["--stdio"] },
+      ],
+    });
+    expect(Object.isFrozen(resolved.edges.sources)).toBe(true);
+    expect(Object.isFrozen(resolved.edges.sources[1]?.args)).toBe(true);
+  });
+
+  it("deep-merges trusted edge settings while preserving user source declarations", async () => {
+    const root = await makeRoot();
+    const home = join(root, "home");
+    const workspace = join(root, "workspace");
+    await mkdir(join(home, ".nausicaa"), { recursive: true });
+    await mkdir(join(workspace, ".nausicaa"), { recursive: true });
+    await writeFile(join(home, ".nausicaa", "settings.json"), JSON.stringify({
+      model: "openrouter:base",
+      edges: {
+        enabled: true,
+        sources: [{ sourceId: "user-skill", type: "skill", location: "skills" }],
+      },
+    }));
+    await writeFile(join(workspace, ".nausicaa", "settings.json"), JSON.stringify({
+      edges: { refreshOnStart: true },
+    }));
+
+    await expect(loadSettings(workspace, {
+      userHome: home,
+      trustWorkspace: true,
+    })).resolves.toMatchObject({
+      edges: {
+        enabled: true,
+        refreshOnStart: true,
+        sources: [{ sourceId: "user-skill" }],
+      },
+    });
+  });
+
+  it("rejects duplicate edge identities and incomplete source declarations", async () => {
+    const root = await makeRoot();
+    const home = join(root, "home");
+    await mkdir(join(home, ".nausicaa"), { recursive: true });
+    const settingsPath = join(home, ".nausicaa", "settings.json");
+    await writeFile(settingsPath, JSON.stringify({
+      model: "openrouter:base",
+      edges: {
+        sources: [
+          { sourceId: "same", type: "skill", location: "skills" },
+          { sourceId: "same", type: "plugin", location: "plugin" },
+        ],
+      },
+    }));
+    await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/duplicate edge sourceId/i);
+
+    await writeFile(settingsPath, JSON.stringify({
+      model: "openrouter:base",
+      edges: { sources: [{ sourceId: "broken", type: "mcp" }] },
+    }));
+    await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/command is required/i);
+  });
+
   it("validates allowNetwork in settings files", async () => {
     const root = await makeRoot();
     const home = join(root, "home");

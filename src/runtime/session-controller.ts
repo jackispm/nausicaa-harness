@@ -115,6 +115,11 @@ import {
   type SessionTranscriptEntry,
 } from "./session-artifacts.js";
 import { SessionProtocolError } from "./session-protocol-error.js";
+import {
+  freezeWorkspaceEdgeToolSnapshot,
+  materializeWorkspaceEdgeTools,
+  type WorkspaceEdgeToolSnapshot,
+} from "../mowe/workspace-catalog.js";
 
 export {
   SessionProtocolError,
@@ -288,6 +293,8 @@ export interface SessionControllerOptions {
   allowShell?: boolean;
   /** Explicitly enable network-backed workspace tools for Main. */
   allowNetwork?: boolean;
+  /** Registry snapshot captured for subsequent Turns; refresh never mutates it. */
+  edgeSnapshot?: WorkspaceEdgeToolSnapshot;
   /** Initial collaboration behavior; interactive users may change it later. */
   collaborationMode?: SessionCollaborationMode;
   /** Optional root directory for per-Run durable process-job metadata. */
@@ -305,6 +312,8 @@ export interface SessionControllerDeps {
   /** Optional provider seams for network-backed Main tools. */
   webFetchProvider?: WebFetchProvider;
   webSearchProvider?: WebSearchProvider;
+  /** Fallback edge snapshot for embedders that keep request options separate. */
+  edgeSnapshot?: WorkspaceEdgeToolSnapshot;
   /** Test/embedding seam for the default workspace-confined foreground Bash. */
   workspaceCommandSandbox?: WorkspaceCommandSandbox;
   /** Host/TUI approval boundary for Main tools that explicitly require approval. */
@@ -364,6 +373,7 @@ export class SessionController {
   private readonly policy: RunPolicy;
   private readonly requestedWorkerEnabled: boolean | undefined;
   private readonly workspaceCommandSandbox: WorkspaceCommandSandbox;
+  private readonly edgeSnapshot: WorkspaceEdgeToolSnapshot | undefined;
   private selectedMainModel: string;
   private writeAllowed: boolean;
   private shellAllowed: boolean;
@@ -408,6 +418,10 @@ export class SessionController {
     this.deps = deps;
     this.workspaceCommandSandbox = deps.workspaceCommandSandbox
       ?? new WorkspaceCommandSandbox({ protectedPaths: [dataDir] });
+    const edgeSnapshot = options.edgeSnapshot ?? deps.edgeSnapshot;
+    this.edgeSnapshot = edgeSnapshot === undefined
+      ? undefined
+      : freezeWorkspaceEdgeToolSnapshot(edgeSnapshot);
     this.clock = deps.clock ?? systemClock;
     this.requestedWorkerEnabled = options.workerEnabled ?? options.policy?.workerEnabled;
     this.policy = resolveRunPolicy({
@@ -1692,7 +1706,7 @@ export class SessionController {
           ? {}
           : { webSearchProvider: this.deps.webSearchProvider }),
         protectedPaths: [this.dataDir],
-      }))];
+      })), ...materializeWorkspaceEdgeTools(this.edgeSnapshot)];
       if (attached.policy.tetoEnabled) {
         tools.push(createAdviceResponseTool(inbox));
         scheduler = new TetoScheduler({

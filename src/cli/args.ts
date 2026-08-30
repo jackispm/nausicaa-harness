@@ -1,5 +1,6 @@
 import { MAX_MAIN_OUTPUT_TOKENS } from "../domain/types.js";
 import type {
+  EdgeSettings,
   FukaiCompactionProviderCapability,
   FukaiCompactionSettings,
 } from "../config/settings.js";
@@ -28,6 +29,12 @@ export interface CliOptions {
   allowWrite?: boolean;
   /** Explicitly enable network-backed workspace tools. */
   allowNetwork?: boolean;
+  /** Enable configured Mowe edge sources for this invocation. */
+  edgesEnabled?: boolean;
+  /** Ask the host to refresh edge sources before the next Turn. */
+  refreshEdges?: boolean;
+  /** Explicit edge settings assembled from CLI flags. */
+  edges?: EdgeSettings;
   /** Explicit Fukai compaction declaration; parsing it never runs a provider. */
   fukaiCompaction?: FukaiCompactionSettings;
   fileArgs: string[];
@@ -192,6 +199,22 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
       case "--allow-network":
         options.allowNetwork = true;
         break;
+      case "--edges":
+        options.edgesEnabled = true;
+        options.edges = { ...(options.edges ?? {}), enabled: true };
+        break;
+      case "--no-edges":
+        options.edgesEnabled = false;
+        options.edges = { ...(options.edges ?? {}), enabled: false };
+        break;
+      case "--refresh-edges":
+        options.refreshEdges = true;
+        options.edges = {
+          ...(options.edges ?? {}),
+          enabled: true,
+          refreshOnStart: true,
+        };
+        break;
       case "--workspace":
         options.workspace = readValue(args, index, argument);
         index += 1;
@@ -300,6 +323,9 @@ Options:
   --allow-write           Override settings to allow workspace writes (default)
   --allow-shell           Explicit high privilege: shell may read/write outside the workspace
   --allow-network         Allow public web fetch/search tools for this run
+  --edges                 Enable configured Skills/MCP/plugin edge sources
+  --no-edges              Disable all configured edge sources for this run
+  --refresh-edges         Refresh edge sources before starting the host/Turn
   --workspace <path>      Bound tools to this workspace
   --data-dir <path>       Runtime state directory (default: .nausicaa)
   --max-steps <number>    Maximum Main model steps (default: 24)

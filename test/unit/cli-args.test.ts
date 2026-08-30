@@ -157,6 +157,20 @@ describe("parseCliArgs", () => {
     });
   });
 
+  it("parses edge enablement and refresh controls", () => {
+    expect(parseCliArgs(["--edges", "--refresh-edges", "task"], "/work"))
+      .toMatchObject({
+        edgesEnabled: true,
+        refreshEdges: true,
+        edges: { enabled: true, refreshOnStart: true },
+        message: "task",
+      });
+    expect(parseCliArgs(["--no-edges", "task"], "/work")).toMatchObject({
+      edgesEnabled: false,
+      edges: { enabled: false },
+    });
+  });
+
   it("parses explicit Fukai disablement without enabling a provider", () => {
     expect(parseCliArgs(["--no-fukai-compaction", "task"], "/work"))
       .toMatchObject({
@@ -233,6 +247,8 @@ describe("parseCliArgs", () => {
     expect(usage).toContain("--fukai-provider <none|pi-ai>");
     expect(usage).toMatch(/--allow-shell.*high privilege.*read\/write outside the workspace/i);
     expect(usage).toContain("--allow-network");
+    expect(usage).toContain("--edges");
+    expect(usage).toContain("--refresh-edges");
     expect(usage).toContain("--daemon");
     expect(usage).toContain("--daemon-socket");
   });

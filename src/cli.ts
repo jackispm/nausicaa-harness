@@ -6,6 +6,7 @@ import { CliUsageError, parseCliArgs, usage } from "./cli/args.js";
 import { selectNewRecoveryFailures } from "./cli/daemon-recovery-reporting.js";
 import { processImageInputs } from "./cli/image-input.js";
 import { runInteractive } from "./cli/interactive.js";
+import { projectConfiguredEdgeStatus } from "./cli/edge-status.js";
 import {
   loadSettings,
   resolveSettings,
@@ -86,11 +87,13 @@ const main = async (): Promise<number> => {
       ...(options.allowWrite === undefined ? {} : { allowWrite: options.allowWrite }),
       ...(options.allowShell === undefined ? {} : { allowShell: options.allowShell }),
       ...(options.allowNetwork === undefined ? {} : { allowNetwork: options.allowNetwork }),
+      ...(options.edges === undefined ? {} : { edges: options.edges }),
       ...(options.fukaiCompaction === undefined
         ? {}
         : { fukaiCompaction: options.fukaiCompaction }),
     };
     const resolvedSettings = resolveSettings(workspace, settings, overrides);
+    const edgeStatus = projectConfiguredEdgeStatus(resolvedSettings.edges);
     // Keep resume semantics explicit: when neither the settings file nor the
     // CLI mentions Fukai, omit the field so a persisted Run policy wins.
     const fukaiCompaction = settings.fukaiCompaction === undefined
@@ -150,6 +153,7 @@ const main = async (): Promise<number> => {
       }
       return await runInteractive({
         session,
+        edgeStatus: () => edgeStatus,
         ...(initialMessage === undefined ? {} : { initialMessage }),
         ...(processedImages.images.length === 0
           ? {}

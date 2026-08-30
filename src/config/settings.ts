@@ -29,6 +29,35 @@ export interface FukaiCompactionSettings {
   minimumGainTokens?: number;
 }
 
+/** External capability sources are declarations only; adapters own loading. */
+export type EdgeSourceType = "skill" | "mcp" | "plugin";
+
+export interface EdgeSourceSettings {
+  /** Stable identity used in provenance and diagnostics. */
+  sourceId: string;
+  type: EdgeSourceType;
+  /** Filesystem path or URI for a skill/plugin source. */
+  location?: string;
+  /** Executable used by an MCP stdio source. */
+  command?: string;
+  args?: readonly string[];
+  enabled?: boolean;
+}
+
+export interface EdgeSettings {
+  /** Edge loading is opt-in; disabled sources never enter a Turn snapshot. */
+  enabled?: boolean;
+  /** Refresh at host startup; explicit refresh remains a runtime concern. */
+  refreshOnStart?: boolean;
+  sources?: readonly EdgeSourceSettings[];
+}
+
+export interface ResolvedEdgeSettings {
+  enabled: boolean;
+  refreshOnStart: boolean;
+  sources: readonly EdgeSourceSettings[];
+}
+
 export interface ResolvedFukaiCompactionSettings extends FukaiCompactionPolicy {
   thresholdRatio: number;
   retainRatio: number;
@@ -54,6 +83,7 @@ export interface Settings {
   allowWrite?: boolean;
   /** Enable network-backed Mowe tools (web_fetch and web_search). */
   allowNetwork?: boolean;
+  edges?: EdgeSettings;
   fukaiCompaction?: FukaiCompactionSettings;
 }
 
@@ -68,6 +98,7 @@ export interface ResolvedSettings {
   allowShell: boolean;
   allowWrite: boolean;
   allowNetwork: boolean;
+  edges: ResolvedEdgeSettings;
   fukaiCompaction: ResolvedFukaiCompactionSettings;
 }
 
@@ -89,6 +120,7 @@ const allowedKeys = new Set<keyof Settings>([
   "allowShell",
   "allowWrite",
   "allowNetwork",
+  "edges",
   "fukaiCompaction",
 ]);
 
@@ -109,6 +141,15 @@ export const loadSettings = async (
       ...project.fukaiCompaction,
     };
   }
+  if (user.edges !== undefined || project.edges !== undefined) {
+    merged.edges = {
+      ...user.edges,
+      ...project.edges,
+      ...(user.edges?.sources !== undefined && project.edges?.sources === undefined
+        ? { sources: user.edges.sources }
+        : {}),
+    };
+  }
   return merged;
 };
 
@@ -123,6 +164,7 @@ export const resolveSettings = (
     settings.fukaiCompaction,
     overrides.fukaiCompaction,
   );
+  const edges = resolveEdgeSettings(settings.edges, overrides.edges);
   const model = merged.model ?? environment.NAUSICAA_MODEL;
   if (model === undefined || model.trim().length === 0) {
     throw new SettingsError(
@@ -154,6 +196,7 @@ export const resolveSettings = (
     // available by default, while unsandboxed shell and network stay off.
     allowWrite: merged.allowWrite ?? true,
     allowNetwork: merged.allowNetwork ?? false,
+    edges,
     fukaiCompaction,
   };
 };
@@ -190,12 +233,109 @@ const readSettingsFile = async (path: string): Promise<Settings> => {
   validateOptionalBoolean(value.allowShell, "allowShell", path);
   validateOptionalBoolean(value.allowWrite, "allowWrite", path);
   validateOptionalBoolean(value.allowNetwork, "allowNetwork", path);
+  validateOptionalEdges(value.edges, path);
   validateOptionalBoolean(value.tetoEnabled, "tetoEnabled", path);
   validateOptionalInteger(value.maxSteps, "maxSteps", path);
   validateOptionalInteger(value.maxModelTokens, "maxModelTokens", path);
   validateOptionalInteger(value.maxOutputTokens, "maxOutputTokens", path);
   validateOptionalFukaiCompaction(value.fukaiCompaction, path);
   return value as Settings;
+};
+
+const resolveEdgeSettings = (
+  settings: EdgeSettings | undefined,
+  overrides: EdgeSettings | undefined,
+): ResolvedEdgeSettings => {
+  const merged = { ...settings, ...overrides };
+  const sources = [...(merged.sources ?? [])].map((source) => ({
+    ...source,
+    ...(source.args === undefined ? {} : { args: Object.freeze([...source.args]) }),
+  }));
+  return {
+    enabled: merged.enabled ?? false,
+    refreshOnStart: merged.refreshOnStart ?? false,
+    sources: Object.freeze(sources.map((source) => Object.freeze(source))),
+  };
+};
+
+const validateOptionalEdges = (value: unknown, path: string): void => {
+  if (value === undefined) return;
+  if (!isRecord(value)) {
+    throw new SettingsError(`edges in ${path} must be a JSON object`);
+  }
+  const allowed = new Set(["enabled", "refreshOnStart", "sources"]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      throw new SettingsError(`Unknown setting edges.${key} in ${path}`);
+    }
+  }
+  validateOptionalBoolean(value.enabled, "edges.enabled", path);
+  validateOptionalBoolean(value.refreshOnStart, "edges.refreshOnStart", path);
+  if (value.sources === undefined) return;
+  if (!Array.isArray(value.sources)) {
+    throw new SettingsError(`edges.sources in ${path} must be an array`);
+  }
+  const seen = new Set<string>();
+  for (const [index, candidate] of value.sources.entries()) {
+    const sourcePath = `edges.sources[${index}] in ${path}`;
+    if (!isRecord(candidate)) {
+      throw new SettingsError(`${sourcePath} must be a JSON object`);
+    }
+    const sourceAllowed = new Set([
+      "sourceId",
+      "type",
+      "location",
+      "command",
+      "args",
+      "enabled",
+    ]);
+    for (const key of Object.keys(candidate)) {
+      if (!sourceAllowed.has(key)) {
+        throw new SettingsError(`Unknown setting ${sourcePath}.${key}`);
+      }
+    }
+    validateOptionalString(candidate.sourceId, `${sourcePath}.sourceId`, path);
+    validateOptionalString(candidate.type, `${sourcePath}.type`, path);
+    if (candidate.sourceId === undefined || typeof candidate.sourceId !== "string") {
+      throw new SettingsError(`${sourcePath}.sourceId is required`);
+    }
+    if (candidate.sourceId.includes("\0")) {
+      throw new SettingsError(`${sourcePath}.sourceId must not contain NUL`);
+    }
+    if (candidate.sourceId.trim().length === 0) {
+      throw new SettingsError(`${sourcePath}.sourceId must not be blank`);
+    }
+    if (/[\u0000-\u001f\u007f]/u.test(candidate.sourceId)) {
+      throw new SettingsError(`${sourcePath}.sourceId must not contain control characters`);
+    }
+    if (seen.has(candidate.sourceId)) {
+      throw new SettingsError(`Duplicate edge sourceId ${candidate.sourceId} in ${path}`);
+    }
+    seen.add(candidate.sourceId);
+    if (candidate.type !== "skill" && candidate.type !== "mcp" && candidate.type !== "plugin") {
+      throw new SettingsError(`${sourcePath}.type must be skill, mcp, or plugin`);
+    }
+    validateOptionalString(candidate.location, `${sourcePath}.location`, path);
+    validateOptionalString(candidate.command, `${sourcePath}.command`, path);
+    const location = typeof candidate.location === "string" ? candidate.location : undefined;
+    const command = typeof candidate.command === "string" ? candidate.command : undefined;
+    if (candidate.type === "mcp" && (command === undefined || command.trim() === "")) {
+      throw new SettingsError(`${sourcePath}.command is required for mcp sources`);
+    }
+    if ((candidate.type === "skill" || candidate.type === "plugin")
+      && (location === undefined || location.trim() === "")) {
+      throw new SettingsError(`${sourcePath}.location is required for ${candidate.type} sources`);
+    }
+    validateOptionalBoolean(candidate.enabled, `${sourcePath}.enabled`, path);
+    if (candidate.args !== undefined) {
+      if (!Array.isArray(candidate.args) || candidate.args.some((arg) => typeof arg !== "string")) {
+        throw new SettingsError(`${sourcePath}.args must be an array of strings`);
+      }
+      if (candidate.args.some((arg) => arg.includes("\0"))) {
+        throw new SettingsError(`${sourcePath}.args must not contain NUL`);
+      }
+    }
+  }
 };
 
 const resolveFukaiCompactionSettings = (

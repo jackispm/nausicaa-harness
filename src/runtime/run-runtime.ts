@@ -91,6 +91,11 @@ import {
 } from "./worker-lane-scheduler.js";
 import { WorkerTaskExecutor } from "./worker-task-executor.js";
 import { shouldAdvertiseImageTools } from "./model-capabilities.js";
+import {
+  freezeWorkspaceEdgeToolSnapshot,
+  materializeWorkspaceEdgeTools,
+  type WorkspaceEdgeToolSnapshot,
+} from "../mowe/workspace-catalog.js";
 
 export interface RunExecutionRequest {
   workspace: string;
@@ -117,6 +122,8 @@ export interface RunExecutionRequest {
   allowShell?: boolean;
   /** Explicitly enable network-backed workspace tools for Main. */
   allowNetwork?: boolean;
+  /** Registry snapshot captured before this Run/Turn; never refreshed mid-turn. */
+  edgeSnapshot?: WorkspaceEdgeToolSnapshot;
   signal?: AbortSignal;
 }
 
@@ -131,6 +138,8 @@ export interface RunExecutionDeps {
   /** Optional provider seams for network-backed Main tools. */
   webFetchProvider?: WebFetchProvider;
   webSearchProvider?: WebSearchProvider;
+  /** Embedding seam for a captured edge snapshot when request data is shared. */
+  edgeSnapshot?: WorkspaceEdgeToolSnapshot;
   /** Host approval boundary for Main tools that explicitly require approval. */
   approveTool?: MainLoopDeps["approve"];
   /** Test/embedding seam for the OS-enforced workspace Bash boundary. */
@@ -169,6 +178,9 @@ export const executeRun = async (
   deps: RunExecutionDeps = {},
 ): Promise<RunExecutionResult> => {
   validateRequest(request);
+  const edgeSnapshot = request.edgeSnapshot === undefined && deps.edgeSnapshot === undefined
+    ? undefined
+    : freezeWorkspaceEdgeToolSnapshot(request.edgeSnapshot ?? deps.edgeSnapshot!);
   const clock = deps.clock ?? systemClock;
   const workspace = resolve(request.workspace);
   const runId = request.resumeRunId ?? (deps.createRunId ?? randomUUID)();
@@ -376,7 +388,7 @@ export const executeRun = async (
         ? {}
         : { webSearchProvider: deps.webSearchProvider }),
       protectedPaths: [resolve(request.dataDir)],
-    }))];
+    })), ...materializeWorkspaceEdgeTools(edgeSnapshot)];
     if (auxiliaryMode === "teto") {
       if (adviceDelivery === "live") tools.push(createAdviceResponseTool(inbox));
       const tetoModel = deps.tetoModel ?? mainModel;
