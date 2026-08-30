@@ -379,8 +379,20 @@ export class DaemonServiceManager {
   close(): Promise<void> {
     if (this.#closePromise !== undefined) return this.#closePromise;
     this.#closed = true;
+    const pendingStarts: Promise<DaemonServiceStatus>[] = [];
+    if (this.#startPromise !== undefined) pendingStarts.push(this.#startPromise);
+    if (this.#restartPromise !== undefined) pendingStarts.push(this.#restartPromise);
     const operation = (async () => {
-      await this.stop();
+      let stopError: unknown;
+      try {
+        await this.stop();
+      } catch (error: unknown) {
+        stopError = error;
+      }
+      // A start/restart may already be waiting for the lifecycle lock. Wait
+      // for it to observe the closed state before completing close().
+      await Promise.allSettled(pendingStarts);
+      if (stopError !== undefined) throw stopError;
       if (this.#childObservers.size > 0) {
         await withTimeout(
           Promise.allSettled([...this.#childObservers]),
@@ -394,6 +406,12 @@ export class DaemonServiceManager {
   }
 
   async #startLocked(): Promise<DaemonServiceStatus> {
+    // A start may have queued for the lifecycle lock before close() marked
+    // this manager closed. Re-check under the lock so it cannot spawn after
+    // close has begun.
+    if (this.#closed) {
+      return failedStatus(failure("manager_closed", "service manager is closed"));
+    }
     try {
       await this.#assertDirectoryIdentity();
       const existing = await this.#readDescriptor();

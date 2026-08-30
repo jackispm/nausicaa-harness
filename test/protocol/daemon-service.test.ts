@@ -566,6 +566,52 @@ describe("detached daemon service lifecycle", () => {
     });
   });
 
+  it("waits for a queued start before completing close", async () => {
+    const host = new FakeServiceHost();
+    const startInspectionEntered = deferred<void>();
+    const releaseStartInspection = deferred<void>();
+    const stopInspected = deferred<void>();
+    let blockFirstSelfInspection = true;
+    const manager = await openService(host, {
+      dependencies: {
+        ...host.dependencies,
+        inspectProcess: async (pid) => {
+          if (pid === process.pid && blockFirstSelfInspection) {
+            blockFirstSelfInspection = false;
+            startInspectionEntered.resolve();
+            await releaseStartInspection.promise;
+          }
+          return host.inspect(pid);
+        },
+        inspectSocket: async () => {
+          stopInspected.resolve();
+          return { status: "absent" };
+        },
+      },
+    });
+
+    const start = manager.start();
+    await startInspectionEntered.promise;
+    const close = manager.close();
+    await stopInspected.promise;
+
+    let closeSettled = false;
+    void close.then(() => {
+      closeSettled = true;
+    });
+    await Promise.resolve();
+    expect(closeSettled).toBe(false);
+    expect(host.spawnRequests).toHaveLength(0);
+
+    releaseStartInspection.resolve();
+    await expect(start).resolves.toMatchObject({
+      state: "failed",
+      error: { code: "manager_closed" },
+    });
+    await expect(close).resolves.toBeUndefined();
+    expect(host.spawnRequests).toHaveLength(0);
+  });
+
   it("bounds close when a child observer never settles", async () => {
     const host = new FakeServiceHost();
     host.signal = async (request) => {
