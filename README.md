@@ -2,7 +2,19 @@
 
 Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注执行的 Main lane 为主线，并让低频辅助 lane 在旁路独立观察、提出建议；辅助线不会复制完整对话，也不会阻塞主线。
 
-这是早期可运行版本，接口与命令行参数尚未稳定。
+这是 `0.1.0` 本地 beta。核心运行、恢复和权限合同已有离线测试，但 API、命令行参数和 daemon 协议仍可能调整；不要把它当作生产集群或稳定 SDK。
+
+## Beta 边界
+
+本版本可以在单机工作区内使用：
+
+- Main + Teto 的 TUI、print 和 JSON 入口，共用同一个 Run/Ledger 恢复边界。
+- Mowe 内置工具、`apply_patch`、Skills/MCP edge（显式配置后）以及 capability boundary。
+- Worker 和跨 Run A2A 仅在显式启用、且由 host 提供身份/roster/router 时出现；缺少授权 composition 时 fail closed。
+- Awareness 的 `/agents`、`/topology` 和 `--topology` 只读投影；没有可见来源时报告 `unavailable`，不伪造 active 节点。
+- 本地 daemon Host、Ledger-backed wake、Run lease，以及显式 `--daemon-worker-command` detached worker composition。
+
+以下内容不属于本 beta 的发布承诺：集群或远程 daemon、跨机器 transport、可写 remote attach、插件 marketplace/热加载、常驻 worker fleet、真实 MCP marketplace 验证、Worker 质量 uplift 或 Phase 2.4 A/B 结论。OpenRouter smoke 是一次受控的 provider 兼容性检查，不是质量或性能证明。
 
 ## 当前能力
 
@@ -84,6 +96,8 @@ nausicaa --model openrouter:<vision-model> '@screenshots/error state.png' "比�
 
 # 脚本或 CI 使用 one-shot，不进入交互界面
 nausicaa -p "查看这个项目如何安装"
+nausicaa --print "查看这个项目如何安装"
+nausicaa --json "检查这个项目的 package 脚本"
 
 # 恢复或附着当前项目最近的 Run
 nausicaa --resume <run-id>
@@ -96,11 +110,39 @@ nausicaa --model openrouter:openai/gpt-5-mini "修复这个项目"
 nausicaa --allow-shell "运行测试并分析失败原因"
 ```
 
+不使用 `npm link` 时也可以从构建产物生成本地 beta tarball。`package.json` 保持
+`private: true`，因此不会被误发布到 npm registry；tarball 安装仍会带上运行时依赖和
+`nausicaa` bin：
+
+```bash
+npm run build
+npm pack
+npm install --global ./nausicaa-0.1.0.tgz
+nausicaa --help
+```
+
+daemon 与 topology 都是显式的本机操作。daemon 默认只持有本地 Host；detached worker
+必须由调用方提供外部命令，参数可重复传入：
+
+```bash
+nausicaa --daemon --data-dir .nausicaa
+nausicaa --daemon --daemon-worker-command /path/to/worker \
+  --daemon-worker-arg --stdio --daemon-worker-arg --workspace=/path/to/project
+nausicaa --attach <run-id> --data-dir .nausicaa
+nausicaa --topology
+nausicaa --topology --json
+```
+
+`--attach` 当前是同一台机器上的只读 TUI，不提供输入、取消或网络 transport。`--topology`
+是只读检查并且不能与任务、Run 恢复、daemon 或权限选项组合。
+
 `@image` 用于启动消息，可重复指定；交互中按 `Ctrl+V`（Windows 为 `Alt+V`）可从剪贴板插入 Prime 风格的 `[image #N]` 标记。提交时只附带仍出现在文本中的标记，删除标记会移除附件，当前进程内通过撤销或历史恢复标记后仍可重新附带。模型必须在 `pi-ai` 模型目录中声明 `image` 输入能力；文本模型会在发起 provider 请求前给出错误。路径必须相对当前工作区，且不能穿过符号链接、硬链接、受保护目录或 `..`；支持 PNG、JPEG、GIF、WebP，按文件内容而非扩展名识别。每次最多 4 张、单张最多 3 MiB、总计最多 10 MiB，当前不会自动缩放。图片内容随 Run 持久化并可恢复；Teto 不会因此读取额外的完整主线内容。
 
 也可设置 `NAUSICAA_MODEL`，省略每次调用的 `--model`。交互会话默认使用 `workspace` 权限：可读写当前工作区，并可在可用的 OS 沙箱内运行前台 Bash，但不开放宿主 Shell、网络或后台进程。`/permissions` 可在 `read-only`、`workspace`、`full-access` 三档之间切换；`full-access` 等同于明确开放工作区写入、宿主 Shell、网络和后台进程，因此边界会直接显示在底部状态栏。`/plan [prompt]` 进入只读 Plan 模式，`/mode` 可在 Default 与 Plan 间切换。
 
 `/goal` 查看当前 Run 的长期目标，`/goal <statement>` 修订它；`/session` 打开当前工作区的 Run 选择器，`/session <run-id>` 可直接切换；`/copy` 将最后一条 assistant 回答复制到系统剪贴板。普通消息仍是各自 Turn 的当前任务。运行状态默认写入工作区的 `.nausicaa/`；使用 `nausicaa --resume <run-id>` 从已提交边界继续。若恢复时发现结果未知的工具操作，CLI 会打印 operation ID 和显式结算命令；确认其应按失败处理后再执行该命令，运行时不会自动重放副作用。
+
+交互命令的最小 beta surface 如下：`/agents`（`/topology` 别名）查看只读 Awareness，`/permissions [read-only|workspace|full-access]` 切换 capability，`/plan [prompt]` 进入只读 Plan，`/skills [refresh|select <id>|deselect <id>]` 管理下一 Turn 的 Skill，`/edges [refresh]` 查看 edge 状态。命令只提交 Ledger 允许的状态变更；它们不会绕过当前 Turn 的 snapshot 或权限边界。
 
 `npm run dev -- <参数>` 通过 `tsx` 直接运行 TypeScript 源码，是开发调试入口，不是产品交互模型。构建后的产品入口是 `nausicaa`；`npm start -- <参数>` 直接运行 `dist/cli.js`。因此别人项目看起来是“进入 CLI”，是因为它们发布了一个 bin；本项目也通过 `package.json` 的 `bin.nausicaa` 提供同样的入口。
 
@@ -117,11 +159,35 @@ npm run eval:cache:verify -- .nausicaa/evals/phase-2.3-cache.json
 npm run check         # 执行完整本地门禁
 ```
 
-真实 OpenRouter 测试不会默认运行。`npm run test:live` 会读取本地 `.env`；只有同时设置 `NAUSICAA_LIVE_TESTS=1`、`OPENROUTER_API_KEY`、`NAUSICAA_LIVE_MODEL`（未设置时回退到 `NAUSICAA_EVAL_MODEL`）和正数 `NAUSICAA_EVAL_BUDGET_USD` 时，才运行最多 7 次请求的 Main-only/Main+Teto 工具循环。缓存 probe 另有最多 2 次请求及独立的 `NAUSICAA_CACHE_EVAL_BUDGET_USD`；它通过真实 Session/MainLoop 生成脱敏 Ledger 摘要、runtime cache projection、commit 和请求时间证据，并可由 `eval:cache:verify` 独立复验。视觉验收还需显式设置具备图片输入能力的 `NAUSICAA_VISION_MODEL` 和正数 `NAUSICAA_VISION_BUDGET_USD`，且最多发起 1 次请求；没有视觉模型时不会退回默认模型。
+### 0.1.0 beta release checklist
+
+1. 在目标 commit 上依次运行 `npm run typecheck`、`npm run build`、`npm test`、`npm run test:smoke` 和 `git diff --check`；不要并发运行会清理 `dist` 的命令。
+2. 运行 `npm pack --dry-run`，确认清单只有 `dist/`、`README.md`、`THIRD_PARTY_NOTICES` 和 npm 必需的 `package.json`，不含 `.env*`、`.nausicaa/`、`.local/`、`docs/`、`test/`、日志或 `node_modules/`。
+3. 若 root 决定执行唯一一次 live smoke，先确认模型、软预算、`$1` 硬限额 key 和干净工作树；否则将 provider compatibility 标为 pending。
+4. 发布说明不得声称 Phase 2.4、Worker uplift、真实 marketplace MCP、远程/集群 daemon 或长期生产稳定性已经验证。
+
+真实 OpenRouter 测试不会默认运行。beta smoke 固定使用 `openrouter:tencent/hy3`，只有同时设置 `NAUSICAA_LIVE_TESTS=1`、`OPENROUTER_API_KEY`、`NAUSICAA_LIVE_MODEL=tencent/hy3`（也接受带 `openrouter:` 前缀）和正数 `NAUSICAA_EVAL_BUDGET_USD` 时才会发起请求；预检还要求工作树干净。请求最多 5 次、单次输出最多 128 token、wall-clock 45 秒，默认软预算为 `$0.85`；provider 未返回可解析的非负 usage/cost 时立即失败关闭。运行形态如下，key 只存在于当前进程环境，不会写入文件或产物：
+
+```bash
+OPENROUTER_API_KEY='(只放进当前进程环境)' \
+NAUSICAA_LIVE_TESTS=1 \
+NAUSICAA_LIVE_MODEL=tencent/hy3 \
+NAUSICAA_EVAL_BUDGET_USD=0.85 \
+npm run test:live -- --no-file-parallelism
+```
+
+smoke fixture 会要求 Main 通过 `read_file` 读取小型 README，再依据工具结果回答；结果摘要只写入被忽略的 `.nausicaa/evals/`，公开字段为 model、request count、usage、cost、status 和 commit。通过只表示 provider、工具循环和本地 harness 接线可运行，不代表 Teto uplift、Worker 质量收益或 Phase 2.4 release。历史 Main-only/Main+Teto 对比、缓存 probe 和视觉验收必须额外设置 `NAUSICAA_LIVE_SCENARIO=legacy`，不会被 beta 命令隐式启动。
+
+上述 live 命令只允许 root 在离线门禁通过后执行一次；执行前应把 OpenRouter key 硬限额设为
+`$1.00`。缺少 key、模型或预算时预检应跳过且不发请求，失败应记录为 provider
+compatibility pending，不改动核心工具合同。
 
 Phase 2.4 能力门禁与普通 live smoke 分开。完整实验使用预注册 manifest 中冻结的模型、10 个任务、3 次重复和 4 个 arm，不读取 `NAUSICAA_EVAL_MODEL`。执行前必须设置 `NAUSICAA_PHASE24_EVAL=1`、`OPENROUTER_API_KEY` 和正数 `NAUSICAA_EVAL_BUDGET_USD`，并保持工作树干净；然后运行 `npm run eval:live`。每次运行写入独立的 `.nausicaa/evals/phase-2.4/<evaluation-id>/`，也可用路径安全的 `NAUSICAA_EVAL_ID` 固定名称。命令会立即校验 raw digest、manifest、配对报告和 release decision；证据不完整或预注册收益门未通过时返回非零，但仍保留可审计结果。`npm run eval:verify -- <目录>` 可稍后重新验证。测试内预算只能在请求间停止后续调用，费用硬上限仍应由 OpenRouter 的限额 key 保证。
 
 Worker 的真实收益实验与普通 live smoke 分开。只有明确设置 `NAUSICAA_WORKER_EVAL=1`、`OPENROUTER_API_KEY` 和正数 `NAUSICAA_WORKER_EVAL_BUDGET_USD`，并保持工作树干净时，才运行 `npm run eval:worker:live`。该预算是响应后记账的软停止阈值，在途请求可能越过它；硬上限必须由 OpenRouter 限额 key 保证。实验使用冻结的 `main-only` / `main-worker` 双 arm、同一模型和配对任务，记录物理 provider 重试、四类 token、缓存、真实请求重叠和 TaskGraph join；结果写入被忽略的 `.nausicaa/evals/worker-live/`。`npm run eval:worker:verify -- <目录>` 只做离线重建和篡改检查。默认 `npm run check` 不会调用真实 provider。
+
+本 beta 发布不要求、也不会在默认门禁中运行 Phase 2.4 全量 A/B、Worker uplift 或真实
+MCP marketplace 验证；这些实验继续留在 roadmap，不能由一次低预算 smoke 推断。
 
 ## 设计原则
 
