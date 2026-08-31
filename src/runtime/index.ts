@@ -49,3 +49,4 @@ export * from "./daemon-supervisor.js";
 export * from "./worker-task-executor.js";
 export * from "./worker-lane-scheduler.js";
 export * from "./agent-awareness.js";
+export * from "./agent-awareness-composition.js";
