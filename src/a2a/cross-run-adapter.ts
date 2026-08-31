@@ -4,11 +4,13 @@ import type {
 } from "../domain/events.js";
 import { systemClock, type Clock } from "../domain/ports.js";
 import type {
+  ArtifactRef,
   CrossRunEndpoint,
   CrossRunEnvelope,
   Visibility,
 } from "../domain/types.js";
 import {
+  computeEventContentHash,
   IdempotencyConflictError,
   type Ledger,
 } from "../ledger/index.js";
@@ -18,6 +20,7 @@ import {
   A2AProtocolError,
 } from "./inbox.js";
 import {
+  assertCrossRunReceiptMatchesEnvelope,
   CrossRunProtocolError,
   type CrossRunFact,
   type CrossRunFactStore,
@@ -58,8 +61,13 @@ interface CrossRunReceiptPayload {
 
 interface CrossRunOutboxEventBase {
   readonly runId: string;
+  readonly turnId?: string;
   readonly laneId: string;
   readonly occurredAt: string;
+  readonly causationId?: string;
+  readonly correlationId: string;
+  readonly idempotencyKey: string;
+  readonly visibility: Visibility;
   readonly globalOffset: number;
 }
 
@@ -77,14 +85,6 @@ type CrossRunOutboxEvent =
       readonly payload: CrossRunReceiptPayload;
     });
 
-type CrossRunAppendEvent = Omit<AppendEvent, "type" | "payload"> & {
-  readonly type: CrossRunOutboxEventType;
-  readonly payload:
-    | CrossRunPendingPayload
-    | CrossRunAttemptPayload
-    | CrossRunReceiptPayload;
-};
-
 export interface LedgerCrossRunFactStoreOptions {
   /** The source Run's existing Ledger; this adapter never owns or closes it. */
   readonly ledger: Ledger;
@@ -98,6 +98,8 @@ export interface LedgerCrossRunTargetAdmissionOptions {
   /** Host-resolved target identity; model input cannot replace it. */
   readonly target: CrossRunEndpoint;
   readonly clock?: Clock;
+  /** Optional host verifier for the opaque attach/lease proof. */
+  readonly verifySender?: (sender: CrossRunSenderIdentity) => boolean | Promise<boolean>;
 }
 
 export interface CrossRunHostWakeRequest {
@@ -114,11 +116,24 @@ export interface CrossRunHostWakeResult {
   readonly retryAt?: string;
 }
 
+/** DaemonHost.wake returns this richer shape; the adapter projects it to the
+ * small CrossRunWake result while preserving the host-owned dedupe boundary. */
+export interface CrossRunDaemonWakeResult {
+  readonly status: "queued" | "duplicate";
+  readonly admission: {
+    readonly status: "admitted" | "duplicate";
+    readonly inputId: string;
+    readonly shouldActivate?: boolean;
+  };
+  /** Host-owned normalized wake; validated structurally before projection. */
+  readonly wake: unknown;
+}
+
 export interface CrossRunHostWakeAdapterOptions {
   /** Host wake is injected so A2A does not become a second scheduler. */
   readonly wake: (
     request: CrossRunHostWakeRequest,
-  ) => Promise<CrossRunHostWakeResult>;
+  ) => Promise<CrossRunHostWakeResult | CrossRunDaemonWakeResult>;
   readonly target: CrossRunEndpoint;
   readonly clock?: Clock;
 }
@@ -155,9 +170,17 @@ export class LedgerCrossRunFactStore implements CrossRunFactStore {
   async read(
     scope: { readonly runId?: string; readonly routeId?: string } = {},
   ): Promise<readonly CrossRunFact[]> {
-    if (scope === null || typeof scope !== "object" || Array.isArray(scope)) {
+    if (scope === null || typeof scope !== "object" || Array.isArray(scope)
+      || (Object.getPrototypeOf(scope) !== Object.prototype
+        && Object.getPrototypeOf(scope) !== null)) {
       throw durableFactError("A2A fact read scope must be an object");
     }
+    for (const key of Object.keys(scope)) {
+      if (key !== "runId" && key !== "routeId") {
+        throw durableFactError(`A2A fact read scope.${key} is not allowed`);
+      }
+    }
+    if (scope.runId !== undefined) identifier(scope.runId, "scope.runId");
     if (scope.runId !== undefined && scope.runId !== this.#source.runId) {
       return [];
     }
@@ -187,9 +210,7 @@ export class LedgerCrossRunFactStore implements CrossRunFactStore {
     assertFactPredecessor(fact, facts, this.#source);
 
     try {
-      const stored = await this.#ledger.append(
-        factAppend(fact, this.#source) as unknown as AppendEvent,
-      );
+      const stored = await this.#ledger.append(factAppend(fact, this.#source));
       const storedFact = factFromEvent(stored as unknown, this.#source);
       if (storedFact === undefined || stableJson(storedFact) !== stableJson(fact)) {
         throw new CrossRunProtocolError(
@@ -211,7 +232,11 @@ export class LedgerCrossRunFactStore implements CrossRunFactStore {
 
   async #readEvents(): Promise<readonly AnyEvent[]> {
     try {
-      return await this.#ledger.read({ runId: this.#source.runId });
+      const events = await this.#ledger.read({ runId: this.#source.runId });
+      if (!Array.isArray(events)) {
+        throw new Error("invalid event list");
+      }
+      return events;
     } catch {
       throw durableFactError("Unable to read A2A outbox facts");
     }
@@ -226,12 +251,14 @@ export class LedgerCrossRunTargetAdmission implements CrossRunTargetAdmission {
   readonly #ledger: Ledger;
   readonly #target: CrossRunEndpoint;
   readonly #inbox: A2AInbox;
+  readonly #verifySender: LedgerCrossRunTargetAdmissionOptions["verifySender"];
 
   constructor(options: LedgerCrossRunTargetAdmissionOptions) {
     assertOptions(options);
     assertLedger(options.ledger);
     this.#ledger = options.ledger;
     this.#target = normalizeEndpoint(options.target, "target");
+    this.#verifySender = options.verifySender;
     this.#inbox = new A2AInbox({
       sink: this.#ledger,
       clock: options.clock ?? systemClock,
@@ -239,20 +266,28 @@ export class LedgerCrossRunTargetAdmission implements CrossRunTargetAdmission {
   }
 
   admit(input: CrossRunTargetAdmissionInput): Promise<CrossRunTargetAdmissionResult> {
-    const normalized = normalizeTargetAdmission(input, this.#target);
     return runLedgerExclusive(
       targetAdmissionTails,
       this.#ledger,
-      endpointScope(this.#target),
-      () => this.#admit(normalized),
+      runScope(this.#target),
+      async () => this.#admit(await normalizeTargetAdmission(input, this.#target, this.#verifySender)),
     );
   }
 
   async #admit(
     input: CrossRunTargetAdmissionInput,
   ): Promise<CrossRunTargetAdmissionResult> {
-    const events = await this.#ledger.read({ runId: this.#target.runId });
-    this.#inbox.rehydrate(events);
+    let events: readonly AnyEvent[];
+    try {
+      events = await this.#ledger.read({ runId: this.#target.runId });
+      if (!Array.isArray(events)) {
+        throw new Error("invalid event list");
+      }
+      this.#inbox.rehydrate(events);
+    } catch (error: unknown) {
+      if (error instanceof CrossRunProtocolError) throw error;
+      throw durableFactError("Unable to rehydrate target Inbox");
+    }
     try {
       const result = await this.#inbox.send(input.message);
       if (result.status === "expired") {
@@ -288,6 +323,11 @@ export class CrossRunHostWakeAdapter implements CrossRunWake {
         "wake-failed",
       );
     }
+    if (options.clock !== undefined
+      && (options.clock === null || typeof options.clock !== "object"
+        || typeof options.clock.now !== "function")) {
+      throw new CrossRunProtocolError("wake clock must implement now", "wake-failed");
+    }
     this.#wake = options.wake;
     this.#target = normalizeEndpoint(options.target, "target");
     this.#clock = options.clock ?? systemClock;
@@ -297,6 +337,10 @@ export class CrossRunHostWakeAdapter implements CrossRunWake {
     readonly status: "queued" | "already-active" | "rejected";
     readonly retryAt?: string;
   }> {
+    if (!plainRecord(input)) {
+      throw new CrossRunProtocolError("Wake input must be an object", "wake-failed");
+    }
+    exactKeys(input, ["envelope", "targetMessageId"], "wake input", "wake-failed");
     const envelope = normalizeEnvelope(input.envelope);
     if (!sameEndpoint(envelope.target, this.#target)) {
       throw new CrossRunProtocolError(
@@ -309,11 +353,17 @@ export class CrossRunHostWakeAdapter implements CrossRunWake {
       "targetMessageId",
     );
     const identity = crossRunWakeIdentity(envelope.routeId, targetMessageId);
-    const occurredAt = this.#clock.now().toISOString();
-    if (!Number.isFinite(Date.parse(occurredAt))) {
+    let occurredAt: string;
+    try {
+      const now = this.#clock.now();
+      if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+        throw new Error("invalid clock");
+      }
+      occurredAt = now.toISOString();
+    } catch {
       throw new CrossRunProtocolError("Wake clock is invalid", "wake-failed");
     }
-    const result = await this.#wake({
+    const request: CrossRunHostWakeRequest = Object.freeze({
       runId: this.#target.runId,
       source: "a2a",
       dedupeKey: `a2a:wake:${identity}`,
@@ -321,7 +371,13 @@ export class CrossRunHostWakeAdapter implements CrossRunWake {
       inputId: `a2a-input:${identity}`,
       occurredAt,
     });
-    const normalized = normalizeHostWakeResult(result);
+    let result: unknown;
+    try {
+      result = await this.#wake(structuredClone(request));
+    } catch {
+      throw new CrossRunProtocolError("Host wake failed", "wake-failed");
+    }
+    const normalized = normalizeHostWakeResult(result, request);
     if (normalized.status === "duplicate" || normalized.status === "already-active") {
       return {
         status: "already-active",
@@ -364,10 +420,11 @@ function normalizeFact(
   value: CrossRunFact,
   source: CrossRunEndpoint,
 ): CrossRunFact {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  if (!plainRecord(value)) {
     throw durableFactError("A2A outbox fact must be an object");
   }
   if (value.kind === "outbox.pending") {
+    exactKeys(value, ["kind", "envelope", "recordedAt"], "fact", "durable-fact-failed");
     const envelope = normalizeEnvelope(value.envelope);
     if (!sameEndpoint(envelope.source, source)) {
       throw new CrossRunProtocolError(
@@ -382,6 +439,7 @@ function normalizeFact(
     });
   }
   if (value.kind === "outbox.attempted") {
+    exactKeys(value, ["kind", "routeId", "messageId", "attemptId", "attemptedAt"], "fact", "durable-fact-failed");
     return Object.freeze({
       kind: value.kind,
       routeId: identifier(value.routeId, "fact.routeId"),
@@ -391,6 +449,7 @@ function normalizeFact(
     });
   }
   if (value.kind === "outbox.receipt") {
+    exactKeys(value, ["kind", "receipt"], "fact", "durable-fact-failed");
     const receipt = normalizeReceipt(value.receipt);
     if (!sameEndpoint(receipt.source, source)) {
       throw new CrossRunProtocolError(
@@ -406,7 +465,7 @@ function normalizeFact(
 function factAppend(
   fact: CrossRunFact,
   source: CrossRunEndpoint,
-): CrossRunAppendEvent {
+): AppendEvent<CrossRunOutboxEventType> {
   const common = {
     runId: source.runId,
     laneId: source.laneId,
@@ -455,10 +514,14 @@ function factsFromEvents(
 ): CrossRunFact[] {
   const facts: CrossRunFact[] = [];
   const identities = new Map<string, CrossRunFact>();
-  for (const event of [...events].sort((left, right) => left.globalOffset - right.globalOffset)) {
+  // A Run Ledger may contain source outboxes for several lanes. Each adapter
+  // owns exactly one lane; unrelated lane facts must not block recovery here.
+  const ownedEvents = events.filter((event) => (
+    event.runId === source.runId && event.laneId === source.laneId
+  ));
+  for (const event of [...ownedEvents].sort((left, right) => left.globalOffset - right.globalOffset)) {
     const fact = factFromEvent(event, source);
     if (fact === undefined) continue;
-    assertFactPredecessor(fact, facts, source);
     const identity = factIdentity(fact);
     const existing = identities.get(identity);
     if (existing !== undefined) {
@@ -467,6 +530,7 @@ function factsFromEvents(
       }
       continue;
     }
+    assertFactPredecessor(fact, facts, source);
     identities.set(identity, fact);
     facts.push(fact);
   }
@@ -477,7 +541,10 @@ function factFromEvent(
   event: unknown,
   source: CrossRunEndpoint,
 ): CrossRunFact | undefined {
-  if (!isCrossRunOutboxEvent(event)) return undefined;
+  if (!isCrossRunOutboxEventType(event)) return undefined;
+  if (!isCrossRunOutboxEvent(event)) {
+    throw durableFactError("A2A outbox event metadata is malformed");
+  }
   if (event.runId !== source.runId || event.laneId !== source.laneId) {
     throw durableFactError("A2A outbox event is outside the bound source endpoint");
   }
@@ -503,6 +570,13 @@ function factFromEvent(
   if (factOccurredAt(normalized) !== event.occurredAt) {
     throw durableFactError("A2A outbox event time does not match its fact time");
   }
+  if (event.turnId !== undefined
+    || event.correlationId !== factCorrelationId(normalized)
+    || event.idempotencyKey !== `a2a:outbox:${sha256(factIdentity(normalized))}`
+    || event.visibility !== factVisibility(normalized)
+    || (event.causationId ?? undefined) !== (factCausationId(normalized) ?? undefined)) {
+    throw durableFactError("A2A outbox event provenance does not match its fact");
+  }
   return normalized;
 }
 
@@ -526,6 +600,16 @@ function assertFactPredecessor(
       "identity-forged",
     );
   }
+  const terminal = existing.find((candidate) => (
+    candidate.kind === "outbox.receipt"
+    && candidate.receipt.routeId === routeId
+  ));
+  if (terminal !== undefined) {
+    throw new CrossRunProtocolError(
+      "A2A route already has a terminal receipt",
+      "idempotency-conflict",
+    );
+  }
   if (fact.kind === "outbox.attempted") {
     if (fact.messageId !== pending.envelope.messageId) {
       throw new CrossRunProtocolError(
@@ -536,28 +620,47 @@ function assertFactPredecessor(
     return;
   }
   const receipt = fact.receipt;
-  if (
-    receipt.messageId !== pending.envelope.messageId
-    || receipt.idempotencyKey !== pending.envelope.idempotencyKey
-    || !sameEndpoint(receipt.target, pending.envelope.target)
-    || receipt.relationship !== pending.envelope.relationship
-  ) {
-    throw new CrossRunProtocolError(
-      "A2A receipt does not match its pending envelope",
-      "idempotency-conflict",
-    );
+  assertCrossRunReceiptMatchesEnvelope(receipt, pending.envelope);
+  if (receipt.attemptId !== undefined) {
+    const attempt = existing.find((candidate) => (
+      candidate.kind === "outbox.attempted"
+      && candidate.routeId === receipt.routeId
+      && candidate.attemptId === receipt.attemptId
+    ));
+    if (attempt === undefined) {
+      throw new CrossRunProtocolError(
+        "A2A receipt references an unknown delivery attempt",
+        "idempotency-conflict",
+      );
+    }
   }
 }
 
-function normalizeTargetAdmission(
+async function normalizeTargetAdmission(
   value: CrossRunTargetAdmissionInput,
   target: CrossRunEndpoint,
-): CrossRunTargetAdmissionInput {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+  verifySender?: (sender: CrossRunSenderIdentity) => boolean | Promise<boolean>,
+): Promise<CrossRunTargetAdmissionInput> {
+  if (!plainRecord(value)) {
     throw new CrossRunProtocolError("Target admission must be an object");
   }
+  exactKeys(value, ["envelope", "message", "source"], "target admission");
   const envelope = normalizeEnvelope(value.envelope);
   const source = normalizeSenderIdentity(value.source);
+  if (verifySender !== undefined) {
+    let verified = false;
+    try {
+      verified = await verifySender(source);
+    } catch {
+      verified = false;
+    }
+    if (verified !== true) {
+      throw new CrossRunProtocolError(
+        "authenticated sender proof was rejected",
+        "identity-forged",
+      );
+    }
+  }
   if (!sameEndpoint(envelope.target, target)) {
     throw new CrossRunProtocolError(
       "Envelope target does not match the bound target",
@@ -568,6 +671,13 @@ function normalizeTargetAdmission(
     throw new CrossRunProtocolError(
       "Authenticated sender does not match the envelope source",
       "identity-forged",
+    );
+  }
+  if (source.relationshipGrants !== undefined
+    && !source.relationshipGrants.includes(envelope.relationship)) {
+    throw new CrossRunProtocolError(
+      "Authenticated sender is not granted this route relationship",
+      "authorization-denied",
     );
   }
   for (const artifact of envelope.artifacts) {
@@ -598,14 +708,23 @@ function cloneSender(source: CrossRunSenderIdentity): CrossRunSenderIdentity {
     proof: structuredClone(source.proof),
     ...(source.relationshipGrants === undefined
       ? {}
-      : { relationshipGrants: [...source.relationshipGrants] }),
+      : { relationshipGrants: Object.freeze([...source.relationshipGrants]) }),
   });
 }
 
-function normalizeHostWakeResult(value: unknown): CrossRunHostWakeResult {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+function normalizeHostWakeResult(
+  value: unknown,
+  expectedRequest: CrossRunHostWakeRequest,
+): CrossRunHostWakeResult {
+  if (!plainRecord(value)) {
     throw new CrossRunProtocolError("Host wake returned an invalid result", "wake-failed");
   }
+  exactKeys(
+    value,
+    ["status", "retryAt", "admission", "wake"],
+    "host wake result",
+    "wake-failed",
+  );
   const candidate = value as Partial<CrossRunHostWakeResult>;
   if (
     candidate.status !== "queued"
@@ -615,31 +734,226 @@ function normalizeHostWakeResult(value: unknown): CrossRunHostWakeResult {
   ) {
     throw new CrossRunProtocolError("Host wake returned an unsupported status", "wake-failed");
   }
+  const daemonResult = value as Record<string, unknown>;
+  const hasAdmission = Object.hasOwn(daemonResult, "admission");
+  const hasWake = Object.hasOwn(daemonResult, "wake");
+  if (hasAdmission !== hasWake
+    || (hasAdmission && (!plainRecord(daemonResult.admission) || !plainRecord(daemonResult.wake)))) {
+    throw new CrossRunProtocolError("Host wake returned an invalid daemon result", "wake-failed");
+  }
+  if (hasAdmission) {
+    if (candidate.status !== "queued" && candidate.status !== "duplicate") {
+      throw new CrossRunProtocolError(
+        "Rich host wake returned an unsupported status",
+        "wake-failed",
+      );
+    }
+    const admission = daemonResult.admission as Record<string, unknown>;
+    exactKeys(admission, ["status", "inputId", "shouldActivate"], "host wake admission", "wake-failed");
+    if (admission.status !== "admitted" && admission.status !== "duplicate") {
+      throw new CrossRunProtocolError("Host wake admission status is invalid", "wake-failed");
+    }
+    const admissionInputId = wakeIdentifier(admission.inputId, "host wake admission.inputId");
+    if (admissionInputId !== expectedRequest.inputId) {
+      throw new CrossRunProtocolError(
+        "Host wake admission inputId does not match the generated wake",
+        "identity-forged",
+      );
+    }
+    if (admission.shouldActivate !== undefined && typeof admission.shouldActivate !== "boolean") {
+      throw new CrossRunProtocolError("Host wake admission.shouldActivate is invalid", "wake-failed");
+    }
+    const expectedStatus = admission.status === "admitted" || admission.shouldActivate === true
+      ? "queued"
+      : "duplicate";
+    if (candidate.status !== expectedStatus) {
+      throw new CrossRunProtocolError(
+        "Host wake status does not match its admission",
+        "wake-failed",
+      );
+    }
+    const wake = daemonResult.wake as Record<string, unknown>;
+    exactKeys(
+      wake,
+      ["runId", "source", "dedupeKey", "wakeId", "inputId", "payloadRef", "occurredAt"],
+      "host wake request",
+      "wake-failed",
+    );
+    const wakeRunId = wakeIdentifier(wake.runId, "host wake request.runId");
+    if (wakeRunId !== expectedRequest.runId) {
+      throw new CrossRunProtocolError(
+        "Host wake request runId does not match the target",
+        "identity-forged",
+      );
+    }
+    if (typeof wake.source !== "string") {
+      throw new CrossRunProtocolError("Host wake request source is invalid", "wake-failed");
+    }
+    if (wake.source !== expectedRequest.source) {
+      throw new CrossRunProtocolError(
+        "Host wake request source does not match the generated wake",
+        "identity-forged",
+      );
+    }
+    const wakeDedupeKey = wakeIdentifier(wake.dedupeKey, "host wake request.dedupeKey");
+    if (wakeDedupeKey !== expectedRequest.dedupeKey) {
+      throw new CrossRunProtocolError(
+        "Host wake request dedupeKey does not match the generated wake",
+        "identity-forged",
+      );
+    }
+    const wakeId = wakeIdentifier(wake.wakeId, "host wake request.wakeId");
+    if (wakeId !== expectedRequest.wakeId) {
+      throw new CrossRunProtocolError(
+        "Host wake request wakeId does not match the generated wake",
+        "identity-forged",
+      );
+    }
+    const wakeInputId = wakeIdentifier(wake.inputId, "host wake request.inputId");
+    if (wakeInputId !== expectedRequest.inputId) {
+      throw new CrossRunProtocolError(
+        "Host wake request inputId does not match the generated wake",
+        "identity-forged",
+      );
+    }
+    const wakeOccurredAt = wakeDateTime(wake.occurredAt, "host wake request.occurredAt");
+    if (wakeOccurredAt !== expectedRequest.occurredAt) {
+      throw new CrossRunProtocolError(
+        "Host wake request occurredAt does not match the generated wake",
+        "identity-forged",
+      );
+    }
+    if (Object.hasOwn(wake, "payloadRef")) {
+      // A host may attach a durable payload to the rich response. It is not
+      // used by this adapter, but accepting it without validating the CAS
+      // identity would let an untrusted daemon smuggle arbitrary metadata.
+      normalizeWakePayloadRef(wake.payloadRef);
+    }
+  }
   return {
     status: candidate.status,
     ...(candidate.retryAt === undefined
       ? {}
-      : { retryAt: dateTime(candidate.retryAt, "wake.retryAt") }),
+      : { retryAt: wakeDateTime(candidate.retryAt, "wake.retryAt") }),
   };
+}
+
+function normalizeWakePayloadRef(value: unknown): ArtifactRef {
+  if (!plainRecord(value)) {
+    throw new CrossRunProtocolError(
+      "Host wake request payloadRef must be an ArtifactRef",
+      "wake-failed",
+    );
+  }
+  exactKeys(
+    value,
+    ["id", "contentHash", "mediaType", "byteLength"],
+    "host wake request.payloadRef",
+    "wake-failed",
+  );
+  const id = wakeIdentifier(value.id, "host wake request.payloadRef.id");
+  const contentHash = wakeIdentifier(
+    value.contentHash,
+    "host wake request.payloadRef.contentHash",
+  );
+  if (!/^sha256:[0-9a-f]{64}$/u.test(contentHash) || id !== contentHash) {
+    throw new CrossRunProtocolError(
+      "Host wake request payloadRef has an invalid content identity",
+      "wake-failed",
+    );
+  }
+  const mediaType = wakeIdentifier(value.mediaType, "host wake request.payloadRef.mediaType");
+  if (!Number.isSafeInteger(value.byteLength) || (value.byteLength as number) < 0) {
+    throw new CrossRunProtocolError(
+      "Host wake request.payloadRef.byteLength is invalid",
+      "wake-failed",
+    );
+  }
+  return Object.freeze({
+    id,
+    contentHash,
+    mediaType,
+    byteLength: value.byteLength as number,
+  });
+}
+
+function wakeIdentifier(value: unknown, field: string): string {
+  try {
+    return identifier(value, field);
+  } catch (error: unknown) {
+    throw new CrossRunProtocolError(
+      error instanceof Error ? error.message : `${field} is invalid`,
+      "wake-failed",
+    );
+  }
+}
+
+function wakeDateTime(value: unknown, field: string): string {
+  const normalized = wakeIdentifier(value, field);
+  if (!Number.isFinite(Date.parse(normalized))) {
+    throw new CrossRunProtocolError(`${field} must be a valid date-time`, "wake-failed");
+  }
+  return normalized;
 }
 
 function isCrossRunOutboxEvent(event: unknown): event is CrossRunOutboxEvent {
   if (event === null || typeof event !== "object" || Array.isArray(event)) {
     return false;
   }
-  const candidate = event as Partial<CrossRunOutboxEvent>;
-  return (
+  const candidate = event as Partial<CrossRunOutboxEvent> & {
+    readonly schemaVersion?: unknown;
+    readonly eventId?: unknown;
+    readonly laneSeq?: unknown;
+    readonly contentHash?: unknown;
+  };
+  if (!(
     (candidate.type === "a2a.outbox.pending"
       || candidate.type === "a2a.outbox.attempted"
       || candidate.type === "a2a.outbox.receipt")
+    && candidate.schemaVersion === 1
+    && typeof candidate.eventId === "string"
+    && candidate.eventId.length > 0
+    && !candidate.eventId.includes("\0")
     && typeof candidate.runId === "string"
+    && candidate.runId.length > 0
+    && !candidate.runId.includes("\0")
     && typeof candidate.laneId === "string"
+    && candidate.laneId.length > 0
+    && !candidate.laneId.includes("\0")
     && typeof candidate.occurredAt === "string"
+    && typeof candidate.correlationId === "string"
+    && typeof candidate.idempotencyKey === "string"
+    && (candidate.visibility === "lane"
+      || candidate.visibility === "run"
+      || candidate.visibility === "user"
+      || candidate.visibility === "sensitive")
+    && (candidate.turnId === undefined || typeof candidate.turnId === "string")
+    && (candidate.causationId === undefined || typeof candidate.causationId === "string")
     && Number.isSafeInteger(candidate.globalOffset)
+    && (candidate.globalOffset as number) > 0
+    && Number.isSafeInteger(candidate.laneSeq)
+    && (candidate.laneSeq as number) > 0
+    && typeof candidate.contentHash === "string"
+    && /^sha256:[0-9a-f]{64}$/u.test(candidate.contentHash)
     && candidate.payload !== null
     && typeof candidate.payload === "object"
     && !Array.isArray(candidate.payload)
-  );
+  )) {
+    return false;
+  }
+  try {
+    return candidate.contentHash === computeEventContentHash(candidate as AnyEvent);
+  } catch {
+    return false;
+  }
+}
+
+function isCrossRunOutboxEventType(event: unknown): boolean {
+  if (event === null || typeof event !== "object" || Array.isArray(event)) return false;
+  const type = (event as { readonly type?: unknown }).type;
+  return type === "a2a.outbox.pending"
+    || type === "a2a.outbox.attempted"
+    || type === "a2a.outbox.receipt";
 }
 
 function factIdentity(fact: CrossRunFact): string {
@@ -673,6 +987,12 @@ function factVisibility(fact: CrossRunFact): Visibility {
   return fact.kind === "outbox.pending" ? fact.envelope.visibility : "run";
 }
 
+function factCausationId(fact: CrossRunFact): string | undefined {
+  if (fact.kind === "outbox.pending") return fact.envelope.causationId;
+  if (fact.kind === "outbox.attempted") return fact.messageId;
+  return fact.receipt.attemptId ?? fact.receipt.messageId;
+}
+
 function crossRunWakeIdentity(routeId: string, targetMessageId: string): string {
   const route = identifier(routeId, "routeId");
   const message = identifier(targetMessageId, "targetMessageId");
@@ -688,6 +1008,14 @@ function endpointScope(endpoint: CrossRunEndpoint): string {
   ]);
 }
 
+function runScope(endpoint: CrossRunEndpoint): string {
+  return stableJson([
+    endpoint.workspaceId,
+    endpoint.sessionId,
+    endpoint.runId,
+  ]);
+}
+
 function isInboxConflict(error: unknown): boolean {
   return error instanceof A2AProtocolError
     && error.message.startsWith("Conflicting idempotencyKey ");
@@ -696,6 +1024,26 @@ function isInboxConflict(error: unknown): boolean {
 function assertOptions(value: unknown): asserts value is Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new CrossRunProtocolError("adapter options must be an object");
+  }
+}
+
+function plainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function exactKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  path: string,
+  code: CrossRunProtocolError["code"] = "invalid-request",
+): void {
+  const accepted = new Set(allowed);
+  for (const key of Object.keys(value)) {
+    if (!accepted.has(key)) {
+      throw new CrossRunProtocolError(`${path}.${key} is not allowed`, code);
+    }
   }
 }
 
@@ -751,3 +1099,10 @@ function runLedgerExclusive<T>(
     if (tails.get(key) === tail) tails.delete(key);
   });
 }
+
+/** Compatibility names used by hosts that describe these as Ledger-backed adapters. */
+export {
+  LedgerCrossRunFactStore as LedgerBackedCrossRunFactStore,
+  LedgerCrossRunTargetAdmission as LedgerBackedCrossRunTargetAdmission,
+  CrossRunHostWakeAdapter as DaemonWakeCrossRunAdapter,
+};

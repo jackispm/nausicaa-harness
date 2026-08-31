@@ -16,6 +16,8 @@ import type {
   TokenUsage,
   TurnId,
   Visibility,
+  CrossRunEnvelope,
+  CrossRunReceipt,
 } from "./types.js";
 import type {
   ContextCompactionBudget,
@@ -199,6 +201,15 @@ export interface EventPayloadMap {
     reason: string;
   };
   "message.sent": { message: A2AMessage };
+  /** Source-side cross-Run delivery saga facts. */
+  "a2a.outbox.pending": { envelope: CrossRunEnvelope; recordedAt: string };
+  "a2a.outbox.attempted": {
+    routeId: string;
+    messageId: string;
+    attemptId: string;
+    attemptedAt: string;
+  };
+  "a2a.outbox.receipt": { receipt: CrossRunReceipt };
   "message.claimed": { messageId: string; claimedBy: LaneId };
   "message.handled": { messageId: string };
   "teto.advice.generated": {

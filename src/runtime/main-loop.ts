@@ -1303,7 +1303,7 @@ function defaultNavigationDelta(
     && previousDelta.uncertainties.some((uncertainty) => uncertainty.includes(failure))
   ));
   const mutationDecision = toolCalls.some((call) => {
-    if (call.name !== "write_file" && call.name !== "edit") return false;
+    if (call.name !== "write_file" && call.name !== "edit" && call.name !== "apply_patch") return false;
     const result = toolResults.find((message) => (
       message.role === "tool" && message.toolCallId === call.id
     ));

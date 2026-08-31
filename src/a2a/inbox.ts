@@ -146,8 +146,14 @@ export class InboxProjector {
     return record === undefined ? undefined : clone(record);
   }
 
-  findByIdempotency(runId: string, idempotencyKey: string): InboxRecord | undefined {
-    const messageId = this.idempotency.get(idempotencyScope(runId, idempotencyKey));
+  findByIdempotency(
+    runId: string,
+    idempotencyKey: string,
+    routeId?: string,
+  ): InboxRecord | undefined {
+    const messageId = this.idempotency.get(
+      messageIdempotencyScope(runId, idempotencyKey, routeId),
+    );
     return messageId === undefined ? undefined : this.get(messageId);
   }
 
@@ -172,7 +178,11 @@ export class InboxProjector {
       return;
     }
 
-    const scope = idempotencyScope(message.runId, message.idempotencyKey);
+    const scope = messageIdempotencyScope(
+      message.runId,
+      message.idempotencyKey,
+      message.routeId,
+    );
     const duplicateId = this.idempotency.get(scope);
     if (duplicateId !== undefined && duplicateId !== message.messageId) {
       const duplicate = this.records.get(duplicateId);
@@ -329,6 +339,7 @@ export class A2AInbox {
     const existing = this.projector.findByIdempotency(
       message.runId,
       message.idempotencyKey,
+      message.routeId,
     );
     if (existing !== undefined) {
       if (!sameLogicalSend(existing.message, message)) {
@@ -373,7 +384,9 @@ export class A2AInbox {
       payload: { message: clone(message) },
       ...(message.causationId === undefined ? {} : { causationId: message.causationId }),
       correlationId: message.correlationId,
-      idempotencyKey: `a2a:send:${message.idempotencyKey}`,
+      idempotencyKey: message.routeId === undefined
+        ? `a2a:send:${message.idempotencyKey}`
+        : `a2a:send:${message.routeId}:${message.idempotencyKey}`,
       visibility: message.visibility,
       occurredAt: message.createdAt,
     });
@@ -885,6 +898,16 @@ function sameJson(left: unknown, right: unknown): boolean {
 
 function idempotencyScope(runId: string, key: string): string {
   return `${runId}\u0000${key}`;
+}
+
+function messageIdempotencyScope(
+  runId: string,
+  key: string,
+  routeId?: string,
+): string {
+  return routeId === undefined
+    ? idempotencyScope(runId, key)
+    : idempotencyScope(runId, `cross-run\u0000${routeId}\u0000${key}`);
 }
 
 function claimIdFromEvent(

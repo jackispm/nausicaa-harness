@@ -46,6 +46,103 @@ export interface ArtifactRef {
   byteLength: number;
 }
 
+/** Stable machine identity for one addressable lane in a persisted Session/Run. */
+export interface CrossRunEndpoint {
+  workspaceId: string;
+  sessionId: string;
+  runId: RunId;
+  laneId: LaneId;
+}
+
+export type CrossRunRelationship = "parent" | "sibling" | "child" | "direct";
+export type CrossRunEndpointStatus = "idle" | "busy" | "inactive";
+
+/**
+ * A verified content-addressed copy. Paths and transport credentials are
+ * deliberately absent from the durable contract.
+ */
+export interface CrossRunArtifactDelivery {
+  sourceRef: ArtifactRef;
+  targetRef: ArtifactRef;
+  visibility: Visibility;
+  targetWorkspaceId: string;
+}
+
+/** Trusted route metadata attached by the host, never accepted from model input. */
+export interface CrossRunRoute {
+  routeId: string;
+  source: CrossRunEndpoint;
+  target: CrossRunEndpoint;
+  relationship: CrossRunRelationship;
+  artifacts: CrossRunArtifactDelivery[];
+}
+
+/** Trusted envelope assembled after target resolution and authorization. */
+export interface CrossRunEnvelope {
+  readonly protocolVersion: 1;
+  readonly messageId: string;
+  readonly routeId: string;
+  readonly source: CrossRunEndpoint;
+  readonly target: CrossRunEndpoint;
+  readonly relationship: CrossRunRelationship;
+  readonly conversationId: string;
+  readonly threadId: string;
+  readonly correlationId: string;
+  readonly idempotencyKey: string;
+  readonly createdAt: string;
+  readonly expiresAt?: string;
+  readonly causationId?: string;
+  readonly visibility: Visibility;
+  readonly priority: number;
+  readonly payload: A2APayload;
+  readonly artifacts: readonly CrossRunArtifactDelivery[];
+}
+
+export type CrossRunReceiptStatus =
+  | "accepted"
+  | "queued"
+  | "delivered"
+  | "handled"
+  | "duplicate"
+  | "expired"
+  | "rejected"
+  | "uncertain"
+  | "conflict";
+
+export type CrossRunReceiptReason =
+  | "authorization-denied"
+  | "cross-workspace-reauthentication-required"
+  | "target-capacity"
+  | "rate-limited"
+  | "stale-lease"
+  | "target-unavailable"
+  | "artifact-rejected"
+  | "artifact-integrity"
+  | "wake-failed"
+  | "target-admission-failed"
+  | "source-receipt-failed"
+  | "delivery-attempt-without-receipt"
+  | "idempotency-conflict"
+  | "expired";
+
+export interface CrossRunReceipt {
+  readonly protocolVersion: 1;
+  readonly receiptId: string;
+  readonly routeId: string;
+  readonly messageId: string;
+  readonly idempotencyKey: string;
+  readonly source: CrossRunEndpoint;
+  readonly target: CrossRunEndpoint;
+  readonly relationship: CrossRunRelationship;
+  readonly status: CrossRunReceiptStatus;
+  readonly recordedAt: string;
+  readonly targetMessageId?: string;
+  readonly attemptId?: string;
+  readonly reason?: CrossRunReceiptReason;
+  readonly retryAt?: string;
+  readonly diagnostic?: string;
+}
+
 export interface ToolCall {
   id: string;
   name: string;
@@ -237,6 +334,12 @@ export interface A2AMessage {
   priority: number;
   delivery: DeliveryMode;
   payload: A2APayload;
+  /** Optional metadata for the cross-Run adapter; ignored by legacy Inbox consumers. */
+  routeId?: string;
+  routeRelationship?: CrossRunRelationship;
+  routeArtifacts?: CrossRunArtifactDelivery[];
+  sourceEndpoint?: CrossRunEndpoint;
+  targetEndpoint?: CrossRunEndpoint;
 }
 
 interface RunPolicyBase {

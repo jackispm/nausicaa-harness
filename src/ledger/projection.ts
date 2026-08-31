@@ -16,6 +16,19 @@ import type {
 } from "../domain/types.js";
 import { cloneJson } from "./hash.js";
 
+// Cross-Run projections live with the router because they consume its saga
+// facts, but are re-exported here alongside the ordinary Ledger projection
+// surface for persistence/recovery callers.
+export {
+  projectCrossRunFacts,
+  projectA2AReceipts,
+  projectCrossRunInbox,
+} from "../a2a/cross-run-router.js";
+export type {
+  CrossRunProjection,
+  CrossRunReceiptView,
+} from "../a2a/cross-run-router.js";
+
 export type RunStatus = "not-started" | "running" | "completed" | "failed";
 
 export interface RunView {

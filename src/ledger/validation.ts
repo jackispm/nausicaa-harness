@@ -1,5 +1,10 @@
 import type { EventPayloadMap, EventType } from "../domain/events.js";
 import {
+  envelopeToA2AMessage,
+  normalizeEnvelope,
+  normalizeReceipt,
+} from "../a2a/cross-run-contract.js";
+import {
   CONTEXT_MANIFEST_SCHEMA_VERSION,
   deriveContextCompactionAttemptId,
   deriveContextCompactionId,
@@ -25,6 +30,7 @@ import type {
   RunPolicy,
   TaskBudget,
   TokenUsage,
+  Visibility,
 } from "../domain/types.js";
 
 type PayloadValidator = (value: unknown, path: string) => void;
@@ -659,6 +665,39 @@ function a2aMessage(value: unknown, path: string): asserts value is A2AMessage {
   optionalString(item.parentId, `${path}.parentId`);
   optionalString(item.replyTo, `${path}.replyTo`);
   optionalString(item.causationId, `${path}.causationId`);
+  const crossRunFields = [
+    "routeId",
+    "routeRelationship",
+    "routeArtifacts",
+    "sourceEndpoint",
+    "targetEndpoint",
+  ] as const;
+  // Treat explicitly supplied `undefined` optionals like absent legacy fields.
+  // A partially populated route (at least one defined field) still must carry
+  // the complete trusted metadata set below.
+  const hasCrossRunMetadata = crossRunFields.some((field) => item[field] !== undefined);
+  if (hasCrossRunMetadata) {
+    // Cross-Run routes carry their own stable topology and causal identity.
+    // Legacy parent/reply fields are ambiguous here and must not be allowed
+    // to smuggle a second route relationship into the trusted envelope.
+    if (item.parentId !== undefined || item.replyTo !== undefined) {
+      invalid(`${path}.parentId`, "absent for a cross-Run message");
+    }
+    for (const field of crossRunFields) {
+      if (item[field] === undefined) {
+        invalid(`${path}.${field}`, "present with the complete cross-Run route metadata");
+      }
+    }
+    crossRunEndpoint(item.sourceEndpoint, `${path}.sourceEndpoint`);
+    crossRunEndpoint(item.targetEndpoint, `${path}.targetEndpoint`);
+    if (item.routeArtifacts !== undefined) {
+      crossRunArtifactDeliveries(
+        item.routeArtifacts,
+        `${path}.routeArtifacts`,
+        item.targetEndpoint as Record<string, unknown>,
+      );
+    }
+  }
   dateTime(item.createdAt, `${path}.createdAt`);
   if (item.expiresAt !== undefined) {
     dateTime(item.expiresAt, `${path}.expiresAt`);
@@ -743,6 +782,90 @@ function a2aMessage(value: unknown, path: string): asserts value is A2AMessage {
       string(payload.text, `${path}.payload.text`);
       break;
   }
+  if (hasCrossRunMetadata) {
+    if (item.delivery !== "next-step") {
+      invalid(`${path}.delivery`, "next-step for a cross-Run message");
+    }
+    let envelope: ReturnType<typeof normalizeEnvelope>;
+    try {
+      envelope = normalizeEnvelope({
+        protocolVersion: 1,
+        messageId: item.messageId,
+        routeId: item.routeId,
+        source: item.sourceEndpoint,
+        target: item.targetEndpoint,
+        relationship: item.routeRelationship,
+        conversationId: item.conversationId,
+        threadId: item.threadId,
+        correlationId: item.correlationId,
+        idempotencyKey: item.idempotencyKey,
+        createdAt: item.createdAt,
+        ...(item.expiresAt === undefined ? {} : { expiresAt: item.expiresAt }),
+        ...(item.causationId === undefined ? {} : { causationId: item.causationId }),
+        visibility: item.visibility,
+        priority: item.priority,
+        payload: item.payload,
+        artifacts: item.routeArtifacts,
+      });
+    } catch (error: unknown) {
+      invalid(
+        path,
+        error instanceof Error ? `a valid cross-Run envelope (${error.message})` : "a valid cross-Run envelope",
+      );
+    }
+    const expected = envelopeToA2AMessage(envelope);
+    for (const field of [
+      "messageId",
+      "runId",
+      "conversationId",
+      "threadId",
+      "from",
+      "to",
+      "createdAt",
+      "correlationId",
+      "idempotencyKey",
+      "visibility",
+      "priority",
+      "delivery",
+      "payload",
+      "routeId",
+      "routeRelationship",
+      "routeArtifacts",
+      "sourceEndpoint",
+      "targetEndpoint",
+    ] as const) {
+      if (stableJson(item[field]) !== stableJson(expected[field])) {
+        invalid(`${path}.${field}`, "match its trusted cross-Run envelope");
+      }
+    }
+    if ((item.expiresAt ?? undefined) !== (expected.expiresAt ?? undefined)) {
+      invalid(`${path}.expiresAt`, "match its trusted cross-Run envelope");
+    }
+    if ((item.causationId ?? undefined) !== (expected.causationId ?? undefined)) {
+      invalid(`${path}.causationId`, "match its trusted cross-Run envelope");
+    }
+  }
+}
+
+function crossRunEndpoint(value: unknown, path: string): void {
+  const item = record(value, path);
+  const keys = ["workspaceId", "sessionId", "runId", "laneId"];
+  for (const key of keys) string(item[key], `${path}.${key}`, false);
+  for (const key of Object.keys(item)) if (!keys.includes(key)) invalid(`${path}.${key}`, "a known endpoint field");
+}
+
+function crossRunArtifactDeliveries(value: unknown, path: string, target: Record<string, unknown>): void {
+  if (!Array.isArray(value)) invalid(path, "an array");
+  value.forEach((candidate, index) => {
+    const item = payloadObject(candidate, `${path}[${index}]`, ["sourceRef", "targetRef", "visibility", "targetWorkspaceId"]);
+    exactKeys(item, ["sourceRef", "targetRef", "visibility", "targetWorkspaceId"], `${path}[${index}]`);
+    artifactRef(item.sourceRef, `${path}[${index}].sourceRef`);
+    artifactRef(item.targetRef, `${path}[${index}].targetRef`);
+    if (stableJson(item.sourceRef) !== stableJson(item.targetRef)) invalid(`${path}[${index}]`, "matching source and target ArtifactRefs");
+    oneOf(item.visibility, `${path}[${index}].visibility`, ["lane", "run", "user", "sensitive"] as const);
+    string(item.targetWorkspaceId, `${path}[${index}].targetWorkspaceId`, false);
+    if (item.targetWorkspaceId !== target.workspaceId) invalid(`${path}[${index}].targetWorkspaceId`, "equal to target workspaceId");
+  });
 }
 
 function payloadObject(
@@ -757,6 +880,13 @@ function payloadObject(
     }
   }
   return item;
+}
+
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[], path: string): void {
+  const accepted = new Set(allowed);
+  for (const key of Object.keys(value)) {
+    if (!accepted.has(key)) invalid(`${path}.${key}`, "a known field");
+  }
 }
 
 const payloadValidators = {
@@ -1126,6 +1256,33 @@ const payloadValidators = {
   "message.sent": (value, path) => {
     const item = payloadObject(value, path, ["message"]);
     a2aMessage(item.message, `${path}.message`);
+  },
+  "a2a.outbox.pending": (value, path) => {
+    const item = payloadObject(value, path, ["envelope", "recordedAt"]);
+    exactKeys(item, ["envelope", "recordedAt"], path);
+    try {
+      normalizeEnvelope(item.envelope);
+    } catch (error: unknown) {
+      invalid(`${path}.envelope`, error instanceof Error ? error.message : "a valid cross-Run envelope");
+    }
+    dateTime(item.recordedAt, `${path}.recordedAt`);
+  },
+  "a2a.outbox.attempted": (value, path) => {
+    const item = payloadObject(value, path, ["routeId", "messageId", "attemptId", "attemptedAt"]);
+    exactKeys(item, ["routeId", "messageId", "attemptId", "attemptedAt"], path);
+    string(item.routeId, `${path}.routeId`, false);
+    string(item.messageId, `${path}.messageId`, false);
+    string(item.attemptId, `${path}.attemptId`, false);
+    dateTime(item.attemptedAt, `${path}.attemptedAt`);
+  },
+  "a2a.outbox.receipt": (value, path) => {
+    const item = payloadObject(value, path, ["receipt"]);
+    exactKeys(item, ["receipt"], path);
+    try {
+      normalizeReceipt(item.receipt);
+    } catch (error: unknown) {
+      invalid(`${path}.receipt`, error instanceof Error ? error.message : "a valid cross-Run receipt");
+    }
   },
   "message.claimed": (value, path) => {
     const item = payloadObject(value, path, ["messageId", "claimedBy"]);
@@ -1508,6 +1665,163 @@ export function validateCompactionRequestEnvelope(
       "payload(fukai.compaction.requested).compactionId",
       "derived from the run, lane, and requested compaction identity",
     );
+  }
+}
+
+export interface CrossRunEventMetadata {
+  readonly occurredAt?: string | undefined;
+  readonly turnId?: string | undefined;
+  readonly causationId?: string | undefined;
+  readonly correlationId?: string | undefined;
+  readonly idempotencyKey?: string | undefined;
+  readonly visibility?: Visibility | undefined;
+}
+
+/** Bind cross-Run facts/messages to the complete Ledger event identity. */
+export function validateCrossRunEventEnvelope(
+  type: EventType,
+  value: unknown,
+  runId: string,
+  laneId: string,
+  occurredAt: string,
+  metadata?: CrossRunEventMetadata,
+): void {
+  if (type === "a2a.outbox.pending") {
+    const item = value as NonNullable<EventPayloadMap[typeof type]>;
+    const envelope = normalizeEnvelope(item.envelope);
+    if (envelope.source.runId !== runId || envelope.source.laneId !== laneId) {
+      invalid(
+        `payload(${type}).envelope.source`,
+        "bound to the event runId and laneId",
+      );
+    }
+    if (item.recordedAt !== occurredAt) {
+      invalid(`payload(${type}).recordedAt`, "equal to event occurredAt");
+    }
+    if (metadata !== undefined) {
+      crossRunMetadata(metadata, {
+        correlationId: envelope.correlationId,
+        idempotencyKey: `a2a:outbox:${sha256(`outbox.pending\u0000${envelope.routeId}`)}`,
+        visibility: envelope.visibility,
+        causationId: envelope.causationId,
+      }, type);
+    }
+    return;
+  }
+  if (type === "a2a.outbox.attempted") {
+    const item = value as NonNullable<EventPayloadMap[typeof type]>;
+    if (item.attemptedAt !== occurredAt) {
+      invalid(`payload(${type}).attemptedAt`, "equal to event occurredAt");
+    }
+    if (metadata !== undefined) {
+      crossRunMetadata(metadata, {
+        correlationId: `a2a:${sha256(item.routeId)}`,
+        idempotencyKey: `a2a:outbox:${sha256(`outbox.attempted\u0000${item.routeId}\u0000${item.attemptId}`)}`,
+        visibility: "run",
+        causationId: item.messageId,
+      }, type);
+    }
+    return;
+  }
+  if (type === "a2a.outbox.receipt") {
+    const item = value as NonNullable<EventPayloadMap[typeof type]>;
+    const receipt = normalizeReceipt(item.receipt);
+    if (receipt.source.runId !== runId || receipt.source.laneId !== laneId) {
+      invalid(
+        `payload(${type}).receipt.source`,
+        "bound to the event runId and laneId",
+      );
+    }
+    if (receipt.recordedAt !== occurredAt) {
+      invalid(`payload(${type}).receipt.recordedAt`, "equal to event occurredAt");
+    }
+    if (metadata !== undefined) {
+      crossRunMetadata(metadata, {
+        correlationId: `a2a:${sha256(receipt.routeId)}`,
+        idempotencyKey: `a2a:outbox:${sha256(`outbox.receipt\u0000${receipt.routeId}\u0000${receipt.status}`)}`,
+        visibility: "run",
+        causationId: receipt.attemptId ?? receipt.messageId,
+      }, type);
+    }
+    return;
+  }
+  if (type === "message.sent") {
+    const item = value as NonNullable<EventPayloadMap[typeof type]>;
+    const message = item.message;
+    const hasCrossRunMetadata = [
+      "routeId",
+      "routeRelationship",
+      "routeArtifacts",
+      "sourceEndpoint",
+      "targetEndpoint",
+    ].some((field) => (
+      (message as unknown as Record<string, unknown>)[field] !== undefined
+    ));
+    if (!hasCrossRunMetadata) return;
+    const envelope = normalizeEnvelope({
+      protocolVersion: 1,
+      messageId: message.messageId,
+      routeId: message.routeId,
+      source: message.sourceEndpoint,
+      target: message.targetEndpoint,
+      relationship: message.routeRelationship,
+      conversationId: message.conversationId,
+      threadId: message.threadId,
+      correlationId: message.correlationId,
+      idempotencyKey: message.idempotencyKey,
+      createdAt: message.createdAt,
+      ...(message.expiresAt === undefined ? {} : { expiresAt: message.expiresAt }),
+      ...(message.causationId === undefined ? {} : { causationId: message.causationId }),
+      visibility: message.visibility,
+      priority: message.priority,
+      payload: message.payload,
+      artifacts: message.routeArtifacts,
+    });
+    if (envelope.target.runId !== runId || envelope.source.laneId !== laneId) {
+      invalid(`payload(${type}).message`, "bound to the event target run and source lane");
+    }
+    if (metadata !== undefined) {
+      crossRunMetadata(metadata, {
+        correlationId: message.correlationId,
+        idempotencyKey: message.routeId === undefined
+          ? `a2a:send:${message.idempotencyKey}`
+          : `a2a:send:${message.routeId}:${message.idempotencyKey}`,
+        visibility: message.visibility,
+        causationId: message.causationId,
+        occurredAt: message.createdAt,
+      }, type);
+    }
+  }
+}
+
+function crossRunMetadata(
+  actual: CrossRunEventMetadata,
+  expected: {
+    readonly correlationId: string;
+    readonly idempotencyKey: string;
+    readonly visibility: Visibility;
+    readonly causationId?: string | undefined;
+    readonly occurredAt?: string | undefined;
+  },
+  type: EventType,
+): void {
+  if (actual.turnId !== undefined) {
+    invalid(`event(${type}).turnId`, "absent for a cross-Run fact");
+  }
+  if (actual.correlationId !== expected.correlationId) {
+    invalid(`event(${type}).correlationId`, "match its cross-Run provenance");
+  }
+  if (actual.idempotencyKey !== expected.idempotencyKey) {
+    invalid(`event(${type}).idempotencyKey`, "match its cross-Run provenance");
+  }
+  if (actual.visibility !== expected.visibility) {
+    invalid(`event(${type}).visibility`, "match its cross-Run provenance");
+  }
+  if ((actual.causationId ?? undefined) !== (expected.causationId ?? undefined)) {
+    invalid(`event(${type}).causationId`, "match its cross-Run provenance");
+  }
+  if (expected.occurredAt !== undefined && actual.occurredAt !== expected.occurredAt) {
+    invalid(`event(${type}).occurredAt`, "match its cross-Run provenance");
   }
 }
 

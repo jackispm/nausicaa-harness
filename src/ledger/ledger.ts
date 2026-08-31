@@ -10,10 +10,16 @@ import type {
 import type { Clock } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
 import type { ArtifactRef, EventId, RunId, TurnId } from "../domain/types.js";
+import {
+  normalizeEnvelope,
+  normalizeReceipt,
+  sameEndpoint,
+} from "../a2a/cross-run-contract.js";
 import { cloneJson, sha256, stableJson } from "./hash.js";
 import {
   eventTypes,
   validateCompactionRequestEnvelope,
+  validateCrossRunEventEnvelope,
   validateEventPayload,
   validateMessageRun,
 } from "./validation.js";
@@ -156,6 +162,21 @@ export function validateEvent(event: unknown): asserts event is AnyEvent {
       candidate.payload,
       candidate.runId,
       candidate.laneId,
+    );
+    validateCrossRunEventEnvelope(
+      candidate.type,
+      candidate.payload,
+      candidate.runId,
+      candidate.laneId,
+      candidate.occurredAt,
+      {
+        occurredAt: candidate.occurredAt,
+        turnId: candidate.turnId,
+        causationId: candidate.causationId,
+        correlationId: candidate.correlationId,
+        idempotencyKey: candidate.idempotencyKey,
+        visibility: candidate.visibility,
+      },
     );
     const payloadTurnId = "turnId" in candidate.payload
       ? candidate.payload.turnId
@@ -419,6 +440,8 @@ export class LedgerState {
       );
     }
 
+    this.#validateCrossRunPredecessor(event);
+
     if (event.type === "input.admitted") {
       const inputScope = `${event.runId}\u0000${event.payload.inputId}`;
       if (this.#inputAdmissions.has(inputScope)) {
@@ -523,6 +546,96 @@ export class LedgerState {
       }
     }
 
+  }
+
+  /**
+   * A2A saga facts are ordinary Ledger events, so the Ledger itself must
+   * enforce their causal order. The adapter performs the same checks at its
+   * port boundary, but callers can append directly to a Ledger as well.
+   */
+  #validateCrossRunPredecessor(event: AnyEvent): void {
+    if (
+      event.type !== "a2a.outbox.pending"
+      && event.type !== "a2a.outbox.attempted"
+      && event.type !== "a2a.outbox.receipt"
+    ) {
+      return;
+    }
+
+    const prior = this.#events;
+    if (event.type === "a2a.outbox.pending") {
+      const routeId = normalizeEnvelope(event.payload.envelope).routeId;
+      if (prior.some((candidate) => (
+        candidate.type === "a2a.outbox.pending"
+        && normalizeEnvelope(candidate.payload.envelope).routeId === routeId
+      ))) {
+        throw new LedgerCorruptionError(
+          `A2A route ${routeId} already has a pending fact`,
+        );
+      }
+      return;
+    }
+
+    const routeId = event.type === "a2a.outbox.attempted"
+      ? event.payload.routeId
+      : event.payload.receipt.routeId;
+    const pendingEvent = prior.find((candidate) => (
+      candidate.type === "a2a.outbox.pending"
+      && normalizeEnvelope(candidate.payload.envelope).routeId === routeId
+    ));
+    if (pendingEvent === undefined || pendingEvent.type !== "a2a.outbox.pending") {
+      throw new LedgerCorruptionError(
+        `A2A ${event.type} has no durable pending predecessor`,
+      );
+    }
+    const pending = normalizeEnvelope(pendingEvent.payload.envelope);
+
+    const terminalEvent = prior.find((candidate) => (
+      candidate.type === "a2a.outbox.receipt"
+      && normalizeReceipt(candidate.payload.receipt).routeId === routeId
+    ));
+    if (terminalEvent !== undefined) {
+      throw new LedgerCorruptionError(
+        `A2A route ${routeId} already has a terminal receipt`,
+      );
+    }
+
+    if (event.type === "a2a.outbox.attempted") {
+      if (
+        event.payload.messageId !== pending.messageId
+        || event.runId !== pending.source.runId
+        || event.laneId !== pending.source.laneId
+      ) {
+        throw new LedgerCorruptionError(
+          `A2A attempt ${event.payload.attemptId} does not match its pending envelope`,
+        );
+      }
+      return;
+    }
+
+    const receipt = normalizeReceipt(event.payload.receipt);
+    if (
+      receipt.messageId !== pending.messageId
+      || receipt.idempotencyKey !== pending.idempotencyKey
+      || !sameEndpoint(receipt.source, pending.source)
+      || !sameEndpoint(receipt.target, pending.target)
+      || receipt.relationship !== pending.relationship
+      || receipt.source.runId !== event.runId
+      || receipt.source.laneId !== event.laneId
+    ) {
+      throw new LedgerCorruptionError(
+        `A2A receipt for route ${routeId} does not match its pending envelope`,
+      );
+    }
+    if (receipt.attemptId !== undefined && !prior.some((candidate) => (
+      candidate.type === "a2a.outbox.attempted"
+      && candidate.payload.routeId === routeId
+      && candidate.payload.attemptId === receipt.attemptId
+    ))) {
+      throw new LedgerCorruptionError(
+        `A2A receipt for route ${routeId} references an unknown attempt`,
+      );
+    }
   }
 
   #validateAppend(input: AppendEvent): void {

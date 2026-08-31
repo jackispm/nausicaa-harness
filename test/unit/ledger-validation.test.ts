@@ -33,6 +33,11 @@ import {
 import { validateEventPayload } from "../../src/ledger/validation.js";
 import { compactionIntegrityReasons } from "../../src/fukai/index.js";
 import { createArtifactRef } from "../../src/store/index.js";
+import {
+  createCrossRunMessageId,
+  createCrossRunReceiptId,
+  createCrossRunRouteId,
+} from "../../src/a2a/index.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -116,6 +121,64 @@ const message: A2AMessage = {
   priority: 10,
   delivery: "next-step",
   payload: { type: "advice.propose", advice },
+};
+const crossRunSource = {
+  workspaceId: "workspace-1",
+  sessionId: "session-source",
+  runId: "run-1",
+  laneId: "main",
+};
+const crossRunTarget = {
+  workspaceId: "workspace-1",
+  sessionId: "session-target",
+  runId: "run-2",
+  laneId: "worker",
+};
+const crossRunRouteId = createCrossRunRouteId(
+  crossRunSource,
+  crossRunTarget,
+  "cross-run-message-1",
+);
+const crossRunMessage = {
+  payload: { type: "message.inform" as const, text: "hello" },
+  conversationId: "conversation-cross-run",
+  threadId: "thread-cross-run",
+  correlationId: "correlation-cross-run",
+  visibility: "run" as const,
+  priority: 1,
+  artifactRefs: [],
+};
+const crossRunMessageId = createCrossRunMessageId(crossRunRouteId, crossRunMessage);
+const crossRunEnvelope = {
+  protocolVersion: 1 as const,
+  messageId: crossRunMessageId,
+  routeId: crossRunRouteId,
+  source: crossRunSource,
+  target: crossRunTarget,
+  relationship: "direct" as const,
+  conversationId: crossRunMessage.conversationId,
+  threadId: crossRunMessage.threadId,
+  correlationId: crossRunMessage.correlationId,
+  idempotencyKey: "cross-run-message-1",
+  createdAt: "2026-08-26T00:00:00.000Z",
+  visibility: crossRunMessage.visibility,
+  priority: crossRunMessage.priority,
+  payload: crossRunMessage.payload,
+  artifacts: [],
+};
+const crossRunReceipt = {
+  protocolVersion: 1 as const,
+  receiptId: createCrossRunReceiptId(crossRunRouteId, "queued"),
+  routeId: crossRunRouteId,
+  messageId: crossRunMessageId,
+  idempotencyKey: crossRunEnvelope.idempotencyKey,
+  source: crossRunSource,
+  target: crossRunTarget,
+  relationship: "direct" as const,
+  status: "queued" as const,
+  recordedAt: "2026-08-26T00:00:02.000Z",
+  targetMessageId: crossRunMessageId,
+  attemptId: "attempt-1",
 };
 
 const validPayloads = {
@@ -238,6 +301,17 @@ const validPayloads = {
     reason: "process-interrupted",
   },
   "message.sent": { message },
+  "a2a.outbox.pending": {
+    envelope: crossRunEnvelope,
+    recordedAt: crossRunEnvelope.createdAt,
+  },
+  "a2a.outbox.attempted": {
+    routeId: crossRunRouteId,
+    messageId: crossRunMessageId,
+    attemptId: "attempt-1",
+    attemptedAt: "2026-08-26T00:00:01.000Z",
+  },
+  "a2a.outbox.receipt": { receipt: crossRunReceipt },
   "message.claimed": { messageId: "message-1", claimedBy: "main" },
   "message.handled": { messageId: "message-1" },
   "teto.advice.generated": { advice, delivery: "shadow" },
@@ -431,6 +505,19 @@ const invalidPayloads = {
     reason: "unknown",
   },
   "message.sent": { message: { ...message, priority: -1 } },
+  "a2a.outbox.pending": {
+    envelope: { ...crossRunEnvelope, routeId: "forged-route" },
+    recordedAt: crossRunEnvelope.createdAt,
+  },
+  "a2a.outbox.attempted": {
+    routeId: "",
+    messageId: crossRunMessageId,
+    attemptId: "attempt-1",
+    attemptedAt: "2026-08-26T00:00:01.000Z",
+  },
+  "a2a.outbox.receipt": {
+    receipt: { ...crossRunReceipt, receiptId: "forged-receipt" },
+  },
   "message.claimed": { messageId: "", claimedBy: "main" },
   "message.handled": { messageId: null },
   "teto.advice.generated": {

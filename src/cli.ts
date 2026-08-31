@@ -48,6 +48,10 @@ import { UnknownToolOperationError } from "./runtime/recovery.js";
 import { createMcpEdgeAdapter } from "./mowe/edges/mcp.js";
 import { createSkillsEdgeAdapter } from "./mowe/edges/skills.js";
 import { runRemoteAttach } from "./cli/remote-attach.js";
+import {
+  createEdgeSelectionController,
+  type EdgeSelectionController,
+} from "./cli/edge-selection.js";
 
 const VERSION = "0.1.0";
 
@@ -203,6 +207,7 @@ const main = async (): Promise<number> => {
         return await runInteractive({
           session,
           edgeStatus: edgeRuntime.status,
+          edgeSelection: edgeRuntime.selection,
           ...(initialMessage === undefined ? {} : { initialMessage }),
           ...(processedImages.images.length === 0
             ? {}
@@ -473,6 +478,7 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
 interface CliEdgeRuntime {
   readonly composition: ConfiguredEdgeComposition;
   readonly provider: EdgeTurnSnapshotProvider;
+  readonly selection: EdgeSelectionController;
   readonly status: () => EdgeStatusProjection;
 }
 
@@ -488,12 +494,20 @@ const openCliEdgeRuntime = async (
     constructors: cliEdgeConstructors(),
     startupRefresh: refreshRequested || settings.edges.refreshOnStart,
   });
-  // Discovery is visible in status, but Skill bodies require an explicit host selector.
-  const provider = createRegistryEdgeTurnSnapshotProvider(composition.registry);
+  // Discovery is visible in status, but Skill bodies require an explicit host
+  // selector. The predicate closes over the controller so each Turn captures
+  // the latest selection without mutating the registry snapshot.
+  let selection: EdgeSelectionController | undefined;
+  const provider = createRegistryEdgeTurnSnapshotProvider(
+    composition.registry,
+    (summary) => selection?.selectionPredicate(summary) ?? false,
+  );
+  selection = createEdgeSelectionController(provider);
   const configured = projectConfiguredEdgeStatus(settings.edges);
   return {
     composition,
     provider,
+    selection,
     status: () => {
       const runtime = projectRuntimeEdgeStatus(edgeStatusFromProvider(provider, {
         enabled: configured.enabled,

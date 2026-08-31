@@ -1771,6 +1771,59 @@ describe("MainLoop", () => {
     });
   });
 
+  it("marks a successful multi-file patch as a decision boundary", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const loop = new MainLoop({
+      model: new ScriptedModel([
+        {
+          content: "",
+          toolCalls: [{
+            id: "patch-1",
+            name: "apply_patch",
+            arguments: { patch: "*** Begin Patch\n*** Update File: src/value.ts\n@@\n-1\n+2\n*** End Patch" },
+          }],
+          stopReason: "toolUse",
+          usage: tokenUsage(3, 1),
+        },
+        {
+          content: "done",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: tokenUsage(3, 1),
+        },
+      ]),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [{
+        definition: {
+          name: "apply_patch",
+          description: "apply a multi-file patch",
+          parameters: { type: "object", additionalProperties: true },
+        },
+        async execute() {
+          return { content: "Patched src/value.ts", isError: false };
+        },
+      }],
+    });
+
+    const result = await loop.run({
+      runId: "patch-mutation-decision-run",
+      goal: { version: 1, statement: "Change the value", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      initialMessage: "Go",
+    });
+
+    expect(result.navigationDeltas[0]).toMatchObject({
+      triggerKind: "decision",
+      actionOrDecision: expect.stringContaining("apply_patch"),
+    });
+  });
+
   it("records monotonic context and provider latency without wall-clock inference", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
