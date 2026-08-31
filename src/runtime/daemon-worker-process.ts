@@ -32,6 +32,10 @@ export class DaemonWorkerProcess {
   private exitCode: number | null | undefined;
   private signal: NodeJS.Signals | null | undefined;
   private publishedInstanceToken: string | undefined;
+  private descriptorPublishPromise: Promise<void> | undefined;
+  private descriptorPublicationSettled = false;
+  private readonly descriptorCleanupTokens = new Set<string>();
+  private closeRequested = false;
   private closePromise: Promise<void> | undefined;
 
   constructor(options: DaemonWorkerProcessOptions) {
@@ -60,16 +64,25 @@ export class DaemonWorkerProcess {
       // Retain the token before publishing so a publisher that writes and then
       // rejects can still be asked to clear the possibly-visible descriptor.
       this.publishedInstanceToken = instanceToken;
+      this.descriptorPublicationSettled = false;
+      const publication = Promise.resolve().then(() => this.options.descriptorPublisher!.publish({
+        version: 1,
+        runId: this.options.runId,
+        workerId: this.options.workerId,
+        leasePath: this.options.lease.leasePath,
+        fencingToken: this.options.lease.fencingToken,
+        instanceToken,
+        publishedAt: new Date().toISOString(),
+      }));
+      this.descriptorPublishPromise = publication;
+      // Observe late completion even when a supervisor ready timeout wins the
+      // race. A completed publication after close must be cleared by token.
+      void publication.then(
+        () => this.finishDescriptorPublication(publication, instanceToken),
+        () => this.finishDescriptorPublication(publication, instanceToken),
+      );
       try {
-        await this.options.descriptorPublisher.publish({
-          version: 1,
-          runId: this.options.runId,
-          workerId: this.options.workerId,
-          leasePath: this.options.lease.leasePath,
-          fencingToken: this.options.lease.fencingToken,
-          instanceToken,
-          publishedAt: new Date().toISOString(),
-        });
+        await publication;
       } catch (error: unknown) {
         // A ready child without a discoverable descriptor is not a usable
         // worker. Tear down the client and process before exposing the error.
@@ -90,24 +103,22 @@ export class DaemonWorkerProcess {
   }
 
   private async closeInternal(): Promise<void> {
+    this.closeRequested = true;
     try {
       await this.client.close();
     } finally {
       try {
-        if (this.publishedInstanceToken !== undefined) {
-          const token = this.publishedInstanceToken;
-          try {
-            // Descriptor cleanup is best-effort at process shutdown. A
-            // broken filesystem/publisher must not keep the worker alive
-            // indefinitely, while failures that arrive before the deadline
-            // remain observable to the caller.
-            await waitBounded(
-              Promise.resolve().then(() => this.options.descriptorPublisher?.clear?.(token)),
-              this.options.cancelGraceMs ?? DEFAULT_DESCRIPTOR_CLEAR_TIMEOUT_MS,
-            );
-          } finally {
-            this.publishedInstanceToken = undefined;
-          }
+        // A ready timeout may have raced with descriptor publication. Give the
+        // publication a bounded chance to settle before clearing its token;
+        // finishDescriptorPublication handles a late completion after timeout.
+        if (this.descriptorPublishPromise !== undefined) {
+          await waitBounded(
+            this.descriptorPublishPromise,
+            this.options.cancelGraceMs ?? DEFAULT_DESCRIPTOR_CLEAR_TIMEOUT_MS,
+          );
+        }
+        if (this.publishedInstanceToken !== undefined && this.descriptorPublicationSettled) {
+          await this.clearDescriptor(this.publishedInstanceToken);
         }
       } finally {
         if (this.child !== undefined && this.child.exitCode === null && this.child.signalCode === null) {
@@ -126,6 +137,31 @@ export class DaemonWorkerProcess {
           ]);
         }
       }
+    }
+  }
+
+  private finishDescriptorPublication(
+    publication: Promise<void>,
+    instanceToken: string,
+  ): void {
+    if (this.descriptorPublishPromise !== publication) return;
+    this.descriptorPublicationSettled = true;
+    this.descriptorPublishPromise = undefined;
+    if (this.closeRequested) void this.clearDescriptor(instanceToken).catch(() => undefined);
+  }
+
+  private async clearDescriptor(instanceToken: string): Promise<void> {
+    if (this.descriptorCleanupTokens.has(instanceToken)) return;
+    this.descriptorCleanupTokens.add(instanceToken);
+    try {
+      // Descriptor cleanup is best-effort at process shutdown. A broken
+      // filesystem/publisher must not keep the worker alive indefinitely.
+      await waitBounded(
+        Promise.resolve().then(() => this.options.descriptorPublisher?.clear?.(instanceToken)),
+        this.options.cancelGraceMs ?? DEFAULT_DESCRIPTOR_CLEAR_TIMEOUT_MS,
+      );
+    } finally {
+      if (this.publishedInstanceToken === instanceToken) this.publishedInstanceToken = undefined;
     }
   }
 

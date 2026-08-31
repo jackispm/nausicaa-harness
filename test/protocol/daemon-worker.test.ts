@@ -564,6 +564,45 @@ describe("daemon worker protocol", () => {
     expect(clearCalls).toBe(1);
   });
 
+  it("clears a descriptor when publication finishes after a close timeout", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-worker-publish-race-"));
+    roots.push(root);
+    const leasePath = join(root, "leases.json");
+    const leases = await FileExecutionLeaseStore.open(leasePath, { createLeaseId: () => "lease-parent" });
+    const claimed = await leases.claim({ runId: "run-1", ownerId: "host", acquisitionId: "claim-1", ttlMs: 10_000 });
+    if (claimed.status !== "acquired") throw new Error("expected lease");
+    const script = [
+      "import { runDaemonWorkerStdioServer } from './src/runtime/daemon-worker-server.ts';",
+      "runDaemonWorkerStdioServer({ runId: 'run-1', workerId: 'worker-1', runner: { activate: async () => ({ status: 'completed' }) } });",
+    ].join(" ");
+    let publishStartedResolve!: () => void;
+    const publishStarted = new Promise<void>((resolve) => { publishStartedResolve = resolve; });
+    let clearCalls = 0;
+    const publisher = {
+      publish: async () => {
+        publishStartedResolve();
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      },
+      clear: async () => { clearCalls += 1; },
+    };
+    const worker = spawnDaemonWorker({
+      runId: "run-1",
+      workerId: "worker-1",
+      lease: { runId: "run-1", leasePath, fencingToken: claimed.lease.fencingToken },
+      args: ["--import", "tsx", "--input-type=module", "-e", script],
+      cwd: process.cwd(),
+      env: process.env,
+      cancelGraceMs: 10,
+      descriptorPublisher: publisher,
+    });
+    const initializing = worker.initialize();
+    await publishStarted;
+    await worker.close();
+    await expect(initializing).resolves.toMatchObject({ lifecycle: "stopped" });
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(clearCalls).toBe(1);
+  });
+
   it("publishes and clears descriptors atomically by instance token", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-worker-descriptor-"));
     roots.push(root);
