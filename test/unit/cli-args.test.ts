@@ -279,6 +279,9 @@ describe("parseCliArgs", () => {
     expect(() => parseCliArgs(["--topology", "--mode", "interactive"], "/work")).toThrow(
       /requires --print or --json/i,
     );
+    expect(() => parseCliArgs(["--topology", "--resume", "run-7"], "/work")).toThrow(
+      /execution.*lane.*permission.*edge/i,
+    );
   });
 
   it("parses an explicit unknown-operation resolution for resume", () => {

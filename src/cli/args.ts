@@ -317,6 +317,27 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   if (options.topology && (options.fileArgs.length > 0 || options.message !== undefined)) {
     throw new CliUsageError("--topology cannot be combined with a task or image input");
   }
+  if (options.topology && (
+    options.daemon
+    || options.attach !== undefined
+    || options.continue
+    || options.resume !== undefined
+    || options.resolveOperation !== undefined
+    || options.workerEnabled !== undefined
+    || options.tetoEnabled !== undefined
+    || options.tetoModel !== undefined
+    || options.maxSteps !== undefined
+    || options.maxOutputTokens !== undefined
+    || options.allowWrite !== undefined
+    || options.allowShell !== undefined
+    || options.allowNetwork !== undefined
+    || options.edges !== undefined
+    || options.fukaiCompaction !== undefined
+  )) {
+    throw new CliUsageError(
+      "--topology cannot be combined with execution, lane, permission, or edge options",
+    );
+  }
   if (options.daemonSocket !== undefined && !options.daemon && options.attach === undefined) {
     throw new CliUsageError("--daemon-socket requires --daemon or --attach");
   }
