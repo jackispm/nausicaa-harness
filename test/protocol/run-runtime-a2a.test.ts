@@ -13,7 +13,7 @@ import type {
   CrossRunTargetAdmissionInput,
   CrossRunTargetResolver,
 } from "../../src/a2a/index.js";
-import { executeRun } from "../../src/runtime/index.js";
+import { executeRun, SessionController } from "../../src/runtime/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 
 const roots: string[] = [];
@@ -182,6 +182,71 @@ describe("executeRun Cross-Run A2A composition", () => {
         },
       },
     })).rejects.toThrow("sender endpoint does not match");
+  });
+
+  it("uses the same composition for an interactive Session Turn", async () => {
+    const root = await temporaryRoot();
+    const target: CrossRunEndpoint = {
+      workspaceId: "workspace-a",
+      sessionId: "session-target",
+      runId: "interactive-target",
+      laneId: "main",
+    };
+    const model = new ScriptedModel([
+      {
+        ...response("send"),
+        stopReason: "toolUse",
+        toolCalls: [{
+          id: "interactive-message",
+          name: "agent_message",
+          arguments: {
+            target: { relationship: "direct", id: target.runId },
+            payload: { type: "message.inform", text: "interactive handoff" },
+          },
+        }],
+      },
+      response("sent"),
+    ]);
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+    }, {
+      mainModel: model,
+      createRunId: () => "interactive-source",
+      crossRun: {
+        sender: ({ runId }) => ({
+          endpoint: {
+            workspaceId: "workspace-a",
+            sessionId: "session-source",
+            runId,
+            laneId: "main",
+          },
+          proof: { kind: "attach", authenticated: true, token: "interactive-proof" },
+          relationshipGrants: ["direct"],
+        }),
+        routerOptions: {
+          resolver: {
+            resolve: async () => ({ endpoint: target, relationship: "direct" }),
+          },
+          targetAdmission: {
+            admit: async ({ envelope }) => ({
+              status: "delivered",
+              messageId: envelope.messageId,
+            }),
+          },
+        },
+      },
+    });
+    await session.submit({ inputId: "interactive-input", text: "Send a handoff" });
+    await session.waitForIdle();
+    expect(session.snapshot().status).toBe("idle");
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).toContain("agent_message");
+    expect(model.requests[1]?.messages.findLast((message) => (
+      message.role === "tool" && message.toolName === "agent_message"
+    ))?.content).toContain('"status":"delivered"');
+    await session.close();
   });
 });
 

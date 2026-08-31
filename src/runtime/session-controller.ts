@@ -94,6 +94,10 @@ import {
 } from "./run-token-budget-recovery.js";
 import { TetoScheduler } from "./teto-scheduler.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
+import {
+  createCrossRunRuntimeTool,
+  type CrossRunRuntimeComposition,
+} from "./cross-run-runtime.js";
 import { TaskDispatcher } from "./task-dispatcher.js";
 import {
   projectCommittedBoundaryMessageIds,
@@ -320,6 +324,8 @@ export interface SessionControllerDeps {
   /** Optional provider seams for network-backed Main tools. */
   webFetchProvider?: WebFetchProvider;
   webSearchProvider?: WebSearchProvider;
+  /** Host-owned Cross-Run A2A composition for interactive Main Turns. */
+  crossRun?: CrossRunRuntimeComposition;
   /** Fallback edge snapshot for embedders that keep request options separate. */
   edgeSnapshot?: WorkspaceEdgeToolSnapshot;
   edgeSnapshotProvider?: EdgeTurnSnapshotProvider;
@@ -1700,6 +1706,15 @@ export class SessionController {
         events,
         clock: this.clock,
       });
+      const crossRunTool = this.deps.crossRun === undefined
+        ? undefined
+        : await createCrossRunRuntimeTool(this.deps.crossRun, {
+            runId: attached.runId,
+            laneId: "main",
+            workspace: this.workspace,
+            ledger: attached.ledger,
+            store: attached.store,
+          });
       const workspaceSandbox = this.deps.tools === undefined
         && permissionProfileForCapabilities(turnCapabilities) === "workspace"
         && this.workspaceCommandSandbox.availability().available
@@ -1736,6 +1751,14 @@ export class SessionController {
         protectedPaths: [this.dataDir],
       });
       const tools: AgentTool[] = [...baseTools];
+      if (crossRunTool !== undefined) {
+        if (tools.some((tool) => tool.definition.name.trim() === crossRunTool.definition.name.trim())) {
+          throw new SessionProtocolError(
+            "cross-Run agent_message capability collides with a host tool",
+          );
+        }
+        tools.push(crossRunTool);
+      }
       if (attached.policy.tetoEnabled) {
         tools.push(createAdviceResponseTool(inbox));
         scheduler = new TetoScheduler({
