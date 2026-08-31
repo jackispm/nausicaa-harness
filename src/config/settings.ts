@@ -394,6 +394,10 @@ const validateOptionalEdges = (value: unknown, path: string): void => {
     if (candidate.type === "mcp" && endpoint !== undefined) {
       validateMcpEndpoint(endpoint, `${sourcePath}.endpoint`, path);
     }
+    if (candidate.type === "mcp" && endpoint === undefined
+      && (candidate.headers !== undefined || sessionId !== undefined)) {
+      throw new SettingsError(`${sourcePath}.headers/sessionId require an MCP endpoint`);
+    }
     if (candidate.type !== "mcp"
       && (endpoint !== undefined || candidate.headers !== undefined || candidate.sessionId !== undefined)) {
       throw new SettingsError(`${sourcePath}.endpoint/headers/sessionId are only allowed for mcp sources`);

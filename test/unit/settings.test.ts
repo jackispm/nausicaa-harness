@@ -393,6 +393,8 @@ describe("settings", () => {
     await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/embedded credentials/i);
     await write({ sources: [{ sourceId: "mcp", type: "mcp", endpoint: "https://example.test/mcp", headers: { "bad name": "value" } }] });
     await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/invalid header name/i);
+    await write({ sources: [{ sourceId: "mcp", type: "mcp", command: "fake", headers: { Authorization: "secret" } }] });
+    await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/require an MCP endpoint/i);
     await write({ grants: [{ sourceId: "grant", effects: ["write", "write"], scopes: ["workspace"] }] });
     await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/must not contain duplicates/i);
   });
