@@ -10,11 +10,28 @@ import {
 import {
   composeAgentAwarenessProjectionInput,
   type AgentAwarenessRunSource,
+  type AgentAwarenessCompositionOptions,
 } from "../runtime/agent-awareness-composition.js";
 import type { AgentTopologyProjectionInput } from "../runtime/agent-awareness.js";
+import type { DaemonHostSnapshot } from "../runtime/daemon-host.js";
+import type { DaemonSupervisorSnapshot } from "../runtime/daemon-supervisor.js";
 
 const LOCAL_WORKSPACE_ID = "local-workspace";
 const LOCAL_SESSION_ID = "local-session";
+
+/** Optional host-owned observations to append to the Ledger projection. */
+export interface WorkspaceAgentAwarenessOptions {
+  readonly now?: string;
+  readonly host?: DaemonHostSnapshot;
+  readonly hostLastSeen?: string;
+  readonly supervisor?: DaemonSupervisorSnapshot;
+  readonly supervisorLastSeen?: string;
+  readonly workers?: AgentAwarenessCompositionOptions["workers"];
+  readonly roster?: AgentAwarenessCompositionOptions["roster"];
+  readonly availability?: AgentAwarenessCompositionOptions["availability"];
+  readonly freshnessMs?: number;
+  readonly maxFutureSkewMs?: number;
+}
 
 /**
  * Build the read-only Awareness source used by `--topology`.
@@ -28,8 +45,13 @@ const LOCAL_SESSION_ID = "local-session";
 export async function readWorkspaceAgentAwareness(
   dataDir: string,
   workspace: string,
-  now = new Date().toISOString(),
+  nowOrOptions: string | WorkspaceAgentAwarenessOptions = new Date().toISOString(),
+  maybeOptions: WorkspaceAgentAwarenessOptions = {},
 ): Promise<AgentTopologyProjectionInput> {
+  const now = typeof nowOrOptions === "string"
+    ? nowOrOptions
+    : nowOrOptions.now ?? new Date().toISOString();
+  const options = typeof nowOrOptions === "string" ? maybeOptions : nowOrOptions;
   const summaries = await listWorkspaceRuns(dataDir, workspace);
   const source = new FileDaemonRunEventSource({ dataDir });
   const runs: AgentAwarenessRunSource[] = [];
@@ -57,6 +79,15 @@ export async function readWorkspaceAgentAwareness(
     workspaceId: LOCAL_WORKSPACE_ID,
     sessionId: LOCAL_SESSION_ID,
     runs,
+    ...(options.host === undefined ? {} : { host: options.host }),
+    ...(options.hostLastSeen === undefined ? {} : { hostLastSeen: options.hostLastSeen }),
+    ...(options.supervisor === undefined ? {} : { supervisor: options.supervisor }),
+    ...(options.supervisorLastSeen === undefined ? {} : { supervisorLastSeen: options.supervisorLastSeen }),
+    ...(options.workers === undefined ? {} : { workers: options.workers }),
+    ...(options.roster === undefined ? {} : { roster: options.roster }),
+    ...(options.availability === undefined ? {} : { availability: options.availability }),
+    ...(options.freshnessMs === undefined ? {} : { freshnessMs: options.freshnessMs }),
+    ...(options.maxFutureSkewMs === undefined ? {} : { maxFutureSkewMs: options.maxFutureSkewMs }),
     now,
     generatedAt: now,
   });
@@ -65,4 +96,3 @@ export async function readWorkspaceAgentAwareness(
 function summaryActivity(summary: WorkspaceRunSummary): string {
   return `${summary.status}: ${summary.goal}`;
 }
-

@@ -28,6 +28,7 @@ export const MAX_AGENT_AWARENESS_EDGES = 8_192;
 export const MAX_AGENT_AWARENESS_ACTIVITY_CHARS = 160;
 
 export type AgentAwarenessRole =
+  | "daemon"
   | "main"
   | "teto"
   | "worker"
@@ -47,11 +48,16 @@ export type AgentAwarenessState =
 export type AgentAwarenessRelation =
   | "parent"
   | "child"
+  | "delegates"
   | "peer"
   | "observer"
+  | "routes-to"
   | "fork-of"
   | "branch-of"
   | "hosted-by";
+
+/** Whether the projection includes a current host observation. */
+export type AgentAwarenessAvailability = "fresh" | "stale" | "unavailable";
 
 /** The immutable, user-visible node in one topology snapshot. */
 export interface AgentTopologyNode {
@@ -75,6 +81,7 @@ export interface AgentTopologyEdge {
 export interface AgentTopologySnapshot {
   readonly version: typeof AGENT_AWARENESS_SNAPSHOT_VERSION;
   readonly generatedAt: string;
+  readonly availability: AgentAwarenessAvailability;
   readonly nodes: readonly AgentTopologyNode[];
   readonly edges: readonly AgentTopologyEdge[];
   readonly roots: readonly string[];
@@ -149,6 +156,8 @@ export interface AgentTopologyProjectionInput {
   readonly nodes?: readonly AgentAwarenessRecord[];
   readonly edges?: readonly AgentAwarenessEdgeInput[];
   readonly generatedAt?: string;
+  /** Explicit source quality; this is presentation metadata, not a new fact. */
+  readonly availability?: AgentAwarenessAvailability;
   /** `now` is used only for freshness; it does not become a new fact source. */
   readonly now?: string;
   readonly freshnessMs?: number;
@@ -168,7 +177,9 @@ const RELATION_ORDER: readonly AgentAwarenessRelation[] = [
   "parent",
   "child",
   "hosted-by",
+  "delegates",
   "observer",
+  "routes-to",
   "peer",
   "fork-of",
   "branch-of",
@@ -251,11 +262,34 @@ export function projectAgentTopology(
   return freezeSnapshot({
     version: AGENT_AWARENESS_SNAPSHOT_VERSION,
     generatedAt: clock.generatedAt,
+    availability: normalizeAvailability(input.availability, nodes.length, orderedRecords, clock),
     nodes,
     edges: boundedEdges,
     roots,
     truncated,
   });
+}
+
+function normalizeAvailability(
+  value: AgentAwarenessAvailability | undefined,
+  nodeCount: number,
+  records: readonly NormalizedRecord[],
+  clock: ProjectionClock,
+): AgentAwarenessAvailability {
+  if (value === undefined) {
+    if (nodeCount === 0) return "unavailable";
+    const hasFreshRecord = records.some((record) => (
+      record.lastSeenPresent
+      && record.generationTrusted
+      && record.sourceValid
+      && Number.isFinite(record.lastSeenMs)
+      && record.lastSeenMs <= clock.nowMs
+      && clock.nowMs - record.lastSeenMs <= clock.freshnessMs
+    ));
+    return hasFreshRecord ? "fresh" : "stale";
+  }
+  if (value === "fresh" || value === "stale" || value === "unavailable") return value;
+  throw new TypeError("awareness availability must be fresh, stale, or unavailable");
 }
 
 /** A small synchronous seam for daemon/host adapters and future Remote TUI. */
@@ -482,6 +516,7 @@ function mapRole(role: string | undefined, laneKind: string | undefined, laneId:
     return "teto";
   }
   const value = (role ?? laneKind ?? laneId).toLowerCase();
+  if (value === "daemon" || value === "host") return "daemon";
   if (value === "main") return "main";
   if (value === "worker") return "worker";
   if (value === "reflection") return "reflection";
@@ -777,6 +812,7 @@ export function redactAgentTopologySnapshot(snapshot: AgentTopologySnapshot): Ag
   return Object.freeze({
     version: AGENT_AWARENESS_SNAPSHOT_VERSION,
     generatedAt: safeTimestamp(snapshot.generatedAt),
+    availability: safeAvailability(snapshot.availability),
     nodes: Object.freeze(nodes),
     edges: Object.freeze(edges),
     roots,
@@ -820,8 +856,14 @@ function safeTimestamp(value: unknown): string {
 
 function safeRole(value: unknown): AgentAwarenessRole {
   return typeof value === "string" && [
-    "main", "teto", "worker", "reflection", "auxiliary", "unknown",
+    "daemon", "main", "teto", "worker", "reflection", "auxiliary", "unknown",
   ].includes(value) ? value as AgentAwarenessRole : "unknown";
+}
+
+function safeAvailability(value: unknown): AgentAwarenessAvailability {
+  return value === "fresh" || value === "stale" || value === "unavailable"
+    ? value
+    : "unavailable";
 }
 
 function safeState(value: unknown): AgentAwarenessState {

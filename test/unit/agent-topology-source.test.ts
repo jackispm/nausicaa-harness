@@ -19,6 +19,7 @@ describe("workspace Awareness source", () => {
         "2026-09-01T12:00:00.000Z",
       );
       expect(source.records).toEqual([]);
+      expect(source.availability).toBe("unavailable");
       expect(renderAgentTopologyFromSource(source)).toContain("0 nodes");
     } finally {
       await rm(workspace, { recursive: true, force: true });
@@ -50,6 +51,35 @@ describe("workspace Awareness source", () => {
 
       expect(output).toContain("local-awareness-run/main");
       expect(output).toContain("completed: Inspect the local topology");
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts one host observation without creating a second source", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "nausicaa-topology-host-"));
+    try {
+      const source = await readWorkspaceAgentAwareness(
+        join(workspace, ".nausicaa"),
+        workspace,
+        "2026-09-01T12:00:00.000Z",
+        {
+          host: {
+            status: "running",
+            ownerId: "private-owner",
+            queuedRuns: 0,
+            runningRuns: 1,
+            attachedClients: 0,
+            runs: [{ runId: "run-host", state: "running", pendingWakeCount: 0 }],
+          },
+        },
+      );
+      expect(source.records?.map((record) => [record.endpoint.runId, record.endpoint.laneId])).toEqual([
+        ["daemon-host", "daemon"],
+        ["run-host", "main"],
+      ]);
+      expect(JSON.stringify(source)).not.toContain("private-owner");
+      expect(renderAgentTopologyFromSource(source)).toContain("source fresh");
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }

@@ -139,6 +139,7 @@ describe("agent awareness runtime composition", () => {
     const input = composeAgentAwarenessProjectionInput(options);
     const snapshot = projectAgentTopology(input);
     expect(snapshot.nodes.map((node) => [node.endpoint.runId, node.endpoint.laneId, node.role, node.state])).toEqual([
+      ["daemon-host", "daemon", "daemon", "active"],
       ["run-a", "main", "main", "active"],
       ["run-a", "teto", "teto", "waiting"],
       ["run-a", "worker", "worker", "active"],
@@ -150,7 +151,11 @@ describe("agent awareness runtime composition", () => {
       expect.objectContaining({ relation: "observer" }),
       expect.objectContaining({ relation: "peer" }),
       expect.objectContaining({ relation: "fork-of" }),
+      expect.objectContaining({ relation: "delegates" }),
+      expect.objectContaining({ relation: "routes-to" }),
+      expect.objectContaining({ relation: "hosted-by" }),
     ]));
+    expect(snapshot.availability).toBe("fresh");
     expect(snapshot.nodes.find((node) => node.endpoint.runId === "run-a" && node.endpoint.laneId === "main")?.activitySummary)
       .toBe("analyzing [redacted] [path]");
     expect(JSON.stringify(snapshot)).not.toContain("private/should-never");
@@ -220,5 +225,120 @@ describe("agent awareness runtime composition", () => {
       lineage: [...base.lineage!].reverse(),
     };
     expect(composeAgentAwarenessProjectionInput(base)).toEqual(composeAgentAwarenessProjectionInput(reverse));
+  });
+
+  it("marks an empty composition unavailable and an old observation stale", () => {
+    expect(projectAgentTopology(composeAgentAwarenessProjectionInput({
+      workspaceId: "repo",
+      sessionId: "session-a",
+      now,
+    })).availability).toBe("unavailable");
+
+    const stale = composeAgentAwarenessProjectionInput({
+      workspaceId: "repo",
+      sessionId: "session-a",
+      now,
+      runs: [{
+        projection: projection("old", { main: lane("main", "waiting") }),
+        lastSeen: "2026-09-01T11:00:00.000Z",
+      }],
+    });
+    expect(stale.availability).toBe("stale");
+    expect(projectAgentTopology(stale).nodes[0]?.state).toBe("offline");
+  });
+
+  it("drops a roster marked unauthorized before it can create nodes or edges", () => {
+    const input = composeAgentAwarenessProjectionInput({
+      workspaceId: "repo",
+      sessionId: "session-a",
+      now,
+      roster: {
+        authorized: false,
+        roster: {
+          current: { workspaceId: "repo", sessionId: "session-a", runId: "current", laneId: "main" },
+          entries: [{
+            endpoint: { workspaceId: "repo", sessionId: "session-b", runId: "hidden", laneId: "worker" },
+            relationship: "child",
+            status: "busy",
+            reachable: true,
+          }],
+        },
+      },
+    });
+    expect(input.records).toEqual([]);
+    expect(input.edges).toEqual([]);
+    expect(projectAgentTopology(input).availability).toBe("unavailable");
+  });
+
+  it("keeps multiple detached workers distinct and exposes their host edges", () => {
+    const input = composeAgentAwarenessProjectionInput({
+      workspaceId: "repo",
+      sessionId: "session-a",
+      now,
+      supervisor: {
+        lifecycle: "ready",
+        maxWorkers: 4,
+        maxPendingRuns: 8,
+        host: {
+          status: "running",
+          ownerId: "private-owner",
+          queuedRuns: 0,
+          runningRuns: 0,
+          attachedClients: 0,
+          runs: [],
+        },
+        workers: [
+          {
+            runId: "run-worker",
+            workerId: "worker-a",
+            generation: 1,
+            state: "running",
+            instanceTokenPresent: true,
+          },
+          {
+            runId: "run-worker",
+            workerId: "worker-b",
+            generation: 2,
+            state: "crashed",
+            instanceTokenPresent: false,
+          },
+        ],
+      },
+    });
+    const snapshot = projectAgentTopology(input);
+    expect(snapshot.nodes
+      .filter((node) => node.role === "worker")
+      .map((node) => [node.endpoint.laneId, node.state, node.generation])).toEqual([
+      ["detached-worker:worker-a", "active", 1],
+      ["detached-worker:worker-b", "offline", 2],
+    ]);
+    expect(snapshot.edges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ relation: "hosted-by" }),
+      expect.objectContaining({ relation: "delegates" }),
+    ]));
+  });
+
+  it("reuses an explicit Run scope for the daemon when no global scope is set", () => {
+    const input = composeAgentAwarenessProjectionInput({
+      now,
+      runs: [{
+        projection: projection("scoped-run", { main: lane("main", "running") }),
+        scope: { workspaceId: "repo", sessionId: "session-scoped" },
+      }],
+      host: {
+        status: "running",
+        ownerId: "private-owner",
+        queuedRuns: 0,
+        runningRuns: 0,
+        attachedClients: 0,
+        runs: [],
+      },
+    });
+    expect(projectAgentTopology(input).nodes[0]?.endpoint).toMatchObject({
+      workspaceId: "repo",
+      sessionId: "session-scoped",
+      runId: "daemon-host",
+      laneId: "daemon",
+    });
   });
 });

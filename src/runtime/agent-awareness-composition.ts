@@ -4,6 +4,7 @@ import type { CrossRunEndpoint } from "../domain/types.js";
 import type { RunProjection } from "../ledger/projection.js";
 import type {
   AgentAwarenessEdgeInput,
+  AgentAwarenessAvailability,
   AgentAwarenessRecord,
   AgentAwarenessRelation,
   AgentTopologyProjectionInput,
@@ -11,6 +12,10 @@ import type {
 import { sanitizeAgentActivitySummary } from "./agent-awareness.js";
 import type { DaemonHostSnapshot, DaemonRunSnapshot } from "./daemon-host.js";
 import type { DaemonWorkerDescriptor } from "./daemon-worker-protocol.js";
+import type {
+  DaemonSupervisorSnapshot,
+  DaemonSupervisorWorkerSnapshot,
+} from "./daemon-supervisor.js";
 import type {
   SessionControllerStatus,
   SessionSnapshot,
@@ -32,6 +37,8 @@ export interface AgentAwarenessRunSource {
   readonly generation?: number;
   readonly generationTrusted?: boolean;
   readonly sourceValid?: boolean;
+  readonly authorized?: boolean;
+  readonly visible?: boolean;
   /** Host-provided, already-safe text; it is sanitized again at this boundary. */
   readonly activitySummary?: string;
   /** Freshness timestamp from the same observation used for this source. */
@@ -48,6 +55,8 @@ export interface AgentAwarenessWorkerSource {
   readonly active?: boolean;
   readonly generationTrusted?: boolean;
   readonly sourceValid?: boolean;
+  readonly authorized?: boolean;
+  readonly visible?: boolean;
   readonly retained?: boolean;
   readonly activitySummary?: string;
   readonly lastSeen?: string;
@@ -55,6 +64,14 @@ export interface AgentAwarenessWorkerSource {
 
 /** Optional trusted lineage supplied by a host or branch manager. */
 export type AgentAwarenessLineageSource = AgentAwarenessEdgeInput;
+
+/** Admission marks stay next to the roster so an untrusted source fails closed. */
+export interface AgentAwarenessRosterSource {
+  readonly roster: CrossRunRoster;
+  readonly authorized?: boolean;
+  readonly visible?: boolean;
+  readonly lastSeen?: string;
+}
 
 export interface AgentAwarenessCompositionOptions {
   /** Required for every local source; filesystem paths are deliberately not accepted as IDs. */
@@ -65,13 +82,19 @@ export interface AgentAwarenessCompositionOptions {
   readonly runScopes?: Readonly<Record<string, AgentAwarenessIdentityScope>>;
   readonly runs?: readonly AgentAwarenessRunSource[];
   readonly host?: DaemonHostSnapshot;
+  readonly hostLastSeen?: string;
+  /** Optional detached-worker view from the same daemon control observation. */
+  readonly supervisor?: DaemonSupervisorSnapshot;
+  readonly supervisorLastSeen?: string;
   readonly workers?: readonly AgentAwarenessWorkerSource[];
   /** Already authorized, bounded A2A roster from the host. */
-  readonly roster?: CrossRunRoster;
+  readonly roster?: CrossRunRoster | AgentAwarenessRosterSource;
   readonly lineage?: readonly AgentAwarenessLineageSource[];
   readonly now?: string;
   readonly generatedAt?: string;
+  readonly availability?: AgentAwarenessAvailability;
   readonly freshnessMs?: number;
+  readonly maxFutureSkewMs?: number;
   readonly maxNodes?: number;
   readonly maxEdges?: number;
 }
@@ -88,12 +111,17 @@ interface Scope {
 
 const EPOCH = "1970-01-01T00:00:00.000Z";
 const DEFAULT_WORKER_LANE = "worker";
+const DETACHED_WORKER_LANE = "detached-worker";
+const DAEMON_RUN_ID = "daemon-host";
+const DAEMON_LANE_ID = "daemon";
 const RECORD_PRIORITY = {
   roster: 10,
   worker: 60,
   run: 40,
   lane: 50,
   host: 70,
+  daemon: 80,
+  placeholder: 1,
 } as const;
 
 /**
@@ -114,6 +142,7 @@ export function composeAgentAwarenessProjectionInput(
   const runScopes = new Map<string, Scope>();
 
   for (const source of options.runs ?? []) {
+    if (source.authorized === false || source.visible === false) continue;
     const runId = source.projection.run.runId;
     const scope = resolveScope(runId, source.scope, options, runScopes);
     runScopes.set(runId, scope);
@@ -121,22 +150,79 @@ export function composeAgentAwarenessProjectionInput(
   }
 
   for (const source of options.workers ?? []) {
+    if (source.authorized === false || source.visible === false) continue;
     const runId = source.descriptor.runId;
     const scope = resolveScope(runId, source.scope, options, runScopes);
     runScopes.set(runId, scope);
     addWorkerSource(source, scope, generatedAt, records, edges);
   }
 
-  if (options.host !== undefined) {
-    for (const run of sortedHostRuns(options.host.runs)) {
+  const host = options.host ?? options.supervisor?.host;
+  const daemonScope = host === undefined && options.supervisor === undefined
+    ? undefined
+    : resolveDaemonScope(options, runScopes);
+  const daemon = daemonScope === undefined
+    ? undefined
+    : endpoint(daemonScope, DAEMON_RUN_ID, DAEMON_LANE_ID);
+  if (daemon !== undefined) {
+    addDaemonSource(
+      host,
+      options.supervisor,
+      daemon,
+      options.supervisorLastSeen ?? options.hostLastSeen ?? generatedAt,
+      records,
+    );
+  }
+
+  if (host !== undefined) {
+    for (const run of sortedHostRuns(host.runs)) {
       const scope = resolveScope(run.runId, undefined, options, runScopes);
       runScopes.set(run.runId, scope);
-      addHostRun(run, scope, generatedAt, records);
+      addHostRun(
+        run,
+        scope,
+        options.hostLastSeen ?? options.supervisorLastSeen ?? generatedAt,
+        daemon,
+        records,
+        edges,
+      );
+    }
+  }
+
+  if (options.supervisor !== undefined) {
+    for (const worker of sortedSupervisorWorkers(options.supervisor.workers)) {
+      const scope = resolveScope(worker.runId, undefined, options, runScopes);
+      runScopes.set(worker.runId, scope);
+      addSupervisorWorker(
+        worker,
+        scope,
+        options.supervisorLastSeen ?? generatedAt,
+        daemon,
+        records,
+        edges,
+      );
+    }
+  }
+
+  if (daemon !== undefined) {
+    for (const source of options.workers ?? []) {
+      if (source.authorized === false || source.visible === false) continue;
+      const scope = resolveScope(source.descriptor.runId, source.scope, options, runScopes);
+      addEdge({
+        source: endpoint(scope, source.descriptor.runId, source.laneId ?? DEFAULT_WORKER_LANE),
+        target: daemon,
+        relation: "hosted-by",
+        authorized: true,
+        visible: true,
+      }, edges);
     }
   }
 
   if (options.roster !== undefined) {
-    addRoster(options.roster, generatedAt, records, edges);
+    const source = normalizeRosterSource(options.roster);
+    if (source.authorized !== false && source.visible !== false) {
+      addRoster(source.roster, source.lastSeen ?? generatedAt, records, edges);
+    }
   }
   for (const lineage of options.lineage ?? []) {
     if (lineage.authorized === false || lineage.visible === false) continue;
@@ -146,11 +232,13 @@ export function composeAgentAwarenessProjectionInput(
   const input: AgentTopologyProjectionInput = {
     generatedAt,
     now,
+    availability: options.availability ?? compositionAvailability(options, records, now),
     records: Object.freeze([...records.values()]
       .sort((left, right) => compareText(endpointKey(left.record.endpoint), endpointKey(right.record.endpoint)))
       .map((candidate) => candidate.record)),
     edges: Object.freeze([...edges.values()].sort(compareEdges)),
     ...(options.freshnessMs === undefined ? {} : { freshnessMs: options.freshnessMs }),
+    ...(options.maxFutureSkewMs === undefined ? {} : { maxFutureSkewMs: options.maxFutureSkewMs }),
     ...(options.maxNodes === undefined ? {} : { maxNodes: options.maxNodes }),
     ...(options.maxEdges === undefined ? {} : { maxEdges: options.maxEdges }),
   };
@@ -218,6 +306,15 @@ function addRunSource(
       authorized: true,
       visible: true,
     }, edges);
+    if (role === "worker") {
+      addEdge({
+        source: main,
+        target: laneEndpoint,
+        relation: "delegates",
+        authorized: true,
+        visible: true,
+      }, edges);
+    }
     if (role === "teto") {
       addEdge({
         source: laneEndpoint,
@@ -233,21 +330,97 @@ function addRunSource(
 function addHostRun(
   run: DaemonRunSnapshot,
   scope: Scope,
-  generatedAt: string,
+  lastSeen: string,
+  daemon: CrossRunEndpoint | undefined,
   records: Map<string, Candidate>,
+  edges: Map<string, AgentAwarenessEdgeInput>,
 ): void {
   const state = stateForHostRun(run.state);
+  const main = endpoint(scope, run.runId, "main");
   addRecord(records, {
-    endpoint: endpoint(scope, run.runId, "main"),
+    endpoint: main,
     role: "main",
     state,
     ...(state === "sleeping" ? { retained: true } : {}),
     authorized: true,
     visible: true,
     ...(run.fencingToken === undefined ? {} : { generation: run.fencingToken }),
-    lastSeen: generatedAt,
+    lastSeen,
     activitySummary: activityForHostRun(run),
   }, RECORD_PRIORITY.host);
+  if (daemon !== undefined) {
+    addEdge({
+      source: main,
+      target: daemon,
+      relation: "hosted-by",
+      authorized: true,
+      visible: true,
+    }, edges);
+  }
+}
+
+function addDaemonSource(
+  host: DaemonHostSnapshot | undefined,
+  supervisor: DaemonSupervisorSnapshot | undefined,
+  daemon: CrossRunEndpoint,
+  lastSeen: string,
+  records: Map<string, Candidate>,
+): void {
+  const sourceState = supervisor === undefined
+    ? host?.status ?? "stopped"
+    : supervisor.lifecycle;
+  const state = stateForDaemon(sourceState);
+  addRecord(records, {
+    endpoint: daemon,
+    role: "daemon",
+    state,
+    authorized: true,
+    visible: true,
+    lastSeen,
+    activitySummary: activityForState(state, "daemon"),
+  }, RECORD_PRIORITY.daemon);
+}
+
+function addSupervisorWorker(
+  worker: DaemonSupervisorWorkerSnapshot,
+  scope: Scope,
+  lastSeen: string,
+  daemon: CrossRunEndpoint | undefined,
+  records: Map<string, Candidate>,
+  edges: Map<string, AgentAwarenessEdgeInput>,
+): void {
+  const main = endpoint(scope, worker.runId, "main");
+  const workerEndpoint = endpoint(scope, worker.runId, workerLaneId(worker.workerId));
+  const state = stateForSupervisorWorker(worker.state);
+  addMainPlaceholder(main, lastSeen, records);
+  addRecord(records, {
+    endpoint: workerEndpoint,
+    role: "worker",
+    state,
+    generation: worker.generation,
+    authorized: true,
+    visible: true,
+    lastSeen,
+    activitySummary: activityForState(state, "detached worker"),
+  }, RECORD_PRIORITY.worker);
+  for (const relation of ["parent", "delegates"] as const) {
+    addEdge({
+      source: main,
+      target: workerEndpoint,
+      relation,
+      authorized: true,
+      visible: true,
+    }, edges);
+  }
+  if (daemon !== undefined) {
+    addEdge({
+      source: workerEndpoint,
+      target: daemon,
+      relation: "hosted-by",
+      authorized: true,
+      visible: true,
+    }, edges);
+  }
 }
 
 function addWorkerSource(
@@ -282,6 +455,33 @@ function addWorkerSource(
     authorized: true,
     visible: true,
   }, edges);
+  addEdge({
+    source: endpoint(scope, descriptor.runId, "main"),
+    target: worker,
+    relation: "delegates",
+    authorized: true,
+    visible: true,
+  }, edges);
+}
+
+function addMainPlaceholder(
+  main: CrossRunEndpoint,
+  lastSeen: string,
+  records: Map<string, Candidate>,
+): void {
+  addRecord(records, {
+    endpoint: main,
+    role: "main",
+    state: "offline",
+    activitySummary: "main unavailable",
+    authorized: true,
+    visible: true,
+    lastSeen,
+  }, RECORD_PRIORITY.placeholder);
+}
+
+function workerLaneId(workerId: string): string {
+  return `${DETACHED_WORKER_LANE}:${workerId}`;
 }
 
 function addRoster(
@@ -324,7 +524,74 @@ function addRoster(
       authorized: true,
       visible: true,
     }, edges);
+    addEdge({
+      source: current,
+      target,
+      relation: "routes-to",
+      authorized: true,
+      visible: true,
+    }, edges);
+    if (entry.relationship === "child") {
+      addEdge({
+        source: current,
+        target,
+        relation: "delegates",
+        authorized: true,
+        visible: true,
+      }, edges);
+    }
   }
+}
+
+function normalizeRosterSource(
+  roster: CrossRunRoster | AgentAwarenessRosterSource,
+): AgentAwarenessRosterSource {
+  if ("roster" in roster) return roster;
+  return { roster };
+}
+
+function resolveDaemonScope(
+  options: AgentAwarenessCompositionOptions,
+  known: ReadonlyMap<string, Scope>,
+): Scope {
+  const first = known.values().next().value as Scope | undefined;
+  if (first !== undefined) {
+    const workspaceId = options.workspaceId ?? first.workspaceId;
+    const sessionId = options.sessionId ?? first.sessionId;
+    if (
+      typeof workspaceId === "string"
+      && typeof sessionId === "string"
+      && workspaceId.trim().length > 0
+      && sessionId.trim().length > 0
+    ) {
+      return { workspaceId, sessionId };
+    }
+  }
+  return resolveScope(DAEMON_RUN_ID, undefined, options, known);
+}
+
+function compositionAvailability(
+  options: AgentAwarenessCompositionOptions,
+  records: ReadonlyMap<string, Candidate>,
+  now: string,
+): AgentAwarenessAvailability {
+  if (records.size === 0) return "unavailable";
+  const freshnessMs = options.freshnessMs ?? 5 * 60_000;
+  const nowMs = Date.parse(now);
+  if (!Number.isFinite(nowMs)) return "stale";
+  let observed = false;
+  let fresh = false;
+  for (const candidate of records.values()) {
+    const seen = candidate.record.lastSeen;
+    if (seen === undefined) continue;
+    observed = true;
+    const seenMs = Date.parse(seen);
+    if (Number.isFinite(seenMs) && seenMs <= nowMs && nowMs - seenMs <= freshnessMs) {
+      fresh = true;
+      break;
+    }
+  }
+  return observed && fresh ? "fresh" : "stale";
 }
 
 function addRecord(
@@ -466,6 +733,37 @@ function stateForHostRun(state: DaemonRunSnapshot["state"]): string {
     case "queued": return "starting";
     case "held": return "sleeping";
     case "failed": return "terminal";
+    default: return "offline";
+  }
+}
+
+function stateForDaemon(state: string): string {
+  switch (state) {
+    case "running":
+    case "ready": return "active";
+    case "starting": return "starting";
+    case "stopping":
+    case "draining": return "waiting";
+    case "failed":
+    case "stopped": return "offline";
+    default: return "offline";
+  }
+}
+
+function stateForSupervisorWorker(state: DaemonSupervisorWorkerSnapshot["state"]): string {
+  switch (state) {
+    case "starting": return "starting";
+    case "ready":
+    case "running": return "active";
+    case "draining": return "waiting";
+    case "completed": return "terminal";
+    case "failed":
+    case "crashed":
+    case "ready-timeout":
+    case "lease-lost":
+    case "uncertain":
+    case "closed": return "offline";
+    default: return "offline";
   }
 }
 
@@ -527,6 +825,16 @@ function sortedHostRuns(runs: readonly DaemonRunSnapshot[]): readonly DaemonRunS
   return [...runs].sort((left, right) => compareText(left.runId, right.runId));
 }
 
+function sortedSupervisorWorkers(
+  workers: readonly DaemonSupervisorWorkerSnapshot[],
+): readonly DaemonSupervisorWorkerSnapshot[] {
+  return [...workers].sort((left, right) => (
+    compareText(left.runId, right.runId)
+      || compareText(left.workerId, right.workerId)
+      || left.generation - right.generation
+  ));
+}
+
 function compareEdges(left: AgentAwarenessEdgeInput, right: AgentAwarenessEdgeInput): number {
   return compareText(endpointKey(left.source), endpointKey(right.source))
     || compareText(endpointKey(left.target), endpointKey(right.target))
@@ -538,7 +846,19 @@ function compareText(left: string, right: string): number {
 }
 
 function stableRecord(record: AgentAwarenessRecord): string {
-  return JSON.stringify(record);
+  return JSON.stringify(sortRecordValue(record));
+}
+
+function sortRecordValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortRecordValue);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => compareText(left, right))
+        .map(([key, item]) => [key, sortRecordValue(item)]),
+    );
+  }
+  return value;
 }
 
 function assertOptions(options: AgentAwarenessCompositionOptions): void {

@@ -39,7 +39,7 @@ export function renderAgentTopologyText(snapshot: AgentTopologySnapshot): string
   for (const bucket of children.values()) bucket.sort(compareChildEdges);
 
   const lines: string[] = [
-    `Nausicaa awareness · ${safeSnapshot.nodes.length} nodes · updated ${safeSnapshot.generatedAt}`,
+    `Nausicaa awareness · ${safeSnapshot.nodes.length} nodes · source ${safeSnapshot.availability} · updated ${safeSnapshot.generatedAt}`,
   ];
   const rendered = new Set<string>();
   const roots = safeSnapshot.roots.length > 0
