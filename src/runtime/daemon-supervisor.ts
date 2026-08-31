@@ -185,7 +185,22 @@ export function createDaemonSupervisorWorkerFactory(
       ...(options.activationTimeoutMs === undefined ? {} : { activationTimeoutMs: options.activationTimeoutMs }),
       ...(options.cancelGraceMs === undefined ? {} : { cancelGraceMs: options.cancelGraceMs }),
     });
-    return { client: process.client, close: () => process.close() };
+    // Keep the process-level initialization hook in the supervisor path. The
+    // wrapper publishes the worker descriptor after the protocol ready
+    // handshake; exposing only `process.client.initialize()` would skip that
+    // publication and leave restart/reconcile readers with no identity.
+    return {
+      client: {
+        get snapshot() { return process.client.snapshot; },
+        initialize: () => process.initialize(),
+        activate: (activation) => process.client.activate(activation),
+        cancel: (activationId, reason) => process.client.cancel(activationId, reason),
+        drain: () => process.client.drain(),
+        shutdown: (reason) => process.client.shutdown(reason),
+        close: () => process.client.close(),
+      },
+      close: () => process.close(),
+    };
   };
 }
 
@@ -258,6 +273,8 @@ interface WorkerRecord {
   state: DaemonSupervisorWorkerState;
   instanceToken?: string;
   lastError?: string;
+  /** Shared close barrier for drain, activation cleanup, and supervisor stop. */
+  closePromise?: Promise<void>;
 }
 
 /**
@@ -465,7 +482,11 @@ export class DaemonSupervisor {
     if (
       !existing
       && !reserved
-      && hostSnapshot.queuedRuns + hostSnapshot.runningRuns + this.wakeReservations.size >= this.maxPendingRuns
+      // `queuedRuns` excludes Runs held behind another Host's lease. Capacity
+      // still applies to those Runs: counting the complete Host projection
+      // prevents lease contention from turning the pending-run bound into an
+      // unbounded admission path.
+      && hostSnapshot.runs.length + this.wakeReservations.size >= this.maxPendingRuns
     ) {
       const capacity = failure("capacity", "daemon supervisor capacity is full");
       this.lastFailure = capacity;
@@ -757,8 +778,9 @@ export class DaemonSupervisor {
     }
   }
 
-  private async closeWorker(record: WorkerRecord): Promise<void> {
-    try {
+  private closeWorker(record: WorkerRecord): Promise<void> {
+    if (record.closePromise !== undefined) return record.closePromise;
+    const operation = (async (): Promise<void> => {
       // A completed/failed worker can receive the normal shutdown command.
       // Uncertain, crashed, and fenced workers are closed without a second
       // command so we never turn an unknown side effect into a replay.
@@ -768,15 +790,26 @@ export class DaemonSupervisor {
         && record.state !== "lease-lost"
         && record.worker.client.shutdown !== undefined
       ) {
-        await record.worker.client.shutdown("activation complete");
+        try {
+          await record.worker.client.shutdown("activation complete");
+        } catch (error: unknown) {
+          record.lastError ??= boundedError(persistedErrorText(error));
+        }
       }
-      if (record.worker.close !== undefined) await record.worker.close();
-      else await record.worker.client.close();
-    } catch (error: unknown) {
-      record.lastError ??= boundedError(persistedErrorText(error));
-    }
-    record.state = "closed";
-    this.emitWorker(record);
+      // Shutdown is advisory. Even when the command fails because the child
+      // crashed or its transport is already gone, invoke the final close hook
+      // so process handles and descriptor state cannot be leaked.
+      try {
+        if (record.worker.close !== undefined) await record.worker.close();
+        else await record.worker.client.close();
+      } catch (error: unknown) {
+        record.lastError ??= boundedError(persistedErrorText(error));
+      }
+      record.state = "closed";
+      this.emitWorker(record);
+    })();
+    record.closePromise = operation;
+    return operation;
   }
 
   private requireReady(): void {
