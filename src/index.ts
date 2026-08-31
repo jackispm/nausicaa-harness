@@ -10,3 +10,4 @@ export * from "./runtime/index.js";
 export * from "./store/index.js";
 export * from "./teto/index.js";
 export * from "./tools/index.js";
+export * from "./cli/agent-topology.js";
