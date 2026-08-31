@@ -374,10 +374,17 @@ function addRecord(
 }
 
 function candidateWins(left: Candidate, right: Candidate): boolean {
+  const leftGeneration = left.record.generation;
+  const rightGeneration = right.record.generation;
+  // A trusted newer generation must not be replaced by a more authoritative
+  // but older source (for example, a delayed Host snapshot). When only one
+  // source carries a generation, retain that fencing evidence.
+  if (leftGeneration !== undefined || rightGeneration !== undefined) {
+    if (leftGeneration === undefined) return false;
+    if (rightGeneration === undefined) return true;
+    if (leftGeneration !== rightGeneration) return leftGeneration > rightGeneration;
+  }
   if (left.priority !== right.priority) return left.priority > right.priority;
-  const leftGeneration = left.record.generation ?? -1;
-  const rightGeneration = right.record.generation ?? -1;
-  if (leftGeneration !== rightGeneration) return leftGeneration > rightGeneration;
   return stableRecord(left.record) > stableRecord(right.record);
 }
 
