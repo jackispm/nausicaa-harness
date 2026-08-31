@@ -42,6 +42,26 @@ describe("parseCliArgs", () => {
       .toThrow(/cannot be combined/u);
   });
 
+  it("keeps detached worker process selection explicit and daemon-scoped", () => {
+    expect(parseCliArgs([
+      "--daemon",
+      "--daemon-worker-command",
+      "/usr/local/bin/nausicaa-worker",
+      "--daemon-worker-arg",
+      "--stdio",
+      "--daemon-worker-arg",
+      "--profile=default",
+    ], "/work")).toMatchObject({
+      daemon: true,
+      daemonWorkerCommand: "/usr/local/bin/nausicaa-worker",
+      daemonWorkerArgs: ["--stdio", "--profile=default"],
+    });
+    expect(() => parseCliArgs(["--daemon-worker-command", "worker"], "/work"))
+      .toThrow(/require --daemon/u);
+    expect(() => parseCliArgs(["--daemon", "--daemon-worker-arg", "--stdio"], "/work"))
+      .toThrow(/requires --daemon-worker-command/u);
+  });
+
   it("parses a read-only daemon attachment without enabling daemon mode", () => {
     expect(parseCliArgs([
       "--attach",

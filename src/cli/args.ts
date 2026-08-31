@@ -12,6 +12,10 @@ export interface CliOptions {
   version: boolean;
   daemon: boolean;
   daemonSocket?: string;
+  /** Optional executable implementing the detached worker protocol. */
+  daemonWorkerCommand?: string;
+  /** Arguments passed verbatim to the detached worker executable. */
+  daemonWorkerArgs?: string[];
   attach?: string;
   mode: OutputMode;
   modeExplicit: boolean;
@@ -49,6 +53,14 @@ const readValue = (args: string[], index: number, flag: string): string => {
   if (value === undefined || value.startsWith("-")) {
     throw new CliUsageError(`${flag} requires a value`);
   }
+  return value;
+};
+
+// Worker argv is intentionally opaque: child commands commonly need values
+// beginning with "-", which are options to the child rather than Nausicaa.
+const readRawValue = (args: string[], index: number, flag: string): string => {
+  const value = args[index + 1];
+  if (value === undefined) throw new CliUsageError(`${flag} requires a value`);
   return value;
 };
 
@@ -114,6 +126,14 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
         break;
       case "--daemon-socket":
         options.daemonSocket = readValue(args, index, argument);
+        index += 1;
+        break;
+      case "--daemon-worker-command":
+        options.daemonWorkerCommand = readValue(args, index, argument);
+        index += 1;
+        break;
+      case "--daemon-worker-arg":
+        (options.daemonWorkerArgs ??= []).push(readRawValue(args, index, argument));
         index += 1;
         break;
       case "--attach":
@@ -282,6 +302,12 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   if (options.daemonSocket !== undefined && !options.daemon && options.attach === undefined) {
     throw new CliUsageError("--daemon-socket requires --daemon or --attach");
   }
+  if ((options.daemonWorkerCommand !== undefined || options.daemonWorkerArgs !== undefined) && !options.daemon) {
+    throw new CliUsageError("--daemon-worker-command/--daemon-worker-arg require --daemon");
+  }
+  if (options.daemonWorkerArgs !== undefined && options.daemonWorkerCommand === undefined) {
+    throw new CliUsageError("--daemon-worker-arg requires --daemon-worker-command");
+  }
   if (options.attach !== undefined && (
     options.daemon
     || options.modeExplicit
@@ -291,6 +317,8 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
     || options.tetoModel !== undefined
     || options.tetoEnabled !== undefined
     || options.workerEnabled !== undefined
+    || options.daemonWorkerCommand !== undefined
+    || options.daemonWorkerArgs !== undefined
     || options.maxSteps !== undefined
     || options.maxOutputTokens !== undefined
     || options.allowWrite !== undefined
@@ -330,6 +358,10 @@ Options:
   --json                  Emit NDJSON events and results
   --daemon                Run the long-lived daemon control host
   --daemon-socket <path>  Unix JSONL control socket (default: <data-dir>/daemon/control.sock)
+  --daemon-worker-command <path>
+                          Opt into detached workers using an external worker protocol command
+  --daemon-worker-arg <value>
+                          Pass one argument to the detached worker command (repeatable)
   --attach <run-id>       Attach a read-only TUI to a daemon-owned Run
   --mode <interactive|print|json>
                           Select the output mode

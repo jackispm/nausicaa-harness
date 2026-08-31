@@ -166,6 +166,12 @@ const main = async (): Promise<number> => {
           ? {}
           : { workerEnabled: options.workerEnabled }),
         ...(options.daemonSocket === undefined ? {} : { socketPath: options.daemonSocket }),
+        ...(options.daemonWorkerCommand === undefined
+          ? {}
+          : {
+            workerCommand: options.daemonWorkerCommand,
+            workerArgs: options.daemonWorkerArgs ?? [],
+          }),
       });
     }
     const processedImages = await processImageInputs(options.fileArgs, {
@@ -375,6 +381,9 @@ interface DaemonModeOptions {
   fukaiCompaction?: ResolvedSettings["fukaiCompaction"];
   workerEnabled?: boolean;
   socketPath?: string;
+  /** Optional external command implementing the detached worker protocol. */
+  workerCommand?: string;
+  readonly workerArgs?: readonly string[];
 }
 
 /** Run the minimal local daemon host until an explicit process signal. */
@@ -440,6 +449,17 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
       },
     },
     closeEdgeComposition: options.edgeRuntime.composition.close,
+    ...(options.workerCommand === undefined
+      ? {}
+      : {
+        supervisor: {
+          process: {
+            command: options.workerCommand,
+            args: options.workerArgs ?? [],
+            cwd: options.workspace,
+          },
+        },
+      }),
   });
   const socketPath = resolve(
     options.workspace,

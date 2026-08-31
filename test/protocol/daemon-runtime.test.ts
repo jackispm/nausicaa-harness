@@ -8,6 +8,8 @@ import type {
   DaemonActivationRequest,
   DaemonSessionFactory,
   DaemonSession,
+  DaemonSupervisorWorkerClient,
+  DaemonWorkerClientSnapshot,
 } from "../../src/runtime/index.js";
 import {
   createDaemonSessionActivator,
@@ -80,6 +82,92 @@ function sessionDouble(): DaemonSession & {
 }
 
 describe("daemon runtime composition", () => {
+  it("uses an explicitly injected supervisor without changing the default Host path", async () => {
+    const ledger = new MemoryLedger();
+    const admissionLedger: Ledger = {
+      append: (event) => ledger.append(event),
+      read: (options) => ledger.read(options),
+      watermark: () => ledger.watermark(),
+      flush: () => ledger.flush(),
+      close: async () => undefined,
+    };
+    let initialized = 0;
+    let activations = 0;
+    let closed = 0;
+    const runtime = await openDaemonRuntime({
+      session: { workspace: "/workspace", dataDir: "/state", model: "scripted" },
+      openLedger: async () => admissionLedger,
+      supervisor: {
+        createWorker: ({ runId, workerId }) => {
+          let lifecycle: DaemonWorkerClientSnapshot["lifecycle"] = "starting";
+          let isInitialized = false;
+          const client: DaemonSupervisorWorkerClient = {
+            get snapshot() {
+              return {
+                lifecycle,
+                connected: lifecycle !== "stopped" && lifecycle !== "failed",
+                initialized: isInitialized,
+                runId,
+                workerId,
+                ...(isInitialized ? { instanceToken: `${workerId}:instance` } : {}),
+                pendingActivations: 0,
+              };
+            },
+            async initialize() {
+              initialized += 1;
+              isInitialized = true;
+              lifecycle = "ready";
+              return this.snapshot;
+            },
+            async activate(request) {
+              activations += 1;
+              return {
+                activationId: request.activationId,
+                runId,
+                status: "completed",
+              };
+            },
+            async drain() {
+              lifecycle = "draining";
+              return this.snapshot;
+            },
+            async close() {
+              closed += 1;
+              lifecycle = "stopped";
+            },
+          };
+          return { client };
+        },
+      },
+    });
+    runtimes.push(runtime);
+
+    expect(runtime.supervisor).toBeDefined();
+    await runtime.start();
+    await expect(runtime.host.wake({
+      runId: "run-1",
+      source: "system",
+      dedupeKey: "supervisor-wake",
+      payloadRef: payloadRef(),
+    })).resolves.toMatchObject({ status: "queued" });
+    await runtime.host.waitForIdle();
+
+    expect(initialized).toBe(1);
+    expect(activations).toBe(1);
+    await expect(ledger.watermark()).resolves.toBe(1);
+    await runtime.stop();
+    expect(closed).toBe(1);
+  });
+
+  it("rejects an external worker process when the Host has no durable lease path", async () => {
+    await expect(openDaemonRuntime({
+      session: { workspace: "/workspace", dataDir: "/state", model: "scripted" },
+      supervisor: {
+        process: { args: ["worker-entry.mjs"] },
+      },
+    })).rejects.toThrow(/durable host\.leasePath/u);
+  });
+
   it("activates the existing SessionController contract for one durable wake", async () => {
     const session = sessionDouble();
     const createSession = vi.fn<DaemonSessionFactory>(async () => session);

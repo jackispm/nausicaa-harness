@@ -11,6 +11,14 @@ import type {
 } from "./daemon-host.js";
 import { DaemonHost } from "./daemon-host.js";
 import {
+  DaemonSupervisor,
+  createDaemonSupervisorWorkerFactory,
+  type DaemonSupervisorDescriptorReader,
+  type DaemonSupervisorProcessFactoryOptions,
+  type DaemonSupervisorService,
+  type DaemonSupervisorWorkerFactory,
+} from "./daemon-supervisor.js";
+import {
   LedgerWakeAdmissionAdapter,
   type LedgerWakeAdmissionAdapterOptions,
 } from "./daemon-wake-adapter.js";
@@ -227,6 +235,27 @@ export interface DaemonRuntimeOptions {
   readonly reconciliation?: DaemonReconciliationOptions;
   /** Host-owned edge composition shutdown hook, invoked once after Host stop. */
   readonly closeEdgeComposition?: () => void | Promise<void>;
+  /**
+   * Optional detached-worker supervisor. When omitted, the existing
+   * in-process Host/Session composition remains the default. A supervisor
+   * needs either an injected worker factory or explicit process options;
+   * no child command is guessed by the runtime.
+   */
+  readonly supervisor?: DaemonRuntimeSupervisorOptions;
+}
+
+/** Supervisor settings which are independent of the Host and wake adapter. */
+export interface DaemonRuntimeSupervisorOptions {
+  readonly createWorker?: DaemonSupervisorWorkerFactory;
+  readonly process?: DaemonSupervisorProcessFactoryOptions;
+  /** Override the durable lease snapshot path passed to child workers. */
+  readonly leasePathForRun?: (runId: string) => string;
+  readonly service?: DaemonSupervisorService;
+  readonly descriptorReader?: DaemonSupervisorDescriptorReader;
+  readonly maxWorkers?: number;
+  readonly maxPendingRuns?: number;
+  readonly readyTimeoutMs?: number;
+  readonly createWorkerId?: () => string;
 }
 
 export interface DaemonReconciliationOptions {
@@ -240,6 +269,8 @@ export interface DaemonReconciliationOptions {
 export interface DaemonRuntime {
   readonly host: DaemonHost;
   readonly activate: DaemonActivator;
+  /** Present only when detached-worker supervision was explicitly injected. */
+  readonly supervisor?: DaemonSupervisor;
   readonly admitWake: DaemonWakeAdmitter;
   start(): Promise<DaemonHostSnapshot>;
   stop(): Promise<DaemonHostSnapshot>;
@@ -305,11 +336,19 @@ export async function openDaemonRuntime(
   };
 
   const hostOptions = options.host ?? {};
-  const host = await DaemonHost.open({
-    ...hostOptions,
+  const supervisor = await openRuntimeSupervisor(
+    options.supervisor,
+    hostOptions,
     admitWake,
-    activate,
-  });
+    resolve(options.session.dataDir, "daemon", "execution-lease.json"),
+  );
+  const host = supervisor === undefined
+    ? await DaemonHost.open({
+      ...hostOptions,
+      admitWake,
+      activate,
+    })
+    : supervisor.daemonHost;
   let activeRecovery: Promise<DaemonRuntimeRecoveryResult> | undefined;
   let reconciliationTimer: ReturnType<typeof setTimeout> | undefined;
   let reconciliationEnabled = false;
@@ -411,7 +450,9 @@ export async function openDaemonRuntime(
 
   const start = async (): Promise<DaemonHostSnapshot> => {
     if (stopPromise !== undefined) await stopPromise;
-    const snapshot = await host.start();
+    const snapshot = supervisor === undefined
+      ? await host.start()
+      : (await supervisor.start()).host ?? host.snapshot();
     stopping = false;
     if (options.reconciliation !== undefined) {
       reconciliationEnabled = true;
@@ -431,7 +472,9 @@ export async function openDaemonRuntime(
     const operation = (async (): Promise<DaemonHostSnapshot> => {
       await activeRecovery?.catch(() => undefined);
       try {
-        return await host.stop();
+        return supervisor === undefined
+          ? await host.stop()
+          : (await supervisor.stop()).host ?? host.snapshot();
       } finally {
         await closeEdgeComposition();
       }
@@ -446,6 +489,7 @@ export async function openDaemonRuntime(
   return {
     host,
     activate,
+    ...(supervisor === undefined ? {} : { supervisor }),
     admitWake,
     start,
     stop,
@@ -460,6 +504,58 @@ function closeOnce(close: (() => void | Promise<void>) | undefined): () => Promi
     closing = Promise.resolve().then(async () => close?.());
     return closing;
   };
+}
+
+/**
+ * Resolve the optional detached-worker boundary at the composition root.
+ * Keeping this adapter here means the ordinary in-process daemon path does
+ * not import or require a worker command, while production callers can inject
+ * either a reviewed worker implementation or the stdio process factory.
+ */
+async function openRuntimeSupervisor(
+  options: DaemonRuntimeSupervisorOptions | undefined,
+  host: Omit<DaemonHostOptions, "admitWake" | "activate">,
+  admitWake: DaemonWakeAdmitter,
+  defaultLeasePath: string,
+): Promise<DaemonSupervisor | undefined> {
+  if (options === undefined) return undefined;
+  validateRuntimeSupervisorOptions(options);
+  if (options.createWorker !== undefined && options.process !== undefined) {
+    throw new DaemonRuntimeCompositionError(
+      "supervisor createWorker and process options are mutually exclusive",
+    );
+  }
+  if (
+    options.process !== undefined
+    && options.leasePathForRun === undefined
+    && host.leasePath === undefined
+  ) {
+    throw new DaemonRuntimeCompositionError(
+      "supervisor process workers require a durable host.leasePath or leasePathForRun",
+    );
+  }
+  const createWorker = options.createWorker
+    ?? (options.process === undefined
+      ? undefined
+      : createDaemonSupervisorWorkerFactory(options.process));
+  if (createWorker === undefined) {
+    throw new DaemonRuntimeCompositionError(
+      "supervisor requires createWorker or process options",
+    );
+  }
+  return DaemonSupervisor.open({
+    host,
+    admitWake,
+    createWorker,
+    ...(options.service === undefined ? {} : { service: options.service }),
+    ...(options.descriptorReader === undefined ? {} : { descriptorReader: options.descriptorReader }),
+    ...(options.maxWorkers === undefined ? {} : { maxWorkers: options.maxWorkers }),
+    ...(options.maxPendingRuns === undefined ? {} : { maxPendingRuns: options.maxPendingRuns }),
+    ...(options.readyTimeoutMs === undefined ? {} : { readyTimeoutMs: options.readyTimeoutMs }),
+    ...(options.createWorkerId === undefined ? {} : { createWorkerId: options.createWorkerId }),
+    leasePathForRun: options.leasePathForRun
+      ?? (() => host.leasePath ?? defaultLeasePath),
+  });
 }
 
 /**
@@ -835,6 +931,32 @@ function validateRuntimeOptions(options: DaemonRuntimeOptions): void {
   }
   if (options.session.dataDir.trim().length === 0) {
     throw new DaemonRuntimeCompositionError("session.dataDir must not be empty");
+  }
+  if (options.supervisor !== undefined) validateRuntimeSupervisorOptions(options.supervisor);
+}
+
+function validateRuntimeSupervisorOptions(
+  options: DaemonRuntimeSupervisorOptions,
+): void {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new DaemonRuntimeCompositionError("supervisor options must be an object");
+  }
+  if (options.createWorker !== undefined && typeof options.createWorker !== "function") {
+    throw new DaemonRuntimeCompositionError("supervisor.createWorker must be a function");
+  }
+  if (options.process !== undefined
+    && (options.process === null || typeof options.process !== "object" || Array.isArray(options.process))) {
+    throw new DaemonRuntimeCompositionError("supervisor.process options must be an object");
+  }
+  if (options.leasePathForRun !== undefined && typeof options.leasePathForRun !== "function") {
+    throw new DaemonRuntimeCompositionError("supervisor.leasePathForRun must be a function");
+  }
+  if (options.service !== undefined && (options.service === null || typeof options.service !== "object")) {
+    throw new DaemonRuntimeCompositionError("supervisor.service must be an object");
+  }
+  if (options.descriptorReader !== undefined
+    && (options.descriptorReader === null || typeof options.descriptorReader.read !== "function")) {
+    throw new DaemonRuntimeCompositionError("supervisor.descriptorReader must provide read");
   }
 }
 
