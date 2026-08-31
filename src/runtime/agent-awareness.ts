@@ -3,13 +3,24 @@ import type {
   LaneKind,
   LaneStatus,
 } from "../domain/types.js";
-import { endpointKey, normalizeEndpoint } from "../a2a/cross-run-contract.js";
+import {
+  CROSS_RUN_MAX_ENDPOINT_LENGTH,
+  CROSS_RUN_MAX_FUTURE_SKEW_MS,
+  endpointKey,
+  normalizeEndpoint,
+} from "../a2a/cross-run-contract.js";
 
 /** Version of the user-facing Awareness projection. */
 export const AGENT_AWARENESS_SNAPSHOT_VERSION = 1 as const;
 
 /** A short observation window keeps abandoned registrations from looking live. */
 export const DEFAULT_AGENT_AWARENESS_FRESHNESS_MS = 5 * 60 * 1_000;
+/**
+ * Keep the default strict: a heartbeat from the future must opt into an
+ * explicitly bounded skew allowance. This prevents an untrusted clock from
+ * making an abandoned registration appear live indefinitely.
+ */
+export const DEFAULT_AGENT_AWARENESS_MAX_FUTURE_SKEW_MS = 0;
 export const DEFAULT_AGENT_AWARENESS_MAX_NODES = 512;
 export const DEFAULT_AGENT_AWARENESS_MAX_EDGES = 2_048;
 export const MAX_AGENT_AWARENESS_NODES = 4_096;
@@ -79,6 +90,9 @@ export type AgentAwarenessSnapshot = AgentTopologySnapshot;
 export interface AgentAwarenessRelationshipInput {
   readonly relation: AgentAwarenessRelation;
   readonly endpoint: CrossRunEndpoint;
+  /** Host admission marks also apply to relationship-derived edges. */
+  readonly authorized?: boolean;
+  readonly visible?: boolean;
 }
 
 /**
@@ -138,12 +152,14 @@ export interface AgentTopologyProjectionInput {
   /** `now` is used only for freshness; it does not become a new fact source. */
   readonly now?: string;
   readonly freshnessMs?: number;
+  readonly maxFutureSkewMs?: number;
   readonly maxNodes?: number;
   readonly maxEdges?: number;
 }
 
 export interface AgentAwarenessProjectionOptions {
   readonly freshnessMs?: number;
+  readonly maxFutureSkewMs?: number;
   readonly maxNodes?: number;
   readonly maxEdges?: number;
 }
@@ -159,6 +175,8 @@ const RELATION_ORDER: readonly AgentAwarenessRelation[] = [
 ];
 const ABSOLUTE_PATH = /^(?:[A-Za-z]:[\\/]|\/)/u;
 const SENSITIVE_ID = /\b(?:token|secret|password|passwd|api[-_ ]?key|authorization|cookie|bearer|pid|process\s+id)\b\s*[:=]/iu;
+const URI_PATH = /^(?:file:)?\/\//iu;
+const MISSING_LAST_SEEN = "1970-01-01T00:00:00.000Z";
 const STATE_VALUES = new Set<AgentAwarenessState>([
   "starting",
   "active",
@@ -190,6 +208,7 @@ interface ProjectionClock {
   readonly generatedAt: string;
   readonly nowMs: number;
   readonly freshnessMs: number;
+  readonly maxFutureSkewMs: number;
 }
 
 /**
@@ -335,7 +354,13 @@ function normalizeClock(
     1,
     24 * 60 * 60 * 1_000,
   );
-  return { generatedAt, nowMs: Date.parse(now), freshnessMs };
+  const maxFutureSkewMs = normalizeBound(
+    options.maxFutureSkewMs ?? input.maxFutureSkewMs ?? DEFAULT_AGENT_AWARENESS_MAX_FUTURE_SKEW_MS,
+    "maxFutureSkewMs",
+    0,
+    CROSS_RUN_MAX_FUTURE_SKEW_MS,
+  );
+  return { generatedAt, nowMs: Date.parse(now), freshnessMs, maxFutureSkewMs };
 }
 
 function normalizeLimits(
@@ -373,7 +398,11 @@ function normalizeRecord(record: AgentAwarenessRecord, clock: ProjectionClock): 
   const key = endpointKey(endpoint);
   const generation = normalizeGeneration(record.generation ?? record.sourceGeneration);
   const lastSeenPresent = record.lastSeen !== undefined;
-  const lastSeen = canonicalTimestamp(record.lastSeen ?? clock.generatedAt, "record.lastSeen");
+  // Do not substitute generatedAt for a missing heartbeat: that would make a
+  // record look current in a JSON/TUI projection even though it was never seen.
+  const lastSeen = lastSeenPresent
+    ? canonicalTimestamp(record.lastSeen!, "record.lastSeen")
+    : MISSING_LAST_SEEN;
   const lastSeenMs = Date.parse(lastSeen);
   const generationTrusted = record.generationTrusted !== false;
   const sourceValid = record.sourceValid !== false;
@@ -400,6 +429,7 @@ function normalizeRecord(record: AgentAwarenessRecord, clock: ProjectionClock): 
     generationTrusted,
     sourceValid,
     retained,
+    lastSeenPresent,
     relations,
   });
   return {
@@ -436,7 +466,7 @@ function canonicalTimestamp(value: string, path: string): string {
 function normalizeAwarenessEndpoint(value: unknown, path: string): CrossRunEndpoint {
   const endpoint = normalizeEndpoint(value, path);
   for (const [field, segment] of Object.entries(endpoint)) {
-    if (ABSOLUTE_PATH.test(segment) || SENSITIVE_ID.test(segment)) {
+    if (ABSOLUTE_PATH.test(segment) || URI_PATH.test(segment) || SENSITIVE_ID.test(segment)) {
       throw new TypeError(`${path}.${field} must be a public endpoint label`);
     }
   }
@@ -510,7 +540,7 @@ function applyFreshness(
   if (sourceState === "sleeping") return "sleeping";
   const stale = !lastSeenPresent
     || !Number.isFinite(lastSeenMs)
-    || lastSeenMs > clock.nowMs
+    || lastSeenMs - clock.nowMs > clock.maxFutureSkewMs
     || clock.nowMs - lastSeenMs > clock.freshnessMs;
   if (!generationTrusted || !sourceValid || stale) return retained ? "sleeping" : "offline";
   return sourceState;
@@ -524,7 +554,7 @@ function compareRecordVersion(left: NormalizedRecord, right: NormalizedRecord): 
   const rightTrust = right.generationTrusted && right.sourceValid ? 1 : 0;
   if (leftTrust !== rightTrust) return leftTrust - rightTrust;
   if (left.lastSeenMs !== right.lastSeenMs) return left.lastSeenMs - right.lastSeenMs;
-  return left.canonical < right.canonical ? -1 : left.canonical > right.canonical ? 1 : 0;
+  return compareCodeUnits(left.canonical, right.canonical);
 }
 
 function compareRecords(left: NormalizedRecord, right: NormalizedRecord): number {
@@ -544,6 +574,7 @@ function collectRecordRelations(record: AgentAwarenessRecord, source: string): r
   };
   for (const relationship of record.relationships ?? []) {
     if (relationship === null || typeof relationship !== "object") throw new TypeError("record relationship must be an object");
+    if (relationship.authorized === false || relationship.visible === false) continue;
     add(relationship.endpoint, relationship.relation);
   }
   if (record.parent !== undefined) add(record.parent, "child");
@@ -591,7 +622,18 @@ function compareEdges(left: AgentTopologyEdge, right: AgentTopologyEdge): number
 }
 
 function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
+  return compareCodeUnits(left, right);
+}
+
+/** Locale-independent UTF-16 code-unit order for reproducible projections. */
+function compareCodeUnits(left: string, right: string): number {
+  const length = Math.min(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftCode = left.charCodeAt(index);
+    const rightCode = right.charCodeAt(index);
+    if (leftCode !== rightCode) return leftCode < rightCode ? -1 : 1;
+  }
+  return left.length - right.length;
 }
 
 function toNode(record: NormalizedRecord): AgentTopologyNode {
@@ -621,7 +663,7 @@ function projectRoots(nodes: readonly AgentTopologyNode[], edges: readonly Agent
     }
     if (parent === undefined || child === undefined || !keys.has(parent) || !keys.has(child)) continue;
     const previous = parentOf.get(child);
-    if (previous === undefined || parent < previous) parentOf.set(child, parent);
+    if (previous === undefined || compareCodeUnits(parent, previous) < 0) parentOf.set(child, parent);
   }
   const roots = new Set<string>(nodes.filter((node) => !parentOf.has(node.key)).map((node) => node.key));
   for (const node of nodes) {
@@ -632,7 +674,7 @@ function projectRoots(nodes: readonly AgentTopologyNode[], edges: readonly Agent
       seen.add(current);
       current = parentOf.get(current)!;
     }
-    if (seen.has(current)) roots.add([...seen].sort()[0]!);
+    if (seen.has(current)) roots.add([...seen].sort(compareCodeUnits)[0]!);
   }
   return [...roots].sort(compareText);
 }
@@ -649,3 +691,151 @@ function freezeSnapshot(snapshot: AgentTopologySnapshot): AgentTopologySnapshot 
 }
 
 export type { CrossRunEndpoint } from "../domain/types.js";
+
+/**
+ * Redact one endpoint for a user-facing projection.  Awareness inputs are
+ * normally rejected when they contain paths or credentials; this additional
+ * boundary protects renderers that receive a snapshot from another host.
+ */
+export function redactAgentEndpoint(value: CrossRunEndpoint): CrossRunEndpoint {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("endpoint must be an object");
+  }
+  return Object.freeze({
+    workspaceId: redactEndpointSegment((value as CrossRunEndpoint).workspaceId),
+    sessionId: redactEndpointSegment((value as CrossRunEndpoint).sessionId),
+    runId: redactEndpointSegment((value as CrossRunEndpoint).runId),
+    laneId: redactEndpointSegment((value as CrossRunEndpoint).laneId),
+  });
+}
+
+/**
+ * Sanitize a snapshot before serializing it to JSON or rendering it in a TUI.
+ * Keys and edges are rebuilt from the redacted endpoints so the original
+ * endpoint tuple cannot remain hidden in a supposedly safe JSON response.
+ */
+export function redactAgentTopologySnapshot(snapshot: AgentTopologySnapshot): AgentTopologySnapshot {
+  assertSnapshotShape(snapshot);
+  const keyMap = new Map<string, string>();
+  const nodes: AgentTopologyNode[] = [];
+  const seenKeys = new Set<string>();
+  const maxNodes = DEFAULT_AGENT_AWARENESS_MAX_NODES;
+  const maxEdges = DEFAULT_AGENT_AWARENESS_MAX_EDGES;
+  for (const node of snapshot.nodes.slice(0, maxNodes)) {
+    if (node === null || typeof node !== "object" || Array.isArray(node)) {
+      throw new TypeError("invalid agent topology node");
+    }
+    const endpoint = redactAgentEndpoint(node.endpoint);
+    const oldKey = typeof node.key === "string" ? node.key : endpointKey(endpoint);
+    const key = endpointKey(endpoint);
+    if (keyMap.has(oldKey)) continue;
+    keyMap.set(oldKey, key);
+    // Redaction can collapse two hostile labels to the same endpoint. Keep the
+    // first deterministic node and omit the duplicate rather than reintroducing
+    // an unredacted suffix into the public key.
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    const role = safeRole(node.role);
+    const state = safeState(node.state);
+    const lastSeen = safeTimestamp(node.lastSeen);
+    const generation = Number.isSafeInteger(node.generation) && node.generation! >= 0
+      ? node.generation
+      : undefined;
+    const activitySummary = sanitizeAgentActivitySummary(
+      typeof node.activitySummary === "string" ? node.activitySummary : "",
+    );
+    nodes.push(Object.freeze({
+      key,
+      endpoint,
+      role,
+      state,
+      ...(activitySummary === undefined ? {} : { activitySummary }),
+      ...(generation === undefined ? {} : { generation }),
+      lastSeen,
+    }));
+  }
+  const edges: AgentTopologyEdge[] = [];
+  const seenEdges = new Set<string>();
+  for (const edge of snapshot.edges.slice(0, maxEdges)) {
+    if (edge === null || typeof edge !== "object" || Array.isArray(edge)) {
+      throw new TypeError("invalid agent topology edge");
+    }
+    const source = keyMap.get(edge.source);
+    const target = keyMap.get(edge.target);
+    if (source === undefined || target === undefined || source === target) continue;
+    if (!isAwarenessRelation(edge.relation)) continue;
+    const identity = `${source}\0${target}\0${edge.relation}`;
+    if (seenEdges.has(identity)) continue;
+    seenEdges.add(identity);
+    edges.push(Object.freeze({ source, target, relation: edge.relation }));
+  }
+  edges.sort(compareRedactedEdges);
+  const roots = Object.freeze([...new Set(snapshot.roots
+    .map((root) => keyMap.get(root))
+    .filter((root): root is string => root !== undefined))]
+    .sort(compareCodeUnits));
+  return Object.freeze({
+    version: AGENT_AWARENESS_SNAPSHOT_VERSION,
+    generatedAt: safeTimestamp(snapshot.generatedAt),
+    nodes: Object.freeze(nodes),
+    edges: Object.freeze(edges),
+    roots,
+    truncated: snapshot.truncated === true
+      || snapshot.nodes.length > maxNodes
+      || snapshot.edges.length > maxEdges,
+  });
+}
+
+function assertSnapshotShape(snapshot: AgentTopologySnapshot): void {
+  if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)
+    || snapshot.version !== AGENT_AWARENESS_SNAPSHOT_VERSION
+    || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.edges)
+    || !Array.isArray(snapshot.roots)) {
+    throw new TypeError("invalid agent topology snapshot");
+  }
+}
+
+function redactEndpointSegment(value: unknown): string {
+  if (typeof value !== "string") return "[redacted]";
+  let text = value
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  if (ABSOLUTE_PATH.test(text) || URI_PATH.test(text)) return "[path]";
+  if (SENSITIVE_ID.test(text)) return "[redacted]";
+  if (text.length === 0) return "[redacted]";
+  return truncateCodeUnits(text, CROSS_RUN_MAX_ENDPOINT_LENGTH);
+}
+
+function truncateCodeUnits(value: string, max: number): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, Math.max(0, max - 3))}...`;
+}
+
+function safeTimestamp(value: unknown): string {
+  if (typeof value !== "string" || value.includes("\0")) return MISSING_LAST_SEEN;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : MISSING_LAST_SEEN;
+}
+
+function safeRole(value: unknown): AgentAwarenessRole {
+  return typeof value === "string" && [
+    "main", "teto", "worker", "reflection", "auxiliary", "unknown",
+  ].includes(value) ? value as AgentAwarenessRole : "unknown";
+}
+
+function safeState(value: unknown): AgentAwarenessState {
+  return typeof value === "string" && STATE_VALUES.has(value as AgentAwarenessState)
+    ? value as AgentAwarenessState
+    : "offline";
+}
+
+function isAwarenessRelation(value: unknown): value is AgentAwarenessRelation {
+  return typeof value === "string" && RELATION_ORDER.includes(value as AgentAwarenessRelation);
+}
+
+function compareRedactedEdges(left: AgentTopologyEdge, right: AgentTopologyEdge): number {
+  return RELATION_ORDER.indexOf(left.relation) - RELATION_ORDER.indexOf(right.relation)
+    || compareCodeUnits(left.source, right.source)
+    || compareCodeUnits(left.target, right.target);
+}

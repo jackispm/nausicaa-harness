@@ -1,18 +1,35 @@
+import { truncateToWidth, type Component } from "@earendil-works/pi-tui";
+
 import type {
   AgentAwarenessRelation,
+  AgentAwarenessInputSource,
+  AgentAwarenessQuery,
   AgentTopologyEdge,
   AgentTopologyNode,
   AgentTopologySnapshot,
 } from "../runtime/agent-awareness.js";
-import { sanitizeAgentActivitySummary } from "../runtime/agent-awareness.js";
+import {
+  createAgentAwarenessQuery,
+  redactAgentTopologySnapshot,
+  sanitizeAgentActivitySummary,
+} from "../runtime/agent-awareness.js";
+
+export type AgentTopologyFormat = "text" | "json";
+
+/** Parse the value accepted by the future `--topology` command. */
+export function parseAgentTopologyFormat(value: unknown): AgentTopologyFormat {
+  if (value === undefined || value === "text") return "text";
+  if (value === "json") return "json";
+  throw new TypeError("topology format must be text or json");
+}
 
 /** Render the canonical snapshot as bounded, copyable terminal text. */
 export function renderAgentTopologyText(snapshot: AgentTopologySnapshot): string {
-  assertSnapshot(snapshot);
-  const nodesByKey = new Map(snapshot.nodes.map((node) => [node.key, node]));
+  const safeSnapshot = redactAgentTopologySnapshot(snapshot);
+  const nodesByKey = new Map(safeSnapshot.nodes.map((node) => [node.key, node]));
   const children = new Map<string, AgentTopologyEdge[]>();
   const hierarchical = new Set<AgentAwarenessRelation>(["parent", "child", "hosted-by"]);
-  for (const edge of snapshot.edges) {
+  for (const edge of safeSnapshot.edges) {
     if (!hierarchical.has(edge.relation)) continue;
     const oriented = orientHierarchy(edge);
     const bucket = children.get(oriented.parent) ?? [];
@@ -22,57 +39,111 @@ export function renderAgentTopologyText(snapshot: AgentTopologySnapshot): string
   for (const bucket of children.values()) bucket.sort(compareChildEdges);
 
   const lines: string[] = [
-    `Nausicaa awareness · ${snapshot.nodes.length} nodes · updated ${snapshot.generatedAt}`,
+    `Nausicaa awareness · ${safeSnapshot.nodes.length} nodes · updated ${safeSnapshot.generatedAt}`,
   ];
   const rendered = new Set<string>();
-  const roots = snapshot.roots.length > 0
-    ? snapshot.roots
-    : snapshot.nodes.map((node) => node.key);
+  const roots = safeSnapshot.roots.length > 0
+    ? safeSnapshot.roots
+    : safeSnapshot.nodes.map((node) => node.key);
   for (const root of roots) {
     if (!nodesByKey.has(root) || rendered.has(root)) continue;
     appendTree(lines, root, "", true, true, nodesByKey, children, rendered);
   }
   // A malformed/cyclic host projection must remain printable and complete.
-  for (const node of snapshot.nodes) {
+  for (const node of safeSnapshot.nodes) {
     if (!rendered.has(node.key)) appendTree(lines, node.key, "", true, true, nodesByKey, children, rendered);
   }
 
-  const connections = snapshot.edges.filter((edge) => !hierarchical.has(edge.relation));
+  const connections = safeSnapshot.edges.filter((edge) => !hierarchical.has(edge.relation));
   if (connections.length > 0) {
     lines.push("", "connections:");
     for (const edge of connections) {
       lines.push(`  ${shortKey(edge.source)}  -- ${edge.relation} -->  ${shortKey(edge.target)}`);
     }
   }
-  if (snapshot.truncated) lines.push("", "[topology truncated at configured bounds]");
+  if (safeSnapshot.truncated) lines.push("", "[topology truncated at configured bounds]");
   return lines.join("\n");
 }
 
-/** Serialize the exact snapshot consumed by the text renderer. */
+/** Serialize the redaction-safe snapshot consumed by the text renderer. */
 export function renderAgentTopologyJson(snapshot: AgentTopologySnapshot): string {
-  assertSnapshot(snapshot);
-  return JSON.stringify(snapshot);
+  return JSON.stringify(redactAgentTopologySnapshot(snapshot));
 }
 
 /** Generic renderer seam for CLI/TUI callers. */
 export function renderAgentTopology(
   snapshot: AgentTopologySnapshot,
-  format: "text" | "json" = "text",
+  format: AgentTopologyFormat = "text",
 ): string {
-  return format === "json" ? renderAgentTopologyJson(snapshot) : renderAgentTopologyText(snapshot);
+  return parseAgentTopologyFormat(format) === "json"
+    ? renderAgentTopologyJson(snapshot)
+    : renderAgentTopologyText(snapshot);
 }
 
-// Compatibility spellings for future `/agents` and `--topology` wiring.
+/** Render one point-in-time query for a CLI `--topology` invocation. */
+export function renderAgentTopologyFromSource(
+  source: AgentAwarenessQuery | AgentAwarenessInputSource,
+  format: AgentTopologyFormat = "text",
+): string {
+  return createAgentTopologyPresenter(source).render(format);
+}
+
+/**
+ * Small composition object for `--topology` and `/agents` callers. It keeps
+ * source reads lazy and exposes no mutation method or daemon control handle.
+ */
+export interface AgentTopologyPresenter {
+  snapshot(): AgentTopologySnapshot;
+  render(format?: AgentTopologyFormat): string;
+}
+
+export function createAgentTopologyPresenter(
+  source: AgentAwarenessQuery | AgentAwarenessInputSource,
+): AgentTopologyPresenter {
+  const query = isAwarenessQuery(source) ? source : createAgentAwarenessQuery(source);
+  return Object.freeze({
+    snapshot: (): AgentTopologySnapshot => query.snapshot(),
+    render: (format: AgentTopologyFormat = "text"): string => renderAgentTopology(query.snapshot(), format),
+  });
+}
+
+/** Compatibility spellings for existing embedders and future command wiring. */
 export const formatAgentTopology = renderAgentTopologyText;
 export const serializeAgentTopology = renderAgentTopologyJson;
 
-function assertSnapshot(snapshot: AgentTopologySnapshot): void {
-  if (snapshot === null || typeof snapshot !== "object" || snapshot.version !== 1
-    || typeof snapshot.generatedAt !== "string"
-    || !Array.isArray(snapshot.nodes) || !Array.isArray(snapshot.edges)
-    || !Array.isArray(snapshot.roots) || typeof snapshot.truncated !== "boolean") {
-    throw new TypeError("invalid agent topology snapshot");
+/**
+ * Read-only `/agents` view.  It intentionally accepts a query rather than a
+ * Session/daemon handle, so mounting it cannot submit input or mutate facts.
+ */
+export class AgentTopologyBlock implements Component {
+  private readonly presenter: AgentTopologyPresenter;
+
+  constructor(source: AgentAwarenessQuery | AgentAwarenessInputSource) {
+    this.presenter = createAgentTopologyPresenter(source);
   }
+
+  render(width: number): string[] {
+    const safeWidth = Math.max(1, width);
+    try {
+      return this.presenter.render("text")
+        .split("\n")
+        .map((line) => truncateToWidth(line, safeWidth, ""));
+    } catch {
+      return [truncateToWidth("Nausicaa agents · unavailable", safeWidth, "")];
+    }
+  }
+
+  invalidate(): void {}
+}
+
+export const AgentTopologyView = AgentTopologyBlock;
+
+function isAwarenessQuery(
+  source: AgentAwarenessQuery | AgentAwarenessInputSource,
+): source is AgentAwarenessQuery {
+  return typeof source === "object"
+    && source !== null
+    && typeof (source as AgentAwarenessQuery).snapshot === "function";
 }
 
 function orientHierarchy(edge: AgentTopologyEdge): { readonly parent: string; readonly edge: AgentTopologyEdge } {
@@ -90,7 +161,17 @@ function compareChildEdges(left: AgentTopologyEdge, right: AgentTopologyEdge): n
 }
 
 function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
+  return compareCodeUnits(left, right);
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  const length = Math.min(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftCode = left.charCodeAt(index);
+    const rightCode = right.charCodeAt(index);
+    if (leftCode !== rightCode) return leftCode < rightCode ? -1 : 1;
+  }
+  return left.length - right.length;
 }
 
 function appendTree(

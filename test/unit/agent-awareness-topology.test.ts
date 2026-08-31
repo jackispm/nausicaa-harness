@@ -1,13 +1,21 @@
 import { describe, expect, it } from "vitest";
 
-import { endpointKey } from "../../src/a2a/cross-run-contract.js";
+import {
+  CROSS_RUN_MAX_FUTURE_SKEW_MS,
+  endpointKey,
+} from "../../src/a2a/cross-run-contract.js";
 import {
   createAgentAwarenessQuery,
   projectAgentTopology,
+  redactAgentTopologySnapshot,
   sanitizeAgentActivitySummary,
   type AgentAwarenessRecord,
 } from "../../src/runtime/agent-awareness.js";
 import {
+  AgentTopologyBlock,
+  createAgentTopologyPresenter,
+  parseAgentTopologyFormat,
+  renderAgentTopologyFromSource,
   renderAgentTopologyJson,
   renderAgentTopologyText,
 } from "../../src/cli/agent-topology.js";
@@ -167,5 +175,75 @@ describe("agent awareness topology", () => {
     expect(query.listAgents()).toHaveLength(1);
     current = [...current, { endpoint: endpoint("run", "teto"), laneKind: "intent-navigator", state: "waiting", lastSeen: now }];
     expect(query.topology().nodes).toHaveLength(2);
+  });
+
+  it("keeps the default future-heartbeat policy strict but allows explicit bounded skew", () => {
+    const record = { endpoint: endpoint("future-skew", "main"), state: "running", lastSeen: "2026-09-01T12:00:30Z" };
+    expect(projectAgentTopology({ now, records: [record] }).nodes[0]?.state).toBe("offline");
+    expect(projectAgentTopology({ now, maxFutureSkewMs: 60_000, records: [record] }).nodes[0]?.state)
+      .toBe("active");
+    expect(projectAgentTopology({ now, maxFutureSkewMs: 60_000, records: [{
+      ...record,
+      lastSeen: "2026-09-01T12:01:01Z",
+    }] }).nodes[0]?.state).toBe("offline");
+    expect(() => projectAgentTopology({ now, maxFutureSkewMs: CROSS_RUN_MAX_FUTURE_SKEW_MS + 1, records: [record] }))
+      .toThrow(/maxFutureSkewMs/u);
+  });
+
+  it("filters relationship-derived edges by visibility and keeps missing heartbeats offline", () => {
+    const main = endpoint("main-edge", "main");
+    const child = endpoint("child-edge", "worker");
+    const snapshot = projectAgentTopology({ now, records: [
+      {
+        endpoint: main,
+        state: "idle",
+        lastSeen: now,
+        relationships: [{ endpoint: child, relation: "parent", visible: false }],
+        children: [child],
+      },
+      { endpoint: child, state: "running" },
+    ] });
+    expect(snapshot.edges).toEqual([{ source: endpointKey(main), target: endpointKey(child), relation: "parent" }]);
+    expect(snapshot.nodes.find((node) => node.endpoint.runId === "child-edge")?.lastSeen)
+      .toBe("1970-01-01T00:00:00.000Z");
+    expect(snapshot.nodes.find((node) => node.endpoint.runId === "child-edge")?.state).toBe("offline");
+  });
+
+  it("uses UTF-16 code-unit ordering and redacts hostile snapshots before JSON", () => {
+    const records = ["\uE000", "\u{1F600}", "a", "A"].map((runId) => ({
+      endpoint: endpoint(runId, "main"),
+      state: "idle",
+      lastSeen: now,
+    }));
+    const snapshot = projectAgentTopology({ now, records });
+    expect(snapshot.nodes.map((node) => node.endpoint.runId)).toEqual(["A", "a", "\u{1F600}", "\uE000"]);
+
+    const hostile = {
+      ...snapshot,
+      nodes: [{
+        ...snapshot.nodes[0]!,
+        endpoint: endpoint("/Users/private", "token=should-not-print"),
+        key: "[\"/Users/private\",\"session\",\"run\",\"token=should-not-print\"]",
+        activitySummary: "secret=value /Users/private",
+      }],
+      edges: [],
+      roots: [],
+    } as typeof snapshot;
+    const redacted = JSON.parse(renderAgentTopologyJson(hostile)) as Record<string, unknown>;
+    expect(JSON.stringify(redacted)).not.toContain("/Users/private");
+    expect(JSON.stringify(redacted)).not.toContain("should-not-print");
+    expect(redactAgentTopologySnapshot(hostile).nodes[0]?.endpoint.runId).toBe("[path]");
+    expect(redactAgentTopologySnapshot(hostile).nodes[0]?.endpoint.laneId).toBe("[redacted]");
+    expect(parseAgentTopologyFormat(undefined)).toBe("text");
+    expect(parseAgentTopologyFormat("json")).toBe("json");
+    expect(() => parseAgentTopologyFormat("yaml")).toThrow(/text or json/u);
+  });
+
+  it("provides a read-only CLI source and TUI component seam", () => {
+    const source = { now, records: [{ endpoint: endpoint("source", "main"), state: "idle", lastSeen: now }] };
+    expect(renderAgentTopologyFromSource(source, "json")).toContain("source");
+    expect(createAgentTopologyPresenter(source).render("text")).toContain("source");
+    const block = new AgentTopologyBlock(source);
+    expect(block.render(120).join("\n")).toContain("source");
   });
 });
