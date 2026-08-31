@@ -317,6 +317,39 @@ describe("settings", () => {
     expect(Object.isFrozen(resolved.edges.sources[1]?.args)).toBe(true);
   });
 
+  it("loads explicit Streamable HTTP MCP sources with bounded host headers", async () => {
+    const root = await makeRoot();
+    const home = join(root, "home");
+    await mkdir(join(home, ".nausicaa"), { recursive: true });
+    await writeFile(
+      join(home, ".nausicaa", "settings.json"),
+      JSON.stringify({
+        model: "openrouter:base",
+        edges: {
+          enabled: true,
+          sources: [{
+            sourceId: "remote-mcp",
+            type: "mcp",
+            endpoint: "https://mcp.example.test/v1",
+            headers: { Authorization: "Bearer host-secret" },
+            sessionId: "session-1",
+          }],
+        },
+      }),
+    );
+
+    const loaded = await loadSettings(root, { userHome: home });
+    const resolved = resolveSettings(root, loaded, {}, {});
+    expect(resolved.edges.sources).toEqual([expect.objectContaining({
+      sourceId: "remote-mcp",
+      type: "mcp",
+      endpoint: "https://mcp.example.test/v1",
+      headers: { Authorization: "Bearer host-secret" },
+      sessionId: "session-1",
+    })]);
+    expect(Object.isFrozen(resolved.edges.sources[0]?.headers)).toBe(true);
+  });
+
   it("loads host grants separately and bounds their authority", async () => {
     const root = await makeRoot();
     const home = join(root, "home");
@@ -356,6 +389,10 @@ describe("settings", () => {
     await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/control characters/i);
     await write({ sources: [{ sourceId: "bad source", type: "skill", location: "skills" }] });
     await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/must not contain whitespace/i);
+    await write({ sources: [{ sourceId: "mcp", type: "mcp", endpoint: "https://user:pass@example.test/mcp" }] });
+    await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/embedded credentials/i);
+    await write({ sources: [{ sourceId: "mcp", type: "mcp", endpoint: "https://example.test/mcp", headers: { "bad name": "value" } }] });
+    await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/invalid header name/i);
     await write({ grants: [{ sourceId: "grant", effects: ["write", "write"], scopes: ["workspace"] }] });
     await expect(loadSettings(root, { userHome: home })).rejects.toThrow(/must not contain duplicates/i);
   });

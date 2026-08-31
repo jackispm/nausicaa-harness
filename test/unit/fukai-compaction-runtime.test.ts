@@ -1223,6 +1223,24 @@ describe("runtime Fukai compaction source windows", () => {
       .toBe(true);
   });
 
+  it("orders same-sequence references with locale-independent lexical ordering", () => {
+    const refs = [
+      { sequence: 1, ref: { id: "a", contentHash: `sha256:${"a".repeat(64)}`, mediaType: "text/plain", byteLength: 1 } },
+      { sequence: 1, ref: { id: "Z", contentHash: `sha256:${"b".repeat(64)}`, mediaType: "text/plain", byteLength: 1 } },
+    ];
+
+    const window = selectRuntimeFukaiCompactionSources({
+      conversationRefs: refs,
+      goal,
+      upperWatermark: 1,
+      budget: { maxInputTokens: 100_000, maxOutputTokens: 100, maxWallClockMs: 1_000 },
+    });
+
+    expect(window?.sourceRefs.map((source) => (
+      source.kind === "conversation" ? source.ref.id : source.kind
+    ))).toEqual(["Z", "a"]);
+  });
+
   it("stops before fixed metadata and worst-case JSON bytes exceed the input budget", () => {
     const refs = [conversationRef(1, "12345678"), conversationRef(2, "abcdefgh")];
     const firstSource = { kind: "conversation" as const, ref: refs[0]!.ref };

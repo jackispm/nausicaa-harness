@@ -552,7 +552,11 @@ function compareConversationRefs(
   left: FukaiConversationRef,
   right: FukaiConversationRef,
 ): number {
-  return left.sequence - right.sequence || left.ref.id.localeCompare(right.ref.id);
+  return left.sequence - right.sequence || compareText(left.ref.id, right.ref.id);
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function decodeCompactionCursor(cursor: string): number {

@@ -42,6 +42,12 @@ export interface EdgeSourceSettings {
   /** Executable used by an MCP stdio source. */
   command?: string;
   args?: readonly string[];
+  /** Explicit Streamable HTTP endpoint for an MCP source. */
+  endpoint?: string;
+  /** Additional HTTP headers for an MCP endpoint; values remain host-owned. */
+  headers?: Readonly<Record<string, string>>;
+  /** Initial MCP session id for an HTTP source. */
+  sessionId?: string;
   enabled?: boolean;
 }
 
@@ -80,6 +86,8 @@ export const MAX_EDGE_GRANTS = 128;
 export const MAX_EDGE_ARGS = 64;
 export const MAX_EDGE_STRING_BYTES = 4 * 1024;
 export const MAX_EDGE_ID_BYTES = 256;
+export const MAX_EDGE_HEADERS = 64;
+export const MAX_EDGE_HEADER_NAME_BYTES = 256;
 
 export interface ResolvedFukaiCompactionSettings extends FukaiCompactionPolicy {
   thresholdRatio: number;
@@ -284,6 +292,9 @@ export const resolveEdgeSettings = (
   const sources = [...(merged.sources ?? [])].map((source) => ({
     ...source,
     ...(source.args === undefined ? {} : { args: Object.freeze([...source.args]) }),
+    ...(source.headers === undefined
+      ? {}
+      : { headers: Object.freeze({ ...source.headers }) }),
   }));
   return {
     enabled: merged.enabled ?? false,
@@ -338,6 +349,9 @@ const validateOptionalEdges = (value: unknown, path: string): void => {
       "location",
       "command",
       "args",
+      "endpoint",
+      "headers",
+      "sessionId",
       "enabled",
     ]);
     for (const key of Object.keys(candidate)) {
@@ -360,13 +374,29 @@ const validateOptionalEdges = (value: unknown, path: string): void => {
     }
     validateOptionalString(candidate.location, `${sourcePath}.location`, path);
     validateOptionalString(candidate.command, `${sourcePath}.command`, path);
+    validateOptionalString(candidate.endpoint, `${sourcePath}.endpoint`, path);
+    validateOptionalString(candidate.sessionId, `${sourcePath}.sessionId`, path);
     const location = typeof candidate.location === "string" ? candidate.location : undefined;
     const command = typeof candidate.command === "string" ? candidate.command : undefined;
-    if (candidate.type === "mcp" && (command === undefined || command.trim() === "")) {
-      throw new SettingsError(`${sourcePath}.command is required for mcp sources`);
+    const endpoint = typeof candidate.endpoint === "string" ? candidate.endpoint : undefined;
+    const sessionId = typeof candidate.sessionId === "string" ? candidate.sessionId : undefined;
+    if (candidate.type === "mcp" && command !== undefined && endpoint !== undefined) {
+      throw new SettingsError(`${sourcePath}.command and endpoint are mutually exclusive for mcp sources`);
+    }
+    if (candidate.type === "mcp"
+      && (command === undefined || command.trim() === "")
+      && (endpoint === undefined || endpoint.trim() === "")) {
+      throw new SettingsError(`${sourcePath}.command is required for mcp sources unless endpoint is supplied`);
     }
     if (candidate.type === "mcp" && location !== undefined) {
       throw new SettingsError(`${sourcePath}.location is not allowed for mcp sources`);
+    }
+    if (candidate.type === "mcp" && endpoint !== undefined) {
+      validateMcpEndpoint(endpoint, `${sourcePath}.endpoint`, path);
+    }
+    if (candidate.type !== "mcp"
+      && (endpoint !== undefined || candidate.headers !== undefined || candidate.sessionId !== undefined)) {
+      throw new SettingsError(`${sourcePath}.endpoint/headers/sessionId are only allowed for mcp sources`);
     }
     if ((candidate.type === "skill" || candidate.type === "plugin")
       && (location === undefined || location.trim() === "")) {
@@ -376,8 +406,17 @@ const validateOptionalEdges = (value: unknown, path: string): void => {
       && (command !== undefined || candidate.args !== undefined)) {
       throw new SettingsError(`${sourcePath}.command/args are only allowed for mcp sources`);
     }
+    if (candidate.type === "mcp" && endpoint !== undefined
+      && (command !== undefined || candidate.args !== undefined)) {
+      throw new SettingsError(`${sourcePath}.command/args are only allowed for mcp stdio sources`);
+    }
     if (location !== undefined) validateEdgeString(location, `${sourcePath}.location`, path, MAX_EDGE_STRING_BYTES);
     if (command !== undefined) validateEdgeString(command, `${sourcePath}.command`, path, MAX_EDGE_STRING_BYTES);
+    if (endpoint !== undefined) validateEdgeString(endpoint, `${sourcePath}.endpoint`, path, MAX_EDGE_STRING_BYTES);
+    if (sessionId !== undefined) {
+      validateEdgeString(sessionId, `${sourcePath}.sessionId`, path, MAX_EDGE_STRING_BYTES);
+    }
+    validateOptionalEdgeHeaders(candidate.headers, sourcePath, path);
     validateOptionalBoolean(candidate.enabled, `${sourcePath}.enabled`, path);
     if (candidate.args !== undefined) {
       if (!Array.isArray(candidate.args) || candidate.args.some((arg) => typeof arg !== "string")) {
@@ -450,6 +489,46 @@ const validateEdgeId = (value: string, name: string, path: string): void => {
   validateEdgeString(value, name, path, MAX_EDGE_ID_BYTES);
   if (/\s/u.test(value)) {
     throw new SettingsError(`${name} in ${path} must not contain whitespace`);
+  }
+};
+
+const validateMcpEndpoint = (value: string, name: string, path: string): void => {
+  let endpoint: URL;
+  try {
+    endpoint = new URL(value);
+  } catch {
+    throw new SettingsError(`${name} in ${path} must be a valid URL`);
+  }
+  if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
+    throw new SettingsError(`${name} in ${path} must use http or https`);
+  }
+  if (endpoint.username.length > 0 || endpoint.password.length > 0) {
+    throw new SettingsError(`${name} in ${path} must not contain embedded credentials`);
+  }
+};
+
+const validateOptionalEdgeHeaders = (
+  value: unknown,
+  sourcePath: string,
+  path: string,
+): void => {
+  if (value === undefined) return;
+  if (!isRecord(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new SettingsError(`${sourcePath}.headers in ${path} must be a JSON object`);
+  }
+  const entries = Object.entries(value);
+  if (entries.length > MAX_EDGE_HEADERS) {
+    throw new SettingsError(`${sourcePath}.headers exceeds ${MAX_EDGE_HEADERS} entries`);
+  }
+  for (const [name, headerValue] of entries) {
+    validateEdgeString(name, `${sourcePath}.headers name`, path, MAX_EDGE_HEADER_NAME_BYTES);
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u.test(name)) {
+      throw new SettingsError(`${sourcePath}.headers contains an invalid header name`);
+    }
+    if (typeof headerValue !== "string") {
+      throw new SettingsError(`${sourcePath}.headers.${name} must be a string`);
+    }
+    validateEdgeString(headerValue, `${sourcePath}.headers.${name}`, path, MAX_EDGE_STRING_BYTES);
   }
 };
 

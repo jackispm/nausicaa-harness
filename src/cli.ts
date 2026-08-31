@@ -540,6 +540,9 @@ const cliEdgeConstructors = (): EdgeAdapterConstructors => ({
     sourceId: source.sourceId,
     ...(source.command === undefined ? {} : { command: source.command }),
     ...(source.args === undefined ? {} : { args: source.args }),
+    ...(source.endpoint === undefined ? {} : { endpoint: source.endpoint }),
+    ...(source.headers === undefined ? {} : { headers: source.headers }),
+    ...(source.sessionId === undefined ? {} : { sessionId: source.sessionId }),
     cwd: context.workspace,
   }),
   skill: (source) => createSkillsEdgeAdapter({
