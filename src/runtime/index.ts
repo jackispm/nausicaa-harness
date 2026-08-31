@@ -26,6 +26,7 @@ export * from "./teto-scheduler.js";
 export * from "./task-dispatcher.js";
 export * from "./delegate-task-tool.js";
 export * from "./agent-message-tool.js";
+export * from "./cross-run-runtime.js";
 export * from "./execution-lease.js";
 export * from "./file-execution-lease.js";
 export * from "./daemon-host.js";

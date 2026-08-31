@@ -92,6 +92,10 @@ import {
 import { WorkerTaskExecutor } from "./worker-task-executor.js";
 import { shouldAdvertiseImageTools } from "./model-capabilities.js";
 import {
+  createCrossRunRuntimeTool,
+  type CrossRunRuntimeComposition,
+} from "./cross-run-runtime.js";
+import {
   freezeWorkspaceEdgeToolSnapshot,
   type WorkspaceEdgeToolSnapshot,
 } from "../mowe/workspace-catalog.js";
@@ -146,6 +150,12 @@ export interface RunExecutionDeps {
   /** Optional provider seams for network-backed Main tools. */
   webFetchProvider?: WebFetchProvider;
   webSearchProvider?: WebSearchProvider;
+  /**
+   * Host-owned Cross-Run A2A composition. When present, Main receives the
+   * `agent_message` capability bound to this Run's authenticated sender;
+   * without it, no cross-Run capability is advertised.
+   */
+  crossRun?: CrossRunRuntimeComposition;
   /** Embedding seam for a captured edge snapshot when request data is shared. */
   edgeSnapshot?: WorkspaceEdgeToolSnapshot;
   edgeSnapshotProvider?: EdgeTurnSnapshotProvider;
@@ -371,6 +381,15 @@ export const executeRun = async (
       events: setup.events,
       clock,
     });
+    const crossRunTool = deps.crossRun === undefined
+      ? undefined
+      : await createCrossRunRuntimeTool(deps.crossRun, {
+          runId,
+          laneId: "main",
+          workspace,
+          ledger,
+          store,
+        });
     const hostShellEnabled = deps.tools === undefined && request.allowShell === true;
     const workspaceShellRequested = deps.tools === undefined
       && request.allowWrite === true
@@ -409,6 +428,12 @@ export const executeRun = async (
       protectedPaths: [resolve(request.dataDir)],
     });
     const tools: AgentTool[] = [...baseTools];
+    if (crossRunTool !== undefined) {
+      if (tools.some((tool) => tool.definition.name.trim() === crossRunTool.definition.name.trim())) {
+        throw new Error("cross-Run agent_message capability collides with a host tool");
+      }
+      tools.push(crossRunTool);
+    }
     if (auxiliaryMode === "teto") {
       if (adviceDelivery === "live") tools.push(createAdviceResponseTool(inbox));
       const tetoModel = deps.tetoModel ?? mainModel;
