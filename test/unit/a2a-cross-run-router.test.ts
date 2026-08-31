@@ -25,7 +25,7 @@ import type {
   CrossRunTargetSelector,
   CrossRunWakeInput,
 } from "../../src/a2a/index.js";
-import { createArtifactRef } from "../../src/store/index.js";
+import { createArtifactRef, MemoryContentAddressedStore } from "../../src/store/index.js";
 
 class FixedClock implements Clock {
   constructor(readonly instant = new Date("2026-08-31T00:00:00.000Z")) {}
@@ -343,6 +343,36 @@ describe("CrossRunRouter", () => {
       targetAdmission: { admit: async () => ({ status: "accepted" }) },
     });
     await expect(allowed.send(request("remote"), sender)).resolves.toMatchObject({ status: "accepted" });
+  });
+
+  it("fails closed for ArtifactRefs without a relay, even within one workspace", async () => {
+    const sourceArtifacts = new MemoryContentAddressedStore();
+    const targetArtifacts = new MemoryContentAddressedStore();
+    const ref = await sourceArtifacts.put("run-local-artifact", "text/plain");
+    expect(await sourceArtifacts.has(ref)).toBe(true);
+    expect(await targetArtifacts.has(ref)).toBe(false);
+    let admitted = false;
+    const store = new MemoryCrossRunFactStore();
+    const r = router({
+      factStore: store,
+      targetAdmission: {
+        admit: async () => {
+          admitted = true;
+          return { status: "queued" as const };
+        },
+      },
+    });
+
+    await expect(r.send(request("same-workspace-artifact", undefined, "hello", { artifactRefs: [ref] }), sender))
+      .resolves.toMatchObject({
+        status: "rejected",
+        reason: "artifact-rejected",
+        diagnostic: "artifact-invalid",
+      });
+    expect(admitted).toBe(false);
+    expect(await targetArtifacts.has(ref)).toBe(false);
+    expect((await store.read({ runId: source.runId })).map((fact) => fact.kind))
+      .toEqual(["outbox.pending", "outbox.receipt"]);
   });
 
   it("resolves family selectors from a constrained roster and rejects ambiguity", async () => {

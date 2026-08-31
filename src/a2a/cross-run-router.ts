@@ -734,18 +734,15 @@ export class CrossRunRouter {
         const relayAdapter = this.#options.artifactRelay;
         const relay = relayAdapter === undefined ? this.#options.relayArtifact : undefined;
         if (relayAdapter === undefined && relay === undefined) {
-          if (source.workspaceId !== target.workspaceId) {
-            throw new CrossRunProtocolError(
-              "cross-workspace ArtifactRef requires an authorized relay",
-              "artifact-invalid",
-            );
-          }
-          delivery = {
-            sourceRef: structuredClone(sourceRef),
-            targetRef: structuredClone(sourceRef),
-            visibility,
-            targetWorkspaceId: target.workspaceId,
-          };
+          // Artifact stores are Run-scoped in the production composition.
+          // A content-addressed ref alone does not make the object available
+          // to the target Run, even when both endpoints share a workspace.
+          // Require the host to inject a relay that verifies and copies the
+          // bytes into the target store before admitting the message.
+          throw new CrossRunProtocolError(
+            "ArtifactRef requires an authorized relay",
+            "artifact-invalid",
+          );
         } else {
           delivery = relayAdapter !== undefined
             ? await relayAdapter.relay(input)
