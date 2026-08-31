@@ -45,6 +45,7 @@ export * from "./daemon-worker-server.js";
 export * from "./daemon-worker-transport.js";
 export * from "./daemon-worker-process.js";
 export * from "./daemon-worker-descriptor.js";
+export * from "./daemon-supervisor.js";
 export * from "./worker-task-executor.js";
 export * from "./worker-lane-scheduler.js";
 export * from "./agent-awareness.js";

@@ -16,6 +16,8 @@ import type {
   DaemonWorkerActivationRequest,
 } from "./daemon-worker-client.js";
 import type { DaemonWorkerLeaseIdentity, DaemonWorkerWake } from "./daemon-worker-protocol.js";
+import { DaemonWorkerProcess } from "./daemon-worker-process.js";
+import type { DaemonWorkerDescriptorPublisher } from "./daemon-worker-protocol.js";
 import { persistedErrorText } from "./redaction.js";
 
 const DEFAULT_MAX_WORKERS = 4;
@@ -136,6 +138,56 @@ export interface DaemonSupervisorWorkerCreateRequest {
 export type DaemonSupervisorWorkerFactory = (
   request: DaemonSupervisorWorkerCreateRequest,
 ) => DaemonSupervisorWorker | Promise<DaemonSupervisorWorker>;
+
+/**
+ * Bind the supervisor to the reviewed detached worker process implementation.
+ * The caller supplies the worker executable/argv and child descriptor
+ * publisher; no process or runtime policy is invented here.
+ */
+export interface DaemonSupervisorProcessFactoryOptions {
+  readonly command?: string;
+  readonly args: readonly string[];
+  readonly cwd?: string;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly descriptorPublisherForRun?: (
+    request: DaemonSupervisorWorkerCreateRequest,
+  ) => DaemonWorkerDescriptorPublisher | undefined;
+  readonly maxFrameBytes?: number;
+  readonly maxPendingActivations?: number;
+  readonly commandTimeoutMs?: number;
+  readonly activationTimeoutMs?: number;
+  readonly cancelGraceMs?: number;
+}
+
+export function createDaemonSupervisorWorkerFactory(
+  options: DaemonSupervisorProcessFactoryOptions,
+): DaemonSupervisorWorkerFactory {
+  if (options === null || typeof options !== "object" || Array.isArray(options)) {
+    throw new DaemonSupervisorError("worker_create_failed", "process factory options must be an object");
+  }
+  if (!Array.isArray(options.args)) {
+    throw new DaemonSupervisorError("worker_create_failed", "process factory args must be an array");
+  }
+  return (request) => {
+    const publisher = options.descriptorPublisherForRun?.(request);
+    const process = new DaemonWorkerProcess({
+      runId: request.runId,
+      workerId: request.workerId,
+      lease: request.lease,
+      args: [...options.args],
+      ...(options.command === undefined ? {} : { command: options.command }),
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      ...(options.env === undefined ? {} : { env: options.env }),
+      ...(publisher === undefined ? {} : { descriptorPublisher: publisher }),
+      ...(options.maxFrameBytes === undefined ? {} : { maxFrameBytes: options.maxFrameBytes }),
+      ...(options.maxPendingActivations === undefined ? {} : { maxPendingActivations: options.maxPendingActivations }),
+      ...(options.commandTimeoutMs === undefined ? {} : { commandTimeoutMs: options.commandTimeoutMs }),
+      ...(options.activationTimeoutMs === undefined ? {} : { activationTimeoutMs: options.activationTimeoutMs }),
+      ...(options.cancelGraceMs === undefined ? {} : { cancelGraceMs: options.cancelGraceMs }),
+    });
+    return { client: process.client, close: () => process.close() };
+  };
+}
 
 export type DaemonSupervisorHostFactory = (
   options: DaemonHostOptions,
