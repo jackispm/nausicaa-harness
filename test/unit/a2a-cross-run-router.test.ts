@@ -246,9 +246,9 @@ describe("CrossRunRouter", () => {
     const r = router({
       factStore: store,
       targetAdmission: {
-        admit: async () => {
+        admit: async ({ envelope }) => {
           admissions += 1;
-          return { status: "delivered", messageId: "target-message-1" };
+          return { status: "delivered", messageId: envelope.messageId };
         },
       },
       createId: (kind) => `${kind}-${admissions + 1}`,
@@ -257,6 +257,44 @@ describe("CrossRunRouter", () => {
     await expect(r.send(request(), sender)).resolves.toMatchObject({ status: "duplicate" });
     await expect(r.send(request("key-1", undefined, "changed"), sender))
       .resolves.toMatchObject({ status: "conflict", reason: "idempotency-conflict" });
+    expect(admissions).toBe(1);
+  });
+
+  it("serializes the same source route across router instances", async () => {
+    const store = new MemoryCrossRunFactStore();
+    let admissions = 0;
+    let releaseFirst!: () => void;
+    let firstAdmissionStarted!: () => void;
+    const admissionStarted = new Promise<void>((resolve) => {
+      firstAdmissionStarted = resolve;
+    });
+    const firstAdmissionRelease = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const targetAdmission = {
+      admit: async ({ envelope }: CrossRunTargetAdmissionInput) => {
+        admissions += 1;
+        if (admissions === 1) {
+          firstAdmissionStarted();
+          await firstAdmissionRelease;
+        }
+        return { status: "queued" as const, messageId: envelope.messageId };
+      },
+    };
+    const options = {
+      clock: new FixedClock(),
+      factStore: store,
+      resolver: { resolve: async () => ({ endpoint: child, relationship: "direct" as const }) },
+      targetAdmission,
+    };
+    const first = new CrossRunRouter(options).send(request("router-race"), sender);
+    await admissionStarted;
+    const second = new CrossRunRouter(options).send(request("router-race"), sender);
+    await Promise.resolve();
+    expect(admissions).toBe(1);
+    releaseFirst();
+    await expect(first).resolves.toMatchObject({ status: "queued" });
+    await expect(second).resolves.toMatchObject({ status: "duplicate" });
     expect(admissions).toBe(1);
   });
 
@@ -616,6 +654,18 @@ describe("CrossRunRouter", () => {
       reason: "target-admission-failed",
     });
     expect(woke).toBe(false);
+  });
+
+  it("rejects a target admission message identity mismatch without wake", async () => {
+    const store = new MemoryCrossRunFactStore();
+    const r = router({
+      factStore: store,
+      targetAdmission: { admit: async () => ({ status: "queued", messageId: "forged-target-id" }) },
+    });
+    await expect(r.send(request("forged-admission-no-wake"), sender)).resolves.toMatchObject({
+      status: "uncertain",
+      reason: "target-admission-failed",
+    });
   });
 
   it("does not project a claimed message without a valid claim lease", () => {

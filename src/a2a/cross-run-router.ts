@@ -76,6 +76,12 @@ export interface CrossRunRouterOptions {
 /** Keep recovery bounded even when a host asks for retries repeatedly. */
 export const CROSS_RUN_MAX_ATTEMPTS = 8;
 
+// The source-side route critical section must span router instances. A host
+// may construct one router per activation while sharing the same source Run
+// (and therefore the same durable fact store); an instance-local tail would
+// let two sends race between the pending read and target admission.
+const sharedSendTails = new Map<string, Promise<void>>();
+
 export interface CrossRunBatchResult {
   readonly receipts: readonly CrossRunReceipt[];
   readonly accepted: number;
@@ -112,7 +118,6 @@ export class CrossRunRouter {
   readonly #maxBatch: number;
   readonly #maxAttempts: number;
   readonly #fallbackStore: CrossRunFactStore;
-  readonly #sendTail = new Map<string, Promise<void>>();
 
   constructor(options: CrossRunRouterOptions = {}) {
     if (options === null || typeof options !== "object" || Array.isArray(options)
@@ -526,10 +531,7 @@ export class CrossRunRouter {
     try {
       admission = await this.admitTarget({ envelope, message, source: sender });
       validateAdmissionResult(admission);
-      const wakeConfigured = this.#options.wake !== undefined
-        || this.#options.wakeTarget !== undefined;
-      if (wakeConfigured
-        && admission.status !== "rejected"
+      if (admission.status !== "rejected"
         && admission.messageId !== undefined
         && admission.messageId !== envelope.messageId) {
         throw new CrossRunProtocolError(
@@ -597,16 +599,16 @@ export class CrossRunRouter {
     operation: () => Promise<T>,
   ): Promise<T> {
     const key = endpointKey(endpoint);
-    const previous = this.#sendTail.get(key) ?? Promise.resolve();
+    const previous = sharedSendTails.get(key) ?? Promise.resolve();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const current = previous.then(() => gate);
-    this.#sendTail.set(key, current);
+    sharedSendTails.set(key, current);
     return previous
       .then(operation)
       .finally(() => {
         release();
-        if (this.#sendTail.get(key) === current) this.#sendTail.delete(key);
+        if (sharedSendTails.get(key) === current) sharedSendTails.delete(key);
       });
   }
 
