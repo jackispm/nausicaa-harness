@@ -87,6 +87,11 @@ import {
   formatEdgeStatus,
   type EdgeStatusProjection,
 } from "./edge-status.js";
+import { AgentTopologyBlock } from "./agent-topology.js";
+import type {
+  AgentAwarenessInputSource,
+  AgentAwarenessQuery,
+} from "../runtime/agent-awareness.js";
 
 export interface InteractiveOptions {
   session: SessionController;
@@ -110,6 +115,8 @@ export interface InteractiveOptions {
   edgeStatus?: () => EdgeStatusProjection;
   /** Optional host-injected Skill selection seam. */
   edgeSelection?: EdgeSelectionController;
+  /** Optional host-owned, read-only Awareness topology source. */
+  awareness?: AgentAwarenessQuery | AgentAwarenessInputSource;
 }
 
 interface QueuedSubmission {
@@ -238,6 +245,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider([
     { name: "help", description: "Show commands" },
     { name: "status", description: "Show session state" },
+    { name: "agents", description: "Show the read-only agent Awareness topology" },
+    { name: "topology", description: "Alias for /agents" },
     { name: "edges", description: "Show configured edge sources and refresh" },
     { name: "skills", description: "Inspect and select Skills for the next Turn", argumentHint: "[refresh|select|deselect]" },
     { name: "context", description: "Show context capacity and cumulative lane usage" },
@@ -418,6 +427,18 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     kind: "info" | "success" | "warning" | "error" = "info",
   ): void => {
     appendBlock(new NoticeBlock(message, kind));
+  };
+
+  const showAgentTopology = (argument: string): void => {
+    if (argument.length > 0) throw new Error("Usage: /agents");
+    if (options.awareness === undefined) {
+      appendNotice(
+        "Agent awareness is unavailable: the host did not provide a read-only topology source.",
+        "warning",
+      );
+      return;
+    }
+    appendBlock(new AgentTopologyBlock(options.awareness));
   };
 
   const moveQueueSelection = (direction: -1 | 1, draft: string): void => {
@@ -1611,6 +1632,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           appendBlock(new Markdown([
             "### Commands",
             "`/status` session details  ·  `/context` context and cumulative usage",
+            "`/agents` read-only Awareness topology  ·  `/topology` alias for `/agents`",
             "`/edges [refresh]` configured edge sources, Skills, and registry generation",
             "`/skills [refresh|select <id>|deselect <id>]` next-Turn Skill context",
             "`/usage` alias for `/context`  ·  `/goal [statement]` show or revise Goal",
@@ -1631,6 +1653,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           break;
         case "/status":
           writeStatus(options.session.snapshot());
+          break;
+        case "/agents":
+        case "/topology":
+          showAgentTopology(argument);
           break;
         case "/edges":
           if (argument === "refresh") {

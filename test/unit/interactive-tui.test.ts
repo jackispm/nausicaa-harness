@@ -1224,6 +1224,105 @@ describe("interactive TUI", () => {
     }
   });
 
+  it.each(["/agents", "/topology"])(
+    "renders %s as a read-only Awareness topology",
+    async (command) => {
+      const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-awareness-"));
+      const terminal = new MemoryTerminal(100, 28);
+      const previousExitCode = process.exitCode;
+      try {
+        const model = new ScriptedModel([]);
+        const session = await SessionController.open({
+          workspace: root,
+          dataDir: join(root, "state"),
+          model: "scripted",
+          policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+        }, {
+          mainModel: model,
+          createRunId: () => "interactive-awareness-run",
+        });
+        const events: SessionRuntimeEvent[] = [];
+        session.subscribe((event) => events.push(event));
+        const running = runInteractive({
+          session,
+          terminal,
+          forceAltScreen: true,
+          awareness: {
+            now: "2026-09-01T12:00:00.000Z",
+            records: [{
+              endpoint: {
+                workspaceId: "repo",
+                sessionId: "session-a",
+                runId: "awareness-run",
+                laneId: "main",
+              },
+              state: "running",
+              lastSeen: "2026-09-01T12:00:00.000Z",
+              activitySummary: "reviewing topology",
+            }],
+          },
+        });
+
+        await terminal.started;
+        terminal.type(command);
+        terminal.send("\r");
+        await waitForOutput(terminal, "Nausicaa awareness");
+        expect(terminal.output).toContain("awareness-run/main");
+        expect(terminal.output).toContain("reviewing topology");
+        expect(model.callCount).toBe(0);
+        expect(events.filter((event) => event.kind === "event")).toHaveLength(0);
+
+        terminal.type(`${command} extra`);
+        terminal.send("\r");
+        await waitForOutput(terminal, "Usage: /agents");
+        expect(model.callCount).toBe(0);
+        expect(events.filter((event) => event.kind === "event")).toHaveLength(0);
+
+        terminal.type("/exit");
+        terminal.send("\r");
+        await expect(running).resolves.toBe(0);
+      } finally {
+        process.exitCode = previousExitCode;
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("reports unavailable Awareness without mutating the Run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-awareness-unavailable-"));
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const model = new ScriptedModel([]);
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: model,
+        createRunId: () => "interactive-awareness-unavailable-run",
+      });
+      const events: SessionRuntimeEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("/agents");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Agent awareness is unavailable");
+      expect(model.callCount).toBe(0);
+      expect(events.filter((event) => event.kind === "event")).toHaveLength(0);
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each([44, 100])(
     "completes command arguments and preserves a multiline Goal at %i columns",
     async (columns) => {
