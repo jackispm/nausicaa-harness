@@ -116,7 +116,10 @@ export interface InteractiveOptions {
   /** Optional host-injected Skill selection seam. */
   edgeSelection?: EdgeSelectionController;
   /** Optional host-owned, read-only Awareness topology source. */
-  awareness?: AgentAwarenessQuery | AgentAwarenessInputSource;
+  awareness?:
+    | AgentAwarenessQuery
+    | AgentAwarenessInputSource
+    | (() => Promise<AgentAwarenessQuery | AgentAwarenessInputSource>);
 }
 
 interface QueuedSubmission {
@@ -429,7 +432,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     appendBlock(new NoticeBlock(message, kind));
   };
 
-  const showAgentTopology = (argument: string): void => {
+  const showAgentTopology = async (argument: string): Promise<void> => {
     if (argument.length > 0) throw new Error("Usage: /agents");
     if (options.awareness === undefined) {
       appendNotice(
@@ -438,7 +441,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       );
       return;
     }
-    appendBlock(new AgentTopologyBlock(options.awareness));
+    try {
+      const source = typeof options.awareness === "function"
+        ? await options.awareness()
+        : options.awareness;
+      appendBlock(new AgentTopologyBlock(source));
+    } catch {
+      appendNotice("Nausicaa agents · unavailable", "warning");
+    }
   };
 
   const moveQueueSelection = (direction: -1 | 1, draft: string): void => {
@@ -1656,7 +1666,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           break;
         case "/agents":
         case "/topology":
-          showAgentTopology(argument);
+          await showAgentTopology(argument);
           break;
         case "/edges":
           if (argument === "refresh") {

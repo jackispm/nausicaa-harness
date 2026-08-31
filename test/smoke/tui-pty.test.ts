@@ -38,8 +38,10 @@ if pid == 0:
 
 output = bytearray()
 marker = b'Try "inspect this project"'
+awareness_marker = b'Nausicaa awareness'
 exit_screen = b'\x1b[?1049l'
 deadline = time.monotonic() + 5.0
+sent_agents = False
 sent_exit = False
 status = None
 
@@ -54,7 +56,10 @@ while time.monotonic() < deadline:
             chunk = b""
         if chunk:
             output.extend(chunk)
-            if not sent_exit and marker in output:
+            if not sent_agents and marker in output:
+                os.write(fd, b"/agents\r")
+                sent_agents = True
+            if sent_agents and not sent_exit and awareness_marker in output:
                 os.write(fd, b"/exit\r")
                 sent_exit = True
 
@@ -94,10 +99,12 @@ except OSError:
 sys.stdout.buffer.write(output)
 if marker not in output:
     sys.exit(124)
-if not sent_exit or exit_screen not in output:
+if awareness_marker not in output:
     sys.exit(125)
-if os.waitstatus_to_exitcode(status) != 0:
+if not sent_exit or exit_screen not in output:
     sys.exit(126)
+if os.waitstatus_to_exitcode(status) != 0:
+    sys.exit(127)
 `;
 
 describe("built CLI PTY", () => {
@@ -135,6 +142,8 @@ describe("built CLI PTY", () => {
         expect(stdout).toContain(basename(root));
         expect(stdout).toContain('Type a task, or "/help" for commands');
         expect(stdout).toContain('Try "inspect this project"');
+        expect(stdout).toContain("Nausicaa awareness");
+        expect(stdout).not.toContain("Agent awareness is unavailable");
         expect(stdout).toContain("main/new");
       } finally {
         await rm(root, { recursive: true, force: true });

@@ -230,6 +230,10 @@ const main = async (): Promise<number> => {
           session,
           edgeStatus: edgeRuntime.status,
           edgeSelection: edgeRuntime.selection,
+          awareness: () => readWorkspaceAgentAwareness(
+            resolvedSettings.dataDir,
+            workspace,
+          ),
           ...(initialMessage === undefined ? {} : { initialMessage }),
           ...(processedImages.images.length === 0
             ? {}

@@ -27,6 +27,30 @@ describe("built CLI", () => {
     expect(stdout.trim()).toBe("0.1.0");
   });
 
+  it.each([
+    ["print", ["--topology", "--print"]],
+    ["json", ["--topology", "--json"]],
+  ] as const)("supports non-TTY %s output without starting a model", async (mode, args) => {
+    const root = await mkdtemp(join(tmpdir(), `nausicaa-cli-${mode}-`));
+    try {
+      const { stdout, stderr } = await execFileAsync(
+        builtCli,
+        ["--workspace", root, "--data-dir", join(root, "state"), ...args],
+        { env: { PATH: process.env.PATH } },
+      );
+
+      expect(stderr).toBe("");
+      if (mode === "json") {
+        expect(JSON.parse(stdout)).toMatchObject({ version: 1, nodes: [], edges: [] });
+      } else {
+        expect(stdout).toContain("Nausicaa awareness");
+        expect(stdout).toContain("0 nodes");
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("executes a minimal Run through the built runtime artifact", async () => {
     const script = `
       import { mkdtemp, rm } from "node:fs/promises";
