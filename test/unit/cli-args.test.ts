@@ -121,6 +121,23 @@ describe("parseCliArgs", () => {
     });
   });
 
+  it("parses read-only topology output and permits JSON", () => {
+    expect(parseCliArgs(["--topology"], "/work")).toMatchObject({
+      topology: true,
+      mode: "print",
+      modeExplicit: true,
+    });
+    expect(parseCliArgs(["--topology", "--json"], "/work")).toMatchObject({
+      topology: true,
+      mode: "json",
+      modeExplicit: true,
+    });
+    expect(parseCliArgs(["--json", "--topology"], "/work")).toMatchObject({
+      topology: true,
+      mode: "json",
+    });
+  });
+
   it("parses model, output, and lane controls", () => {
     expect(
       parseCliArgs(
@@ -256,6 +273,12 @@ describe("parseCliArgs", () => {
     expect(() => parseCliArgs(["--fukai-max-output-tokens", "0"], "/work")).toThrow(
       /fukai-max-output-tokens.*positive integer/i,
     );
+    expect(() => parseCliArgs(["--topology", "task"], "/work")).toThrow(
+      /cannot be combined/i,
+    );
+    expect(() => parseCliArgs(["--topology", "--mode", "interactive"], "/work")).toThrow(
+      /requires --print or --json/i,
+    );
   });
 
   it("parses an explicit unknown-operation resolution for resume", () => {
@@ -297,5 +320,6 @@ describe("parseCliArgs", () => {
     expect(usage).toContain("--refresh-edges");
     expect(usage).toContain("--daemon");
     expect(usage).toContain("--daemon-socket");
+    expect(usage).toContain("--topology");
   });
 });

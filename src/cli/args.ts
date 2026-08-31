@@ -10,6 +10,8 @@ export type OutputMode = "interactive" | "print" | "json";
 export interface CliOptions {
   help: boolean;
   version: boolean;
+  /** Print the read-only agent Awareness topology and exit. */
+  topology: boolean;
   daemon: boolean;
   daemonSocket?: string;
   /** Optional executable implementing the detached worker protocol. */
@@ -92,6 +94,7 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   const options: CliOptions = {
     help: false,
     version: false,
+    topology: false,
     daemon: false,
     mode: "interactive",
     modeExplicit: false,
@@ -120,6 +123,15 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
       case "--json":
         options.mode = "json";
         options.modeExplicit = true;
+        break;
+      case "--topology":
+        options.topology = true;
+        // Awareness is a read-only inspection command. Make it usable from a
+        // pipe by default while still allowing an explicit --json mode.
+        if (!options.modeExplicit) {
+          options.mode = "print";
+          options.modeExplicit = true;
+        }
         break;
       case "--daemon":
         options.daemon = true;
@@ -299,6 +311,12 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   if (options.resume !== undefined && options.continue) {
     throw new CliUsageError("--resume and --continue are mutually exclusive");
   }
+  if (options.topology && options.mode === "interactive") {
+    throw new CliUsageError("--topology requires --print or --json output");
+  }
+  if (options.topology && (options.fileArgs.length > 0 || options.message !== undefined)) {
+    throw new CliUsageError("--topology cannot be combined with a task or image input");
+  }
   if (options.daemonSocket !== undefined && !options.daemon && options.attach === undefined) {
     throw new CliUsageError("--daemon-socket requires --daemon or --attach");
   }
@@ -326,6 +344,7 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
     || options.allowNetwork !== undefined
     || options.edges !== undefined
     || options.fukaiCompaction !== undefined
+    || options.topology
     || options.fileArgs.length > 0
     || options.message !== undefined
   )) {
@@ -338,6 +357,7 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
     || options.continue
     || options.resume !== undefined
     || options.resolveOperation !== undefined
+    || options.topology
     || options.fileArgs.length > 0
     || options.message !== undefined
   )) {
@@ -356,6 +376,7 @@ Usage:
 Options:
   -p, --print             Run once and print the final answer
   --json                  Emit NDJSON events and results
+  --topology              Print the read-only agent Awareness topology and exit
   --daemon                Run the long-lived daemon control host
   --daemon-socket <path>  Unix JSONL control socket (default: <data-dir>/daemon/control.sock)
   --daemon-worker-command <path>

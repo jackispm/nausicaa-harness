@@ -40,6 +40,8 @@ import {
   edgeStatusFromProvider,
   type EdgeTurnSnapshotProvider,
 } from "./runtime/edge-runtime.js";
+import { renderAgentTopologyFromSource } from "./cli/agent-topology.js";
+import { readWorkspaceAgentAwareness } from "./cli/agent-topology-source.js";
 import {
   persistedErrorText,
   stringifyRedactedJson,
@@ -97,6 +99,20 @@ const main = async (): Promise<number> => {
   let openedEdgeComposition: ConfiguredEdgeComposition | undefined;
   try {
     const settings = await loadSettings(workspace);
+    if (options.topology) {
+      // Topology inspection is deliberately independent of model/provider
+      // configuration. It only reads committed Run JSONL files.
+      const topologyDataDir = resolve(
+        workspace,
+        options.dataDir ?? settings.dataDir ?? ".nausicaa",
+      );
+      const source = await readWorkspaceAgentAwareness(topologyDataDir, workspace);
+      process.stdout.write(`${renderAgentTopologyFromSource(
+        source,
+        options.mode === "json" ? "json" : "text",
+      )}\n`);
+      return 0;
+    }
     const overrides: Settings = {
       ...(options.model === undefined ? {} : { model: options.model }),
       ...(options.tetoModel === undefined ? {} : { tetoModel: options.tetoModel }),
