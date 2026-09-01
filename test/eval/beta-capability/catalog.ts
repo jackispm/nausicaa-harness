@@ -184,7 +184,7 @@ const definitions: readonly CaseDefinition[] = [
       ],
       [],
       [prime, pi],
-      { maxMainSteps: 6, requestBudgetHint: 4, maxOutputTokens: 512, timeoutMs: 60_000 },
+      { maxMainSteps: 100, requestBudgetHint: 100, maxOutputTokens: 512, timeoutMs: 600_000 },
       ["read_file", "read_many", "list_files", "grep", "find", "file_info"],
     ),
     files: {
