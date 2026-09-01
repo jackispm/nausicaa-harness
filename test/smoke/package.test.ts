@@ -11,6 +11,7 @@ const execFileAsync = promisify(execFile);
 
 interface PackFile {
   path: string;
+  mode: number;
 }
 
 interface PackResult {
@@ -18,6 +19,46 @@ interface PackResult {
   version: string;
   files: PackFile[];
 }
+
+const REQUIRED_PACK_FILES = [
+  "README.md",
+  "THIRD_PARTY_NOTICES",
+  "dist/cli.js",
+  "dist/index.js",
+  "dist/index.d.ts",
+  "package.json",
+] as const;
+
+const ALLOWED_PACK_PATHS = new Set<string>([
+  "README.md",
+  "THIRD_PARTY_NOTICES",
+  "package.json",
+]);
+
+const ALLOWED_PACK_PREFIXES = ["dist/"] as const;
+
+const FORBIDDEN_PACK_PREFIXES = [
+  ".env",
+  ".nausicaa",
+  ".local",
+  ".git",
+  "docs",
+  "test",
+  "src",
+  "node_modules",
+  "AGENTS.md",
+  "ledger",
+  "eval",
+  "traces",
+  "artifacts",
+  "fixtures",
+  "reference-repository",
+  "reference-repositories",
+  "reference-repo",
+  "reference-repos",
+  "snapshots",
+  "coverage",
+] as const;
 
 describe("npm package surface", () => {
   it("keeps documented beta commands aligned with built CLI help", async () => {
@@ -57,12 +98,18 @@ describe("npm package surface", () => {
       name: string;
       version: string;
       private?: boolean;
+      license?: string;
       bin?: Record<string, string>;
       exports?: Record<string, unknown>;
       files?: string[];
+      engines?: { node?: string };
     };
 
     expect(packageJson.private).toBe(true);
+    expect(packageJson.name).toMatch(/^@[a-z0-9._-]+\/[a-z0-9._-]+$|^[a-z0-9._-]+$/u);
+    expect(packageJson.version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
+    expect(packageJson.license).toBe("UNLICENSED");
+    expect(packageJson.engines?.node).toBe(">=22.19.0");
     expect(packageJson.bin?.nausicaa).toBe("dist/cli.js");
     expect(packageJson.exports?.["."]).toBeDefined();
     expect(packageJson.files).toEqual(
@@ -90,24 +137,26 @@ describe("npm package surface", () => {
       expect(result[0]?.version).toBe(packageJson.version);
 
       const paths = (result[0]?.files ?? []).map((file) => file.path);
-      expect(paths).toContain("dist/cli.js");
-      expect(paths).toContain("README.md");
-      expect(paths).toContain("THIRD_PARTY_NOTICES");
+      for (const required of REQUIRED_PACK_FILES) {
+        expect(paths).toContain(required);
+      }
+      const cliFile = result[0]?.files.find((file) => file.path === "dist/cli.js");
+      expect(cliFile?.mode).toSatisfy((mode: unknown) =>
+        typeof mode === "number" && (mode & 0o111) !== 0);
       expect(paths).not.toContain("package-lock.json");
 
-      const forbidden = [
-        ".env",
-        ".env.",
-        ".nausicaa/",
-        ".local/",
-        ".git/",
-        "docs/",
-        "test/",
-        "node_modules/",
-        "AGENTS.md",
-      ];
-      expect(paths.filter((path) => forbidden.some((prefix) => path === prefix || path.startsWith(prefix))))
+      expect(paths.every((path) => path.length > 0 && !path.startsWith("/")))
+        .toBe(true);
+      expect(paths.filter((path) =>
+        !ALLOWED_PACK_PATHS.has(path)
+        && !ALLOWED_PACK_PREFIXES.some((prefix) => path.startsWith(prefix))))
         .toEqual([]);
+      expect(paths.filter((path) => FORBIDDEN_PACK_PREFIXES.some((prefix) =>
+        path === prefix || path.startsWith(`${prefix}/`) || path.startsWith(`${prefix}.`))))
+        .toEqual([]);
+      expect(paths.some((path) =>
+        (path.endsWith(".ts") && !path.endsWith(".d.ts")) || path.endsWith(".tsx")))
+        .toBe(false);
     } finally {
       await rm(npmCache, { recursive: true, force: true });
     }
