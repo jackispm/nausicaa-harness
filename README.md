@@ -12,7 +12,7 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 - Mowe 内置工具、`apply_patch`、Skills/MCP edge（显式配置后）以及 capability boundary。
 - Worker 和跨 Run A2A 仅在显式启用、且由 host 提供身份/roster/router 时出现；缺少授权 composition 时 fail closed。
 - Awareness 的 `/agents`、`/topology` 和 `--topology` 只读投影；没有可见来源时报告 `unavailable`，不伪造 active 节点。
-- 本地 daemon Host、Ledger-backed wake、Run lease，以及显式 `--daemon-worker-command` detached worker composition。
+- 本地 daemon Host、Ledger-backed wake、Run lease、显式 `--daemon-worker-command` detached worker composition，以及同机只读 `--attach` 回放。
 
 以下内容不属于本 beta 的发布承诺：集群或远程 daemon、跨机器 transport、可写 remote attach、插件 marketplace/热加载、常驻 worker fleet、真实 MCP marketplace 验证、Worker 质量 uplift 或 Phase 2.4 A/B 结论。OpenRouter smoke 是一次受控的 provider 兼容性检查，不是质量或性能证明。
 
@@ -34,7 +34,7 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 - TTY 默认进入持续 Session：一个 Run 可包含多个 Turn，支持 steering、取消、恢复和 `--continue`。
 - 运行中按 Enter 注入 steering，按 Alt+Enter 排队 follow-up；输入和 ACK 都写入 Ledger。
 - `pi-tui` 只负责终端 surface；SessionController、Ledger 和模型执行保持独立，未来可接桌面 UI。
-- `--daemon` 启动最小长期 Host，并在 `<data-dir>/daemon/control.sock` 提供 Unix JSONL 控制面；客户端可发送 `start`、`stop`、`status`、`attach`、`detach`、`wake` 和 `events.subscribe`。Host 会在启动时及运行期间串行扫描 `<data-dir>/runs`，重新排队已持久化但尚未投递的输入和被进程中断的活动 Turn；它不会抢占正被交互 TUI 持有的 Run。`--attach <run-id>` 可从另一个本地进程打开只读 TUI，按 Ledger cursor 分页追赶并在 socket 重启后续接；transcript 仍从同一个 Ledger/Store 投影。daemon 与普通可写 TUI/print 入口分离，当前仍是本地单进程 Host。
+- `--daemon` 启动最小长期 Host，并在 `<data-dir>/daemon/control.sock` 提供 Unix JSONL 控制面；客户端可发送 `start`、`stop`、`status`、`attach`、`detach`、`wake` 和 `events.subscribe`。Host 会在启动时及运行期间串行扫描 `<data-dir>/runs`，重新排队已持久化但尚未投递的输入和被进程中断的活动 Turn；它不会抢占正被交互 TUI 持有的 Run。显式配置 worker command 时，supervisor 通过版本化 stdio 协议管理 detached worker，并用 descriptor、lease 和 fencing token 保护生命周期。`--attach <run-id>` 可从另一个本地进程打开只读 TUI，按 Ledger cursor 分页追赶、衔接实时事件，并在 socket 重启后重连/resync；transcript 仍从同一个 Ledger/Store 投影。daemon 与普通可写 TUI/print 入口分离，Host/control 保持本地进程，worker 作为显式子进程运行。
 
 当前没有通用 graph DSL 或插件市场；Mowe 的 `MoweCatalog` 提供窄的本地注册 seam，便于接入自定义 AgentTool，而不要求引入 Cordis 级插件运行时。
 
@@ -63,7 +63,8 @@ Turn。Skill 正文只会在显式选择后以有界、标记为不可信的 Fuk
 
 命令行可用 `--edges`、`--no-edges` 和 `--refresh-edges` 覆盖本次启动的 edge 开关。
 `--refresh-edges` 只请求宿主刷新；没有 registry 时也不会进行网络或外部进程调用。当前
-实现没有插件热加载、自动安装市场或完整的远程 daemon parity；当前 attach 仅观察本机 Unix socket，不提供输入、取消或网络 transport。插件声明保持诊断状态。
+实现没有插件热加载、自动安装市场或跨机器 daemon parity；`--attach` 仅观察本机 Unix socket，
+不提供输入、取消或网络 transport。插件声明保持诊断状态。
 
 `read_file` 支持按行分页，`read_many` 可在共享字节预算内并发读取最多 16 个窗口；`grep` 与 `find` 在截断时返回绑定查询的续页 cursor。Git 查看工具使用固定参数、受保护路径过滤、可信可执行文件解析和有界输出，不要求开放 Shell。`write_file` 只在已有目录中写文件，不负责创建目录；`edit` 要求被替换文本唯一匹配。工作区文件工具会拒绝绝对路径、`..`、已有符号链接和受保护路径；当前威胁模型不覆盖同一系统账号下的其他进程并发替换文件系统节点。两档 `bash` 都有独立的环境变量白名单、取消/超时和有界输出；`workspace` 档再由 Seatbelt 或 bubblewrap 限制写入、网络和进程边界，`full-access` 档则明确运行在宿主权限下。需要异步观察开发服务器或测试进程时使用 Full Access 提供的 Job 生命周期工具，而不是在前台 `bash` 中放任后台命令。
 
@@ -71,7 +72,8 @@ Turn。Skill 正文只会在显式选择后以有界、标记为不可信的 Fuk
 
 ## 本地使用
 
-要求 Node.js `>=22.19`。
+要求 Node.js `>=22.19`。模型调用需要 `OPENROUTER_API_KEY`；离线的 `--help`、`--topology`、
+构建和测试不需要 API key。key 只放在当前进程环境，不写入设置文件或 beta 产物。
 
 ```bash
 npm install
@@ -111,8 +113,8 @@ nausicaa --allow-shell "运行测试并分析失败原因"
 ```
 
 不使用 `npm link` 时也可以从构建产物生成本地 beta tarball。`package.json` 保持
-`private: true`，因此不会被误发布到 npm registry；tarball 安装仍会带上运行时依赖和
-`nausicaa` bin：
+`private: true`，因此不会被误发布到 npm registry；`npm pack` 只生成本地文件，tarball
+安装仍会带上运行时依赖和 `nausicaa` bin：
 
 ```bash
 npm run build
