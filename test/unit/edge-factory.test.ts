@@ -17,7 +17,7 @@ function tool(name: string): AgentTool {
     definition: {
       name,
       description: `factory ${name}`,
-      parameters: { type: "object", additionalProperties: false },
+      parameters: { type: "object", properties: {}, additionalProperties: false },
     },
     execute: async () => ({ content: name, isError: false }),
   };
@@ -32,8 +32,8 @@ function makeAdapter(sourceId: string, sourceType: "mcp" | "skill", name: string
     capabilityVersion: "1",
     schemaVersion: "2020-12",
     description: `factory ${name}`,
-    inputSchema: { type: "object", additionalProperties: false },
-    outputSchema: { type: "object", additionalProperties: false },
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    outputSchema: { type: "object", properties: {}, additionalProperties: false },
     effect: "read",
     scope: "workspace",
     cancellable: true,

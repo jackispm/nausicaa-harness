@@ -18,6 +18,7 @@ export type {
   EdgeRuntimeStatusSource,
   EdgeTurnSnapshotProvider,
 } from "./edge-runtime.js";
+export * from "./skill-tool.js";
 export * from "./run-token-budget.js";
 export * from "./run-token-budget-recovery.js";
 export * from "./reflection-scheduler.js";

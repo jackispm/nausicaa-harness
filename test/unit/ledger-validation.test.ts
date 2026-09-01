@@ -860,6 +860,19 @@ describe("event payload validation", () => {
       ...validPayloads["model.requested"],
       contextBuildMs: -1,
     })).toThrow(/contextBuildMs/);
+    expect(() => validateEventPayload("model.requested", {
+      ...validPayloads["model.requested"],
+      deadlineMs: 30_000,
+      deadlineAt: "2026-09-01T08:00:30.000Z",
+    })).not.toThrow();
+    expect(() => validateEventPayload("model.requested", {
+      ...validPayloads["model.requested"],
+      deadlineMs: 0,
+    })).toThrow(/deadlineMs/);
+    expect(() => validateEventPayload("model.requested", {
+      ...validPayloads["model.requested"],
+      deadlineAt: "not-a-date",
+    })).toThrow(/deadlineAt/);
     expect(() => validateEventPayload("model.completed", {
       ...validPayloads["model.completed"],
       cacheOutcome: "miss",
@@ -883,6 +896,24 @@ describe("event payload validation", () => {
       workspace: "/workspace",
       policy: withoutStepLimit,
     })).toThrow(/exactly one/);
+    expect(() => validateEventPayload("run.created", {
+      goal,
+      workspace: "/workspace",
+      policy: {
+        ...withoutStepLimit,
+        maxMainStepsPerActivation: 8,
+        mainRequestTimeoutMs: 60_000,
+      },
+    })).not.toThrow();
+    expect(() => validateEventPayload("run.created", {
+      goal,
+      workspace: "/workspace",
+      policy: {
+        ...withoutStepLimit,
+        maxMainStepsPerActivation: 8,
+        mainRequestTimeoutMs: 3_600_001,
+      },
+    })).toThrow(/mainRequestTimeoutMs/);
     expect(() => validateEventPayload("run.created", {
       goal,
       workspace: "/workspace",

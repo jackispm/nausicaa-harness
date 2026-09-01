@@ -1,8 +1,10 @@
 import type { FukaiCompactionPolicy, RunPolicy } from "../domain/types.js";
 import {
+  DEFAULT_MAIN_REQUEST_TIMEOUT_MS,
   DEFAULT_FUKAI_COMPACTION_MINIMUM_GAIN_TOKENS,
   DEFAULT_FUKAI_COMPACTION_RETAIN_RATIO,
   DEFAULT_FUKAI_COMPACTION_THRESHOLD_RATIO,
+  MAX_MAIN_REQUEST_TIMEOUT_MS,
   mainStepAllowance,
 } from "../domain/types.js";
 
@@ -13,6 +15,7 @@ const MAX_FUKAI_COMPACTION_WALL_CLOCK_MS = 5 * 60 * 1_000;
 export const DEFAULT_RUN_POLICY: RunPolicy = {
   maxMainStepsPerActivation: 24,
   maxModelTokens: 200_000,
+  mainRequestTimeoutMs: DEFAULT_MAIN_REQUEST_TIMEOUT_MS,
   tetoEnabled: true,
   tetoMaxOutputTokens: 64,
   tetoTokenRatio: 0.1,
@@ -26,6 +29,8 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
   const policy: RunPolicy = {
     maxMainStepsPerActivation: allowance,
     maxModelTokens: input.maxModelTokens ?? DEFAULT_RUN_POLICY.maxModelTokens,
+    mainRequestTimeoutMs: input.mainRequestTimeoutMs
+      ?? DEFAULT_MAIN_REQUEST_TIMEOUT_MS,
     tetoEnabled: input.tetoEnabled ?? DEFAULT_RUN_POLICY.tetoEnabled,
     tetoMaxOutputTokens: input.tetoMaxOutputTokens ?? DEFAULT_RUN_POLICY.tetoMaxOutputTokens,
     tetoTokenRatio: input.tetoTokenRatio ?? DEFAULT_RUN_POLICY.tetoTokenRatio,
@@ -43,6 +48,15 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
   }
   if (!Number.isSafeInteger(policy.maxModelTokens) || policy.maxModelTokens < 1) {
     throw new RangeError("maxModelTokens must be a positive integer");
+  }
+  if (
+    !Number.isSafeInteger(policy.mainRequestTimeoutMs)
+    || policy.mainRequestTimeoutMs! < 1
+    || policy.mainRequestTimeoutMs! > MAX_MAIN_REQUEST_TIMEOUT_MS
+  ) {
+    throw new RangeError(
+      `mainRequestTimeoutMs must be an integer between 1 and ${MAX_MAIN_REQUEST_TIMEOUT_MS}`,
+    );
   }
   if (
     !Number.isSafeInteger(policy.tetoMaxOutputTokens)

@@ -745,15 +745,47 @@ class SkillsEdgeAdapterImpl implements SkillsEdgeAdapter {
     const workspace = await awaitWithSignal(canonicalWorkspace(context.workspace), context.signal);
     if (workspace !== selected.workspace) throw new SkillPathError("Skill contribution workspace does not match discovery");
     const resourcePaths = selectedResourcePaths(context);
+    // Runtime callers may provide their own defaults.  A caller's value can
+    // narrow the host contract, but must never widen it.
+    const hostMaxFileBytes = boundedLimit(
+      this.#options.maxFileBytes,
+      DEFAULT_SKILL_MAX_FILE_BYTES,
+      MAX_SKILL_FILE_BYTES,
+      "maxFileBytes",
+    );
+    const runtimeMaxFileBytes = context.maxFileBytes === undefined
+      ? MAX_SKILL_FILE_BYTES
+      : boundedLimit(
+        context.maxFileBytes,
+        DEFAULT_SKILL_MAX_FILE_BYTES,
+        MAX_SKILL_FILE_BYTES,
+        "maxFileBytes",
+      );
+    const maxFileBytes = Math.min(hostMaxFileBytes, runtimeMaxFileBytes);
+    const hostMaxBodyBytes = boundedLimit(
+      this.#options.maxBodyBytes,
+      DEFAULT_SKILL_MAX_FILE_BYTES,
+      MAX_SKILL_FILE_BYTES,
+      "maxBodyBytes",
+    );
+    const runtimeMaxBodyBytes = context.maxBodyBytes === undefined
+      ? runtimeMaxFileBytes
+      : boundedLimit(
+        context.maxBodyBytes,
+        DEFAULT_SKILL_MAX_FILE_BYTES,
+        MAX_SKILL_FILE_BYTES,
+        "maxBodyBytes",
+      );
+    const maxBodyBytes = Math.min(
+      maxFileBytes,
+      hostMaxBodyBytes,
+      runtimeMaxBodyBytes,
+    );
     const limits = resolveResourceLimits(this.#options, context);
     const loaded = await awaitWithSignal(
       loadSkill(selected, {
-        ...(context.maxFileBytes ?? this.#options.maxFileBytes) === undefined
-          ? {}
-          : { maxFileBytes: context.maxFileBytes ?? this.#options.maxFileBytes },
-        ...(context.maxBodyBytes ?? this.#options.maxBodyBytes) === undefined
-          ? {}
-          : { maxBodyBytes: context.maxBodyBytes ?? this.#options.maxBodyBytes },
+        maxFileBytes,
+        maxBodyBytes,
       }),
       context.signal,
     );
@@ -929,20 +961,23 @@ function resolveResourceLimits(
   options: SkillsEdgeAdapterOptions,
   context: SkillContextLoadContext,
 ): { readonly maxBytes: number; readonly maxTotalBytes: number; readonly maxResources: number } {
-  const maxBytes = boundedLimit(
-    context.maxResourceBytes ?? options.maxResourceBytes,
+  const maxBytes = composeLimit(
+    options.maxResourceBytes,
+    context.maxResourceBytes,
     DEFAULT_SKILL_MAX_RESOURCE_BYTES,
     MAX_SKILL_FILE_BYTES,
     "maxResourceBytes",
   );
-  const maxTotalBytes = boundedLimit(
-    context.maxResourceTotalBytes ?? options.maxResourceTotalBytes,
+  const maxTotalBytes = composeLimit(
+    options.maxResourceTotalBytes,
+    context.maxResourceTotalBytes,
     DEFAULT_SKILL_MAX_RESOURCE_TOTAL_BYTES,
     MAX_SKILL_RESOURCE_TOTAL_BYTES,
     "maxResourceTotalBytes",
   );
-  const maxResources = boundedLimit(
-    context.maxResources ?? options.maxResources,
+  const maxResources = composeLimit(
+    options.maxResources,
+    context.maxResources,
     DEFAULT_SKILL_MAX_RESOURCES,
     MAX_SKILL_RESOURCES,
     "maxResources",
@@ -950,6 +985,22 @@ function resolveResourceLimits(
   const selected = context.resourcePaths ?? context.resources ?? [];
   if (selected.length > maxResources) throw new SkillLoaderError(`Selected Skills exceed the ${maxResources} resource limit`);
   return { maxBytes, maxTotalBytes, maxResources };
+}
+
+function composeLimit(
+  hostValue: number | undefined,
+  runtimeValue: number | undefined,
+  fallback: number,
+  maximum: number,
+  name: string,
+): number {
+  const hostLimit = boundedLimit(hostValue, fallback, maximum, name);
+  // An omitted per-call value adds no restriction; explicit runtime defaults
+  // still compose by the stricter minimum with the host contract.
+  const runtimeLimit = runtimeValue === undefined
+    ? maximum
+    : boundedLimit(runtimeValue, fallback, maximum, name);
+  return Math.min(hostLimit, runtimeLimit);
 }
 
 function assertContributionShape(value: SkillEdgeContextContribution): void {

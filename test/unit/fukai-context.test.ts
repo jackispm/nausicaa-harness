@@ -961,6 +961,108 @@ describe("FukaiContextProvider", () => {
     expect(text.cacheKey).not.toBe(vision.cacheKey);
     expect(text.manifest.dynamicHash).not.toBe(vision.manifest.dynamicHash);
   });
+
+  it("bounds interrupted reasoning and never retains a partial tool-call group", async () => {
+    const store = new MemoryContentAddressedStore();
+    const provider = new FukaiContextProvider(new ContentStoreFukaiSource(store));
+    const reasoning = "private displayed reasoning ".repeat(200);
+    const interrupted = await putMessage(store, {
+      role: "assistant",
+      content: "visible answer prefix",
+      reasoning,
+      toolCalls: [],
+      interrupted: true,
+      interruptionReason: "cancelled",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+    const common = {
+      runId: "run-reasoning-budget",
+      laneId: "main",
+      laneKind: "main" as const,
+      goal: { version: 1, statement: "Resume safely", successCriteria: [], hardConstraints: [] },
+      systemPrompt: "Main",
+      artifactSelections: [],
+      tools: [],
+      upperWatermark: 3,
+      policyVersion: "1",
+      budget: {
+        maxInputTokens: 10_000,
+        maxConversationMessages: 10,
+        maxArtifacts: 0,
+        maxArtifactBytes: 0,
+        maxQueries: 10,
+      },
+    };
+    const empty = await provider.build({ ...common, conversationRefs: [] });
+    const maxInputTokens = empty.usage.estimatedInputTokens + 48;
+    const bounded = await provider.build({
+      ...common,
+      conversationRefs: [{ ref: interrupted, sequence: 1 }],
+      budget: { ...common.budget, maxInputTokens },
+    });
+    const boundedAssistant = bounded.messages.find((message) => message.role === "assistant");
+
+    expect(bounded.usage.estimatedInputTokens).toBeLessThanOrEqual(maxInputTokens);
+    expect(boundedAssistant).toMatchObject({
+      role: "assistant",
+      toolCalls: [],
+      interrupted: true,
+      interruptionReason: "cancelled",
+    });
+    if (boundedAssistant?.role !== "assistant") throw new Error("Missing bounded assistant");
+    expect(boundedAssistant.content).toContain("visible answer prefix");
+    expect(boundedAssistant.content).toContain("TRUNCATED BY FUKAI");
+    expect(boundedAssistant.reasoning?.length ?? 0).toBeLessThan(reasoning.length);
+
+    const calls = [
+      { id: "call-a", name: "inspect", arguments: { payload: "a".repeat(8_000) } },
+      { id: "call-b", name: "inspect", arguments: { payload: "b".repeat(8_000) } },
+    ];
+    const assistantWithCalls = await putMessage(store, {
+      role: "assistant",
+      content: "tool plan",
+      toolCalls: calls,
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    const boundedCalls = await provider.build({
+      ...common,
+      conversationRefs: [{ ref: assistantWithCalls, sequence: 2 }],
+      budget: {
+        ...common.budget,
+        maxInputTokens: empty.usage.estimatedInputTokens + 200,
+      },
+    });
+    expect(boundedCalls.messages.find((message) => message.role === "assistant"))
+      .toMatchObject({ toolCalls: [] });
+
+    const orphanedToolResult = await putMessage(store, {
+      role: "tool",
+      content: "x".repeat(128),
+      toolCallId: "call-a",
+      toolName: "inspect",
+      isError: false,
+      createdAt: "2026-01-01T00:00:02.000Z",
+    });
+    const boundedHistory = await provider.build({
+      ...common,
+      conversationRefs: [
+        { ref: assistantWithCalls, sequence: 2, groupId: "tool-group" },
+        { ref: orphanedToolResult, sequence: 3, groupId: "tool-group" },
+      ],
+      budget: {
+        ...common.budget,
+        maxInputTokens: empty.usage.estimatedInputTokens + 64,
+      },
+    });
+    expect(boundedHistory.usage.estimatedInputTokens)
+      .toBeLessThanOrEqual(empty.usage.estimatedInputTokens + 64);
+    expect(boundedHistory.truncations).toContainEqual(expect.objectContaining({
+      kind: "conversation-shape",
+    }));
+    expect(boundedHistory.messages.every((message) => (
+      message.role !== "assistant" || message.toolCalls.length !== 1
+    ))).toBe(true);
+  });
 });
 
 async function putMessage(

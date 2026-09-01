@@ -243,7 +243,9 @@ describe("runtime activation parity", () => {
 
     expect(projectMainRequest(sessionModel.requests[0]))
       .toEqual(projectMainRequest(oneShotModel.requests[0]));
-    expect(oneShotModel.requests[0]?.signal).toBe(oneShotAbort.signal);
+    expect(oneShotModel.requests[0]?.signal).toBeInstanceOf(AbortSignal);
+    expect(oneShotModel.requests[0]?.signal).not.toBe(oneShotAbort.signal);
+    expect(oneShotModel.requests[0]?.signal?.aborted).toBe(false);
     expect(sessionModel.requests[0]?.signal).toBeInstanceOf(AbortSignal);
     expect(oneShotModel.requests[0]?.tools.map((tool) => tool.name)).toEqual([
       "read_file",

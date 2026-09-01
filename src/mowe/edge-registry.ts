@@ -327,6 +327,12 @@ export class MoweEdgeRegistry {
       readonly signal?: AbortSignal;
       /** Optional Turn snapshot so a refresh cannot invalidate selection. */
       readonly snapshot?: MoweEdgeRegistrySnapshot;
+      /** Optional bounded Skill resource selection forwarded to adapters. */
+      readonly resourcePaths?: readonly string[];
+      readonly maxBodyBytes?: number;
+      readonly maxResourceBytes?: number;
+      readonly maxResourceTotalBytes?: number;
+      readonly maxResources?: number;
     } = {},
   ): Promise<EdgeContextContribution> {
     if (this.#closed) throw new MoweEdgeRegistryError("Edge registry is closed");
@@ -361,12 +367,38 @@ export class MoweEdgeRegistry {
     const loaded = await awaitWithSignal(
       adapter.loadContribution(
         validated,
-        edgeContext(context.workspace ?? this.#workspace, signal),
+        {
+          ...edgeContext(context.workspace ?? this.#workspace, signal),
+          ...(context.resourcePaths === undefined ? {} : { resourcePaths: context.resourcePaths }),
+          ...(context.maxBodyBytes === undefined ? {} : { maxBodyBytes: context.maxBodyBytes }),
+          ...(context.maxResourceBytes === undefined ? {} : { maxResourceBytes: context.maxResourceBytes }),
+          ...(context.maxResourceTotalBytes === undefined
+            ? {}
+            : { maxResourceTotalBytes: context.maxResourceTotalBytes }),
+          ...(context.maxResources === undefined ? {} : { maxResources: context.maxResources }),
+        },
       ),
       signal,
     );
     const contribution = validateEdgeContextContribution(loaded);
     assertContextIdentity(current, contribution);
+    // Skills may carry bounded, adapter-owned resource results as a
+    // non-enumerable extension. Preserve that extension across the shared
+    // contribution validator without widening the model-facing contract or
+    // allowing it to participate in identity hashing.
+    const resources = isRecord(loaded)
+      ? Object.getOwnPropertyDescriptor(loaded, "resources")
+      : undefined;
+    if (resources !== undefined && !resources.enumerable && Array.isArray(resources.value)) {
+      const enriched = { ...contribution };
+      Object.defineProperty(enriched, "resources", {
+        configurable: false,
+        enumerable: false,
+        value: Object.freeze([...resources.value]),
+        writable: false,
+      });
+      return Object.freeze(enriched) as EdgeContextContribution;
+    }
     return contribution;
   }
 

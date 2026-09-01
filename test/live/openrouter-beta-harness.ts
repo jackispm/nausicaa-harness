@@ -259,13 +259,15 @@ export class BetaBudgetMeter {
   private requestCountValue = 0;
   private usageValue: BetaUsageTotals = emptyUsage();
   private costValue = 0;
+  private costUncertainValue = false;
+  private currentRequestOutputCap = BETA_MAX_OUTPUT_TOKENS;
 
   constructor(
     readonly limitUsd: number,
     readonly maxRequests = BETA_MAX_REQUESTS,
     readonly maxOutputTokens = BETA_MAX_OUTPUT_TOKENS,
   ) {
-    if (!Number.isFinite(limitUsd) || limitUsd <= 0 || limitUsd > BETA_HARD_BUDGET_USD) {
+    if (!Number.isFinite(limitUsd) || limitUsd <= 0 || limitUsd > BETA_SOFT_BUDGET_USD || limitUsd > BETA_HARD_BUDGET_USD) {
       throw new BetaBudgetError("Invalid beta smoke budget");
     }
     if (!Number.isInteger(maxRequests) || maxRequests <= 0 || maxRequests > BETA_MAX_REQUESTS) {
@@ -287,6 +289,9 @@ export class BetaBudgetMeter {
     if (this.requestCountValue >= this.maxRequests) {
       throw new BetaBudgetError(`Beta smoke request limit of ${this.maxRequests} was reached`);
     }
+    if (this.costUncertainValue) {
+      throw new BetaBudgetError("Beta smoke cost is uncertain after a dispatched request");
+    }
     if (this.costValue >= this.limitUsd) {
       throw new BetaBudgetError(`Beta smoke cost limit of $${this.limitUsd} was reached`);
     }
@@ -298,15 +303,16 @@ export class BetaBudgetMeter {
         `Beta smoke maxOutputTokens must not exceed ${this.maxOutputTokens}`,
       );
     }
+    this.currentRequestOutputCap = request.maxOutputTokens;
     this.requestCountValue += 1;
   }
 
   charge(usage: ModelResponse["usage"]): void {
     const checked = parseUsage(usage);
-    if (checked.output > this.maxOutputTokens
+    if (checked.output > this.currentRequestOutputCap
       || this.usageValue.output + checked.output > this.maxOutputTokens * this.requestCountValue) {
       throw new BetaUsageError(
-        `Provider output exceeds the beta limit of ${this.maxOutputTokens} tokens per request`,
+        `Provider output exceeds the beta limit of ${this.currentRequestOutputCap} tokens per request`,
       );
     }
     this.usageValue = {
@@ -323,11 +329,16 @@ export class BetaBudgetMeter {
     }
   }
 
+  /** Mark a dispatched request whose provider charge cannot be trusted. */
+  markUncertain(): void {
+    this.costUncertainValue = true;
+  }
+
   snapshot(): BetaBudgetSnapshot {
     return {
       requestCount: this.requestCountValue,
       usage: { ...this.usageValue },
-      costUsd: this.requestCountValue === 0 ? null : this.costValue,
+      costUsd: this.requestCountValue === 0 || this.costUncertainValue ? null : this.costValue,
     };
   }
 }
@@ -344,6 +355,7 @@ export class CappedBetaModel implements ModelPort {
     const maxOutputTokens = Math.min(request.maxOutputTokens, this.budget.maxOutputTokens);
     const requestWithCap = { ...request, maxOutputTokens };
     this.budget.beforeRequest(requestWithCap);
+    let dispatched = true;
 
     const timeoutController = new AbortController();
     const signal = request.signal === undefined
@@ -361,7 +373,14 @@ export class CappedBetaModel implements ModelPort {
         }),
       ]);
       this.budget.charge(response.usage);
+      dispatched = false;
       return response;
+    } catch (error: unknown) {
+      // A request has already crossed the provider boundary. Without a
+      // successfully charged usage record its cost is unknown, so callers
+      // must stop the batch and report null rather than treating it as zero.
+      if (dispatched) this.budget.markUncertain();
+      throw error;
     } finally {
       if (timeout !== undefined) clearTimeout(timeout);
       timeoutController.abort(new Error("Beta smoke request cleanup"));
@@ -534,7 +553,10 @@ export function betaArtifactPathIsScoped(path: string, cwd = process.cwd()): boo
 }
 
 function parseUsage(value: ModelResponse["usage"]): BetaUsageTotals & { costUsd: number } {
-  if (!isRecord(value)) throw new BetaUsageError("Provider usage is missing");
+  if (!isRecord(value)
+    || Object.keys(value).sort().join(",") !== "cacheRead,cacheWrite,costUsd,input,output") {
+    throw new BetaUsageError("Provider usage is missing or has an unsupported shape");
+  }
   return {
     input: finiteNonNegative(value.input, "input"),
     output: finiteNonNegative(value.output, "output"),

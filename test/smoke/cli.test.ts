@@ -91,7 +91,7 @@ describe("built CLI", () => {
     expect(JSON.parse(stdout)).toEqual({ completed: true, runId: "built-smoke-run" });
   });
 
-  it("prints actionable recovery metadata after a built CLI Run fails", async () => {
+  it("fails closed on an unknown model before starting a built CLI Run", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "nausicaa-cli-failure-")));
     try {
       const failure = await runBuiltCli([
@@ -106,12 +106,10 @@ describe("built CLI", () => {
         "fail without network access",
       ], "", { HOME: root, PATH: process.env.PATH ?? "" });
 
-      expect(failure.code).toBe(1);
-      expect(failure.stderr).toContain("Run:");
-      expect(failure.stderr).toContain("State directory:");
-      expect(failure.stderr).toContain("Resume with:");
-      expect(failure.stderr).toContain("--workspace");
-      expect(failure.stderr).toContain("--data-dir");
+      expect(failure.code).toBe(2);
+      expect(failure.stderr).toContain("Model is not present in the local catalog");
+      expect(failure.stderr).toContain("No provider request or edge refresh was started");
+      expect(failure.stderr).not.toContain("Run:");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -134,8 +132,8 @@ describe("built CLI", () => {
         "task from stdin\n",
         env,
       );
-      expect(stdinOnly.code).toBe(1);
-      expect(stdinOnly.stderr).toContain("Unknown model: missing:model");
+      expect(stdinOnly.code).toBe(2);
+      expect(stdinOnly.stderr).toContain("Model is not present in the local catalog");
       expect(stdinOnly.stderr).not.toContain("requires a task");
 
       const positionalOnly = await runBuiltCli(
@@ -143,8 +141,8 @@ describe("built CLI", () => {
         "",
         env,
       );
-      expect(positionalOnly.code).toBe(1);
-      expect(positionalOnly.stderr).toContain("Unknown model: missing:model");
+      expect(positionalOnly.code).toBe(2);
+      expect(positionalOnly.stderr).toContain("Model is not present in the local catalog");
 
       const continued = await runBuiltCli(
         [
@@ -156,9 +154,23 @@ describe("built CLI", () => {
         "",
         env,
       );
-      expect(continued.code).toBe(1);
-      expect(continued.stderr).toContain("Run:");
+      expect(continued.code).toBe(2);
+      expect(continued.stderr).toContain("Model is not present in the local catalog");
       expect(continued.stderr).not.toContain("Credential not detected");
+
+      const continuedWithTask = await runBuiltCli(
+        [
+          ...baseArgs,
+          "--continue",
+          "--data-dir",
+          join(root, "continued-task-state"),
+          "new task",
+        ],
+        "",
+        env,
+      );
+      expect(continuedWithTask.code).toBe(2);
+      expect(continuedWithTask.stderr).toContain("Model is not present in the local catalog");
 
       const conflict = await runBuiltCli(
         [...baseArgs, "--data-dir", join(root, "conflict-state"), "positional task"],
@@ -231,6 +243,74 @@ describe("built CLI", () => {
           authStatus: "unverified",
         },
       });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not start configured edge refresh when local model preflight fails", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "nausicaa-cli-preflight-edge-")));
+    const marker = join(root, "edge-started");
+    const command = join(root, "edge-command.mjs");
+    const homeSettings = join(root, ".nausicaa", "settings.json");
+    try {
+      await mkdir(join(root, ".nausicaa"), { recursive: true });
+      await writeFile(
+        command,
+        `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "started");\n`,
+      );
+      await writeFile(homeSettings, JSON.stringify({
+        model: "missing:model",
+        edges: {
+          enabled: true,
+          refreshOnStart: true,
+          sources: [{
+            sourceId: "side-effect",
+            type: "mcp",
+            command: process.execPath,
+            args: [command],
+          }],
+        },
+      }));
+      const result = await runBuiltCli(
+        ["--print", "--workspace", root, "--data-dir", join(root, "state"), "task"],
+        "",
+        { HOME: root, PATH: process.env.PATH ?? "" },
+      );
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain("No provider request or edge refresh was started");
+      await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+
+      const continued = await runBuiltCli(
+        ["--print", "--continue", "--workspace", root, "--data-dir", join(root, "continue-state"), "task"],
+        "",
+        { HOME: root, PATH: process.env.PATH ?? "" },
+      );
+      expect(continued.code).toBe(2);
+      expect(continued.stderr).toContain("No provider request or edge refresh was started");
+      await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+
+      await writeFile(homeSettings, JSON.stringify({
+        model: "openrouter:openai/gpt-5-mini",
+        edges: {
+          enabled: true,
+          refreshOnStart: true,
+          sources: [{
+            sourceId: "side-effect",
+            type: "mcp",
+            command: process.execPath,
+            args: [command],
+          }],
+        },
+      }));
+      const missingCredential = await runBuiltCli(
+        ["--print", "--workspace", root, "--data-dir", join(root, "credential-state"), "task"],
+        "",
+        { HOME: root, PATH: process.env.PATH ?? "" },
+      );
+      expect(missingCredential.code).toBe(2);
+      expect(missingCredential.stderr).toContain("Credential not detected: OPENROUTER_API_KEY");
+      await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

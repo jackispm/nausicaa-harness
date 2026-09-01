@@ -12,6 +12,7 @@ import {
   SessionController,
   type SessionRuntimeEvent,
 } from "../../src/runtime/index.js";
+import type { EdgeContextContributionSummary } from "../../src/mowe/edge-types.js";
 import {
   MESSAGE_MEDIA_TYPE,
   projectSessionTranscript,
@@ -461,6 +462,88 @@ describe("SessionController", () => {
     await session.close();
   });
 
+  it("uses distinct recovery boundaries when the same Turn times out repeatedly", async () => {
+    const root = await temporaryRoot();
+    let calls = 0;
+    const model: ModelPort = {
+      complete() {
+        calls += 1;
+        return calls <= 2
+          ? new Promise<ModelResponse>(() => undefined)
+          : Promise.resolve(response("answer after timeout"));
+      },
+    };
+    const events: SessionRuntimeEvent[] = [];
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      policy: {
+        maxMainStepsPerActivation: 1,
+        maxModelTokens: 10_000,
+        // Leave enough scheduling headroom for the successful recovery when the
+        // full suite is running concurrently; the hung requests still
+        // deterministically exercises the timeout boundary.
+        mainRequestTimeoutMs: 100,
+        tetoEnabled: false,
+      },
+    }, {
+      mainModel: model,
+      createRunId: () => "session-provider-timeout",
+    });
+    session.subscribe((event) => events.push(event));
+
+    await session.submit({ inputId: "timeout-input", text: "Finish after recovery" });
+    await session.waitForIdle();
+
+    expect(calls).toBe(1);
+    expect(session.snapshot()).toMatchObject({
+      status: "idle",
+      blocker: "turn-interrupted",
+    });
+    expect(durableEvents(events).filter((event) => event.type === "model.failed"))
+      .toEqual([expect.objectContaining({
+        payload: expect.objectContaining({ retryable: true }),
+      })]);
+    expect(durableEvents(events).filter((event) => event.type === "turn.interrupted"))
+      .toEqual([expect.objectContaining({
+        payload: expect.objectContaining({ retryable: true }),
+      })]);
+
+    await session.resumeCurrent();
+    await session.waitForIdle();
+
+    expect(calls).toBe(2);
+    expect(session.snapshot()).toMatchObject({
+      status: "idle",
+      blocker: "turn-interrupted",
+    });
+    const repeatedTimeouts = durableEvents(events).filter((event) => (
+      event.type === "turn.interrupted"
+    ));
+    expect(repeatedTimeouts).toHaveLength(2);
+    expect(repeatedTimeouts.map((event) => event.payload.lastCommittedStep)).toEqual([1, 2]);
+    expect(new Set(repeatedTimeouts.map((event) => event.idempotencyKey)).size).toBe(2);
+
+    await session.resumeCurrent();
+    await session.waitForIdle();
+
+    expect(calls).toBe(3);
+    expect(session.snapshot().blocker).toBeUndefined();
+    await expect(session.transcript()).resolves.toEqual([
+      expect.objectContaining({ role: "user", content: "Finish after recovery" }),
+      expect.objectContaining({ role: "assistant", content: "answer after timeout" }),
+    ]);
+    const durable = durableEvents(events);
+    expect(durable.filter((event) => event.type === "turn.resumed")).toHaveLength(2);
+    expect(durable.filter((event) => event.type === "model.requested")).toHaveLength(3);
+    expect(durable.filter((event) => event.type === "model.failed")).toHaveLength(2);
+    expect(durable.filter((event) => event.type === "model.completed")).toHaveLength(1);
+    expect(durable.filter((event) => event.type === "budget.charged")).toHaveLength(1);
+    expect(durable.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    await session.close();
+  });
+
   it("projects the latest durable Main context estimate against the model window", async () => {
     const root = await temporaryRoot();
     const model: ModelPort = {
@@ -616,6 +699,42 @@ describe("SessionController", () => {
     expect(readTools).not.toContain("edge_write");
     expect(readTools).not.toContain("edge_external");
     expect(readTools).not.toContain("edge_host_read");
+    await session.close();
+  });
+
+  it("hides an injected Skill schema when the captured catalog is empty", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([(request) => {
+      expect(request.tools.map((tool) => tool.name)).not.toContain("skill");
+      expect(request.messages.some((message) => message.content.includes("available_skills"))).toBe(false);
+      return response("done");
+    }]);
+    const emptySnapshot = {
+      generation: 4,
+      contextContributions: [] as readonly EdgeContextContributionSummary[],
+    };
+    const provider = {
+      capture: () => emptySnapshot,
+      registry: {
+        snapshot: () => emptySnapshot,
+        loadContribution: async () => ({}),
+      },
+    };
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      edgeSnapshotProvider: provider,
+    }, {
+      mainModel: model,
+      tools: [namedTool("skill")],
+      createRunId: () => "session-empty-skill-catalog",
+    });
+
+    await session.submit({ inputId: "empty-skill-input", text: "Inspect without Skills" });
+    await session.waitForIdle();
+    expect(session.snapshot().blocker).toBeUndefined();
     await session.close();
   });
 

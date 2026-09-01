@@ -29,7 +29,9 @@ import type {
 } from "../domain/types.js";
 import { type UserImage, validateUserImages } from "../domain/images.js";
 import {
+  DEFAULT_MAIN_REQUEST_TIMEOUT_MS,
   DEFAULT_MAIN_OUTPUT_TOKENS,
+  MAX_MAIN_REQUEST_TIMEOUT_MS,
   MAX_MAIN_OUTPUT_TOKENS,
   mainStepAllowance,
 } from "../domain/types.js";
@@ -39,8 +41,10 @@ import type {
   FukaiCompactionSelection,
   FukaiConversationRef,
   FukaiEdgeContextContribution,
+  FukaiSkillCatalog,
   MainContextProvider,
 } from "../fukai/types.js";
+import { FukaiBudgetError, fukaiSkillCatalogIdentity } from "../fukai/context-provider.js";
 import { MoweExecutor } from "../mowe/index.js";
 import type {
   MoweCall,
@@ -48,6 +52,7 @@ import type {
   MoweExecutionRequest,
 } from "../mowe/types.js";
 import { MAX_MOWE_MAX_OUTPUT_BYTES } from "../mowe/types.js";
+import { ProviderModelError } from "../model/provider-error.js";
 import {
   boundedRedactedText,
   persistedErrorText,
@@ -168,6 +173,8 @@ export interface MainLoopDeps {
   mowe?: MoweExecutor;
   /** Selected edge Skill context captured for this activation. */
   edgeContext?: readonly FukaiEdgeContextContribution[];
+  /** Metadata-only Skill catalog paired with the runtime skill tool. */
+  skillCatalog?: FukaiSkillCatalog;
   clock?: Clock;
   /** Monotonic milliseconds used for provider/context latency metrics. */
   monotonicNow?: () => number;
@@ -223,6 +230,11 @@ type PendingMainStreamEvent = {
   | { type: "stream.cancelled"; reason: string }
   | { type: "stream.failed"; error: string }
 );
+
+interface MainModelStreamProgress {
+  text: string;
+  reasoning: string;
+}
 
 export interface MainLoopInput {
   runId: RunId;
@@ -293,6 +305,7 @@ export class MainLoop {
   private readonly approve: MainLoopDeps["approve"];
   private readonly onStreamEvent: MainLoopDeps["onStreamEvent"];
   private readonly edgeContext: readonly FukaiEdgeContextContribution[];
+  private readonly skillCatalog: FukaiSkillCatalog | undefined;
   private readonly artifactAuthorization: RunArtifactAuthorization | undefined;
   private readonly streamSequences = new Map<string, number>();
   private readonly modelCallAttempts = new Map<string, number>();
@@ -342,6 +355,15 @@ export class MainLoop {
     this.edgeContext = deps.edgeContext === undefined
       ? []
       : Object.freeze(deps.edgeContext.map((item) => structuredClone(item)));
+    if (deps.skillCatalog === undefined) {
+      this.skillCatalog = undefined;
+    } else {
+      const skillCatalog = structuredClone(deps.skillCatalog);
+      this.skillCatalog = Object.freeze({
+        generation: skillCatalog.generation,
+        entries: Object.freeze(skillCatalog.entries.map((entry) => Object.freeze({ ...entry }))),
+      });
+    }
   }
 
   async run(input: MainLoopInput): Promise<MainLoopResult> {
@@ -361,6 +383,8 @@ export class MainLoop {
     })}`;
     const startStep = input.startStep ?? 1;
     const policyVersion = input.policyVersion ?? deriveRuntimePolicyVersion(input.policy);
+    const mainRequestTimeoutMs = input.policy.mainRequestTimeoutMs
+      ?? DEFAULT_MAIN_REQUEST_TIMEOUT_MS;
     const allowance = mainStepAllowance(input.policy);
     const finalStep = "maxMainStepsPerActivation" in input.policy
       ? startStep + allowance - 1
@@ -469,9 +493,14 @@ export class MainLoop {
         )).map(({ metadata: _metadata, ...definition }) => definition);
         const artifactReadAvailable = this.artifactAuthorization === undefined
           || this.artifactAuthorization.hasAny(input.runId);
-        const requestTools = availableRequestTools.filter((definition) => (
+        // The runtime-owned Skill capability is atomic: a schema is eligible
+        // only when this activation captured a matching non-empty catalog.
+        let requestTools = availableRequestTools.filter((definition) => (
           definition.name !== ARTIFACT_READ_TOOL_NAME || artifactReadAvailable
+        )).filter((definition) => (
+          definition.name !== "skill" || this.skillCatalog !== undefined
         ));
+        let requestToolNames = new Set(requestTools.map((definition) => definition.name));
         const projectInstructions = await loadProjectInstructions(input.workspace);
         throwIfAborted(input.signal);
         const projectInstructionBundleRef = projectInstructions.files.length === 0
@@ -500,11 +529,15 @@ export class MainLoop {
             compaction = undefined;
           }
         }
-        const contextRequestFor = (tools: readonly AgentTool["definition"][]) => ({
+        const contextRequestFor = (
+          tools: readonly AgentTool["definition"][],
+          includeSkillCatalog = true,
+        ) => ({
           runId: input.runId,
           laneId,
           laneKind: "main" as const,
           goal: input.goal,
+          workspace: input.workspace,
           ...(input.activeObjective === undefined
             ? {}
             : { activeObjective: input.activeObjective }),
@@ -513,6 +546,9 @@ export class MainLoop {
           projectInstructionManifest: projectInstructionsManifest,
           ...(this.edgeContext.length === 0 ? {} : { edgeContext: this.edgeContext }),
           ...(this.edgeContext.length === 0 ? {} : { skillContext: this.edgeContext }),
+          ...(includeSkillCatalog && this.skillCatalog !== undefined
+            ? { skillCatalog: this.skillCatalog }
+            : {}),
           conversationRefs,
           artifactSelections,
           tools,
@@ -524,7 +560,9 @@ export class MainLoop {
             : { imageInputSupported: imageInputCapability }),
           ...(input.signal === undefined ? {} : { signal: input.signal }),
         });
-        const contextRequest = contextRequestFor(requestTools);
+        let includeSkillCatalog = this.skillCatalog !== undefined
+          && requestTools.some((definition) => definition.name === "skill");
+        let contextRequest = contextRequestFor(requestTools, includeSkillCatalog);
         const buildContext = async (): Promise<Awaited<ReturnType<MainContextProvider["build"]>>> => {
           try {
             return await this.contextProvider.build({
@@ -532,13 +570,44 @@ export class MainLoop {
               ...(compaction === undefined ? {} : { compaction }),
             });
           } catch (error: unknown) {
+            if (!(error instanceof FukaiBudgetError) || compaction === undefined) throw error;
             throwIfAborted(input.signal);
-            if (compaction === undefined) throw error;
             compaction = undefined;
             return this.contextProvider.build(contextRequest);
           }
         };
-        let view = await buildContext();
+        let view: Awaited<ReturnType<MainContextProvider["build"]>>;
+        try {
+          view = await buildContext();
+        } catch (error: unknown) {
+          if (!(error instanceof FukaiBudgetError)
+            || !includeSkillCatalog
+            || this.skillCatalog === undefined) {
+            throw error;
+          }
+          // A catalog is optional dynamic context. If retaining it leaves no
+          // room for required selected context, retry this boundary with the
+          // paired schema and catalog removed together.
+          requestTools = requestTools.filter((definition) => definition.name !== "skill");
+          requestToolNames = new Set(requestTools.map((definition) => definition.name));
+          includeSkillCatalog = false;
+          contextRequest = contextRequestFor(requestTools, false);
+          view = await buildContext();
+        }
+        // Fukai may omit the catalog when the dynamic context cannot fit its
+        // budget. In that case hide the paired schema in the same provider
+        // request instead of exposing an unusable runtime capability.
+        if (
+          includeSkillCatalog
+          && this.skillCatalog !== undefined
+          && !hasRenderedSkillCatalog(view, this.skillCatalog)
+        ) {
+          requestTools = requestTools.filter((definition) => definition.name !== "skill");
+          requestToolNames = new Set(requestTools.map((definition) => definition.name));
+          includeSkillCatalog = false;
+          contextRequest = contextRequestFor(requestTools, false);
+          view = await buildContext();
+        }
         const remainingTokens = Math.max(
           1,
           input.policy.maxModelTokens - chargedTokens(usage),
@@ -628,6 +697,18 @@ export class MainLoop {
         });
         let requestEvent: { eventId: string; globalOffset: number } | undefined;
         let response: ModelResponse;
+        const streamProgress: MainModelStreamProgress = { text: "", reasoning: "" };
+        let requestDeadlineSignal: AbortSignal | undefined;
+        // Start the wall-clock budget at the provider request boundary, before
+        // persisting model.requested.  The event and ModelRequest therefore
+        // describe the same deadline even when the Ledger append is slow.
+        const deadline = createMainRequestDeadline(
+          input.signal,
+          mainRequestTimeoutMs,
+          this.clock.now(),
+        );
+        requestDeadlineSignal = deadline.signal;
+        const deadlineAt = deadline.deadlineAt;
         const modelStartedAt = this.monotonicNow();
         try {
           requestEvent = await this.emit(input, laneId, correlationId, eventState, {
@@ -636,6 +717,8 @@ export class MainLoop {
               model: requestModel,
               requestHash,
               contextWatermark: view.upperWatermark,
+              deadlineMs: mainRequestTimeoutMs,
+              deadlineAt,
               sessionId,
               prefixHash: view.prefixHash,
               dependencyRefs: [...view.dependencyRefs],
@@ -655,20 +738,42 @@ export class MainLoop {
             messages: view.messages,
             tools: requestTools,
             maxOutputTokens,
-            ...(input.signal === undefined ? {} : { signal: input.signal }),
           };
+          // The runtime-owned signal is authoritative for every provider
+          // request. It combines caller cancellation with the bounded Main
+          // deadline, so a provider cannot outlive either boundary merely
+          // because this activation is a one-shot invocation.
+          const providerSignal = deadline.signal;
           response = await this.requestModel(
-            modelRequest,
+            {
+              ...modelRequest,
+              deadlineMs: mainRequestTimeoutMs,
+              deadlineAt,
+              signal: providerSignal,
+            },
             input,
             laneId,
             requestEvent.eventId,
+            streamProgress,
+            deadline.signal,
           );
+          // A provider promise and the runtime timer can settle in the same
+          // turn of the event loop. Once the deadline has fired, the response
+          // is no longer admissible even if the promise won the race.
+          if (deadline.signal.aborted) {
+            throw abortReason(deadline.signal);
+          }
         } catch (error: unknown) {
           if (requestEvent === undefined) {
             this.runTokenBudget?.cancel(reservationId);
             throw error;
           }
-          const failureUsage = providerUsageFromError(error);
+          const timedOut = input.signal?.aborted !== true
+            && isMainRequestTimeout(requestDeadlineSignal);
+          const terminalError = timedOut
+            ? mainRequestTimeoutError()
+            : error;
+          const failureUsage = providerUsageFromError(terminalError);
           if (failureUsage === undefined) {
             this.runTokenBudget?.cancel(reservationId);
           } else {
@@ -686,6 +791,24 @@ export class MainLoop {
             }
           }
           const cancelled = input.signal?.aborted === true;
+          const interruptionReason = cancelled
+            ? "cancelled" as const
+            : terminalError instanceof ProviderModelError && terminalError.category === "timeout"
+              ? "timeout" as const
+              : "error" as const;
+          if (interruptionReason !== "error") {
+            await this.persistInterruptedStream(
+              input,
+              laneId,
+              correlationId,
+              eventState,
+              eventPrefix,
+              step,
+              requestEvent.eventId,
+              streamProgress,
+              interruptionReason,
+            );
+          }
           if (cancelled) {
             const reason = persistedErrorText(input.signal?.reason, "Cancelled");
             await this.emit(input, laneId, correlationId, eventState, {
@@ -702,10 +825,15 @@ export class MainLoop {
               reason,
             });
           } else {
-            const message = persistedErrorText(error);
+            const message = persistedErrorText(terminalError);
+            const retryable = providerRetryability(terminalError);
             await this.emit(input, laneId, correlationId, eventState, {
               type: "model.failed",
-              payload: { model: requestModel, error: message },
+              payload: {
+                model: requestModel,
+                error: message,
+                ...(retryable === undefined ? {} : { retryable }),
+              },
               idempotencyKey: `${eventPrefix}:step:${step}:model:failed`,
               causationId: requestEvent.eventId,
             });
@@ -717,7 +845,9 @@ export class MainLoop {
               error: message,
             });
           }
-          throw error;
+          throw terminalError;
+        } finally {
+          deadline.dispose();
         }
         try {
           this.runTokenBudget?.settle(reservationId, response.usage);
@@ -793,6 +923,7 @@ export class MainLoop {
               eventPrefix,
               step,
               response.toolCalls,
+              requestToolNames,
               truncatedToolCallError,
             );
         for (const toolMessage of toolMessages) {
@@ -951,6 +1082,7 @@ export class MainLoop {
     eventPrefix: string,
     step: number,
     calls: readonly ToolCall[],
+    requestToolNames: ReadonlySet<string>,
     forcedError?: string,
   ): Promise<{ message: ConversationMessage; ref: ArtifactRef }[]> {
     throwIfAborted(input.signal);
@@ -978,6 +1110,13 @@ export class MainLoop {
         },
         idempotencyKey: `${eventPrefix}:step:${step}:tool:${call.id}:requested`,
       });
+      const callForcedError = forcedError ?? (
+        requestToolNames.has(call.name)
+          ? undefined
+          : this.mowe.catalog.get(call.name) === undefined
+            ? undefined
+            : `Tool is not available in this model request: ${call.name}`
+      );
       preparedCalls.push({
         ...structuredClone(call),
         operationId,
@@ -987,7 +1126,7 @@ export class MainLoop {
         ...(this.mowe.catalog.get(call.name)?.metadata.outputKinds.includes("image") === true
           ? { projection: { mode: "inline" as const } }
           : {}),
-        ...(forcedError === undefined ? {} : { forcedError }),
+        ...(callForcedError === undefined ? {} : { forcedError: callForcedError }),
       });
     }
 
@@ -1088,6 +1227,36 @@ export class MainLoop {
     return this.conversationStore.put(stableStringify(message), MESSAGE_MEDIA_TYPE);
   }
 
+  private async persistInterruptedStream(
+    input: MainLoopInput,
+    laneId: LaneId,
+    correlationId: string,
+    eventState: { watermark: number },
+    eventPrefix: string,
+    step: number,
+    requestId: string,
+    progress: MainModelStreamProgress,
+    reason: "cancelled" | "timeout" | "error",
+  ): Promise<void> {
+    if (progress.text.length === 0 && progress.reasoning.length === 0) return;
+    const message: ConversationMessage = {
+      role: "assistant",
+      content: progress.text,
+      toolCalls: [],
+      ...(progress.reasoning.length === 0 ? {} : { reasoning: progress.reasoning }),
+      interrupted: true,
+      interruptionReason: reason,
+      createdAt: this.clock.now().toISOString(),
+    };
+    const messageRef = await this.writeMessage(message);
+    await this.emit(input, laneId, correlationId, eventState, {
+      type: "assistant.message",
+      payload: { messageRef },
+      idempotencyKey: `${eventPrefix}:step:${step}:assistant:interrupted`,
+      causationId: requestId,
+    });
+  }
+
   private async emit<K extends EventType>(
     input: MainLoopInput,
     laneId: LaneId,
@@ -1124,55 +1293,72 @@ export class MainLoop {
     input: MainLoopInput,
     laneId: LaneId,
     requestId: string,
+    progress: MainModelStreamProgress,
+    cancellationSignal: AbortSignal,
   ): Promise<ModelResponse> {
+    // Check before evaluating the provider call expression.  Passing the
+    // promise directly to raceAbort would otherwise invoke a ModelPort once
+    // even when a slow model.requested append already consumed the deadline.
+    throwIfAborted(cancellationSignal);
     if (this.onStreamEvent === undefined || this.model.stream === undefined) {
-      return raceAbort(this.model.complete(request), request.signal);
+      return raceAbort(this.model.complete(request), cancellationSignal);
     }
 
     this.publishStream({ type: "stream.start", input, laneId, requestId });
     const iterator = this.model.stream(request)[Symbol.asyncIterator]();
-    while (true) {
-      const next = await raceAbort(iterator.next(), request.signal);
-      if (next.done) {
-        throw new Error("Model stream ended without a final response");
+    try {
+      while (true) {
+        const next = await raceAbort(iterator.next(), cancellationSignal);
+        if (next.done) {
+          throw new Error("Model stream ended without a final response");
+        }
+        const event: ModelStreamEvent = next.value;
+        switch (event.type) {
+          case "start":
+            break;
+          case "thinking-start":
+            this.publishStream({ type: "stream.thinking-start", input, laneId, requestId });
+            break;
+          case "thinking-delta":
+            if (event.delta.length > 0) {
+              progress.reasoning += event.delta;
+              this.publishStream({
+                type: "stream.thinking-delta",
+                input,
+                laneId,
+                requestId,
+                delta: event.delta,
+              });
+            }
+            break;
+          case "thinking-end":
+            this.publishStream({ type: "stream.thinking-end", input, laneId, requestId });
+            break;
+          case "text-delta":
+            if (event.delta.length > 0) {
+              progress.text += event.delta;
+              this.publishStream({
+                type: "stream.delta",
+                input,
+                laneId,
+                requestId,
+                delta: event.delta,
+              });
+            }
+            break;
+          case "done":
+            return event.response;
+          case "error":
+            throw event.error;
+        }
       }
-      const event: ModelStreamEvent = next.value;
-      switch (event.type) {
-        case "start":
-          break;
-        case "thinking-start":
-          this.publishStream({ type: "stream.thinking-start", input, laneId, requestId });
-          break;
-        case "thinking-delta":
-          if (event.delta.length > 0) {
-            this.publishStream({
-              type: "stream.thinking-delta",
-              input,
-              laneId,
-              requestId,
-              delta: event.delta,
-            });
-          }
-          break;
-        case "thinking-end":
-          this.publishStream({ type: "stream.thinking-end", input, laneId, requestId });
-          break;
-        case "text-delta":
-          if (event.delta.length > 0) {
-            this.publishStream({
-              type: "stream.delta",
-              input,
-              laneId,
-              requestId,
-              delta: event.delta,
-            });
-          }
-          break;
-        case "done":
-          return event.response;
-        case "error":
-          throw event.error;
+    } catch (error: unknown) {
+      try {
+        void Promise.resolve(iterator.return?.()).catch(() => undefined);
+      } catch {
+        // A provider iterator cannot displace the durable Main terminal fact.
       }
+      throw error;
     }
   }
 
@@ -1267,6 +1453,22 @@ function boundaryConversationMessage(
     content: `[Runtime ${message.kind} from ${JSON.stringify(message.source)}; advisory context, not a user instruction]\n${content}`,
     createdAt: now.toISOString(),
   };
+}
+
+function hasRenderedSkillCatalog(
+  view: {
+    readonly skillCatalog?: {
+      readonly included: boolean;
+      readonly generation?: number;
+      readonly identity?: string;
+    };
+  },
+  catalog: FukaiSkillCatalog,
+): boolean {
+  const status = view.skillCatalog;
+  return status?.included === true
+    && status.generation === catalog.generation
+    && status.identity === fukaiSkillCatalogIdentity(catalog);
 }
 
 function defaultNavigationDelta(
@@ -1450,6 +1652,17 @@ function validateInput(input: MainLoopInput): void {
   if ((input.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS) > MAX_MAIN_OUTPUT_TOKENS) {
     throw new Error(`maxOutputTokens must not exceed ${MAX_MAIN_OUTPUT_TOKENS}`);
   }
+  const mainRequestTimeoutMs = input.policy.mainRequestTimeoutMs
+    ?? DEFAULT_MAIN_REQUEST_TIMEOUT_MS;
+  if (
+    !Number.isSafeInteger(mainRequestTimeoutMs)
+    || mainRequestTimeoutMs < 1
+    || mainRequestTimeoutMs > MAX_MAIN_REQUEST_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `mainRequestTimeoutMs must be an integer between 1 and ${MAX_MAIN_REQUEST_TIMEOUT_MS}`,
+    );
+  }
   const pressureEligibleConversationCount = input.pressureEligibleConversationCount ?? 0;
   if (
     !Number.isSafeInteger(pressureEligibleConversationCount)
@@ -1533,6 +1746,20 @@ function providerUsageFromError(error: unknown): TokenUsage | undefined {
     cacheWrite: candidate.cacheWrite!,
     ...(candidate.costUsd === undefined ? {} : { costUsd: candidate.costUsd }),
   };
+}
+
+function providerRetryability(error: unknown): boolean | undefined {
+  return error instanceof ProviderModelError ? error.retryable : undefined;
+}
+
+function isMainRequestTimeout(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true
+    && signal.reason instanceof ProviderModelError
+    && signal.reason.category === "timeout";
+}
+
+function mainRequestTimeoutError(): ProviderModelError {
+  return new ProviderModelError({ category: "timeout", retryable: true });
 }
 
 function defaultMonotonicNow(): number {
@@ -1742,4 +1969,46 @@ async function raceAbort<T>(
       },
     );
   });
+}
+
+interface MainRequestDeadline {
+  signal: AbortSignal;
+  deadlineAt: string;
+  dispose(): void;
+}
+
+function createMainRequestDeadline(
+  parentSignal: AbortSignal | undefined,
+  timeoutMs: number,
+  startedAt: Date,
+): MainRequestDeadline {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const onParentAbort = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    controller.abort(abortReason(parentSignal!));
+  };
+
+  if (parentSignal?.aborted === true) {
+    controller.abort(abortReason(parentSignal));
+  } else {
+    parentSignal?.addEventListener("abort", onParentAbort, { once: true });
+    const timeoutError = new ProviderModelError({ category: "timeout", retryable: true });
+    timer = setTimeout(() => controller.abort(timeoutError), timeoutMs);
+  }
+
+  return {
+    signal: controller.signal,
+    deadlineAt: new Date(startedAt.getTime() + timeoutMs).toISOString(),
+    dispose() {
+      if (timer !== undefined) clearTimeout(timer);
+      parentSignal?.removeEventListener("abort", onParentAbort);
+    },
+  };
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException("The operation was aborted", "AbortError");
 }

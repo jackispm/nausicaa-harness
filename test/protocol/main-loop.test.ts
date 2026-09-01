@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type {
   AgentTool,
   ModelPort,
+  ModelRequest,
   ModelResponse,
 } from "../../src/domain/ports.js";
 import type { Goal } from "../../src/domain/types.js";
@@ -49,6 +50,125 @@ afterEach(async () => {
 });
 
 describe("MainLoop", () => {
+  it("does not preserve a Skill schema from a historical catalog marker", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const scripted = new ScriptedModel([{
+      content: "done",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(10, 5),
+    }]);
+    const baseProvider = new FukaiContextProvider(new ContentStoreFukaiSource(store));
+    const observedContextTools: string[][] = [];
+    const contextProvider: MainContextProvider = {
+      async build(request) {
+        observedContextTools.push(request.tools.map((tool) => tool.name));
+        const view = await baseProvider.build(request);
+        const { skillCatalog: _skillCatalog, ...viewWithoutCatalog } = view;
+        return {
+          ...viewWithoutCatalog,
+          // Simulate an old/replayed message that contains a catalog marker,
+          // while deliberately omitting the structured admission status.
+          messages: [
+            ...view.messages,
+            {
+              role: "user" as const,
+              content: '<available_skills generation="1"><skill><name>review</name></skill></available_skills>',
+              createdAt: "1970-01-01T00:00:00.000Z",
+            },
+          ],
+        };
+      },
+    };
+    const skillTool: AgentTool = {
+      definition: {
+        name: "skill",
+        description: "Load a selected Skill",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      async execute() {
+        return { content: "unused", isError: true };
+      },
+    };
+    const loop = new MainLoop({
+      model: scripted,
+      contextProvider,
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: [skillTool],
+      skillCatalog: {
+        generation: 1,
+        entries: [{ name: "review", description: "Review code" }],
+      },
+    });
+
+    await expect(loop.run({
+      runId: "main-historical-skill-marker",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    })).resolves.toMatchObject({ completed: true });
+
+    expect(scripted.requests).toHaveLength(1);
+    expect(observedContextTools).toEqual([["skill"], []]);
+    expect(scripted.requests[0]?.tools.map((tool) => tool.name)).toEqual([]);
+    expect(scripted.requests[0]?.messages.some((message) => (
+      message.content.includes("available_skills")
+    ))).toBe(true);
+  });
+
+  it("propagates non-budget context failures without a Skill retry", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const scripted = new ScriptedModel([{
+      content: "must not run",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: tokenUsage(1, 1),
+    }]);
+    let buildCalls = 0;
+    const contextProvider: MainContextProvider = {
+      async build() {
+        buildCalls += 1;
+        throw new Error("durable context read failed");
+      },
+    };
+    const loop = new MainLoop({
+      model: scripted,
+      contextProvider,
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: [{
+        definition: {
+          name: "skill",
+          description: "Load a selected Skill",
+          parameters: { type: "object", additionalProperties: false },
+        },
+        async execute() {
+          return { content: "unused", isError: true };
+        },
+      }],
+      skillCatalog: {
+        generation: 1,
+        entries: [{ name: "review", description: "Review code" }],
+      },
+    });
+
+    await expect(loop.run({
+      runId: "main-context-failure-no-retry",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    })).rejects.toThrow("durable context read failed");
+    expect(buildCalls).toBe(1);
+    expect(scripted.requests).toHaveLength(0);
+  });
+
   it("keeps model request capacity independent from the cumulative Run budget", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
@@ -426,7 +546,10 @@ describe("MainLoop", () => {
   it("keeps evidence guidance aligned with the visible grep schema", async () => {
     const workspace = await temporaryDirectory();
     const goal = { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] };
-    const run = async (tools: readonly AgentTool[], runId: string): Promise<string> => {
+    const run = async (
+      tools: readonly AgentTool[],
+      runId: string,
+    ): Promise<string> => {
       const model = new ScriptedModel([{
         content: "done",
         toolCalls: [],
@@ -449,13 +572,104 @@ describe("MainLoop", () => {
         policy: policy(1),
         initialMessage: "Inspect the repository",
       });
-      return model.requests[0]?.systemPrompt ?? "";
+      const request = model.requests[0];
+      if (request === undefined) throw new Error("Missing model request");
+      return request.systemPrompt;
     };
 
     await expect(run([createGrepTool()], "grep-files-prompt"))
       .resolves.toContain("outputMode=files");
     await expect(run([createGrepTool({}, { pagination: "legacy" })], "grep-legacy-prompt"))
       .resolves.not.toContain("outputMode=files");
+  });
+
+  it("never executes tools omitted from the current request schema", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    let imageExecutions = 0;
+    let writeExecutions = 0;
+    const hiddenImageTool: MoweAgentTool = {
+      definition: {
+        name: "read_image",
+        description: "Return an image",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      metadata: {
+        effect: "read",
+        scope: "workspace",
+        outputKinds: ["image"],
+      },
+      async execute() {
+        imageExecutions += 1;
+        return { content: "image", isError: false };
+      },
+    };
+    const hiddenWriteTool: MoweAgentTool = {
+      definition: {
+        name: "hidden_write",
+        description: "Perform a workspace write",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      metadata: { effect: "write", scope: "workspace" },
+      async execute() {
+        writeExecutions += 1;
+        return { content: "written", isError: false };
+      },
+    };
+    const scripted = new ScriptedModel([
+      (request) => {
+        expect(request.tools).toEqual([]);
+        return {
+          content: "attempt hidden tools",
+          toolCalls: [
+            { id: "hidden-image-call", name: "read_image", arguments: {} },
+            { id: "hidden-write-call", name: "hidden_write", arguments: {} },
+          ],
+          stopReason: "toolUse",
+          usage: tokenUsage(5, 2),
+        };
+      },
+      (request) => {
+        const results = request.messages.filter((message) => message.role === "tool");
+        expect(results).toHaveLength(2);
+        expect(results.map((message) => message.content)).toEqual([
+          "Tool is not available in this model request: read_image",
+          "Tool is not available in this model request: hidden_write",
+        ]);
+        expect(results.every((message) => message.role === "tool" && message.isError)).toBe(true);
+        return {
+          content: "done",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: tokenUsage(5, 2),
+        };
+      },
+    ]);
+    const loop = new MainLoop({
+      model: modelWithContextWindows(scripted, { demo: 20_000 }),
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      mowe: new MoweExecutor({ catalog: [hiddenImageTool, hiddenWriteTool] }),
+    });
+
+    const result = await loop.run({
+      runId: "request-tool-allowlist",
+      goal: { version: 1, statement: "Stay within the request tools", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      collaborationMode: "plan",
+      initialMessage: "Inspect without changes",
+    });
+
+    expect(result).toMatchObject({ completed: true, finalText: "done" });
+    expect(imageExecutions).toBe(0);
+    expect(writeExecutions).toBe(0);
+    const events = await ledger.read({ runId: "request-tool-allowlist" });
+    expect(events.filter((event) => event.type === "tool.requested")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "tool.failed")).toHaveLength(2);
   });
 
   it("rejects malformed tool arguments before recording a tool operation", async () => {
@@ -1351,6 +1565,278 @@ describe("MainLoop", () => {
     if (ended?.type !== "stream.end") throw new Error("Missing stream.end");
     const committed = JSON.parse(new TextDecoder().decode(await store.get(ended.messageRef)));
     expect(committed.content).toBe(response.content);
+  });
+
+  it("persists only the displayed stream prefix when the caller cancels", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const controller = new AbortController();
+    const streamed: MainStreamEvent[] = [];
+    let providerSignal: AbortSignal | undefined;
+    const model: ModelPort = {
+      async complete() {
+        return new Promise<ModelResponse>(() => undefined);
+      },
+      async *stream(request) {
+        providerSignal = request.signal;
+        yield { type: "start" as const };
+        yield { type: "thinking-start" as const };
+        yield { type: "thinking-delta" as const, delta: "visible reasoning" };
+        yield { type: "thinking-end" as const };
+        yield { type: "text-delta" as const, delta: "visible answer prefix" };
+        await new Promise<void>(() => undefined);
+      },
+    };
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+      onStreamEvent: (event) => {
+        streamed.push(event);
+        if (event.type === "stream.delta") {
+          controller.abort(new Error("caller cancelled after display"));
+        }
+      },
+    });
+
+    await expect(loop.run({
+      runId: "stream-cancel-prefix-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: { ...policy(1), mainRequestTimeoutMs: 1_000 },
+      initialMessage: "Go",
+      signal: controller.signal,
+    })).rejects.toThrow("caller cancelled after display");
+
+    expect(providerSignal).toBeInstanceOf(AbortSignal);
+    expect(providerSignal).not.toBe(controller.signal);
+    expect(providerSignal?.aborted).toBe(true);
+
+    const events = await ledger.read({ runId: "stream-cancel-prefix-run" });
+    const assistant = events.find((event) => event.type === "assistant.message");
+    expect(assistant?.type).toBe("assistant.message");
+    if (assistant?.type !== "assistant.message") throw new Error("Missing interrupted prefix");
+    const artifact = JSON.parse(new TextDecoder().decode(
+      await store.get(assistant.payload.messageRef),
+    ));
+    expect(artifact).toMatchObject({
+      role: "assistant",
+      content: "visible answer prefix",
+      reasoning: "visible reasoning",
+      toolCalls: [],
+      interrupted: true,
+      interruptionReason: "cancelled",
+    });
+    expect(events.filter((event) => event.type === "model.cancelled")).toHaveLength(1);
+    expect(events.some((event) => (
+      event.type === "model.completed"
+      || event.type === "tool.requested"
+      || event.type === "budget.charged"
+    ))).toBe(false);
+    expect(streamed.at(-1)?.type).toBe("stream.cancelled");
+
+    const recovery = projectMainExecutionRecovery(events);
+    expect(recovery.conversationRefs.map((item) => item.ref.id))
+      .toContain(assistant.payload.messageRef.id);
+  });
+
+  it("times out a hung provider and isolates its late completion", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    let resolveProvider: ((response: ModelResponse) => void) | undefined;
+    let observedRequest: ModelRequest | undefined;
+    const model: ModelPort = {
+      complete(request) {
+        observedRequest = request;
+        return new Promise<ModelResponse>((resolve) => {
+          resolveProvider = resolve;
+        });
+      },
+    };
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+    });
+
+    await expect(loop.run({
+      runId: "main-provider-timeout-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: { ...policy(2), mainRequestTimeoutMs: 5 },
+      initialMessage: "Go",
+    })).rejects.toMatchObject({ category: "timeout", retryable: true });
+
+    const terminalEvents = await ledger.read({ runId: "main-provider-timeout-run" });
+    const requested = terminalEvents.find((event) => event.type === "model.requested");
+    expect(requested?.type).toBe("model.requested");
+    if (requested?.type !== "model.requested") throw new Error("Missing timed request");
+    expect(requested.payload).toMatchObject({
+      deadlineMs: 5,
+      deadlineAt: observedRequest?.deadlineAt,
+    });
+    expect(observedRequest).toMatchObject({
+      deadlineMs: 5,
+      deadlineAt: expect.any(String),
+    });
+    expect(observedRequest?.signal?.aborted).toBe(true);
+    expect(terminalEvents.filter((event) => event.type === "model.failed"))
+      .toEqual([expect.objectContaining({
+        payload: expect.objectContaining({
+          error: "Model provider failure (timeout)",
+          retryable: true,
+        }),
+      })]);
+    expect(terminalEvents.some((event) => (
+      event.type === "model.completed"
+      || event.type === "assistant.message"
+      || event.type === "tool.requested"
+      || event.type === "budget.charged"
+    ))).toBe(false);
+
+    resolveProvider?.({
+      content: "late answer",
+      toolCalls: [{ id: "late-call", name: "noop", arguments: {} }],
+      stopReason: "toolUse",
+      usage: tokenUsage(10, 5),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(await ledger.read({ runId: "main-provider-timeout-run" })).toEqual(terminalEvents);
+
+    const recovery = projectMainExecutionRecovery(terminalEvents);
+    const resumedModel = new ScriptedModel([(request) => {
+      expect(request.messages.some((message) => message.content === "late answer")).toBe(false);
+      return {
+        content: "recovered answer",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(7, 3),
+      };
+    }]);
+    const resumedLoop = new MainLoop({
+      model: resumedModel,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+    });
+    const resumed = await resumedLoop.run({
+      runId: "main-provider-timeout-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: { ...policy(2), mainRequestTimeoutMs: 1_000 },
+      startStep: 2,
+      upperWatermark: terminalEvents.at(-1)!.globalOffset,
+      conversationRefs: recovery.conversationRefs,
+      pressureEligibleConversationCount: recovery.pressureEligibleConversationCount,
+    });
+    expect(resumed).toMatchObject({ completed: true, finalText: "recovered answer" });
+    expect(resumedModel.callCount).toBe(1);
+    const recoveredEvents = await ledger.read({ runId: "main-provider-timeout-run" });
+    expect(recoveredEvents.filter((event) => event.type === "model.requested")).toHaveLength(2);
+    expect(recoveredEvents.filter((event) => event.type === "model.failed")).toHaveLength(1);
+    expect(recoveredEvents.filter((event) => event.type === "model.completed")).toHaveLength(1);
+    expect(recoveredEvents.filter((event) => event.type === "assistant.message")).toHaveLength(1);
+    expect(recoveredEvents.filter((event) => event.type === "budget.charged")).toHaveLength(1);
+    expect(recoveredEvents.some((event) => event.type === "tool.requested")).toBe(false);
+  });
+
+  it("does not start a provider when the request event append consumes the deadline", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    let providerCalls = 0;
+    const eventSink = {
+      async append(event: Parameters<MemoryLedger["append"]>[0]) {
+        if (event.type === "model.requested") {
+          await new Promise<void>((resolve) => setTimeout(resolve, 30));
+        }
+        return ledger.append(event as never);
+      },
+    };
+    const model: ModelPort = {
+      complete() {
+        providerCalls += 1;
+        return Promise.resolve({
+          content: "must not run",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: tokenUsage(1, 1),
+        });
+      },
+    };
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink,
+      tools: [],
+    });
+
+    await expect(loop.run({
+      runId: "main-request-event-deadline-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: { ...policy(1), mainRequestTimeoutMs: 10 },
+      initialMessage: "Go",
+    })).rejects.toMatchObject({ category: "timeout", retryable: true });
+
+    expect(providerCalls).toBe(0);
+    const events = await ledger.read({ runId: "main-request-event-deadline-run" });
+    expect(events.filter((event) => event.type === "model.requested")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "model.failed")).toHaveLength(1);
+  });
+
+  it("rejects a provider response that settles from the deadline abort", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const model: ModelPort = {
+      complete(request) {
+        return new Promise<ModelResponse>((resolve) => {
+          request.signal?.addEventListener("abort", () => resolve({
+            content: "response released by timeout",
+            toolCalls: [],
+            stopReason: "stop",
+            usage: tokenUsage(8, 4),
+          }), { once: true });
+        });
+      },
+    };
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: ledger,
+      tools: [],
+    });
+
+    await expect(loop.run({
+      runId: "main-provider-deadline-race-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: { ...policy(1), mainRequestTimeoutMs: 5 },
+      initialMessage: "Go",
+    })).rejects.toMatchObject({ category: "timeout", retryable: true });
+
+    const events = await ledger.read({ runId: "main-provider-deadline-race-run" });
+    expect(events.filter((event) => event.type === "model.failed")).toHaveLength(1);
+    expect(events.some((event) => (
+      event.type === "model.completed"
+      || event.type === "assistant.message"
+      || event.type === "budget.charged"
+    ))).toBe(false);
   });
 
   it("accepts an image-only initial message and preserves it for the model", async () => {

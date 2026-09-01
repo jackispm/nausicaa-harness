@@ -316,6 +316,9 @@ function toPiMessage(
   }
 
   const content: AssistantMessage["content"] = [];
+  if (message.reasoning !== undefined && message.reasoning.length > 0) {
+    content.push({ type: "thinking", thinking: message.reasoning });
+  }
   if (message.content.length > 0) {
     content.push({ type: "text", text: message.content });
   }
@@ -335,7 +338,11 @@ function toPiMessage(
     provider: model.provider,
     model: model.id,
     usage: emptyPiUsage(),
-    stopReason: message.toolCalls.length > 0 ? "toolUse" : "stop",
+    stopReason: message.interrupted
+      ? "aborted"
+      : message.toolCalls.length > 0
+        ? "toolUse"
+        : "stop",
     timestamp,
   };
 }

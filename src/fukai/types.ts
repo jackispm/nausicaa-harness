@@ -60,6 +60,27 @@ export interface FukaiEdgeContextContribution {
   readonly provenance?: unknown;
 }
 
+/** Metadata-only Skill catalog captured for one runtime activation. */
+export interface FukaiSkillCatalogEntry {
+  readonly name: string;
+  readonly description: string;
+}
+
+export interface FukaiSkillCatalog {
+  readonly generation: number;
+  readonly entries: readonly FukaiSkillCatalogEntry[];
+}
+
+/** Structured admission result for the optional model-facing Skill catalog. */
+export interface FukaiSkillCatalogStatus {
+  /** Whether this context view actually retained the catalog message. */
+  readonly included: boolean;
+  /** Generation captured for the catalog, when one was requested. */
+  readonly generation?: number;
+  /** Deterministic identity of the requested/retained catalog projection. */
+  readonly identity?: string;
+}
+
 export interface FukaiBudget {
   maxInputTokens: number;
   maxConversationMessages: number;
@@ -139,6 +160,8 @@ export interface FukaiContextRequest {
   goal: Goal;
   /** Current Turn intent, pinned as a dynamic user reminder outside the stable prefix. */
   activeObjective?: string;
+  /** Absolute runtime workspace used by workspace-relative tools. */
+  workspace?: string;
   systemPrompt: string;
   projectInstructions?: readonly FukaiProjectInstruction[];
   /** Hash-only Ledger projection plus a Store ref for exact reconstruction. */
@@ -147,6 +170,8 @@ export interface FukaiContextRequest {
   edgeContext?: readonly FukaiEdgeContextContribution[];
   /** Explicit name for the dedicated untrusted Skill slot. */
   skillContext?: readonly FukaiEdgeContextContribution[];
+  /** Dynamic metadata-only catalog paired with the runtime `skill` tool. */
+  skillCatalog?: FukaiSkillCatalog;
   conversationRefs: readonly FukaiConversationRef[];
   artifactSelections: readonly FukaiArtifactSelection[];
   tools: readonly ToolDefinition[];
@@ -187,6 +212,8 @@ export interface FukaiContextView {
   upperWatermark: number;
   truncated: boolean;
   truncations: FukaiTruncation[];
+  /** Structured Skill catalog admission; never infer this from message text. */
+  skillCatalog?: FukaiSkillCatalogStatus;
   /** Redacted metadata for replaying the six context slots. */
   manifest: ContextManifest;
   usage: {

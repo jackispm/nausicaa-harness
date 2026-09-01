@@ -135,6 +135,9 @@ export interface EventPayloadMap {
     model: string;
     requestHash: string;
     contextWatermark: number;
+    /** Runtime-owned bounded Main request deadline. Optional for legacy events. */
+    deadlineMs?: number;
+    deadlineAt?: string;
     /** Provider cache affinity. Optional for schema-v1 legacy events. */
     sessionId?: string;
     /** Stable prompt/tool prefix hash. Optional for schema-v1 legacy events. */

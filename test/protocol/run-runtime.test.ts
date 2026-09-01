@@ -12,6 +12,7 @@ import type {
 } from "../../src/domain/index.js";
 import { JsonlLedger } from "../../src/ledger/index.js";
 import { ScriptedModel, type ScriptedModelStep } from "../../src/model/index.js";
+import type { EdgeContextContributionSummary } from "../../src/mowe/edge-types.js";
 import { executeRun } from "../../src/runtime/index.js";
 import type { RuntimeFukaiCompactionFactory } from "../../src/runtime/fukai-compaction-runtime.js";
 
@@ -235,6 +236,136 @@ describe("executeRun", () => {
 
     expect(captures).toBe(2);
     expect(closes).toBe(0);
+  });
+
+  it("closes an owned edge provider when Ledger setup fails", async () => {
+    const root = await temporaryRoot();
+    const dataDir = join(root, "state-file");
+    await writeFile(dataDir, "not a directory", "utf8");
+    let closes = 0;
+    const provider = {
+      capture: () => ({ generation: 1 }),
+      close: async () => {
+        closes += 1;
+      },
+    };
+
+    await expect(executeRun({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      message: "This must fail before activation",
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      edgeSnapshotProvider: provider,
+    }, {
+      mainModel: new ScriptedModel([response("unused")]),
+      createRunId: () => "preflight-ledger-failure",
+    })).rejects.toBeDefined();
+
+    expect(closes).toBe(1);
+  });
+
+  it("pins the Skill catalog and edge generation for one activation", async () => {
+    const root = await temporaryRoot();
+    const oldSummary = skillSummary("old-skill", "Use the old snapshot");
+    const newSummary = skillSummary("new-skill", "Use the refreshed snapshot");
+    const oldSnapshot = { generation: 1, contextContributions: [oldSummary] };
+    let currentSnapshot: { generation: number; contextContributions: readonly EdgeContextContributionSummary[] } = oldSnapshot;
+    let captures = 0;
+    const loadedSnapshots: unknown[] = [];
+    const registry = {
+      loadContribution: async (
+        summary: EdgeContextContributionSummary,
+        context: { snapshot?: unknown },
+      ) => {
+        loadedSnapshots.push(context.snapshot);
+        return { ...summary, body: "# Old instructions\n" };
+      },
+    };
+    const provider = {
+      capture: () => {
+        captures += 1;
+        return currentSnapshot;
+      },
+      registry: {
+        snapshot: () => currentSnapshot,
+        loadContribution: registry.loadContribution,
+      },
+    };
+    const model = new ScriptedModel([
+      (request) => {
+        expect(request.tools.map((tool) => tool.name)).toContain("skill");
+        expect(request.messages.some((message) => (
+          message.content.includes('<available_skills generation="1">')
+            && message.content.includes("old-skill")
+        ))).toBe(true);
+        currentSnapshot = { generation: 2, contextContributions: [newSummary] };
+        return {
+          ...response("Load the matching Skill"),
+          stopReason: "toolUse" as const,
+          toolCalls: [{ id: "load-old-skill", name: "skill", arguments: { name: "old-skill" } }],
+        };
+      },
+      (request) => {
+        expect(request.tools.map((tool) => tool.name)).toContain("skill");
+        expect(request.messages.some((message) => (
+          message.content.includes('<available_skills generation="1">')
+            && message.content.includes("old-skill")
+        ))).toBe(true);
+        expect(request.messages.some((message) => message.content.includes("new-skill"))).toBe(false);
+        expect(request.messages.some((message) => (
+          message.role === "tool" && message.content.includes("Old instructions")
+        ))).toBe(true);
+        return response("done");
+      },
+    ]);
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Use the workspace Skill",
+      policy: { maxMainSteps: 2, tetoEnabled: false },
+      edgeSnapshotProvider: provider,
+    }, {
+      mainModel: model,
+      createRunId: () => "skill-generation-run",
+    });
+
+    expect(result).toMatchObject({ completed: true, finalText: "done" });
+    expect(captures).toBe(1);
+    expect(loadedSnapshots).toEqual([oldSnapshot]);
+  });
+
+  it("hides the Skill schema and catalog together when the catalog is empty", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([(request) => {
+      expect(request.tools.map((tool) => tool.name)).not.toContain("skill");
+      expect(request.messages.some((message) => message.content.includes("available_skills"))).toBe(false);
+      return response("done");
+    }]);
+    const provider = {
+      capture: () => ({ generation: 3, contextContributions: [] }),
+      registry: {
+        snapshot: () => ({ generation: 3, contextContributions: [] }),
+        loadContribution: async () => ({}),
+      },
+    };
+
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect without Skills",
+      policy: { maxMainSteps: 1, tetoEnabled: false },
+      edgeSnapshotProvider: provider,
+    }, {
+      mainModel: model,
+      tools: [namedTool("skill")],
+      createRunId: () => "empty-skill-catalog-run",
+    });
+
+    expect(result.completed).toBe(true);
   });
 
   it("does not construct the compaction runtime when the recorded policy is disabled", async () => {
@@ -470,7 +601,9 @@ describe("executeRun", () => {
     let compactionCalls = 0;
     const observedCompactionEvents: string[] = [];
     const crashingModel: ModelPort = {
-      capabilities: () => ({ imageInput: false, contextWindowTokens: 2_200 }),
+      // Keep this comfortably above the pressure threshold; the exact prompt
+      // wording is not part of the compaction contract.
+      capabilities: () => ({ imageInput: false, contextWindowTokens: 2_000 }),
       async complete(request) {
         if (request.sessionId.startsWith("fukai-compaction:")) {
           compactionCalls += 1;
@@ -553,7 +686,11 @@ describe("executeRun", () => {
       model: "scripted",
       message: "Inspect the workspace",
       fukaiCompaction,
-      policy: { maxMainSteps: 1, tetoEnabled: false },
+      policy: {
+        maxMainSteps: 1,
+        tetoEnabled: false,
+        mainRequestTimeoutMs: 45_000,
+      },
     }, {
       mainModel: model,
       createRunId: () => "run-fukai-config",
@@ -567,6 +704,7 @@ describe("executeRun", () => {
     expect(created?.type).toBe("run.created");
     if (created?.type !== "run.created") throw new Error("Missing run.created");
     expect(created.payload.policy.fukaiCompaction).toEqual(fukaiCompaction);
+    expect(created.payload.policy.mainRequestTimeoutMs).toBe(45_000);
     const requested = events.find((event) => event.type === "model.requested");
     expect(requested?.type).toBe("model.requested");
     if (requested?.type !== "model.requested") throw new Error("Missing model.requested");
@@ -662,7 +800,10 @@ describe("executeRun", () => {
     expect(events).toContain("run.completed");
     expect(model.requests[0]?.maxOutputTokens).toBe(8_192);
     const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
-    expect((await ledger.read()).at(-1)?.type).toBe("checkpoint.committed");
+    const durable = await ledger.read();
+    expect(durable.find((event) => event.type === "run.created")?.payload.policy)
+      .toMatchObject({ mainRequestTimeoutMs: 300_000 });
+    expect(durable.at(-1)?.type).toBe("checkpoint.committed");
     await ledger.close();
   });
 
@@ -687,6 +828,16 @@ describe("executeRun", () => {
     }, {
       mainModel: new ScriptedModel([response("unused")]),
     })).rejects.toThrow("tetoMaxOutputTokens must be a positive integer");
+
+    await expect(executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      message: "Inspect the workspace",
+      policy: { mainRequestTimeoutMs: 3_600_001 },
+    }, {
+      mainModel: new ScriptedModel([response("unused")]),
+    })).rejects.toThrow(/mainRequestTimeoutMs.*3600000/);
   });
 
   it("runs Teto sparsely beside Main and records a silent pass", async () => {
@@ -1417,6 +1568,18 @@ function namedTool(name: string): AgentTool {
     async execute() {
       return { content: name, isError: false };
     },
+  };
+}
+
+function skillSummary(name: string, description: string): EdgeContextContributionSummary {
+  return {
+    kind: "context",
+    sourceId: "skills",
+    contributionId: `skill:${name}`,
+    sourceType: "skill",
+    name,
+    description,
+    disabled: false,
   };
 }
 

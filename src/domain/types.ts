@@ -160,6 +160,11 @@ export type ConversationMessage =
       role: "assistant";
       content: string;
       toolCalls: ToolCall[];
+      /** Displayed reasoning retained for interrupted-stream audit/replay metadata. */
+      reasoning?: string;
+      /** Optional for legacy artifacts; true means the provider response never committed. */
+      interrupted?: boolean;
+      interruptionReason?: "cancelled" | "timeout" | "error";
       createdAt: string;
     }
   | {
@@ -344,6 +349,8 @@ export interface A2AMessage {
 
 interface RunPolicyBase {
   maxModelTokens: number;
+  /** Optional for legacy Runs; runtime applies the durable default when absent. */
+  mainRequestTimeoutMs?: number;
   tetoEnabled: boolean;
   tetoMaxOutputTokens: number;
   tetoTokenRatio: number;
@@ -366,3 +373,6 @@ export type RunPolicy = RunPolicyBase & (
 export function mainStepAllowance(policy: RunPolicy): number {
   return policy.maxMainStepsPerActivation ?? policy.maxMainSteps;
 }
+
+export const DEFAULT_MAIN_REQUEST_TIMEOUT_MS = 5 * 60 * 1_000;
+export const MAX_MAIN_REQUEST_TIMEOUT_MS = 60 * 60 * 1_000;

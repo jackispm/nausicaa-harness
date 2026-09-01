@@ -99,6 +99,50 @@ describe("Mowe Skills contribution adapter", () => {
     expect(valid.resources?.[0]?.content).toBe("1234");
   });
 
+  it("composes runtime limits with stricter host limits", async () => {
+    const workspace = await temporaryRoot();
+    const directory = path.join(workspace, "skills", "host-bounded");
+    await writeSkill(directory, "Host bounded", "1234567890\n");
+    await writeFile(path.join(directory, "one.txt"), "1234");
+    await writeFile(path.join(directory, "two.txt"), "5678");
+    const adapter = createSkillsEdgeAdapter({
+      sourceId: "host-bounded-skills",
+      roots: ["skills"],
+      maxFileBytes: 4 * 1024,
+      maxBodyBytes: 4,
+      maxResourceBytes: 4,
+      maxResourceTotalBytes: 4,
+      maxResources: 1,
+    });
+    const summary = (await adapter.discoverContributions({ workspace }))[0]!;
+
+    // The runtime's larger defaults must not widen the host's body bound.
+    await expect(adapter.loadContribution(summary, {
+      workspace,
+      maxFileBytes: 256 * 1024,
+      maxBodyBytes: 256 * 1024,
+      maxResourceBytes: 256 * 1024,
+      maxResourceTotalBytes: 2 * 1024 * 1024,
+      maxResources: 64,
+    })).rejects.toThrow(/body exceeds the 4 byte limit/u);
+
+    // Use a short-body Skill to exercise all resource dimensions.
+    const resourceDirectory = path.join(workspace, "skills", "resource-bounded");
+    await writeSkill(resourceDirectory, "Resource bounded", "ok\n");
+    await writeFile(path.join(resourceDirectory, "one.txt"), "1234");
+    await writeFile(path.join(resourceDirectory, "two.txt"), "5678");
+    await adapter.refresh?.({ workspace });
+    const resourceSummary = (await adapter.discoverContributions({ workspace }))
+      .find((candidate) => candidate.name === "resource-bounded")!;
+    await expect(adapter.loadContribution(resourceSummary, {
+      workspace,
+      resourcePaths: ["one.txt", "two.txt"],
+      maxResourceBytes: 256 * 1024,
+      maxResourceTotalBytes: 2 * 1024 * 1024,
+      maxResources: 64,
+    })).rejects.toThrow(/resource limit/u);
+  });
+
   it("projects selected Skill content only as bounded untrusted data", async () => {
     const workspace = await temporaryRoot();
     const directory = path.join(workspace, "skills", "review-code");

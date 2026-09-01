@@ -232,6 +232,12 @@ function runPolicy(value: unknown, path: string): asserts value is RunPolicy {
     integer(item.maxMainSteps, `${path}.maxMainSteps`, 1);
   }
   integer(item.maxModelTokens, `${path}.maxModelTokens`, 1);
+  if (item.mainRequestTimeoutMs !== undefined) {
+    integer(item.mainRequestTimeoutMs, `${path}.mainRequestTimeoutMs`, 1);
+    if ((item.mainRequestTimeoutMs as number) > 60 * 60 * 1_000) {
+      invalid(`${path}.mainRequestTimeoutMs`, "at most 3600000");
+    }
+  }
   boolean(item.tetoEnabled, `${path}.tetoEnabled`);
   if (item.workerEnabled !== undefined) {
     boolean(item.workerEnabled, `${path}.workerEnabled`);
@@ -1135,6 +1141,15 @@ const payloadValidators = {
     string(item.model, `${path}.model`, false);
     string(item.requestHash, `${path}.requestHash`, false);
     integer(item.contextWatermark, `${path}.contextWatermark`);
+    if (item.deadlineMs !== undefined) {
+      integer(item.deadlineMs, `${path}.deadlineMs`, 1);
+      if ((item.deadlineMs as number) > 60 * 60 * 1_000) {
+        invalid(`${path}.deadlineMs`, "at most 3600000");
+      }
+    }
+    if (item.deadlineAt !== undefined) {
+      dateTime(item.deadlineAt, `${path}.deadlineAt`);
+    }
     if (item.sessionId !== undefined) {
       string(item.sessionId, `${path}.sessionId`, false);
     }

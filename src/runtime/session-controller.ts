@@ -45,6 +45,7 @@ import {
 import {
   createOpenRouterModelPort,
   normalizeModelSelector,
+  ProviderModelError,
   UNCONFIGURED_MODEL_SELECTOR,
   type ModelCatalogEntry,
 } from "../model/index.js";
@@ -130,6 +131,7 @@ import {
   captureEdgeTurnSnapshot,
   type EdgeTurnSnapshotProvider,
 } from "./edge-runtime.js";
+import { createRuntimeSkillCapability } from "./skill-tool.js";
 
 export {
   SessionProtocolError,
@@ -816,6 +818,7 @@ export class SessionController {
   async transcript(): Promise<SessionTranscriptEntry[]> {
     this.assertOpen();
     const attached = this.requireAttached();
+    await attached.ledger.flush();
     const events = await attached.ledger.read({ runId: attached.runId });
     return projectSessionTranscript(attached.store, events, attached.runId);
   }
@@ -1838,6 +1841,23 @@ export class SessionController {
           store: attached.store,
         }));
       }
+      const skillCapability = edgeProjection.registry === undefined
+        || typeof edgeProjection.registry.loadContribution !== "function"
+        ? undefined
+        : createRuntimeSkillCapability({
+            snapshot: edgeProjection.snapshot ?? edgeProjection.edgeSnapshot,
+            registry: edgeProjection.registry as { loadContribution: NonNullable<typeof edgeProjection.registry.loadContribution> },
+            workspace: this.workspace,
+          });
+      // `skill` is a host-owned capability. Remove injected/edge collisions
+      // even when the captured catalog is invalid, keeping schema and catalog
+      // admission atomic.
+      for (let index = tools.length - 1; index >= 0; index -= 1) {
+        if (tools[index]?.definition.name.trim() === "skill") tools.splice(index, 1);
+      }
+      if (skillCapability !== undefined) {
+        tools.push(skillCapability.tool);
+      }
       // Optional runtime capabilities are host-owned too; append edge tools
       // only after they are admitted so an edge cannot shadow their names.
       const admittedTools = appendPermittedEdgeTools(tools, edgeProjection.edgeSnapshot, turnCapabilities);
@@ -1892,6 +1912,14 @@ export class SessionController {
         ...(edgeProjection.contextContributions.length === 0
           ? {}
           : { edgeContext: edgeProjection.contextContributions }),
+        ...(skillCapability === undefined
+          ? {}
+          : {
+              skillCatalog: {
+                generation: skillCapability.catalog.generation,
+                entries: skillCapability.catalog.modelEntries,
+              },
+            }),
         ...(this.deps.approveTool === undefined
           ? {}
           : { approve: this.deps.approveTool }),
@@ -2003,6 +2031,31 @@ export class SessionController {
         ));
       } else if (error instanceof MainRunTokenBudgetExhaustedError) {
         await this.failRunBudget(turn.turnId);
+      } else if (error instanceof ProviderModelError && error.category === "timeout") {
+        const message = persistedErrorText(error);
+        const timeoutStep = highestTurnStep(attached.sink.cachedEvents, turn.turnId);
+        await attached.sink.append({
+          runId: attached.runId,
+          turnId: turn.turnId,
+          laneId: "main",
+          type: "turn.interrupted",
+          payload: {
+            turnId: turn.turnId,
+            reason: message,
+            retryable: true,
+            lastCommittedStep: timeoutStep,
+          },
+          correlationId: `turn:${turn.turnId}`,
+          idempotencyKey: `${attached.runId}:turn:${turn.turnId}:provider-timeout:${timeoutStep}`,
+          visibility: "run",
+          occurredAt: this.clock.now().toISOString(),
+        });
+        await this.appendMainLaneStatus(
+          "waiting",
+          message,
+          `turn:${turn.turnId}:waiting:provider-timeout:${timeoutStep}`,
+          turn.turnId,
+        );
       } else {
         const message = persistedErrorText(error);
         await attached.sink.append({

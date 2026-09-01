@@ -1,0 +1,264 @@
+import { sha256 } from "../../../src/ledger/hash.js";
+import { hashJson } from "../fingerprint.js";
+import {
+  BETA_CAPABILITY_SCORER_VERSION,
+  type BetaAttribution,
+  type BetaCaseId,
+  type BetaCaseManifest,
+} from "./types.js";
+
+const deepSeek: BetaAttribution = {
+  project: "DeepSeek Harness",
+  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/headless-agent/tests/coding-task.e2e.ts",
+  commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  license: "MIT",
+  adopted: ["temporary workspace", "real bug-fix task", "external test execution", "immutable test file"],
+  rejected: ["Cordis", "plugin system", "runtime implementation"],
+};
+const deepSeekResume: BetaAttribution = {
+  project: "DeepSeek Harness",
+  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/headless-agent/tests/resume.e2e.ts",
+  commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  license: "MIT",
+  adopted: ["world-state verification", "separate resume phase design"],
+  rejected: ["Cordis", "live recovery runtime"],
+};
+const pi: BetaAttribution = {
+  project: "Pi",
+  sourcePath: "/Users/gongdongjie/Downloads/pi/packages/evals/README.md",
+  commit: "1defa151e0c1dac87d38a2d0ac09d67f817b30f9",
+  license: "MIT",
+  adopted: ["same-task comparisons", "repeatable tool traces", "token, latency, and cost telemetry"],
+  rejected: ["Pi session/runtime", "extension framework"],
+};
+const prime: BetaAttribution = {
+  project: "Prime Agent",
+  sourcePath: "/Users/gongdongjie/Downloads/primeagent/packages/coding-agent/src/modes/daemon",
+  commit: "7787f07415d843b9a800f6a4720e0c739bd608e5",
+  license: "MIT",
+  adopted: ["observable session and artifact metrics"],
+  rejected: ["performance benchmark as capability score", "daemon runtime"],
+};
+const codex: BetaAttribution = {
+  project: "Codex",
+  sourcePath: "/Users/gongdongjie/Downloads/codex/codex-rs/protocol/src/permission_profile_intersection_tests.rs",
+  commit: "31d338a1ea89cd65a48d8ac07f50bb3917009806",
+  license: "Apache-2.0",
+  adopted: ["fail-closed checks", "isolated reproducible tests"],
+  rejected: ["Codex runtime", "performance or help-text tasks"],
+};
+
+const BUGGY_ADD = "export function add(a, b) {\n  return a - b;\n}\n";
+const ADD_TEST = "import assert from \"node:assert/strict\";\nimport { add } from \"./add.js\";\n\nassert.equal(add(2, 3), 5);\nassert.equal(add(-1, 1), 0);\n";
+const README = "Install with npm install. Requires Node >=22.19. Run checks with npm test.\n";
+const scorerContract = {
+  version: BETA_CAPABILITY_SCORER_VERSION,
+  rules: [
+    "grader runs the failing fixture before the agent",
+    "grader reruns the test outside the agent",
+    "forbidden test bytes and workspace boundary are immutable",
+    "at least one successful read and one successful mutation are required",
+  ],
+} as const;
+
+export const BETA_CAPABILITY_SCORER_HASH = hashJson(scorerContract);
+export const BETA_CAPABILITY_SCORER_CONTRACT = Object.freeze(scorerContract);
+
+interface CaseDefinition {
+  readonly manifest: BetaCaseManifest;
+  readonly files: Readonly<Record<string, string>>;
+  readonly goal: { version: 1; statement: string; successCriteria: string[]; hardConstraints: string[] };
+  readonly message: string;
+}
+
+function file(path: string, role: "source" | "test" | "evidence", content: string): BetaCaseManifest["fixtureFiles"][number] {
+  return { path, role, initialHash: sha256(content) };
+}
+
+function manifest(
+  id: BetaCaseId,
+  tier: BetaCaseManifest["tier"],
+  enabledTonight: boolean,
+  capabilityScore: boolean,
+  task: string,
+  fixtureFiles: BetaCaseManifest["fixtureFiles"],
+  allowedModifyPaths: string[],
+  attribution: BetaAttribution[],
+  limits: BetaCaseManifest["limits"],
+  allowedCapabilities: string[] = ["read_file", "write_file", "edit"],
+): BetaCaseManifest {
+  return {
+    id,
+    version: 1,
+    tier,
+    enabledTonight,
+    capabilityScore,
+    task,
+    allowedCapabilities,
+    fixtureFiles,
+    allowedModifyPaths,
+    graderVersion: BETA_CAPABILITY_SCORER_VERSION,
+    graderHash: BETA_CAPABILITY_SCORER_HASH,
+    attribution,
+    limits,
+  };
+}
+
+const definitions: readonly CaseDefinition[] = [
+  {
+    manifest: manifest(
+      "compatibility",
+      "compatibility",
+      true,
+      false,
+      "Read README.md and report its install command, Node requirement, and test command.",
+      [file("README.md", "evidence", README)],
+      [],
+      [deepSeek, pi],
+      { maxMainSteps: 3, requestBudgetHint: 2, maxOutputTokens: 128, timeoutMs: 45_000 },
+      ["read_file", "read_many", "list_files", "grep", "find", "file_info"],
+    ),
+    files: { "README.md": README },
+    message: "Read README.md with the read_file tool, then report the install command, Node requirement, and test command in one short line.",
+    goal: {
+      version: 1 as const,
+      statement: "Report the fixture setup commands from workspace evidence.",
+      successCriteria: ["Use read_file evidence before answering"],
+      hardConstraints: ["Do not write files"],
+    },
+  },
+  {
+    manifest: manifest(
+      "bugfix",
+      "P0",
+      true,
+      true,
+      "Fix add.js so node add.test.js passes without modifying the test.",
+      [file("add.js", "source", BUGGY_ADD), file("add.test.js", "test", ADD_TEST)],
+      ["add.js"],
+      [deepSeek, pi, codex],
+      { maxMainSteps: 6, requestBudgetHint: 4, maxOutputTokens: 512, timeoutMs: 60_000 },
+    ),
+    files: { "add.js": BUGGY_ADD, "add.test.js": ADD_TEST },
+    message: "The current directory contains add.js and add.test.js. Read the files, fix add.js so node add.test.js passes, and report the result. Do not modify add.test.js or create any other files.",
+    goal: {
+      version: 1,
+      statement: "Repair add.js while preserving the test bytes and workspace boundary.",
+      successCriteria: ["node add.test.js passes", "add.test.js remains byte-identical", "use read and mutation tools"],
+      hardConstraints: ["Do not modify add.test.js", "Do not create files outside add.js"],
+    },
+  },
+  {
+    manifest: manifest(
+      "resume",
+      "P1",
+      false,
+      true,
+      "Persist a non-sensitive work fact, resume the same session, and complete a small file change.",
+      [file("resume.txt", "evidence", "pending\n")],
+      ["resume.txt"],
+      [deepSeekResume, prime],
+      { maxMainSteps: 4, requestBudgetHint: 4, maxOutputTokens: 256, timeoutMs: 60_000 },
+    ),
+    files: { "resume.txt": "pending\n" },
+    message: "Record the bounded work fact 'resume-ready' in resume.txt and confirm it.",
+    goal: {
+      version: 1,
+      statement: "Exercise durable session continuity before a small file modification.",
+      successCriteria: ["Resume the same run", "write resume-ready"],
+      hardConstraints: ["Do not write outside resume.txt"],
+    },
+  },
+  {
+    manifest: manifest(
+      "incident-triage",
+      "P1",
+      false,
+      true,
+      "Diagnose the checkout incident from independent evidence without modifying files.",
+      [
+        file("logs/gateway.log", "evidence", "2026-08-27T09:14:02Z checkout request accepted\n2026-08-27T09:14:05Z payment upstream timed out\n"),
+        file("logs/payment.log", "evidence", "2026-08-27T09:14:03Z ERROR missing PAYMENT_REGION; refusing authorization\n"),
+        file("config/payment.example", "evidence", "PAYMENT_REGION=eu-west\n"),
+        file("runbooks/checkout.md", "evidence", "For a missing PAYMENT_REGION, restore the validated regional value and restart only the payment service. Do not retry captured charges manually.\n"),
+      ],
+      [],
+      [prime, pi],
+      { maxMainSteps: 6, requestBudgetHint: 4, maxOutputTokens: 512, timeoutMs: 60_000 },
+      ["read_file", "read_many", "list_files", "grep", "find", "file_info"],
+    ),
+    files: {
+      "logs/gateway.log": "2026-08-27T09:14:02Z checkout request accepted\n2026-08-27T09:14:05Z payment upstream timed out\n",
+      "logs/payment.log": "2026-08-27T09:14:03Z ERROR missing PAYMENT_REGION; refusing authorization\n",
+      "config/payment.example": "PAYMENT_REGION=eu-west\n",
+      "runbooks/checkout.md": "For a missing PAYMENT_REGION, restore the validated regional value and restart only the payment service. Do not retry captured charges manually.\n",
+    },
+    message: "Triage the checkout incident from the available evidence. Identify the first failing service and timestamp, the downstream symptom, the likely configuration cause, and the safest immediate action.",
+    goal: {
+      version: 1,
+      statement: "Synthesize independent incident evidence into one grounded triage note.",
+      successCriteria: ["Identify cause and effect", "Recommend only the approved immediate action"],
+      hardConstraints: ["Do not modify files", "Use only repository evidence"],
+    },
+  },
+  ...(["edge-extension", "multi-agent", "fukai-compaction", "permission-boundary"] as const).map((id) => ({
+    manifest: manifest(
+      id,
+      "P2",
+      false,
+      true,
+      `Catalog placeholder for ${id}; not scheduled for tonight.`,
+      [],
+      [],
+      [pi, codex],
+      { maxMainSteps: 1, requestBudgetHint: 0, maxOutputTokens: 128, timeoutMs: 30_000 },
+    ),
+    files: {},
+    message: "This catalog entry is not scheduled for tonight.",
+    goal: {
+      version: 1 as const,
+      statement: `Catalog placeholder for ${id}.`,
+      successCriteria: ["Remain unexecuted"],
+      hardConstraints: ["Do not run"],
+    },
+  })),
+];
+
+export const BETA_CAPABILITY_CATALOG = deepFreeze(definitions.map(({ manifest: value }) => value));
+export const BETA_CAPABILITY_MANIFEST_HASH = hashJson(BETA_CAPABILITY_CATALOG);
+export const BETA_CAPABILITY_MANIFEST = deepFreeze({
+  schemaVersion: 1 as const,
+  suite: "beta-capability-minieval" as const,
+  cases: BETA_CAPABILITY_CATALOG,
+  manifestHash: BETA_CAPABILITY_MANIFEST_HASH,
+  scorerHash: BETA_CAPABILITY_SCORER_HASH,
+});
+
+export function betaCaseOrder(): readonly BetaCaseId[] {
+  return BETA_CAPABILITY_CATALOG.map((value) => value.id);
+}
+
+export function getBetaCaseDefinition(id: BetaCaseId): CaseDefinition {
+  const value = definitions.find((candidate) => candidate.manifest.id === id);
+  if (value === undefined) throw new Error(`Unknown beta capability case: ${id}`);
+  return value;
+}
+
+export function getBetaCaseManifest(id: BetaCaseId): BetaCaseManifest {
+  return getBetaCaseDefinition(id).manifest;
+}
+
+export function verifyBetaCaseManifest(manifestValue: BetaCaseManifest): void {
+  const canonical = getBetaCaseManifest(manifestValue.id);
+  if (hashJson(manifestValue) !== hashJson(canonical)) {
+    throw new Error(`Beta capability manifest was modified: ${manifestValue.id}`);
+  }
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+  }
+  return value;
+}

@@ -12,6 +12,7 @@ import {
   type WorkspaceEdgeToolSnapshot,
 } from "../mowe/workspace-catalog.js";
 import type { FukaiEdgeContextContribution } from "../fukai/types.js";
+import type { EdgeContextContributionSummary } from "../mowe/edge-types.js";
 
 const MAX_SELECTED_EDGE_CONTEXT_ITEMS = 16;
 const MAX_EDGE_CONTEXT_LOAD_CONCURRENCY = 4;
@@ -26,6 +27,9 @@ export interface EdgeRuntimeProjection {
   readonly tools: readonly AgentTool[];
   readonly edgeSnapshot: WorkspaceEdgeToolSnapshot;
   readonly contextContributions: readonly FukaiEdgeContextContribution[];
+  readonly contextSummaries: readonly EdgeContextContributionSummary[];
+  readonly snapshot?: unknown;
+  readonly registry?: EdgeRuntimeRegistryLike;
   readonly status: EdgeRuntimeStatusProjection;
 }
 
@@ -109,7 +113,7 @@ export function createRegistryEdgeTurnSnapshotProvider(
           }: ${errorMessage(outcome.error)}`,
         }];
       });
-      return {
+      const projected = {
         ...raw,
         contextContributions: outcomes.flatMap((outcome) => (
           "loaded" in outcome ? [outcome.loaded] : []
@@ -123,6 +127,14 @@ export function createRegistryEdgeTurnSnapshotProvider(
               ],
             }),
       };
+      // Keep the registry-owned identity available to activation-scoped
+      // loaders even when selected context bodies were projected into a copy.
+      Object.defineProperty(projected, "__registrySnapshot", {
+        configurable: false,
+        enumerable: false,
+        value: snapshot,
+      });
+      return projected;
     },
     snapshot: () => registry.snapshot(),
     ...(registry.refresh === undefined ? {} : {
@@ -174,7 +186,7 @@ export function appendPermittedEdgeTools(
     const name = tool.definition.name.trim();
     // MainLoop owns this run-authorized reader even though it is injected
     // after the ordinary first-party tool assembly.
-    if (name === ARTIFACT_READ_TOOL_NAME) return false;
+    if (name === ARTIFACT_READ_TOOL_NAME || name === "skill") return false;
     if (names.has(name)) return false;
     names.add(name);
     return true;
@@ -251,6 +263,9 @@ export function projectEdgeRegistrySnapshot(
     tools: Object.freeze(tools),
     edgeSnapshot,
     contextContributions: Object.freeze(contextContributions),
+    contextSummaries: Object.freeze(contextSummaries
+      .map((item) => structuredClone(item) as EdgeContextContributionSummary)),
+    snapshot: envelope,
     status,
   });
 }
@@ -273,7 +288,20 @@ export async function captureEdgeTurnSnapshot(
         ? provider.getSnapshot()
       : fallback ?? { generation: 0 };
   if (signal?.aborted === true) throw signal.reason ?? new Error("Edge snapshot capture cancelled");
-  return projectEdgeRegistrySnapshot(value);
+  const projected = projectEdgeRegistrySnapshot(value);
+  const capturedSnapshot = isRecord(value) && value.__registrySnapshot !== undefined
+    ? value.__registrySnapshot
+    : value;
+  const capturedSummaries = isRecord(capturedSnapshot)
+    ? readContextSummaryRecords(capturedSnapshot)
+      .map((item) => structuredClone(item) as EdgeContextContributionSummary)
+    : projected.contextSummaries;
+  return Object.freeze({
+    ...projected,
+    ...(provider.registry === undefined ? {} : { registry: provider.registry }),
+    snapshot: capturedSnapshot,
+    contextSummaries: Object.freeze(capturedSummaries),
+  });
 }
 
 export function edgeStatusFromProvider(
@@ -353,13 +381,14 @@ function readContextContributions(snapshot: Record<string, any>): FukaiEdgeConte
     : Array.isArray(snapshot.context) ? snapshot.context : [];
   return raw.flatMap((value: unknown) => {
     if (!isRecord(value) || value.kind === "tool" || value.disabled === true) return [];
+    if (value.sourceType !== "skill" && value.sourceType !== "plugin") return [];
     if (typeof value.sourceId !== "string" || typeof value.contributionId !== "string") return [];
     if (typeof value.name !== "string" || typeof value.description !== "string") return [];
     if (typeof value.body !== "string") return [];
     return [{
       sourceId: value.sourceId,
       contributionId: value.contributionId,
-      sourceType: value.sourceType === "plugin" ? "plugin" : "skill",
+      sourceType: value.sourceType,
       name: value.name,
       description: value.description,
       body: value.body,
@@ -378,6 +407,7 @@ function readContextSummaryRecords(snapshot: Record<string, any>): Record<string
     isRecord(value)
     && value.kind !== "tool"
     && value.disabled !== true
+    && (value.sourceType === "skill" || value.sourceType === "plugin")
     && typeof value.sourceId === "string"
     && typeof value.contributionId === "string"
   ));

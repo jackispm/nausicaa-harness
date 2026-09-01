@@ -45,8 +45,9 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 创建带 generation 的不可变工具快照。Main 通过 Mowe 使用快照，Worker 仍只获得固定的
 只读工具集。交互会话中的 `/edges` 只读取状态投影，不直接管理 edge 进程。
 每个 Main Turn 在工具和上下文组装前捕获一次 registry snapshot；Turn 期间的刷新只影响后续
-Turn。Skill 正文只会在显式选择后以有界、标记为不可信的 Fukai context 数据进入 Main，
-不会成为工具、`projectInstructions`、系统策略或 Worker 上下文。
+Turn。Main 会看到当前快照中可调用 Skill 的名称和描述，并可用精确名称按需加载有界正文或
+相对资源；正文仍作为低优先级运行时数据返回，不会成为工具、`projectInstructions`、系统策略
+或 Worker 上下文。显式 `/skills select` 仍保持兼容，并继续把选中的正文作为本 Turn 的受限上下文。
 
 ```json
 {
@@ -65,6 +66,11 @@ Turn。Skill 正文只会在显式选择后以有界、标记为不可信的 Fuk
 `--refresh-edges` 只请求宿主刷新；没有 registry 时也不会进行网络或外部进程调用。当前
 实现没有插件热加载、自动安装市场或跨机器 daemon parity；`--attach` 仅观察本机 Unix socket，
 不提供输入、取消或网络 transport。插件声明保持诊断状态。
+
+本 beta 暂不承诺只读 external MCP。当前 external MCP edge 只有在 host 同时授予
+`allowWrite`、`allowShell` 和 `allowNetwork` 时才会投影；`allowNetwork` 不会隐式扩大为写入或
+Shell 权限。只读网络 MCP 的 effect/grant/approval 语义仍是后续产品决策，缺少完整授权时会
+保持不可见并 fail closed。
 
 `read_file` 支持按行分页，`read_many` 可在共享字节预算内并发读取最多 16 个窗口；`grep` 与 `find` 在截断时返回绑定查询的续页 cursor。Git 查看工具使用固定参数、受保护路径过滤、可信可执行文件解析和有界输出，不要求开放 Shell。`write_file` 只在已有目录中写文件，不负责创建目录；`edit` 要求被替换文本唯一匹配。工作区文件工具会拒绝绝对路径、`..`、已有符号链接和受保护路径；当前威胁模型不覆盖同一系统账号下的其他进程并发替换文件系统节点。两档 `bash` 都有独立的环境变量白名单、取消/超时和有界输出；`workspace` 档再由 Seatbelt 或 bubblewrap 限制写入、网络和进程边界，`full-access` 档则明确运行在宿主权限下。需要异步观察开发服务器或测试进程时使用 Full Access 提供的 Job 生命周期工具，而不是在前台 `bash` 中放任后台命令。
 
@@ -120,6 +126,7 @@ nausicaa --allow-shell "运行测试并分析失败原因"
 检测到非空 stdin 与 positional task 同时出现会以退出码 2 拒绝，避免静默拼接或覆盖；EOF 和纯空白
 stdin 仍按缺少任务处理。CLI 不提供明文 `--api-key`，也不自动读取项目 `.env`。当前仍使用
 `provider:model` selector；`--provider` 延期，因为拆分 provider 与 selector 会引入重复语义。
+项目级 `.nausicaa/settings.json` 继续默认不受信任，本 beta 也不提供开启项目设置的 trust flag。
 
 不使用 `npm link` 时也可以从构建产物生成本地 beta tarball。`package.json` 保持
 `private: true`，因此不会被误发布到 npm registry；`npm pack` 只生成本地文件，tarball
@@ -177,19 +184,21 @@ npm run check         # 执行完整本地门禁
 3. 若 root 决定执行唯一一次 live smoke，先确认模型、软预算、`$1` 硬限额 key 和干净工作树；否则将 provider compatibility 标为 pending。
 4. 发布说明不得声称 Phase 2.4、Worker uplift、真实 marketplace MCP、远程/集群 daemon 或长期生产稳定性已经验证。
 
-真实 OpenRouter 测试不会默认运行。beta smoke 固定使用 `openrouter:tencent/hy3`，只有同时设置 `NAUSICAA_LIVE_TESTS=1`、`OPENROUTER_API_KEY`、`NAUSICAA_LIVE_MODEL=tencent/hy3`（也接受带 `openrouter:` 前缀）和正数 `NAUSICAA_EVAL_BUDGET_USD` 时才会发起请求；预检还要求工作树干净。请求最多 5 次、单次输出最多 128 token、wall-clock 45 秒，默认软预算为 `$0.85`；provider 未返回可解析的非负 usage/cost 时立即失败关闭。运行形态如下，key 只存在于当前进程环境，不会写入文件或产物：
+真实 OpenRouter 测试不会默认运行。普通 `npm run test:live` 是 legacy provider/tool smoke，仍使用 `NAUSICAA_LIVE_MODEL`；它与首批 beta capability suite 分开。首批 beta suite 固定使用 `openrouter:tencent/hy3`，只有同时设置 `NAUSICAA_LIVE_TESTS=1`、`OPENROUTER_API_KEY`、`NAUSICAA_BETA_EVAL_MODEL=openrouter:tencent/hy3`、显式 `NAUSICAA_BETA_CASES`、正数 `NAUSICAA_EVAL_BUDGET_USD` 和 `NAUSICAA_EVAL_MAX_REQUESTS` 时才会发起请求；预检还要求工作树干净。请求最多 5 次、单次输出最多 128 token、wall-clock 10 分钟批次上限，默认软预算为 `$0.85`；provider 未返回可解析的非负 usage/cost 时立即失败关闭。运行形态如下，key 只存在于当前进程环境，不会写入文件或产物：
 
 ```bash
 OPENROUTER_API_KEY='(只放进当前进程环境)' \
 NAUSICAA_LIVE_TESTS=1 \
-NAUSICAA_LIVE_MODEL=tencent/hy3 \
+NAUSICAA_BETA_EVAL_MODEL=openrouter:tencent/hy3 \
+NAUSICAA_BETA_CASES=compatibility,bugfix \
 NAUSICAA_EVAL_BUDGET_USD=0.85 \
-npm run test:live -- --no-file-parallelism
+NAUSICAA_EVAL_MAX_REQUESTS=5 \
+npm run test:beta:live
 ```
 
-smoke fixture 会要求 Main 通过 `read_file` 读取小型 README，再依据工具结果回答；结果摘要只写入被忽略的 `.nausicaa/evals/`，公开字段为 model、request count、usage、cost、status 和 commit。通过只表示 provider、工具循环和本地 harness 接线可运行，不代表 Teto uplift、Worker 质量收益或 Phase 2.4 release。历史 Main-only/Main+Teto 对比、缓存 probe 和视觉验收必须额外设置 `NAUSICAA_LIVE_SCENARIO=legacy`，不会被 beta 命令隐式启动。
+beta fixture 会按显式选择运行 Compatibility/MiniEval cases；结果摘要只写入被忽略的 `.nausicaa/evals/`，公开字段为 model、case status、request count、usage、cost、latency、工具名和执行 commit。通过只表示 provider、工具循环和本地 harness 接线可运行，不代表 Teto uplift、Worker 质量收益或 Phase 2.4 release。历史 Main-only/Main+Teto 对比、缓存 probe 和视觉验收必须额外设置 `NAUSICAA_LIVE_SCENARIO=legacy`，不会被 beta 命令隐式启动。
 
-上述 live 命令只允许 root 在离线门禁通过后执行一次；执行前应把 OpenRouter key 硬限额设为
+上述 beta live 命令只允许 root 在离线门禁通过后执行一次；执行前应把 OpenRouter key 硬限额设为
 `$1.00`。缺少 key、模型或预算时预检应跳过且不发请求，失败应记录为 provider
 compatibility pending，不改动核心工具合同。
 

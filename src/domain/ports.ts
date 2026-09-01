@@ -29,6 +29,10 @@ export interface ModelRequest {
   messages: ConversationMessage[];
   tools: ToolDefinition[];
   maxOutputTokens: number;
+  /** Runtime-owned per-request wall-clock budget; provider must treat signal as authoritative. */
+  deadlineMs?: number;
+  /** ISO timestamp recorded for diagnostics/replay; not used as provider authority. */
+  deadlineAt?: string;
   signal?: AbortSignal;
 }
 

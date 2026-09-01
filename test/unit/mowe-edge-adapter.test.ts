@@ -63,6 +63,89 @@ describe("Mowe edge contract", () => {
     })).toThrow(/retry requires an idempotent capability/);
   });
 
+  it.each(["oneOf", "anyOf", "allOf", "$ref"])(
+    "rejects unsupported input schema keyword %s during manifest creation",
+    (keyword) => {
+      const input = manifestInput();
+      input.inputSchema.properties = {
+        query: keyword === "$ref"
+          ? { $ref: "#/$defs/query" }
+          : { [keyword]: [{ type: "string" }] },
+      };
+
+      expect(() => createEdgeManifest(input)).toThrowError(
+        new RegExp(`manifest\\.inputSchema\\.properties\\.query\\.${escapeRegExp(keyword)}`),
+      );
+    },
+  );
+
+  it("rejects type arrays before publishing or validating an edge manifest", () => {
+    const input = manifestInput();
+    input.inputSchema.properties = { query: { type: ["string", "null"] } };
+    expect(() => createEdgeManifest(input)).toThrow(/manifest\.inputSchema\.properties\.query\.type/u);
+
+    const persisted = structuredClone(createEdgeManifest(manifestInput()));
+    (persisted.inputSchema.properties?.query as Record<string, unknown>).type = ["string", "null"];
+    expect(() => validateEdgeManifest(persisted)).toThrow(
+      /manifest\.inputSchema\.properties\.query\.type/u,
+    );
+  });
+
+  it("rejects additionalProperties without properties at the edge boundary", () => {
+    const input = {
+      ...manifestInput(),
+      inputSchema: {
+        type: "object" as const,
+        additionalProperties: { type: "string" as const },
+      },
+    } as unknown as EdgeManifestInput;
+
+    expect(() => createEdgeManifest(input)).toThrow(
+      /manifest\.inputSchema\.additionalProperties.*explicit properties object/u,
+    );
+  });
+
+  it.each([
+    ["pattern", 42, /pattern.*must be a string/u],
+    ["pattern", "[", /pattern.*valid regular expression/u],
+    ["minimum", "0", /minimum.*finite number/u],
+    ["maximum", Number.POSITIVE_INFINITY, /maximum.*finite number/u],
+    ["exclusiveMinimum", null, /exclusiveMinimum.*finite number/u],
+    ["exclusiveMaximum", false, /exclusiveMaximum.*finite number/u],
+    ["minLength", -1, /minLength.*non-negative safe integer/u],
+    ["maxLength", 1.5, /maxLength.*non-negative safe integer/u],
+    ["minItems", -1, /minItems.*non-negative safe integer/u],
+    ["maxItems", Number.MAX_SAFE_INTEGER + 1, /maxItems.*non-negative safe integer/u],
+    ["enum", [], /enum.*non-empty array/u],
+    ["enum", [{ a: 1, b: 2 }, { b: 2, a: 1 }], /enum\[1\].*unique JSON values/u],
+    ["properties", [], /properties.*must be an object/u],
+    ["required", ["query", "query"], /required.*unique strings/u],
+    ["items", [{ type: "string" }], /items.*tuple-form/u],
+    ["additionalProperties", "no", /additionalProperties.*boolean or schema object/u],
+  ] as const)("rejects malformed %s declarations during normalization", (keyword, value, message) => {
+    const input = manifestInput();
+    input.inputSchema.properties = {
+      query: keyword === "properties"
+        || keyword === "required"
+        || keyword === "additionalProperties"
+        || keyword === "items"
+        ? { type: keyword === "items" ? "array" : "object", [keyword]: value }
+        : { type: keyword.includes("Items") ? "array" : "string", [keyword]: value },
+    };
+    expect(() => createEdgeManifest(input)).toThrow(message);
+  });
+
+  it("accepts JSON const/enum values and existing legacy object envelopes", () => {
+    const input = manifestInput();
+    input.inputSchema.properties = {
+      exact: { const: { nested: [1, true, null] } },
+      choice: { enum: [{ key: "a" }, { key: "b" }] },
+    };
+    input.inputSchema.required = [];
+
+    expect(() => createEdgeManifest(input)).not.toThrow();
+  });
+
   it("pins tool identity, schema, metadata, and execute implementation", async () => {
     const manifest = createEdgeManifest(manifestInput());
     const original = vi.fn(async () => ({ content: "first", isError: false }));
@@ -251,4 +334,8 @@ function context() {
     workspace: "/workspace",
     operationId: "operation-1",
   };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

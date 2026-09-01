@@ -1,5 +1,6 @@
 import type { AgentTool, JsonSchema, ToolDefinition } from "../domain/ports.js";
 import { cloneJson, sha256, stableJson } from "../ledger/hash.js";
+import { inspectSchema } from "./admission.js";
 import type { MoweAgentTool, MoweToolMetadata } from "./types.js";
 import {
   EDGE_MANIFEST_VERSION,
@@ -452,10 +453,13 @@ function normalizeProvenance(value: unknown): EdgeProvenance {
 }
 
 function normalizeSchema(value: unknown, path: string): JsonSchema {
+  const diagnostic = inspectSchema(value, path, {
+    requireObjectRoot: true,
+    requirePropertiesForAdditionalProperties: true,
+  });
+  if (diagnostic !== undefined) fail(diagnostic.path, diagnostic.detail ?? diagnostic.message);
   assertJsonValue(value, path, new Set<object>(), { nodes: 0 }, 0);
   const record = asRecord(value, path);
-  if (record.type !== "object") fail(`${path}.type`, "must equal object");
-  validateSchemaNode(record, path, 0);
   if (Buffer.byteLength(stableJson(record), "utf8") > MAX_EDGE_SCHEMA_BYTES) {
     fail(path, `must not exceed ${MAX_EDGE_SCHEMA_BYTES} UTF-8 bytes`);
   }
@@ -629,45 +633,6 @@ function requiredIdentity(value: unknown, path: string): string {
     fail(path, `must not exceed ${MAX_EDGE_IDENTITY_BYTES} UTF-8 bytes`);
   }
   return identity;
-}
-
-function validateSchemaNode(value: unknown, path: string, depth: number): void {
-  if (typeof value === "boolean") return;
-  const record = asRecord(value, path);
-  if (record.type !== undefined) {
-    const allowed = ["array", "boolean", "integer", "null", "number", "object", "string"];
-    const types = Array.isArray(record.type) ? record.type : [record.type];
-    if (types.length === 0
-      || types.some((item) => typeof item !== "string" || !allowed.includes(item))
-      || new Set(types).size !== types.length) {
-      fail(`${path}.type`, "must be one type or an array of unique JSON Schema types");
-    }
-  }
-  if (record.properties !== undefined) {
-    const properties = asRecord(record.properties, `${path}.properties`);
-    for (const [key, schema] of Object.entries(properties)) {
-      validateSchemaNode(schema, `${path}.properties.${key}`, depth + 1);
-    }
-  }
-  if (record.required !== undefined) {
-    if (!Array.isArray(record.required)
-      || record.required.some((item) => typeof item !== "string")
-      || new Set(record.required).size !== record.required.length) {
-      fail(`${path}.required`, "must be an array of unique strings");
-    }
-  }
-  if (record.additionalProperties !== undefined
-    && typeof record.additionalProperties !== "boolean") {
-    validateSchemaNode(record.additionalProperties, `${path}.additionalProperties`, depth + 1);
-  }
-  if (record.items !== undefined) {
-    if (Array.isArray(record.items)) {
-      record.items.forEach((item, index) => validateSchemaNode(item, `${path}.items[${index}]`, depth + 1));
-    } else {
-      validateSchemaNode(record.items, `${path}.items`, depth + 1);
-    }
-  }
-  if (depth > MAX_EDGE_JSON_DEPTH) fail(path, `must not exceed JSON depth ${MAX_EDGE_JSON_DEPTH}`);
 }
 
 function optionalString(value: unknown, path: string): string | undefined {

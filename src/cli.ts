@@ -224,10 +224,84 @@ const main = async (): Promise<number> => {
         else await session.close().catch(() => undefined);
       }
     }
+    const mainModel = createOpenRouterModelPort();
+    const modelCatalog = mainModel.catalog();
+    const credentialStatus = inspectCredential(resolvedSettings.model, modelCatalog);
+    const selectedRunId = options.continue
+      ? await findLatestRunId(resolvedSettings.dataDir, workspace)
+      : options.resume;
+    activeRunId = selectedRunId;
+    // `--continue` resumes only when lookup found a Run. With no candidate it
+    // becomes a new invocation and must pass the same local startup gate.
+    const isNewRun = !options.daemon
+      && selectedRunId === undefined
+      && options.resume === undefined;
+    const localModelPreflightFailed = startupModelMissing
+      || !credentialStatus.selectorRecognized
+      || credentialStatus.catalogKnown === false
+      || (
+        credentialStatus.credentialEnv !== undefined
+        && !credentialStatus.credentialPresent
+      );
+    if (
+      options.mode !== "interactive"
+      && isNewRun
+      && (
+        !credentialStatus.selectorRecognized
+        || credentialStatus.catalogKnown === false
+      )
+    ) {
+      const malformed = !credentialStatus.selectorRecognized;
+      const message = malformed
+        ? `Model selector is not recognized locally: ${resolvedSettings.model}. Use a provider:model selector.`
+        : `Model is not present in the local catalog: ${resolvedSettings.model}. `
+          + "No provider request or edge refresh was started; availability remains unverified.";
+      if (options.mode === "json") {
+        writeJson({
+          kind: "error",
+          error: {
+            type: malformed ? "configuration.model-invalid" : "configuration.model-unknown",
+            message,
+            model: resolvedSettings.model,
+            authStatus: credentialStatus.authStatus,
+            nextStep: nonInteractiveGuidance(resolvedSettings.model),
+          },
+        });
+      } else {
+        process.stderr.write(`${message}\n${nonInteractiveGuidance(resolvedSettings.model)}\n`);
+      }
+      return 2;
+    }
+    if (
+      options.mode !== "interactive"
+      && isNewRun
+      && credentialStatus.credentialEnv !== undefined
+      && !credentialStatus.credentialPresent
+    ) {
+      const message = `Credential not detected: ${credentialStatus.credentialEnv}. `
+        + "No provider request or edge refresh was started; auth remains unverified.";
+      if (options.mode === "json") {
+        writeJson({
+          kind: "error",
+          error: {
+            type: "configuration.credential-missing",
+            message,
+            provider: credentialStatus.provider,
+            source: credentialStatus.credentialEnv,
+            authStatus: credentialStatus.authStatus,
+            nextStep: nonInteractiveGuidance(resolvedSettings.model),
+          },
+        });
+      } else {
+        process.stderr.write(`${message}\n${nonInteractiveGuidance(resolvedSettings.model)}\n`);
+      }
+      return 2;
+    }
     const edgeRuntime = await openCliEdgeRuntime(
       workspace,
       resolvedSettings,
       options.refreshEdges === true,
+      !(isNewRun && localModelPreflightFailed),
     );
     openedEdgeComposition = edgeRuntime.composition;
     // Keep resume semantics explicit: when neither the settings file nor the
@@ -260,9 +334,6 @@ const main = async (): Promise<number> => {
           }),
       });
     }
-    const mainModel = createOpenRouterModelPort();
-    const modelCatalog = mainModel.catalog();
-    const credentialStatus = inspectCredential(resolvedSettings.model, modelCatalog);
     const showStartupSetup = startupModelMissing
       || !credentialStatus.selectorRecognized
       || credentialStatus.catalogKnown === false
@@ -289,10 +360,6 @@ const main = async (): Promise<number> => {
       processedImages.text,
       options.message ?? stdinMessage,
     );
-    const selectedRunId = options.continue
-      ? await findLatestRunId(resolvedSettings.dataDir, workspace)
-      : options.resume;
-    activeRunId = selectedRunId;
     if (
       options.mode !== "interactive"
       && selectedRunId === undefined
@@ -305,33 +372,6 @@ const main = async (): Promise<number> => {
         writeJson({ kind: "error", error: { type: "input.task-missing", message } });
       } else {
         process.stderr.write(`${message}\n`);
-      }
-      await edgeRuntime.composition.close().catch(() => undefined);
-      return 2;
-    }
-    if (
-      options.mode !== "interactive"
-      && selectedRunId === undefined
-      && credentialStatus.catalogKnown !== false
-      && credentialStatus.credentialEnv !== undefined
-      && !credentialStatus.credentialPresent
-    ) {
-      const message = `Credential not detected: ${credentialStatus.credentialEnv}. `
-        + "No provider request was started; auth remains unverified.";
-      if (options.mode === "json") {
-        writeJson({
-          kind: "error",
-          error: {
-            type: "configuration.credential-missing",
-            message,
-            provider: credentialStatus.provider,
-            source: credentialStatus.credentialEnv,
-            authStatus: credentialStatus.authStatus,
-            nextStep: nonInteractiveGuidance(resolvedSettings.model),
-          },
-        });
-      } else {
-        process.stderr.write(`${message}\n${nonInteractiveGuidance(resolvedSettings.model)}\n`);
       }
       await edgeRuntime.composition.close().catch(() => undefined);
       return 2;
@@ -688,12 +728,16 @@ const openCliEdgeRuntime = async (
   workspace: string,
   settings: ResolvedSettings,
   refreshRequested: boolean,
+  /** Defer adapter discovery while interactive setup is incomplete. */
+  startupRefreshAllowed = true,
 ): Promise<CliEdgeRuntime> => {
+  const startupRefresh = startupRefreshAllowed
+    && (refreshRequested || settings.edges.refreshOnStart);
   const composition = await createConfiguredEdgeComposition({
     workspace,
     settings,
     constructors: cliEdgeConstructors(),
-    startupRefresh: refreshRequested || settings.edges.refreshOnStart,
+    startupRefresh,
   });
   // Discovery is visible in status, but Skill bodies require an explicit host
   // selector. The predicate closes over the controller so each Turn captures
@@ -722,9 +766,14 @@ const openCliEdgeRuntime = async (
       return {
         ...runtime,
         enabled: settings.edges.enabled,
-        refreshRequested: refreshRequested || settings.edges.refreshOnStart,
+        refreshRequested: startupRefresh,
         diagnostics: Object.freeze([
           ...(runtime.diagnostics ?? []),
+          ...(
+            !startupRefreshAllowed && (refreshRequested || settings.edges.refreshOnStart)
+              ? ["edge startup refresh deferred until local model setup is complete"]
+              : []
+          ),
           ...composition.diagnostics.map((diagnostic) => (
             diagnostic.sourceId === undefined
               ? `${diagnostic.code}: ${diagnostic.message}`

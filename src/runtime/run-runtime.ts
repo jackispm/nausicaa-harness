@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import { A2AInbox } from "../a2a/index.js";
@@ -104,6 +105,7 @@ import {
   captureEdgeTurnSnapshot,
   type EdgeTurnSnapshotProvider,
 } from "./edge-runtime.js";
+import { createRuntimeSkillCapability } from "./skill-tool.js";
 
 export interface RunExecutionRequest {
   workspace: string;
@@ -198,19 +200,39 @@ export const executeRun = async (
   request: RunExecutionRequest,
   deps: RunExecutionDeps = {},
 ): Promise<RunExecutionResult> => {
-  validateRequest(request);
-  const edgeSnapshot = request.edgeSnapshot === undefined && deps.edgeSnapshot === undefined
-    ? undefined
-    : freezeWorkspaceEdgeToolSnapshot(request.edgeSnapshot ?? deps.edgeSnapshot!);
   const closeEdgeCompositionOnClose = request.closeEdgeCompositionOnClose
     ?? deps.closeEdgeCompositionOnClose
     ?? true;
+  const edgeSnapshotProvider = request.edgeSnapshotProvider ?? deps.edgeSnapshotProvider;
   const clock = deps.clock ?? systemClock;
-  const workspace = resolve(request.workspace);
-  const runId = request.resumeRunId ?? (deps.createRunId ?? randomUUID)();
-  validateRunId(runId);
-  const stateDir = resolve(request.dataDir, "runs", runId);
-  const ledger = await JsonlLedger.open(resolve(stateDir, "ledger.jsonl"));
+  let edgeSnapshot: WorkspaceEdgeToolSnapshot | undefined;
+  let workspace: string;
+  let runId: string;
+  let stateDir: string;
+  let ledger: JsonlLedger;
+  try {
+    validateRequest(request);
+    edgeSnapshot = request.edgeSnapshot === undefined && deps.edgeSnapshot === undefined
+      ? undefined
+      : freezeWorkspaceEdgeToolSnapshot(request.edgeSnapshot ?? deps.edgeSnapshot!);
+    // Match Session's canonical workspace identity when the directory exists.
+    // Keep a resolved fallback for legacy callers that create the workspace
+    // later; this also keeps owned edge resources inside the cleanup boundary.
+    workspace = await canonicalWorkspace(request.workspace);
+    runId = request.resumeRunId ?? (deps.createRunId ?? randomUUID)();
+    validateRunId(runId);
+    stateDir = resolve(request.dataDir, "runs", runId);
+    ledger = await JsonlLedger.open(resolve(stateDir, "ledger.jsonl"));
+  } catch (error: unknown) {
+    if (closeEdgeCompositionOnClose) {
+      try {
+        await edgeSnapshotProvider?.close?.();
+      } catch {
+        // A failed preflight must not hide the original validation/open error.
+      }
+    }
+    throw error;
+  }
   let scheduler: TetoScheduler | ReflectionScheduler | undefined;
   let workerScheduler: WorkerLaneScheduler | undefined;
   let processJobManager: ProcessJobManager | undefined;
@@ -361,7 +383,7 @@ export const executeRun = async (
 
     const mainModel = compactionModel ?? deps.mainModel ?? createOpenRouterModelPort();
     const edgeProjection = await captureEdgeTurnSnapshot(
-      request.edgeSnapshotProvider ?? deps.edgeSnapshotProvider,
+      edgeSnapshotProvider,
       edgeSnapshot,
       request.signal,
     );
@@ -516,6 +538,23 @@ export const executeRun = async (
       });
       tools.push(createDelegateTaskTool({ dispatcher, store }));
     }
+    const skillCapability = edgeProjection.registry === undefined
+      || typeof edgeProjection.registry.loadContribution !== "function"
+      ? undefined
+      : createRuntimeSkillCapability({
+          snapshot: edgeProjection.snapshot ?? edgeProjection.edgeSnapshot,
+          registry: edgeProjection.registry as { loadContribution: NonNullable<typeof edgeProjection.registry.loadContribution> },
+          workspace,
+        });
+    // `skill` is a host-owned capability. Remove injected/edge collisions even
+    // when the captured catalog is invalid, so schema and catalog fail closed
+    // as one unit.
+    for (let index = tools.length - 1; index >= 0; index -= 1) {
+      if (tools[index]?.definition.name.trim() === "skill") tools.splice(index, 1);
+    }
+    if (skillCapability !== undefined) {
+      tools.push(skillCapability.tool);
+    }
     // Optional runtime capabilities are host-owned too; append edge tools only
     // after they have been admitted so an edge cannot shadow their names.
     const admittedTools = appendPermittedEdgeTools(tools, edgeProjection.edgeSnapshot, {
@@ -544,6 +583,14 @@ export const executeRun = async (
       ...(edgeProjection.contextContributions.length === 0
         ? {}
         : { edgeContext: edgeProjection.contextContributions }),
+      ...(skillCapability === undefined
+        ? {}
+        : {
+            skillCatalog: {
+              generation: skillCapability.catalog.generation,
+              entries: skillCapability.catalog.modelEntries,
+            },
+          }),
       ...(deps.approveTool === undefined ? {} : { approve: deps.approveTool }),
       ...(outputContinuationMessageId === undefined
         && scheduler === undefined
@@ -720,7 +767,7 @@ export const executeRun = async (
     await processJobManager?.close().catch(() => undefined);
     if (closeEdgeCompositionOnClose) {
       try {
-        await (request.edgeSnapshotProvider ?? deps.edgeSnapshotProvider)?.close?.();
+        await edgeSnapshotProvider?.close?.();
       } catch {
         // Edge shutdown is best effort after the durable Run boundary closes.
       }
@@ -1083,6 +1130,16 @@ const validateRunId = (runId: string): void => {
     throw new Error("Run id contains unsupported characters");
   }
 };
+
+async function canonicalWorkspace(workspace: string): Promise<string> {
+  const resolved = resolve(workspace);
+  try {
+    return await realpath(resolved);
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return resolved;
+    throw error;
+  }
+}
 
 const totalTokens = (usage: TokenUsage): number =>
   usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
