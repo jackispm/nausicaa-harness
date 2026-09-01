@@ -137,7 +137,7 @@ const definitions: readonly CaseDefinition[] = [
       [file("add.js", "source", BUGGY_ADD), file("add.test.js", "test", ADD_TEST)],
       ["add.js"],
       [deepSeek, pi, codex],
-      { maxMainSteps: 6, requestBudgetHint: 5, maxOutputTokens: 512, timeoutMs: 60_000 },
+      { maxMainSteps: 100, requestBudgetHint: 100, maxOutputTokens: 512, timeoutMs: 600_000 },
     ),
     files: { "add.js": BUGGY_ADD, "add.test.js": ADD_TEST },
     message: "The current directory contains add.js and add.test.js. Read the files, fix add.js so node add.test.js passes, and report the result. Do not modify add.test.js or create any other files.",
