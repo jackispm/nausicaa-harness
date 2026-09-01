@@ -28,9 +28,11 @@ The archive provenance is recorded in `docs/reference-prompts/README.md`:
 | Prime ordinary Main | `snapshots/prime-agent/coding-agent-system-prompt.ts:38-168` calls `buildRlmPrompt()` (`rlm-prompts.ts:60-166`), then conditionally appends delegation guidance, harness state, additional guidance, project context, skills, and append text. | One RLM-oriented system string; tool schemas are separate. | RLM base text stable; depth, parent, tools, skills, harness state, files, and append text dynamic. |
 | Prime goals/continuation | `snapshots/prime-agent/goals.ts:154-179,192-250` creates a custom user-role goal context for continuation, budget limit, or objective update. The objective is explicitly user data, not higher-priority policy. | User/context message injected only at the relevant goal event. | Template stable; objective and counters dynamic. |
 | Prime autonomous/daemon | Autonomous continuation text is `snapshots/prime-agent/autonomous.ts:45-55`; dashboard status uses `daemon-session-summarizer.ts:20-33,80-99,150-177`. | Auxiliary continuation or independent status-summary request, never the ordinary Main prompt. | Template stable; gate failures, recent messages, and working state dynamic. |
+| Prime subagents | `snapshots/prime-agent/subagent-prompts/**` contains fresh, scout, planner, worker, reviewer, and orchestration templates. | Independent child request; parent task, recursion depth, child doctrine, and report are supplied only when delegation is triggered. | Template stable; task, parent state, and tool set dynamic. |
 | DeepSeek ordinary Main | `snapshots/deepseek-harness/system-prompt.ts:337-370,457-542` registers ordered sections, scoped overrides, dynamic contexts, tool schemas, and strict variables. Default identity is `harness:identity`; persona is `deployment:persona`. | Ordered system sections plus tool schemas plus projected user-role contexts/messages. | Registered section text and tool schemas can be stable; scoped plugins, persona, variables, and runtime contexts are dynamic. |
 | DeepSeek skills/runtime context | `snapshots/deepseek-harness/dynamic-context/skill-tool.ts:71-83,163-203,213-245` emits a catalog when the `skill` schema is visible and loads a body on explicit invocation. `dynamic-context/runtime-context.ts:24-75` replaces one durable runtime snapshot when its content changes. | User-role catalog/instruction/snapshot messages and the `skill` tool schema. | Catalog framing is stable; skill list/body and runtime snapshot are dynamic. |
 | DeepSeek compaction | `snapshots/deepseek-harness/compaction-summarizer.ts:25-76,110-163` replays the routed prefix (system, tools, leading messages) and appends a final user compaction instruction. | Separate `purpose: 'compaction'` request. | Compaction instruction stable; replayed prefix and summary output dynamic. |
+| DeepSeek goals/subagents/daemon/errors | `dynamic-context/goal-round-prompt.ts`, `subagent-continuation.ts`, `schedule-runtime.ts`, `user-approval.ts`, and `repeat-tool-reminder.ts` are selected by goal rounds, child settlement, reminders/approval, and repeated-call or error conditions. | Conditional system context or user-role message; no such text is present in every Main request. | Framing is stable per context type; goal state, child result, approval, and error details dynamic. |
 
 The Pi/Prime/DeepSeek rows describe upstream assembly rules only. None of those
 rows means that the archived text is included in Nausicaa.
@@ -99,7 +101,7 @@ Fukai:  systemPrompt = PI_AI_FUKAI_COMPACTION_SYSTEM_PROMPT,
 
 ### Teto
 
-`src/teto/navigator.ts:11` supplies one stable, no-tool instruction requiring
+`src/teto/navigator.ts:14` supplies one stable, no-tool instruction requiring
 `silent` or a tightly bounded `advise` JSON object. The scheduler calls it only
 after cadence, token-ratio, and hard-trigger checks (`src/teto/cadence.ts:65-123`;
 `src/runtime/teto-scheduler.ts:265-330`). The frame contains only mission,
@@ -148,8 +150,9 @@ they are recommendations, not changes made in this lane.
 | Priority | Evidence and impact | Smallest repair boundary |
 | --- | --- | --- |
 | **P1** | Teto receives tool-derived `actionOrDecision` text despite the explicit tool-free projection contract (`main-loop.ts:1280-1343`, `observation.ts:78-88`, `docs/architecture/03-context-contracts.md:122-128`). This can expose implementation details and makes observer behavior dependent on tool wording. | Add a runtime-owned Teto-safe projection before `ObservationFrameBuilder`, retaining only abstract action/outcome/status and setting `truncated` when provenance is incomplete. Add a regression fixture that asserts tool names, arguments, paths, and result snippets cannot reach `ModelRequest.messages[0]`. |
-| **P2** | Main gives useful batch advice (`main-loop.ts:74`, `src/tools/read-many.ts:39-65`), but there is no compact, conditional explanation that a batch may be partially successful and that each returned offset is authoritative. Repeated models could retry a successful item or treat one file error as a batch-wide failure. | Add one conditional Main guidance section only when `read_many` is visible, owned by `effectiveSystemPrompt()`; do not duplicate the schema or expose Mowe host metadata. Verify with a focused assembled-prompt test and a model eval for retry/partial-result behavior. |
-| **P2** | Teto's stable prompt enforces minified JSON and silence/advice bounds, while cadence enforces low frequency (`navigator.ts:11`, `cadence.ts:65-123`), but the prompt does not explicitly say it is an observer and not a code reviewer. This is a clarity opportunity, not a current authority failure. | If evals show over-reviewing, append one sentence to `TETO_SYSTEM_PROMPT` and keep the existing parser/cadence contract. A parser/unit test is insufficient for quality; use a small offline model eval. |
+| **P1** | Main describes “available tools” and Plan mode but does not state in one stable sentence that visible schemas are only this request's capability view and that runtime policy/approval is authoritative. Filtering and Plan allow-list enforcement already live outside the prompt (`main-loop.ts:462-473,994-1008`), so this is a model-clarity gap rather than a permission bypass; a model may retry a hidden operation or misread a denied effect. | Add one short capability-boundary sentence to the Main lane section; keep Mowe admission, approval, and Ledger authority unchanged. Test ordinary/Plan/denied-tool request shapes and use an offline eval for retry behavior. |
+| **P2** | Main gives useful batch advice (`main-loop.ts:74`, `src/tools/read-many.ts:39-65`), but there is no compact, conditional explanation that a batch may be partially successful and that each returned offset is authoritative. Mowe also returns per-call `succeeded`/`failed`/`cancelled` statuses and bounded inline/preview/summary/artifact projections (`src/mowe/executor.ts:246-255`, `src/mowe/types.ts:97-185`). Repeated models could retry a successful item, treat one file error as a batch-wide failure, or treat a preview as complete evidence. | Add one conditional Main guidance section only when the relevant schema is visible, owned by `effectiveSystemPrompt()`; do not duplicate the schema or expose Mowe host metadata. Verify with a focused assembled-prompt/projection test and a model eval for retry and partial-result behavior. |
+| **P2** | Teto's stable prompt enforces minified JSON and silence/advice bounds, while cadence enforces low frequency (`navigator.ts:14`, `cadence.ts:65-123`), but the prompt does not explicitly say it is an observer and not a code reviewer. This is a clarity opportunity, not a current authority failure. | If evals show over-reviewing, append one sentence to `TETO_SYSTEM_PROMPT` and keep the existing parser/cadence contract. A parser/unit test is insufficient for quality; use a small offline model eval. |
 
 Existing behavior should remain unchanged for these covered principles:
 
@@ -180,6 +183,12 @@ fixed tool set, policy, and project snapshot.
 | 5 | Untrusted runtime context | User-role data: active objective, compaction capsule, Skill edge blocks, and artifact evidence with explicit framing. Dynamic and bounded. | Fukai context provider |
 | 6 | Current conversation/tool history | User/assistant/tool messages selected by refs and budget; dynamic tail. | Main loop plus Fukai source |
 
+This presentation is compatible with the six conceptual slots in
+`docs/architecture/03-context-contracts.md`: Goal is section 3, Policy is section
+3 plus lane identity, Tools is section 2, Inbox is section 6, and Compaction plus
+Lane Context are bounded subparts of section 5. The split is a presentation
+choice; it does not add a seventh request stage or a second fact source.
+
 Teto intentionally uses a smaller independent shape: fixed observer system
 instruction, then one bounded safe `ObservationFrame` user message. Fukai
 compaction intentionally uses its fixed JSON summarizer system instruction and
@@ -206,13 +215,16 @@ copy Prime RLM/IPython or DeepSeek Cordis semantics.
 ### Task B: Conditional Mowe batch guidance
 
 - **Allowed files:** `src/runtime/main-loop.ts` and focused Main prompt tests.
-- **Change:** when `read_many` is visible, add a short system section explaining
-  ordered per-file results, isolated failures, and returned continuation offsets;
-  retain schemas and Mowe enforcement as the authority.
-- **Tests/acceptance:** assert the section appears only with the relevant schema,
-  Plan mode still filters effects, and no Mowe metadata is serialized. A small
-  model eval should measure partial-result retry behavior; do not claim a unit
-  test proves quality.
+- **Change:** add the one-sentence capability-boundary rule for every Main request;
+  when `read_many` is visible, add a short system section explaining ordered
+  per-file results, isolated failures, returned continuation offsets, and
+  projection/truncation markers. Retain schemas and Mowe enforcement as the
+  authority.
+- **Tests/acceptance:** assert the capability rule is present without changing
+  `requestTools`, the batch section appears only with the relevant schema, Plan
+  mode still filters effects, and no Mowe metadata is serialized. A small model
+  eval should measure partial-result retry behavior; do not claim a unit test
+  proves quality.
 - **Rollback:** delete the conditional section; no persisted data or protocol
   migration is required.
 
@@ -246,3 +258,18 @@ copy Prime RLM/IPython or DeepSeek Cordis semantics.
 - Do not describe an archive snapshot as a live prompt, and do not use a large
   upstream body as a brittle unit-test fixture. Test request shape and safety
   boundaries; use model evals for behavioral quality.
+
+## S6 Handoff
+
+- Baseline is `main@c9bf684`. This S2 change is documentation-only and should
+  include this report plus the small archive-status clarification in
+  `docs/reference-prompts/README.md`; no runtime, test, schema, or generated
+  catalog change belongs in the commit.
+- Please re-check the Teto-safe projection P1 against
+  `docs/architecture/03-context-contracts.md:122-128`, and confirm that the
+  capability/batch P1/P2 recommendations remain model-guidance changes rather
+  than hidden permission changes.
+- Offline evidence used here: `git diff --check` and path/source searches with
+  `rg`. No provider, network, MCP, browser, cloud, OpenRouter, or key-bearing
+  command was run. The existing worktree edits in the package/live-smoke lanes
+  are intentionally outside this S2 commit.

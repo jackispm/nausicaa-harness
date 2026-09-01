@@ -9,9 +9,8 @@ It lives under this repository's intentionally ignored `docs/` working-material 
 本目录**不会**被 Nausicaa 自动读取，也不会因为文件名包含 `system-prompt` 就发送给模型。
 这里的文件是我们从 Pi、Prime Agent 和 DeepSeek Harness 复制的研究快照，作用是阅读、比较和
 追踪上游变化。它们位于 `docs/reference-prompts/`，不在 `src/` 的运行时导入图中；`docs/` 也被
-本仓库的 `.gitignore` 排除。`docs/prompt-archive/` contains short, curated
-comparison pages and generated upstream catalogs; it is also archive material,
-not a runtime resource.
+本仓库的 `.gitignore` 排除。`docs/prompt-archive/` 当前包含简短的整理页和生成的上游工具目录；
+这些同样属于归档材料，不是运行时资源。
 
 模型真正收到的是**运行时按当前状态组装的一次请求**，通常由下面几部分组成：
 
@@ -34,6 +33,7 @@ model request，不能把它们的提示词误认为 Main 每轮都会附带的�
 | `snapshots/pi/**` | Pi 上游源码快照，含 prompt builder、工具说明、compaction 和示例 | 否；仅研究资料 |
 | `snapshots/prime-agent/**` | Prime 上游源码快照，含 RLM、daemon、goal、subagent 等 prompt builder | 否；仅研究资料 |
 | `snapshots/deepseek-harness/**` | DeepSeek 上游 section registry、工具 section 和动态 context 快照 | 否；仅研究资料 |
+| `docs/prompt-archive/*.md` | 对快照的来源、顺序和触发条件的整理页及生成工具目录 | 否；仅研究资料 |
 | `catalog.txt` | 本归档的文件索引 | 否 |
 | Nausicaa `src/runtime/main-loop.ts` / `src/fukai/context-provider.ts` | Nausicaa 自己的运行时 prompt/context 组装代码 | 会影响实际请求 |
 | 当前 `AgentTool.definition` | 当前 Turn 的工具 schema 和说明 | 只发送本轮允许的工具 |

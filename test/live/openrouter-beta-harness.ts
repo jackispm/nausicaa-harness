@@ -468,11 +468,11 @@ export function classifyBetaFailure(error: unknown): BetaSmokeEvidence {
     failureCategory = "budget-guard";
   } else if (message.includes("timeout") || message.includes("aborted")) {
     failureCategory = "timeout";
+  } else if (/(?:401|403|unauthor|forbidden|api key|credential|quota|rate limit)/u.test(message)) {
+    failureCategory = "provider-auth-failure";
   } else if (error instanceof BetaUsageError
     || /(?:model|tool|function|schema|unsupported)/u.test(message)) {
     failureCategory = "model-tool-call-incompatibility";
-  } else if (/(?:401|403|unauthor|forbidden|api key|credential|quota|rate limit)/u.test(message)) {
-    failureCategory = "provider-auth-failure";
   } else {
     failureCategory = "harness-defect";
   }
