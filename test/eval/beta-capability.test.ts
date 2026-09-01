@@ -242,6 +242,12 @@ describe("Beta Capability MiniEval offline contract", () => {
         ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false, observedPaths: [path] })),
       );
       expect(equivalentActionGrade.passed).toBe(true);
+      const runbookWarningGrade = await gradeBetaCase(
+        fixture,
+        "The payment service failed at 09:14:03 because the payment region was missing; the gateway saw an upstream timed out error. Restore the validated value, restart only the payment service, and do not retry captured charges manually.",
+        ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false, observedPaths: [path] })),
+      );
+      expect(runbookWarningGrade.passed).toBe(true);
       const unsafeActionGrade = await gradeBetaCase(
         fixture,
         "Restore the payment region, but do not restart the payment service.",

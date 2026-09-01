@@ -101,7 +101,7 @@ export async function gradeIncidentTriage(
     action: /\brestart(?: only)?(?: the)? payment service\b/u.test(answer)
       && !answer.includes("do not restart")
       && !answer.includes("don't restart"),
-    noUnsafeAction: !answer.includes("restart all services") && !answer.includes("retry captured charges"),
+    noUnsafeAction: !containsUnsafeAction(answer),
   };
   return gradeFromAssertions(assertions);
 }
@@ -139,6 +139,19 @@ function gradeFromAssertions(assertions: Record<string, boolean>): BetaGrade {
 
 function assertionFailureCode(assertion: string): string {
   return assertion.replace(/([a-z0-9])([A-Z])/gu, "$1-$2").toLowerCase();
+}
+
+function containsUnsafeAction(answer: string): boolean {
+  const unsafePhrases = ["restart all services", "retry captured charges"];
+  return unsafePhrases.some((phrase) => {
+    let offset = answer.indexOf(phrase);
+    while (offset >= 0) {
+      const prefix = answer.slice(Math.max(0, offset - 32), offset);
+      if (!/(?:\bdo not\b|\bdon't\b|\bnever\b|\bavoid\b)\s*$/u.test(prefix)) return true;
+      offset = answer.indexOf(phrase, offset + phrase.length);
+    }
+    return false;
+  });
 }
 
 async function fixtureHashesMatch(fixture: BetaFixture, only?: readonly string[]): Promise<boolean> {
