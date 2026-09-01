@@ -116,7 +116,7 @@ export async function gradeResume(
   const assertions = {
     fixtureHash: await fixtureMetadataIntact(fixture),
     sessionResumed: options.resumed === true,
-    resumedFactWritten: content === "resume-ready\ncomplete\n",
+    resumedFactWritten: /^resume-ready\ncomplete(?:\n)?$/u.test(content.replaceAll("\r\n", "\n")),
     readToolUsed: collectObservedReadPaths(toolTrace).has("resume.txt"),
     mutationToolUsed: toolTrace.some((entry) => ["edit", "write_file", "apply_patch"].includes(entry.name) && !entry.isError),
     finalTextMentionsFact: canonical(finalText).includes("resume-ready"),

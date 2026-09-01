@@ -204,6 +204,24 @@ describe("Beta Capability MiniEval offline contract", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
+  it("accepts a completed resume fact without requiring an extra terminal newline", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-resume-newline-"));
+    try {
+      const fixture = await createBetaFixture("resume", root);
+      await writeFile(join(fixture.workspace, "resume.txt"), "resume-ready\ncomplete", "utf8");
+      const grade = await gradeBetaCase(
+        fixture,
+        "Final state: resume-ready complete",
+        [
+          { laneId: "main", name: "read_file", arguments: { path: "resume.txt" }, isError: false, observedPaths: ["resume.txt"] },
+          { laneId: "main", name: "edit", arguments: { path: "resume.txt" }, isError: false },
+        ],
+        { resumed: true },
+      );
+      expect(grade.passed).toBe(true);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("derives read evidence only from successful structured tool results", () => {
     const allowed = new Set(["a.log", "b.log", "c.log"]);
     expect(observedReadPathsFromToolResult(

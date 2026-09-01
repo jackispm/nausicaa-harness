@@ -58,6 +58,7 @@ const scorerContract = {
     "grader reruns the test outside the agent",
     "forbidden test bytes and workspace boundary are immutable",
     "at least one successful read and one successful mutation are required",
+    "resume completion accepts one optional terminal newline after the two required lines",
   ],
 } as const;
 
