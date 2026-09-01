@@ -151,6 +151,20 @@ describe("Beta Capability MiniEval offline contract", () => {
         ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path: `./${path}` }, isError: false })),
       );
       expect(grade.passed).toBe(true);
+      const batchGrade = await gradeBetaCase(
+        fixture,
+        "The payment service first failed at 09:14:03 because PAYMENT_REGION was missing; the gateway saw an upstream timed out error. Restore the validated regional value and restart only the payment service.",
+        [{
+          laneId: "main",
+          name: "read_many",
+          arguments: {
+            targets: ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"]
+              .map((path) => ({ path: `./${path}` })),
+          },
+          isError: false,
+        }],
+      );
+      expect(batchGrade.passed).toBe(true);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

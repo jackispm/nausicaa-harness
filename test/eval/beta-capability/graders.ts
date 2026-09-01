@@ -86,10 +86,11 @@ export async function gradeIncidentTriage(
   toolTrace: readonly BetaToolTraceEntry[] = [],
 ): Promise<BetaGrade> {
   const answer = canonical(finalText);
+  const observedReadPaths = traceReadPaths(toolTrace);
   const assertions = {
     fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
     reads: ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"]
-      .every((path) => toolTrace.some((entry) => entry.name === "read_file" && !entry.isError && normalizeWorkspacePath(entry.arguments.path) === path)),
+      .every((path) => observedReadPaths.has(path)),
     paymentService: answer.includes("payment"),
     timestamp: answer.includes("09:14:03"),
     timeout: answer.includes("upstream timed out") || answer.includes("gateway timeout"),
@@ -261,4 +262,24 @@ function normalizeWorkspacePath(value: unknown): string {
     parts.push(part);
   }
   return parts.join("/");
+}
+
+/** Accept the equivalent bounded batch-read tool as evidence. */
+function traceReadPaths(toolTrace: readonly BetaToolTraceEntry[]): Set<string> {
+  const paths = new Set<string>();
+  for (const entry of toolTrace) {
+    if (entry.isError) continue;
+    if (entry.name === "read_file") {
+      const path = normalizeWorkspacePath(entry.arguments.path);
+      if (path.length > 0) paths.add(path);
+      continue;
+    }
+    if (entry.name !== "read_many" || !Array.isArray(entry.arguments.targets)) continue;
+    for (const target of entry.arguments.targets) {
+      if (target === null || typeof target !== "object" || Array.isArray(target)) continue;
+      const path = normalizeWorkspacePath((target as Record<string, unknown>).path);
+      if (path.length > 0) paths.add(path);
+    }
+  }
+  return paths;
 }
