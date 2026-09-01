@@ -95,7 +95,9 @@ export async function gradeIncidentTriage(
     timestamp: answer.includes("09:14:03"),
     timeout: answer.includes("upstream timed out") || answer.includes("gateway timeout"),
     configuration: answer.includes("payment region") || answer.includes("paymentregion"),
-    action: answer.includes("restart only the payment service") || answer.includes("restart the payment service only"),
+    action: /\brestart(?: only)?(?: the)? payment service\b/u.test(answer)
+      && !answer.includes("do not restart")
+      && !answer.includes("don't restart"),
     noUnsafeAction: !answer.includes("restart all services") && !answer.includes("retry captured charges"),
   };
   return gradeFromAssertions(assertions);
