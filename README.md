@@ -73,7 +73,9 @@ Turn。Skill 正文只会在显式选择后以有界、标记为不可信的 Fuk
 ## 本地使用
 
 要求 Node.js `>=22.19`。模型调用需要 `OPENROUTER_API_KEY`；离线的 `--help`、`--topology`、
-构建和测试不需要 API key。key 只放在当前进程环境，不写入设置文件或 beta 产物。
+构建和测试不需要 API key。key 只从当前进程环境读取，不写入设置文件或 beta 产物。首次
+TTY 启动缺少 model 时会打开可跳过的本地 `/model` 选择器；`/setup` 只显示 selector/catalog
+状态、环境变量来源和固定掩码。`auth unverified` 表示没有发送网络请求，不能证明 key 有效。
 
 ```bash
 npm install
@@ -101,6 +103,9 @@ nausicaa -p "查看这个项目如何安装"
 nausicaa --print "查看这个项目如何安装"
 nausicaa --json "检查这个项目的 package 脚本"
 
+# 没有 positional task 时，print/json 从非 TTY stdin 读取一次有界任务
+printf '%s\n' "查看这个项目如何安装" | nausicaa --print
+
 # 恢复或附着当前项目最近的 Run
 nausicaa --resume <run-id>
 nausicaa --continue
@@ -111,6 +116,10 @@ nausicaa --model openrouter:openai/gpt-5-mini "修复这个项目"
 # 需要访问宿主或运行后台进程时单独开启高权限 Shell
 nausicaa --allow-shell "运行测试并分析失败原因"
 ```
+
+检测到非空 stdin 与 positional task 同时出现会以退出码 2 拒绝，避免静默拼接或覆盖；EOF 和纯空白
+stdin 仍按缺少任务处理。CLI 不提供明文 `--api-key`，也不自动读取项目 `.env`。当前仍使用
+`provider:model` selector；`--provider` 延期，因为拆分 provider 与 selector 会引入重复语义。
 
 不使用 `npm link` 时也可以从构建产物生成本地 beta tarball。`package.json` 保持
 `private: true`，因此不会被误发布到 npm registry；`npm pack` 只生成本地文件，tarball

@@ -45,6 +45,8 @@ import {
 import {
   createOpenRouterModelPort,
   normalizeModelSelector,
+  UNCONFIGURED_MODEL_SELECTOR,
+  type ModelCatalogEntry,
 } from "../model/index.js";
 import {
   FileContentAddressedStore,
@@ -154,6 +156,7 @@ export type SessionRuntimeEvent =
 
 export interface SessionModelCapabilities {
   imageInput: "supported" | "unsupported" | "unknown";
+  contextWindowTokens?: number;
 }
 
 export interface SessionModelSelectionResult {
@@ -316,6 +319,8 @@ export interface SessionControllerOptions {
 
 export interface SessionControllerDeps {
   mainModel?: ModelPort;
+  /** Optional last-known local catalog used only to validate interactive selection. */
+  modelCatalog?: readonly ModelCatalogEntry[];
   tetoModel?: ModelPort;
   workerModel?: ModelPort;
   tools?: readonly AgentTool[];
@@ -379,8 +384,6 @@ interface ActiveTurn {
 export class SessionController {
   readonly workspace: string;
   readonly dataDir: string;
-  readonly tetoModel: string;
-  readonly workerModel: string;
   readonly maxOutputTokens: number;
   readonly processJobRegistryDir: string | undefined;
 
@@ -393,6 +396,8 @@ export class SessionController {
   private readonly edgeSnapshotProvider: EdgeTurnSnapshotProvider | undefined;
   private readonly closeEdgeCompositionOnClose: boolean;
   private selectedMainModel: string;
+  private selectedTetoModel: string;
+  private selectedWorkerModel: string;
   private writeAllowed: boolean;
   private shellAllowed: boolean;
   private networkAllowed: boolean;
@@ -423,8 +428,8 @@ export class SessionController {
     this.workspace = workspace;
     this.dataDir = dataDir;
     this.selectedMainModel = normalizeModelSelector(options.model);
-    this.tetoModel = normalizeModelSelector(options.tetoModel ?? options.model);
-    this.workerModel = normalizeModelSelector(options.workerModel ?? options.model);
+    this.selectedTetoModel = normalizeModelSelector(options.tetoModel ?? options.model);
+    this.selectedWorkerModel = normalizeModelSelector(options.workerModel ?? options.model);
     this.maxOutputTokens = options.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS;
     this.writeAllowed = options.allowWrite === true;
     this.shellAllowed = options.allowShell === true;
@@ -481,6 +486,14 @@ export class SessionController {
     return this.selectedMainModel;
   }
 
+  get tetoModel(): string {
+    return this.selectedTetoModel;
+  }
+
+  get workerModel(): string {
+    return this.selectedWorkerModel;
+  }
+
   get allowWrite(): boolean {
     return this.writeAllowed;
   }
@@ -514,6 +527,9 @@ export class SessionController {
       if (capabilities === undefined) return { imageInput: "unknown" };
       return {
         imageInput: capabilities.imageInput ? "supported" : "unsupported",
+        ...(capabilities.contextWindowTokens === undefined
+          ? {}
+          : { contextWindowTokens: capabilities.contextWindowTokens }),
       };
     } catch {
       // Capability discovery is advisory. The model boundary still reports
@@ -540,6 +556,33 @@ export class SessionController {
       }
       const previousModel = this.selectedMainModel;
       const activeRequestUnaffected = this.active !== undefined;
+      if (this.deps.modelCatalog !== undefined) {
+        const entry = this.deps.modelCatalog.find((candidate) => (
+          candidate.selector === model
+          || (model.indexOf(":") < 0 && candidate.selector === `openrouter:${model}`)
+        ));
+        if (entry === undefined) {
+          throw new SessionProtocolError(
+            `Unknown local model: ${model}. The previous model remains selected.`,
+          );
+        }
+        const capabilities = this.deps.mainModel?.capabilities?.(model);
+        if (
+          capabilities !== undefined
+          && (
+            capabilities.imageInput !== entry.imageInput
+            || (
+              capabilities.contextWindowTokens !== undefined
+              && capabilities.contextWindowTokens !== entry.contextWindowTokens
+            )
+          )
+        ) {
+          throw new SessionProtocolError(
+            `Local capability metadata for ${model} does not match the catalog. The previous model remains selected.`,
+          );
+        }
+      }
+
       if (model === previousModel) {
         return {
           model,
@@ -565,6 +608,12 @@ export class SessionController {
           occurredAt: this.clock.now().toISOString(),
         });
         attached.mainModel = model;
+      }
+      if (this.selectedTetoModel === UNCONFIGURED_MODEL_SELECTOR) {
+        this.selectedTetoModel = model;
+      }
+      if (this.selectedWorkerModel === UNCONFIGURED_MODEL_SELECTOR) {
+        this.selectedWorkerModel = model;
       }
       this.selectedMainModel = model;
       this.publishState();

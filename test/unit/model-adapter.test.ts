@@ -133,6 +133,33 @@ describe("PiAiModelPort", () => {
     });
   });
 
+  it("projects the injected local catalog without auth or refresh probes", () => {
+    const faux = fauxProvider({
+      provider: "openrouter",
+      models: [{
+        id: "vision",
+        input: ["text", "image"],
+        contextWindow: 128_000,
+        maxTokens: 8_192,
+        reasoning: true,
+      }],
+    });
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models });
+
+    expect(adapter.catalog()).toEqual([expect.objectContaining({
+      selector: "openrouter:vision",
+      provider: "openrouter",
+      contextWindowTokens: 128_000,
+      maxOutputTokens: 8_192,
+      imageInput: true,
+      toolUse: "unknown",
+      reasoning: true,
+      authStatus: "unverified",
+    })]);
+  });
+
   it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
     "omits an invalid pi-ai context window capability: %s",
     (contextWindow) => {

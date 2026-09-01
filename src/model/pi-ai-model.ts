@@ -28,6 +28,9 @@ import {
 const MAX_FAILURE_TEXT_CHARS = 4_096;
 const MAX_RETRY_AFTER_MS = 7 * 24 * 60 * 60 * 1_000;
 
+/** In-memory-only selector used while first-run setup has no configured model. */
+export const UNCONFIGURED_MODEL_SELECTOR = "openrouter:__nausicaa_unconfigured__";
+
 export interface PiAiModelPortOptions {
   models: Models;
   defaultProvider?: string;
@@ -37,6 +40,19 @@ export interface PiAiModelPortOptions {
 export interface OpenRouterModelPortOptions {
   models?: MutableModels;
   fetch?: FetchFunction;
+}
+
+export interface ModelCatalogEntry {
+  selector: string;
+  provider: string;
+  id: string;
+  name: string;
+  contextWindowTokens: number;
+  maxOutputTokens: number;
+  imageInput: boolean;
+  toolUse: "unknown";
+  reasoning: boolean;
+  authStatus: "unverified";
 }
 
 /**
@@ -66,6 +82,22 @@ export class PiAiModelPort implements ModelPort {
         ? { contextWindowTokens: model.contextWindow }
         : {}),
     };
+  }
+
+  /** Read the last-known in-memory catalog without refreshing or authenticating. */
+  catalog(): readonly ModelCatalogEntry[] {
+    return this.models.getProviders().flatMap((provider) => provider.getModels().map((model) => ({
+      selector: `${provider.id}:${model.id}`,
+      provider: provider.id,
+      id: model.id,
+      name: model.name,
+      contextWindowTokens: model.contextWindow,
+      maxOutputTokens: model.maxTokens,
+      imageInput: model.input.includes("image"),
+      toolUse: "unknown" as const,
+      reasoning: model.reasoning,
+      authStatus: "unverified" as const,
+    })));
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {

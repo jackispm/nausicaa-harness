@@ -51,6 +51,15 @@ import { createMcpEdgeAdapter } from "./mowe/edges/mcp.js";
 import { createSkillsEdgeAdapter } from "./mowe/edges/skills.js";
 import { runRemoteAttach } from "./cli/remote-attach.js";
 import {
+  nonInteractiveGuidance,
+  inspectCredential,
+  readAvailableBoundedStdinTask,
+  readBoundedStdinTask,
+  startupGuidance,
+  UNCONFIGURED_MODEL,
+} from "./cli/onboarding.js";
+import { createOpenRouterModelPort } from "./model/index.js";
+import {
   createEdgeSelectionController,
   type EdgeSelectionController,
 } from "./cli/edge-selection.js";
@@ -83,7 +92,8 @@ const main = async (): Promise<number> => {
     && (!process.stdin.isTTY || !process.stdout.isTTY)
   ) {
     process.stderr.write(
-      `Interactive mode requires a TTY. Use -p/--print or --json for non-TTY output.\n\n${usage}`,
+      `Interactive mode requires a TTY. Use -p/--print or --json for non-TTY output.\n\n` +
+      `${nonInteractiveGuidance(options.model)}\n\n${usage}`,
     );
     return 2;
   }
@@ -113,6 +123,49 @@ const main = async (): Promise<number> => {
       )}\n`);
       return 0;
     }
+    let stdinMessage: string | undefined;
+    if (
+      (options.mode === "print" || options.mode === "json")
+      && !process.stdin.isTTY
+      && options.resume === undefined
+      && (!options.continue || options.message !== undefined)
+    ) {
+      try {
+        stdinMessage = options.message === undefined
+          ? await readBoundedStdinTask(process.stdin)
+          : await readAvailableBoundedStdinTask(process.stdin);
+      } catch (error: unknown) {
+        process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+        return 2;
+      }
+      if (stdinMessage !== undefined && options.message !== undefined) {
+        process.stderr.write(
+          "Task input was provided both positionally and on stdin; use one source.\n",
+        );
+        return 2;
+      }
+      if (
+        stdinMessage === undefined
+        && options.message === undefined
+        && options.fileArgs.length === 0
+        && options.resume === undefined
+        && !options.continue
+      ) {
+        const message = "A non-interactive Run requires a task on stdin, a positional task, or an image.";
+        if (options.mode === "json") {
+          writeJson({
+            kind: "error",
+            error: {
+              type: "input.task-missing",
+              message,
+            },
+          });
+        } else {
+          process.stderr.write(`${message}\n`);
+        }
+        return 2;
+      }
+    }
     const overrides: Settings = {
       ...(options.model === undefined ? {} : { model: options.model }),
       ...(options.tetoModel === undefined ? {} : { tetoModel: options.tetoModel }),
@@ -130,7 +183,24 @@ const main = async (): Promise<number> => {
         ? {}
         : { fukaiCompaction: options.fukaiCompaction }),
     };
-    const resolvedSettings = resolveSettings(workspace, settings, overrides);
+    let startupModelMissing = false;
+    let resolvedSettings: ResolvedSettings;
+    try {
+      resolvedSettings = resolveSettings(workspace, settings, overrides);
+    } catch (error: unknown) {
+      const canKeepEmptyTtySession = options.mode === "interactive"
+        && process.stdin.isTTY
+        && options.resume === undefined
+        && !options.continue
+        && error instanceof SettingsError
+        && error.message === "No model configured. Pass --model or set NAUSICAA_MODEL.";
+      if (!canKeepEmptyTtySession) throw error;
+      startupModelMissing = true;
+      resolvedSettings = resolveSettings(workspace, settings, {
+        ...overrides,
+        model: UNCONFIGURED_MODEL,
+      });
+    }
     if (options.attach !== undefined) {
       const socketPath = resolve(
         workspace,
@@ -190,15 +260,83 @@ const main = async (): Promise<number> => {
           }),
       });
     }
+    const mainModel = createOpenRouterModelPort();
+    const modelCatalog = mainModel.catalog();
+    const credentialStatus = inspectCredential(resolvedSettings.model, modelCatalog);
+    const showStartupSetup = startupModelMissing
+      || !credentialStatus.selectorRecognized
+      || credentialStatus.catalogKnown === false
+      || (
+        credentialStatus.credentialEnv !== undefined
+        && !credentialStatus.credentialPresent
+      );
+    const modelChoices = modelCatalog.map((entry) => ({
+      value: entry.selector,
+      label: entry.selector,
+      description: `${entry.name} · context ${entry.contextWindowTokens} · `
+        + `max ${entry.maxOutputTokens} · ${entry.imageInput ? "images" : "text only"} · `
+        + "tools unverified · auth unverified",
+      contextWindowTokens: entry.contextWindowTokens,
+      imageInput: entry.imageInput,
+      toolUse: entry.toolUse,
+      authStatus: entry.authStatus,
+    }));
     const processedImages = await processImageInputs(options.fileArgs, {
       workspace,
       protectedPaths: [resolvedSettings.dataDir],
     });
-    const initialMessage = combineInitialMessage(processedImages.text, options.message);
+    const initialMessage = combineInitialMessage(
+      processedImages.text,
+      options.message ?? stdinMessage,
+    );
+    const selectedRunId = options.continue
+      ? await findLatestRunId(resolvedSettings.dataDir, workspace)
+      : options.resume;
+    activeRunId = selectedRunId;
+    if (
+      options.mode !== "interactive"
+      && selectedRunId === undefined
+      && options.resume === undefined
+      && initialMessage === undefined
+      && processedImages.images.length === 0
+    ) {
+      const message = "A non-interactive Run requires a task on stdin, a positional task, or an image.";
+      if (options.mode === "json") {
+        writeJson({ kind: "error", error: { type: "input.task-missing", message } });
+      } else {
+        process.stderr.write(`${message}\n`);
+      }
+      await edgeRuntime.composition.close().catch(() => undefined);
+      return 2;
+    }
+    if (
+      options.mode !== "interactive"
+      && selectedRunId === undefined
+      && credentialStatus.catalogKnown !== false
+      && credentialStatus.credentialEnv !== undefined
+      && !credentialStatus.credentialPresent
+    ) {
+      const message = `Credential not detected: ${credentialStatus.credentialEnv}. `
+        + "No provider request was started; auth remains unverified.";
+      if (options.mode === "json") {
+        writeJson({
+          kind: "error",
+          error: {
+            type: "configuration.credential-missing",
+            message,
+            provider: credentialStatus.provider,
+            source: credentialStatus.credentialEnv,
+            authStatus: credentialStatus.authStatus,
+            nextStep: nonInteractiveGuidance(resolvedSettings.model),
+          },
+        });
+      } else {
+        process.stderr.write(`${message}\n${nonInteractiveGuidance(resolvedSettings.model)}\n`);
+      }
+      await edgeRuntime.composition.close().catch(() => undefined);
+      return 2;
+    }
     if (options.mode === "interactive") {
-      const selectedRunId = options.continue
-        ? await findLatestRunId(resolvedSettings.dataDir, workspace)
-        : options.resume;
       try {
         const session = await SessionController.open({
           workspace,
@@ -222,7 +360,7 @@ const main = async (): Promise<number> => {
           allowNetwork: resolvedSettings.allowNetwork,
           edgeSnapshotProvider: edgeRuntime.provider,
           ...(selectedRunId === undefined ? {} : { runId: selectedRunId }),
-        });
+        }, { mainModel, modelCatalog });
         if (options.resolveOperation !== undefined) {
           await session.resolveOperation(options.resolveOperation);
         }
@@ -230,6 +368,17 @@ const main = async (): Promise<number> => {
           session,
           edgeStatus: edgeRuntime.status,
           edgeSelection: edgeRuntime.selection,
+          modelChoices,
+          credentialStatus: () => inspectCredential(
+            session.model === UNCONFIGURED_MODEL ? undefined : session.model,
+            modelCatalog,
+          ),
+          startupModelMissing,
+          showStartupSetup,
+          startupNotice: () => startupGuidance({
+            model: session.model === UNCONFIGURED_MODEL ? undefined : session.model,
+            catalog: modelCatalog,
+          }),
           awareness: () => readWorkspaceAgentAwareness(
             resolvedSettings.dataDir,
             workspace,
@@ -267,7 +416,7 @@ const main = async (): Promise<number> => {
         ...(processedImages.images.length === 0
           ? {}
           : { images: processedImages.images }),
-        ...(options.resume === undefined ? {} : { resumeRunId: options.resume }),
+        ...(selectedRunId === undefined ? {} : { resumeRunId: selectedRunId }),
         ...(options.resolveOperation === undefined
           ? {}
           : { resolveOperationId: options.resolveOperation }),
@@ -284,6 +433,7 @@ const main = async (): Promise<number> => {
         edgeSnapshotProvider: edgeRuntime.provider,
         signal: controller.signal,
       }, {
+        mainModel,
         onEvent: (event: AnyEvent) => {
           activeRunId ??= event.runId;
           if (options.mode === "json") writeJson({ kind: "event", event });
@@ -353,6 +503,11 @@ const main = async (): Promise<number> => {
       return 3;
     }
     const message = persistedErrorText(error, "Nausicaa failed");
+    const actionableMessage = error instanceof SettingsError
+      && message === "No model configured. Pass --model or set NAUSICAA_MODEL."
+      && options.mode !== "interactive"
+      ? `${message}\n${nonInteractiveGuidance(options.model)}`
+      : message;
     if (activeRunId !== undefined) {
       const stateDir = resolve(resolvedDataDir, "runs", activeRunId);
       const resumeCommand = buildResumeCommand({
@@ -370,7 +525,7 @@ const main = async (): Promise<number> => {
           kind: "error",
           error: {
             type: "runtime.error",
-            message,
+            message: actionableMessage,
             runId: activeRunId,
             stateDir,
             resumeCommand,
@@ -378,12 +533,12 @@ const main = async (): Promise<number> => {
         });
       } else {
         process.stderr.write(
-          `${message}\nRun: ${activeRunId}\nState directory: ${stateDir}\n` +
+          `${actionableMessage}\nRun: ${activeRunId}\nState directory: ${stateDir}\n` +
           `Resume with:\n  ${resumeCommand}\n`,
         );
       }
     } else {
-      process.stderr.write(`${message}\n`);
+      process.stderr.write(`${actionableMessage}\n`);
     }
     return error instanceof SettingsError ? 2 : 1;
   }

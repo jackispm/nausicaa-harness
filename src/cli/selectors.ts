@@ -17,6 +17,14 @@ export interface SelectorOption {
   disabled?: boolean;
 }
 
+export interface ModelSelectorCandidate extends SelectorOption {
+  /** Provider-owned local metadata, when available. */
+  contextWindowTokens?: number;
+  imageInput?: boolean;
+  toolUse?: boolean | "unknown";
+  authStatus?: "unverified";
+}
+
 export type ThemeChoice = "auto" | "light" | "dark";
 
 export function permissionProfileOptions(
@@ -113,19 +121,31 @@ export function filterSelectorOptions(
 export function modelSelectorOptions(
   current: string,
   tetoModel: string,
-  additional: readonly string[] = [],
+  additional: readonly (string | ModelSelectorCandidate)[] = [],
 ): SelectorOption[] {
-  const values = [...new Set([current, tetoModel, ...additional].map((value) => value.trim()))]
-    .filter((value) => value.length > 0);
-  return values.map((value) => ({
-    value,
-    label: value,
-    ...(value === current
-      ? { description: "Main lane" }
-      : value === tetoModel
-        ? { description: "Teto lane" }
-        : { description: "Configured candidate" }),
-  }));
+  const candidates = new Map<string, ModelSelectorCandidate>();
+  const add = (candidate: string | ModelSelectorCandidate, fallbackDescription: string): void => {
+    const option = typeof candidate === "string"
+      ? { value: candidate.trim(), label: candidate.trim(), description: fallbackDescription }
+      : {
+          ...candidate,
+          value: candidate.value.trim(),
+          label: candidate.label.trim() || candidate.value.trim(),
+        };
+    if (option.value.length === 0 || candidates.has(option.value)) return;
+    candidates.set(option.value, option);
+  };
+  add(current, "Main lane");
+  add(tetoModel, "Teto lane");
+  for (const candidate of additional) add(candidate, "Configured candidate");
+  return [...candidates.values()].map((option) => {
+    const description = option.value === current
+      ? "Main lane"
+      : option.value === tetoModel
+        ? "Teto lane"
+        : option.description ?? "Configured candidate";
+    return { ...option, description };
+  });
 }
 
 export function themeSelectorOptions(current: ThemeChoice): SelectorOption[] {

@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -92,9 +92,9 @@ describe("built CLI", () => {
   });
 
   it("prints actionable recovery metadata after a built CLI Run fails", async () => {
-    const root = await mkdtemp(join(tmpdir(), "nausicaa-cli-failure-"));
+    const root = await realpath(await mkdtemp(join(tmpdir(), "nausicaa-cli-failure-")));
     try {
-      const failure = await execFileAsync(builtCli, [
+      const failure = await runBuiltCli([
         "-p",
         "--main-only",
         "--model",
@@ -104,17 +104,133 @@ describe("built CLI", () => {
         "--data-dir",
         join(root, "state"),
         "fail without network access",
-      ]).then(
-        () => undefined,
-        (error: unknown) => error as { code?: number; stderr?: string },
-      );
+      ], "", { HOME: root, PATH: process.env.PATH ?? "" });
 
-      expect(failure?.code).toBe(1);
-      expect(failure?.stderr).toContain("Run:");
-      expect(failure?.stderr).toContain("State directory:");
-      expect(failure?.stderr).toContain("Resume with:");
-      expect(failure?.stderr).toContain("--workspace");
-      expect(failure?.stderr).toContain("--data-dir");
+      expect(failure.code).toBe(1);
+      expect(failure.stderr).toContain("Run:");
+      expect(failure.stderr).toContain("State directory:");
+      expect(failure.stderr).toContain("Resume with:");
+      expect(failure.stderr).toContain("--workspace");
+      expect(failure.stderr).toContain("--data-dir");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts one non-interactive task source and rejects conflicts or empty stdin", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "nausicaa-cli-stdin-")));
+    const baseArgs = [
+      "--print",
+      "--main-only",
+      "--model",
+      "missing:model",
+      "--workspace",
+      root,
+    ];
+    const env = { HOME: root, PATH: process.env.PATH ?? "" };
+    try {
+      const stdinOnly = await runBuiltCli(
+        [...baseArgs, "--data-dir", join(root, "stdin-state")],
+        "task from stdin\n",
+        env,
+      );
+      expect(stdinOnly.code).toBe(1);
+      expect(stdinOnly.stderr).toContain("Unknown model: missing:model");
+      expect(stdinOnly.stderr).not.toContain("requires a task");
+
+      const positionalOnly = await runBuiltCli(
+        [...baseArgs, "--data-dir", join(root, "positional-state"), "positional task"],
+        "",
+        env,
+      );
+      expect(positionalOnly.code).toBe(1);
+      expect(positionalOnly.stderr).toContain("Unknown model: missing:model");
+
+      const continued = await runBuiltCli(
+        [
+          ...baseArgs,
+          "--continue",
+          "--data-dir",
+          join(root, "positional-state"),
+        ],
+        "",
+        env,
+      );
+      expect(continued.code).toBe(1);
+      expect(continued.stderr).toContain("Run:");
+      expect(continued.stderr).not.toContain("Credential not detected");
+
+      const conflict = await runBuiltCli(
+        [...baseArgs, "--data-dir", join(root, "conflict-state"), "positional task"],
+        "task from stdin\n",
+        env,
+      );
+      expect(conflict).toMatchObject({
+        code: 2,
+        stdout: "",
+      });
+      expect(conflict.stderr).toContain("both positionally and on stdin");
+
+      const empty = await runBuiltCli(
+        ["--print", "--workspace", root, "--data-dir", join(root, "empty-state")],
+        " \n\t",
+        env,
+      );
+      expect(empty).toMatchObject({ code: 2, stdout: "" });
+      expect(empty.stderr).toContain("requires a task on stdin");
+      expect(empty.stderr).not.toContain("No model configured");
+
+      const jsonEmpty = await runBuiltCli(
+        ["--json", "--workspace", root, "--data-dir", join(root, "json-empty-state")],
+        "",
+        env,
+      );
+      expect(jsonEmpty).toMatchObject({ code: 2, stderr: "" });
+      expect(JSON.parse(jsonEmpty.stdout)).toMatchObject({
+        kind: "error",
+        error: { type: "input.task-missing" },
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports missing model or credential without starting a provider request", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "nausicaa-cli-setup-")));
+    const env = { HOME: root, PATH: process.env.PATH ?? "" };
+    try {
+      const missingModel = await runBuiltCli([
+        "--print",
+        "--workspace",
+        root,
+        "--data-dir",
+        join(root, "missing-model-state"),
+        "task",
+      ], "", env);
+      expect(missingModel.code).toBe(2);
+      expect(missingModel.stderr).toContain("No model configured");
+      expect(missingModel.stderr).toContain("Next step (non-interactive)");
+
+      const missingCredential = await runBuiltCli([
+        "--json",
+        "--main-only",
+        "--model",
+        "openrouter:openai/gpt-5-mini",
+        "--workspace",
+        root,
+        "--data-dir",
+        join(root, "missing-credential-state"),
+        "task",
+      ], "", env);
+      expect(missingCredential).toMatchObject({ code: 2, stderr: "" });
+      expect(JSON.parse(missingCredential.stdout)).toMatchObject({
+        kind: "error",
+        error: {
+          type: "configuration.credential-missing",
+          source: "OPENROUTER_API_KEY",
+          authStatus: "unverified",
+        },
+      });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -233,6 +349,27 @@ async function waitForOutput(
     stream.on("data", onData);
     child.once("exit", onExit);
   });
+}
+
+async function runBuiltCli(
+  args: readonly string[],
+  input: string,
+  env: NodeJS.ProcessEnv,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const child = spawn(process.execPath, [builtCli, ...args], {
+    cwd: process.cwd(),
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+  child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+  child.stdin.end(input);
+  const { code } = await waitForExit(child, 5_000);
+  return { code, stdout, stderr };
 }
 
 async function sendControlStop(socketPath: string): Promise<Record<string, unknown>> {

@@ -10,6 +10,11 @@ import {
   runInteractive,
 } from "../../src/cli/interactive.js";
 import {
+  inspectCredential,
+  startupGuidance,
+  UNCONFIGURED_MODEL,
+} from "../../src/cli/onboarding.js";
+import {
   getNausicaaColorScheme,
   setNausicaaColorScheme,
 } from "../../src/cli/tui-components.js";
@@ -21,7 +26,7 @@ import type {
   ModelStreamEvent,
 } from "../../src/domain/index.js";
 import { JsonlLedger } from "../../src/ledger/index.js";
-import { ScriptedModel } from "../../src/model/index.js";
+import { ScriptedModel, type ModelCatalogEntry } from "../../src/model/index.js";
 import {
   SessionController,
   type SessionRuntimeEvent,
@@ -1505,6 +1510,125 @@ describe("interactive TUI", () => {
       terminal.send("\r");
       await waitForOutput(terminal, "PLAN_ANSWER");
       expect(session.snapshot().collaborationMode).toBe("plan");
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("lets first-run setup skip safely and retry model selection without exposing the key", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-onboarding-"));
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    const sentinelKey = "or-onboarding-secret-9876";
+    const catalog: readonly ModelCatalogEntry[] = [{
+      selector: "openrouter:demo",
+      provider: "openrouter",
+      id: "demo",
+      name: "Demo",
+      contextWindowTokens: 32_000,
+      maxOutputTokens: 4_096,
+      imageInput: false,
+      toolUse: "unknown",
+      reasoning: false,
+      authStatus: "unverified",
+    }];
+    try {
+      const model = new ScriptedModel([response("ONBOARDING_ANSWER")]);
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: UNCONFIGURED_MODEL,
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: model,
+        modelCatalog: catalog,
+        createRunId: () => "onboarding-run",
+      });
+      const environment = { OPENROUTER_API_KEY: sentinelKey };
+      const running = runInteractive({
+        session,
+        terminal,
+        forceAltScreen: true,
+        startupModelMissing: true,
+        startupNotice: () => startupGuidance({
+          model: session.model === UNCONFIGURED_MODEL ? undefined : session.model,
+          catalog,
+          environment,
+        }),
+        credentialStatus: () => inspectCredential(
+          session.model === UNCONFIGURED_MODEL ? undefined : session.model,
+          catalog,
+          environment,
+        ),
+        modelChoices: catalog.map((entry) => entry.selector),
+        initialMessage: "held startup task",
+      });
+
+      await terminal.started;
+      await waitForOutput(terminal, "Local setup");
+      await waitForOutput(terminal, "Models");
+      await waitForOutput(terminal, "Initial task is kept in the editor");
+      expect(terminal.output).toContain("****9876");
+      expect(terminal.output).not.toContain(sentinelKey);
+
+      terminal.send("\x1b");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Choose a model with /model");
+      expect(model.callCount).toBe(0);
+      expect(session.snapshot().runId).toBeUndefined();
+
+      terminal.send("\x03");
+      terminal.type("/model openrouter:demo");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Main model set to openrouter:demo");
+      terminal.type("run after setup");
+      terminal.send("\r");
+      await waitForOutput(terminal, "ONBOARDING_ANSWER");
+      expect(model.callCount).toBe(1);
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps setup queryable without interrupting a configured startup", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-setup-command-"));
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "openrouter:demo",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([]),
+        createRunId: () => "setup-command-run",
+      });
+      const running = runInteractive({
+        session,
+        terminal,
+        forceAltScreen: true,
+        startupNotice: "CONFIGURED_SETUP_STATUS",
+        showStartupSetup: false,
+      });
+
+      await terminal.started;
+      await delay(120);
+      expect(terminal.output).not.toContain("CONFIGURED_SETUP_STATUS");
+
+      terminal.type("/setup");
+      terminal.send("\r");
+      await waitForOutput(terminal, "CONFIGURED_SETUP_STATUS");
 
       terminal.type("/exit");
       terminal.send("\r");

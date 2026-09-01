@@ -55,7 +55,10 @@ import {
   themeSelectorOptions,
   type SelectorOption,
   type ThemeChoice,
+  type ModelSelectorCandidate,
 } from "./selectors.js";
+import { UNCONFIGURED_MODEL } from "./onboarding.js";
+import type { CredentialStatus } from "./onboarding.js";
 import { SelectorOverlay } from "./selector-component.js";
 import type { EdgeSelectionController, EdgeSelectionSnapshot } from "./edge-selection.js";
 import {
@@ -110,7 +113,15 @@ export interface InteractiveOptions {
   /** Test seam; production uses the platform clipboard writer. */
   clipboardTextWriter?: ClipboardTextWriter;
   /** Optional extra model candidates shown by the Prime-style `/model` selector. */
-  modelChoices?: readonly string[];
+  modelChoices?: readonly (string | ModelSelectorCandidate)[];
+  /** True when the CLI kept an empty TTY session open for first-run setup. */
+  startupModelMissing?: boolean;
+  /** Show setup status at startup while keeping `/setup` independently available. */
+  showStartupSetup?: boolean;
+  /** Local-only startup status; never contains a complete credential value. */
+  startupNotice?: string | (() => string);
+  /** Local credential presence only; it is never an authentication result. */
+  credentialStatus?: CredentialStatus | (() => CredentialStatus);
   /** Read-only edge status projection supplied by the host/CLI. */
   edgeStatus?: () => EdgeStatusProjection;
   /** Optional host-injected Skill selection seam. */
@@ -247,6 +258,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   tui.setFocus(editor);
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider([
     { name: "help", description: "Show commands" },
+    { name: "setup", description: "Show local model and credential setup status" },
     { name: "status", description: "Show session state" },
     { name: "agents", description: "Show the read-only agent Awareness topology" },
     { name: "topology", description: "Alias for /agents" },
@@ -259,11 +271,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       description: "Switch the Main model",
       argumentHint: "[model]",
       getArgumentCompletions: (prefix) => commandArgumentCompletions(
-        modelSelectorOptions(
-          options.session.snapshot().model,
-          options.session.tetoModel,
-          options.modelChoices ?? [],
-        ),
+        readModelOptions(),
         prefix,
       ),
     },
@@ -1308,10 +1316,48 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   };
 
   const readModelOptions = () => modelSelectorOptions(
-    options.session.snapshot().model,
-    options.session.tetoModel,
+    options.session.snapshot().model === UNCONFIGURED_MODEL
+      ? ""
+      : options.session.snapshot().model,
+    options.session.tetoModel === UNCONFIGURED_MODEL ? "" : options.session.tetoModel,
     options.modelChoices ?? [],
   );
+
+  const showSetup = (): void => {
+    const startupNotice = typeof options.startupNotice === "function"
+      ? options.startupNotice()
+      : options.startupNotice;
+    appendBlock(new Markdown([
+      "### Local setup",
+      startupNotice ?? "Use `/model` to choose a local catalog entry. Provider auth is unverified until a real request.",
+      "No credential is saved by this screen.",
+    ].join("\n\n"), 1, 0, nausicaaMarkdownTheme));
+  };
+
+  const providerReadinessError = (): string | undefined => {
+    if (options.session.snapshot().model === UNCONFIGURED_MODEL) {
+      return "Choose a model with /model before sending a task.";
+    }
+    const credential = typeof options.credentialStatus === "function"
+      ? options.credentialStatus()
+      : options.credentialStatus;
+    if (credential?.selectorRecognized === false) {
+      return "The selected model selector is not recognized locally. Choose a catalog entry with /model.";
+    }
+    if (credential?.catalogKnown === false) {
+      return "The selected model is not in the local catalog. Choose a catalog entry with /model.";
+    }
+    if (credential?.credentialEnv !== undefined && !credential.credentialPresent) {
+      return `Credential not detected: ${credential.credentialEnv}. `
+        + "Restart after setting it; auth is not verified locally.";
+    }
+    return undefined;
+  };
+
+  const assertProviderReady = (): void => {
+    const message = providerReadinessError();
+    if (message !== undefined) throw new Error(message);
+  };
 
   function closeSelector(restorePreview: boolean): void {
     const selected = activeSelector;
@@ -1351,10 +1397,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
 
   const showModelSelector = (): void => {
     const current = options.session.snapshot().model;
+    const modelOptions = readModelOptions();
     const selector = new SelectorOverlay({
       title: "Models",
-      subtitle: "Switch Main at the next provider request boundary.",
-      options: readModelOptions(),
+      subtitle: modelOptions.length === 0
+        ? "Local model catalog unavailable/unverified; configure a provider:model selector and retry."
+        : "Switch Main at the next provider request boundary.",
+      options: modelOptions,
       current,
       onSelect: (value) => {
         closeSelector(false);
@@ -1367,6 +1416,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
 
   const applyModelSelection = async (value: string): Promise<void> => {
     try {
+      if (value === UNCONFIGURED_MODEL) {
+        throw new Error("Choose a model from the local catalog before sending a task");
+      }
       const result = await options.session.selectModel(value);
       if (!result.changed) {
         appendNotice(`Already using model ${result.model}.`, "info");
@@ -1641,6 +1693,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "/help":
           appendBlock(new Markdown([
             "### Commands",
+            "`/setup` local model and credential status (auth remains unverified)",
             "`/status` session details  ·  `/context` context and cumulative usage",
             "`/agents` read-only Awareness topology  ·  `/topology` alias for `/agents`",
             "`/edges [refresh]` configured edge sources, Skills, and registry generation",
@@ -1660,6 +1713,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             "`Ctrl+Up/Down` jump between prompts  ·  `Ctrl+Shift+F` search transcript",
             "`Ctrl+C` cancel/clear",
           ].join("\n\n"), 1, 0, nausicaaMarkdownTheme));
+          break;
+        case "/setup":
+          if (argument.length > 0) throw new Error("Usage: /setup");
+          showSetup();
           break;
         case "/status":
           writeStatus(options.session.snapshot());
@@ -1734,6 +1791,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           await applyCollaborationMode("plan");
           const prompt = argument;
           if (prompt.length > 0) {
+            assertProviderReady();
             await options.session.submit({
               inputId: createInputId(),
               text: prompt,
@@ -1761,6 +1819,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
               ? "No Run Goal yet."
               : `Goal v${goal.version}: ${goal.statement}`);
           } else {
+            assertProviderReady();
             const goal = await options.session.reviseGoal(statement);
             adoptAttachedPromptStashScope();
             appendNotice(`Goal v${goal.version}: ${goal.statement}`, "success");
@@ -1790,6 +1849,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           appendNotice("New Run ready.", "success");
           break;
         case "/resume":
+          assertProviderReady();
           if (
             options.session.snapshot().status === "running"
             || options.session.snapshot().status === "cancelling"
@@ -1844,6 +1904,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     if (value.startsWith("/")) {
       addPromptToHistory(value);
       await handleCommand(value, submission.images);
+      return;
+    }
+    const readinessError = providerReadinessError();
+    if (readinessError !== undefined) {
+      editor.setText(value);
+      appendNotice(readinessError, "warning");
       return;
     }
     const inputId = createInputId();
@@ -1935,6 +2001,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       ...collectMarkedImages(pastedImages, value),
     ];
     if ((value.length === 0 && submittedImages.length === 0) || closing) return Promise.resolve();
+    if (!value.startsWith("/") && options.session.snapshot().model === UNCONFIGURED_MODEL) {
+      editor.setText(value);
+      appendNotice("Choose a model with /model before sending a task. Use /setup for local credential status.", "warning");
+      return Promise.resolve();
+    }
     if (submittedImages.length > 0 && options.session.modelCapabilities().imageInput === "unsupported") {
       editor.setText(value);
       appendNotice(
@@ -2056,14 +2127,34 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     // Some terminals do not answer OSC 10/11 queries; the light palette remains valid.
   }
   await refreshQueue();
+  if (options.showStartupSetup === true || options.startupModelMissing === true) {
+    showSetup();
+    if (options.startupModelMissing === true) showModelSelector();
+  }
   if (options.resumeOnStart === true) {
     try {
+      assertProviderReady();
       await options.session.resumeCurrent();
     } catch (error: unknown) {
       appendNotice(error instanceof Error ? error.message : String(error), "error");
     }
   }
-  if (options.initialMessage !== undefined || (options.initialImages?.length ?? 0) > 0) {
+  if (
+    options.startupModelMissing === true
+    && (options.initialMessage !== undefined || (options.initialImages?.length ?? 0) > 0)
+  ) {
+    const initialDraftParts = [options.initialMessage ?? ""];
+    for (const image of options.initialImages ?? []) {
+      const markerId = await allocateImageMarkerId();
+      rememberPastedImage(markerId, image);
+      initialDraftParts.push(formatImageMarker(markerId));
+    }
+    editor.setText(initialDraftParts.filter((part) => part.length > 0).join("\n"));
+    appendNotice(
+      "Initial task is kept in the editor until a local model is selected.",
+      "info",
+    );
+  } else if (options.initialMessage !== undefined || (options.initialImages?.length ?? 0) > 0) {
     await submitText(options.initialMessage ?? "", undefined, options.initialImages);
   }
 

@@ -395,8 +395,9 @@ Usage:
   nausicaa --attach <run-id> [options]
 
 Options:
-  -p, --print             Run once and print the final answer
-  --json                  Emit NDJSON events and results
+  -p, --print             Run once and print the final answer; reads bounded non-TTY stdin
+                          when no positional task is supplied
+  --json                  Emit NDJSON events and results; uses the same stdin task rule
   --topology              Print the read-only agent Awareness topology and exit
   --daemon                Run the long-lived daemon control host
   --daemon-socket <path>  Unix JSONL control socket (default: <data-dir>/daemon/control.sock)
@@ -408,6 +409,7 @@ Options:
   --mode <interactive|print|json>
                           Select the output mode
   --model <provider:id>   Main model, for example openrouter:openai/gpt-5-mini
+                          Or set NAUSICAA_MODEL; provider auth is not pre-verified
   --teto-model <value>    Optional model override for the Teto lane
   --resume <run-id>       Resume an interrupted Run
   --continue              Resume the latest Run for this workspace
@@ -437,4 +439,8 @@ Options:
                           Maximum output tokens per Main call (default: 4096)
   -h, --help              Show help
   -v, --version           Show version
+
+Environment:
+  NAUSICAA_MODEL          Fallback model selector when settings/CLI omit model
+  OPENROUTER_API_KEY      Current-process credential; never saved by setup
 `;

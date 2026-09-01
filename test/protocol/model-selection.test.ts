@@ -6,7 +6,12 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { AgentTool, ModelResponse } from "../../src/domain/index.js";
 import { JsonlLedger, projectRun } from "../../src/ledger/index.js";
-import { ScriptedModel, type ScriptedModelStep } from "../../src/model/index.js";
+import {
+  ScriptedModel,
+  UNCONFIGURED_MODEL_SELECTOR,
+  type ModelCatalogEntry,
+  type ScriptedModelStep,
+} from "../../src/model/index.js";
 import { SessionController } from "../../src/runtime/index.js";
 import { FileContentAddressedStore } from "../../src/store/index.js";
 
@@ -80,6 +85,113 @@ describe("Session Main model selection", () => {
     await expect(session.selectModel(":missing-provider"))
       .rejects.toThrow(/selector/i);
     expect(session.snapshot().model).toBe("openrouter:vision");
+    await session.close();
+  });
+
+  it("rejects unknown or contradictory local catalog choices before writing model.selected", async () => {
+    const root = await temporaryRoot();
+    const model = new CatalogCapabilityModel([response("attached")]);
+    const modelCatalog: readonly ModelCatalogEntry[] = [
+      catalogEntry("openrouter:vision", { imageInput: true }),
+      catalogEntry("openrouter:contradictory", { imageInput: false }),
+    ];
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "openrouter:initial",
+      policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+    }, {
+      mainModel: model,
+      modelCatalog,
+      createRunId: () => "catalog-preflight-run",
+    });
+    const selectedEvents: string[] = [];
+    session.subscribe((runtimeEvent) => {
+      if (runtimeEvent.kind === "event" && runtimeEvent.event.type === "model.selected") {
+        selectedEvents.push(runtimeEvent.event.payload.model);
+      }
+    });
+    await session.submit({ inputId: "attach", text: "Attach the Run" });
+    await session.waitForIdle();
+
+    await expect(session.selectModel("openrouter:unknown"))
+      .rejects.toThrow(/unknown local model/i);
+    await expect(session.selectModel("openrouter:contradictory"))
+      .rejects.toThrow(/capability metadata/i);
+    expect(session.snapshot().model).toBe("openrouter:initial");
+
+    expect(selectedEvents).toEqual([]);
+
+    await expect(session.selectModel("openrouter:vision")).resolves.toMatchObject({
+      changed: true,
+      model: "openrouter:vision",
+    });
+    expect(selectedEvents).toEqual(["openrouter:vision"]);
+    await session.close();
+
+    const ledgerPath = join(root, "state", "runs", "catalog-preflight-run", "ledger.jsonl");
+    const ledger = await JsonlLedger.open(ledgerPath);
+    expect((await ledger.read()).filter((event) => event.type === "model.selected"))
+      .toHaveLength(1);
+    await ledger.close();
+  });
+
+  it("does not accept an unchanged current model that is absent from the local catalog", async () => {
+    const root = await temporaryRoot();
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "openrouter:stale",
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([]),
+      modelCatalog: [catalogEntry("openrouter:known", { imageInput: false })],
+    });
+
+    await expect(session.selectModel("openrouter:stale"))
+      .rejects.toThrow(/unknown local model/i);
+    expect(session.snapshot().model).toBe("openrouter:stale");
+    await session.close();
+  });
+
+  it("replaces only unconfigured onboarding auxiliary selectors on first selection", async () => {
+    const root = await temporaryRoot();
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: UNCONFIGURED_MODEL_SELECTOR,
+      policy: { maxMainStepsPerActivation: 2, tetoEnabled: true },
+    }, {
+      mainModel: new ScriptedModel([]),
+      modelCatalog: [catalogEntry("openrouter:vision", { imageInput: true })],
+    });
+
+    await expect(session.selectModel("openrouter:vision")).resolves.toMatchObject({
+      changed: true,
+      model: "openrouter:vision",
+    });
+    expect(session.tetoModel).toBe("openrouter:vision");
+    expect(session.workerModel).toBe("openrouter:vision");
+    await session.close();
+  });
+
+  it("keeps explicitly configured auxiliary selectors fixed during onboarding selection", async () => {
+    const root = await temporaryRoot();
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: UNCONFIGURED_MODEL_SELECTOR,
+      tetoModel: "openrouter:fixed-teto",
+      workerModel: "openrouter:fixed-worker",
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: true },
+    }, {
+      mainModel: new ScriptedModel([]),
+      modelCatalog: [catalogEntry("openrouter:vision", { imageInput: true })],
+    });
+
+    await session.selectModel("openrouter:vision");
+    expect(session.tetoModel).toBe("openrouter:fixed-teto");
+    expect(session.workerModel).toBe("openrouter:fixed-worker");
     await session.close();
   });
 
@@ -183,6 +295,37 @@ class CapabilityScriptedModel extends ScriptedModel {
   capabilities(model: string): { imageInput: boolean } {
     return { imageInput: model.endsWith(":vision") };
   }
+}
+
+class CatalogCapabilityModel extends ScriptedModel {
+  capabilities(model: string): {
+    imageInput: boolean;
+    contextWindowTokens: number;
+  } {
+    return {
+      imageInput: model.endsWith(":vision") || model.endsWith(":contradictory"),
+      contextWindowTokens: 64_000,
+    };
+  }
+}
+
+function catalogEntry(
+  selector: string,
+  capabilities: { imageInput: boolean },
+): ModelCatalogEntry {
+  const separator = selector.indexOf(":");
+  return {
+    selector,
+    provider: selector.slice(0, separator),
+    id: selector.slice(separator + 1),
+    name: selector,
+    contextWindowTokens: 64_000,
+    maxOutputTokens: 4_096,
+    imageInput: capabilities.imageInput,
+    toolUse: "unknown",
+    reasoning: false,
+    authStatus: "unverified",
+  };
 }
 
 const noopTool: AgentTool = {

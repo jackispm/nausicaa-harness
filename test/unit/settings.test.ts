@@ -149,6 +149,27 @@ describe("settings", () => {
     });
   });
 
+  it("keeps explicit and settings model choices ahead of the environment fallback", () => {
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:settings" },
+      { model: "openrouter:explicit" },
+      { NAUSICAA_MODEL: "openrouter:environment" },
+    ).model).toBe("openrouter:explicit");
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:settings" },
+      {},
+      { NAUSICAA_MODEL: "openrouter:environment" },
+    ).model).toBe("openrouter:settings");
+    expect(resolveSettings(
+      "/work",
+      {},
+      {},
+      { NAUSICAA_MODEL: "openrouter:environment" },
+    ).model).toBe("openrouter:environment");
+  });
+
   it("keeps Fukai compaction disabled by default without selecting a provider", () => {
     const resolved = resolveSettings(
       "/work",
