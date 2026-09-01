@@ -19,7 +19,7 @@ export const BETA_BUDGET_ENV = "NAUSICAA_EVAL_BUDGET_USD" as const;
 export const BETA_SOFT_BUDGET_USD = 0.85;
 export const BETA_HARD_BUDGET_USD = 1;
 export const BETA_MAX_REQUESTS = 100;
-export const BETA_MAX_OUTPUT_TOKENS = 128;
+export const BETA_MAX_OUTPUT_TOKENS = 10_200;
 export const BETA_TETO_OUTPUT_TOKENS = 16;
 export const BETA_WALL_CLOCK_TIMEOUT_MS = 45_000;
 
