@@ -1,7 +1,7 @@
 # Nausicaa 首次启动与 API Key Onboarding 研究报告
 
-版本：`onboarding-research-2026-09-01.v1`  
-基线：`main@c9bf6841f08f7d04afa646c92814c17b7a2fb6b5`（`update beta documentation status`）  
+版本：`onboarding-research-2026-09-01.v1`
+基线：`main@c9bf6841f08f7d04afa646c92814c17b7a2fb6b5`（`update beta documentation status`）
 范围：只做本地代码/文档研究，不联网、不读取或写入真实 key，不修改运行时代码。
 
 ## 结论摘要
@@ -216,4 +216,3 @@ Run/Ledger/Store/events/prompt/screenshots/logs: no key-bearing field
 - **仍需产品决策**：是否允许 beta 预填但不默认提交 `openrouter:tencent/hy3`；未验证状态是否
   允许用户直接发送首条请求；认证/配置错误最终退出码是否统一为 2；后续 OS keychain 的支持平台
   与文件 fallback 策略。以上不应在本研究报告中擅自决定。
-
