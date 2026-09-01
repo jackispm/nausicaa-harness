@@ -28,8 +28,8 @@ import {
 
 describe("OpenRouter beta smoke offline contract", () => {
   it("normalizes only the pinned OpenRouter model", () => {
-    expect(normalizeBetaModel("tencent/hy3")).toBe(BETA_MODEL_SELECTOR);
-    expect(normalizeBetaModel("openrouter:tencent/hy3")).toBe(BETA_MODEL_SELECTOR);
+    expect(normalizeBetaModel("deepseek/deepseek-v4-pro-0813")).toBe(BETA_MODEL_SELECTOR);
+    expect(normalizeBetaModel("openrouter:deepseek/deepseek-v4-pro-0813")).toBe(BETA_MODEL_SELECTOR);
     expect(() => normalizeBetaModel("openai/gpt-5-mini")).toThrow();
     expect(() => normalizeBetaModel("https://openrouter.ai/api/v1")).toThrow();
   });
@@ -38,7 +38,7 @@ describe("OpenRouter beta smoke offline contract", () => {
     const base = {
       liveRequested: true,
       apiKeyConfigured: true,
-      modelInput: "tencent/hy3",
+      modelInput: "deepseek/deepseek-v4-pro-0813",
       model: BETA_MODEL_SELECTOR,
       budgetUsd: 0.85,
       tetoEnabled: false,

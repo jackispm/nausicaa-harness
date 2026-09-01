@@ -11,6 +11,7 @@ import { createBetaFixture } from "./beta-capability/fixtures.js";
 import { gradeBetaCase } from "./beta-capability/graders.js";
 import { betaCapabilityPreflight, readBetaCapabilityConfig, runBetaCapabilityBatch, verifyBetaCapabilityArtifact } from "./beta-capability/runner.js";
 import { observedReadPathsFromToolResult } from "./beta-capability/trace.js";
+import { BETA_MODEL_SELECTOR } from "../live/openrouter-beta-harness.js";
 
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: 0.001 };
 const answer = (content = "done", toolCalls: ModelResponse["toolCalls"] = []): ModelResponse => ({ content, toolCalls, stopReason: "stop", usage });
@@ -70,7 +71,7 @@ describe("Beta Capability MiniEval offline contract", () => {
   it("requires explicit cases, model, budget, requests, and clean provenance", async () => {
     const envConfig = readBetaCapabilityConfig({ NAUSICAA_LIVE_TESTS: "1", OPENROUTER_API_KEY: "x" });
     expect((await betaCapabilityPreflight(envConfig)).code).toBe("missing-model");
-    const base = readBetaCapabilityConfig({ NAUSICAA_LIVE_TESTS: "1", OPENROUTER_API_KEY: "x", NAUSICAA_BETA_EVAL_MODEL: "openrouter:tencent/hy3", NAUSICAA_BETA_CASES: "compatibility,bugfix", NAUSICAA_EVAL_BUDGET_USD: "0.1", NAUSICAA_EVAL_MAX_REQUESTS: "4" });
+    const base = readBetaCapabilityConfig({ NAUSICAA_LIVE_TESTS: "1", OPENROUTER_API_KEY: "x", NAUSICAA_BETA_EVAL_MODEL: BETA_MODEL_SELECTOR, NAUSICAA_BETA_CASES: "compatibility,bugfix", NAUSICAA_EVAL_BUDGET_USD: "0.1", NAUSICAA_EVAL_MAX_REQUESTS: "4" });
     expect((await betaCapabilityPreflight(base, { executionCommit: "abc", repositoryDirty: true })).code).toBe("dirty-worktree");
     expect((await betaCapabilityPreflight(base)).ok).toBe(true);
     expect((await betaCapabilityPreflight({ ...base, cases: ["compatibility", "bugfix", "resume", "incident-triage"], caseInputs: ["compatibility", "bugfix", "resume", "incident-triage"] })).code).toBe("too-many-cases");
@@ -78,13 +79,13 @@ describe("Beta Capability MiniEval offline contract", () => {
     expect((await betaCapabilityPreflight({ ...base, cases: ["edge-extension"], caseInputs: ["edge-extension"] })).code).toBe("invalid-cases");
     expect((await betaCapabilityPreflight({ ...base, modelInput: "tencent/hy3", model: "tencent/hy3" })).code).toBe("invalid-model");
     expect((await betaCapabilityPreflight({ ...base, budgetUsd: 0.86 })).code).toBe("invalid-budget");
-    expect((await betaCapabilityPreflight({ ...base, maxRequests: 6 })).code).toBe("invalid-max-requests");
+    expect((await betaCapabilityPreflight({ ...base, maxRequests: 101 })).code).toBe("invalid-max-requests");
   });
 
   it("shares one meter and marks later cases not-run-budget", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-runner-"));
     try {
-      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: "openrouter:tencent/hy3", model: "openrouter:tencent/hy3", caseInputs: ["compatibility", "bugfix"], cases: ["compatibility", "bugfix"] as const, budgetUsd: 0.01, maxRequests: 1, deadlineMs: 10_000 };
+      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: BETA_MODEL_SELECTOR, model: BETA_MODEL_SELECTOR, caseInputs: ["compatibility", "bugfix"], cases: ["compatibility", "bugfix"] as const, budgetUsd: 0.01, maxRequests: 1, deadlineMs: 10_000 };
       const model = new ScriptedModel([
         call("read", "read_file", { path: "README.md" }),
       ]);
@@ -99,7 +100,7 @@ describe("Beta Capability MiniEval offline contract", () => {
   it("stops the batch and reports null cost when a dispatched usage is unknown", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-uncertain-"));
     try {
-      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: "openrouter:tencent/hy3", model: "openrouter:tencent/hy3", caseInputs: ["compatibility", "bugfix"] as const, cases: ["compatibility", "bugfix"] as const, budgetUsd: 0.1, maxRequests: 4, deadlineMs: 10_000 };
+      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: BETA_MODEL_SELECTOR, model: BETA_MODEL_SELECTOR, caseInputs: ["compatibility", "bugfix"] as const, cases: ["compatibility", "bugfix"] as const, budgetUsd: 0.1, maxRequests: 4, deadlineMs: 10_000 };
       const model = new ScriptedModel([
         { content: "", toolCalls: [], stopReason: "stop", usage: undefined as never },
       ]);
@@ -115,7 +116,7 @@ describe("Beta Capability MiniEval offline contract", () => {
   it("rejects unsafe paths and non-exact grade records in artifacts", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-artifact-contract-"));
     try {
-      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: "openrouter:tencent/hy3", model: "openrouter:tencent/hy3", caseInputs: ["compatibility"] as const, cases: ["compatibility"] as const, budgetUsd: 0.1, maxRequests: 2, deadlineMs: 10_000 };
+      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: BETA_MODEL_SELECTOR, model: BETA_MODEL_SELECTOR, caseInputs: ["compatibility"] as const, cases: ["compatibility"] as const, budgetUsd: 0.1, maxRequests: 2, deadlineMs: 10_000 };
       const model = new ScriptedModel([{ content: "npm install Node 22.19 npm test", toolCalls: [], stopReason: "stop", usage }]);
       const run = await runBetaCapabilityBatch({ config, model, rootDirectory: root, repository: { executionCommit: "abc123", repositoryDirty: false } });
       const artifact = run.artifact!;
@@ -133,7 +134,7 @@ describe("Beta Capability MiniEval offline contract", () => {
   it("rejects a case that is not enabled tonight", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-resume-"));
     try {
-      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: "openrouter:tencent/hy3", model: "openrouter:tencent/hy3", caseInputs: ["edge-extension"], cases: ["edge-extension"] as const, budgetUsd: 0.02, maxRequests: 1, deadlineMs: 10_000 };
+      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: BETA_MODEL_SELECTOR, model: BETA_MODEL_SELECTOR, caseInputs: ["edge-extension"], cases: ["edge-extension"] as const, budgetUsd: 0.02, maxRequests: 1, deadlineMs: 10_000 };
       const model = new ScriptedModel([]);
       const run = await runBetaCapabilityBatch({ config, model, rootDirectory: root, repository: { executionCommit: "abc123", repositoryDirty: false } });
       expect(run.preflight.code).toBe("invalid-cases");
@@ -148,8 +149,8 @@ describe("Beta Capability MiniEval offline contract", () => {
       const config = {
         liveRequested: true,
         apiKeyConfigured: true,
-        modelInput: "openrouter:tencent/hy3",
-        model: "openrouter:tencent/hy3",
+        modelInput: BETA_MODEL_SELECTOR,
+        model: BETA_MODEL_SELECTOR,
         caseInputs: ["resume"],
         cases: ["resume"] as const,
         budgetUsd: 0.02,
@@ -174,8 +175,8 @@ describe("Beta Capability MiniEval offline contract", () => {
       const config = {
         liveRequested: true,
         apiKeyConfigured: true,
-        modelInput: "openrouter:tencent/hy3",
-        model: "openrouter:tencent/hy3",
+        modelInput: BETA_MODEL_SELECTOR,
+        model: BETA_MODEL_SELECTOR,
         caseInputs: ["resume"],
         cases: ["resume"] as const,
         budgetUsd: 0.02,
@@ -262,6 +263,37 @@ describe("Beta Capability MiniEval offline contract", () => {
         }],
       );
       expect(batchGrade.passed).toBe(true);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("serializes failed grader assertions as canonical artifact codes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-failed-grade-"));
+    try {
+      const config = {
+        liveRequested: true,
+        apiKeyConfigured: true,
+        modelInput: BETA_MODEL_SELECTOR,
+        model: BETA_MODEL_SELECTOR,
+        caseInputs: ["incident-triage"],
+        cases: ["incident-triage"] as const,
+        budgetUsd: 0.02,
+        maxRequests: 1,
+        deadlineMs: 10_000,
+      };
+      const run = await runBetaCapabilityBatch({
+        config,
+        model: new ScriptedModel([answer("insufficient evidence; restart all services")]),
+        rootDirectory: root,
+        repository: { executionCommit: "abc123", repositoryDirty: false },
+        writeArtifact: true,
+        artifactCwd: root,
+      });
+      const result = run.artifact?.cases[0];
+      expect(result?.status).toBe("fail");
+      expect(result?.grade?.failureCodes).toContain("payment-service");
+      expect(result?.grade?.failureCodes).toContain("no-unsafe-action");
+      expect(result?.grade?.failureCodes.every((code) => /^[a-z][a-z0-9_-]{0,127}$/u.test(code))).toBe(true);
+      expect(verifyBetaCapabilityArtifact(run.artifact!)).toEqual(run.artifact);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

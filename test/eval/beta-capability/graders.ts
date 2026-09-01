@@ -61,7 +61,9 @@ export async function gradeBugfix(
   assertions.readToolUsed = toolTrace.some((entry) => entry.name === "read_file" && !entry.isError);
   assertions.mutationToolUsed = toolTrace.some((entry) => ["edit", "write_file", "apply_patch"].includes(entry.name) && !entry.isError);
   assertions.sourcePathAllowed = definition.manifest.allowedModifyPaths.includes("add.js");
-  for (const [code, passed] of Object.entries(assertions)) if (!passed) failures.push(code);
+  for (const [code, passed] of Object.entries(assertions)) {
+    if (!passed) failures.push(assertionFailureCode(code));
+  }
   return { passed: failures.length === 0, failureCodes: failures, assertions };
 }
 
@@ -129,8 +131,14 @@ function failed(code: string): BetaGrade {
 }
 
 function gradeFromAssertions(assertions: Record<string, boolean>): BetaGrade {
-  const failureCodes = Object.entries(assertions).filter(([, passed]) => !passed).map(([code]) => code);
+  const failureCodes = Object.entries(assertions)
+    .filter(([, passed]) => !passed)
+    .map(([code]) => assertionFailureCode(code));
   return { passed: failureCodes.length === 0, failureCodes, assertions };
+}
+
+function assertionFailureCode(assertion: string): string {
+  return assertion.replace(/([a-z0-9])([A-Z])/gu, "$1-$2").toLowerCase();
 }
 
 async function fixtureHashesMatch(fixture: BetaFixture, only?: readonly string[]): Promise<boolean> {
