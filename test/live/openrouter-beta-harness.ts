@@ -70,6 +70,28 @@ export interface BetaBudgetSnapshot {
 
 export type BetaSmokeStatus = "pass" | "failed" | "skipped";
 
+/** Finite categories used in public beta evidence; never copy provider text here. */
+export type BetaFailureCategory =
+  | "provider-auth-failure"
+  | "model-tool-call-incompatibility"
+  | "timeout"
+  | "budget-guard"
+  | "harness-defect"
+  | "nondeterministic-quality-result";
+
+export type BetaNextOwner =
+  | "provider-owner"
+  | "runtime-owner"
+  | "harness-owner"
+  | "release-owner"
+  | "evaluation-owner";
+
+export interface BetaSmokeEvidence {
+  readonly elapsedMs: number;
+  readonly failureCategory: BetaFailureCategory | null;
+  readonly nextOwner: BetaNextOwner | null;
+}
+
 /**
  * This is intentionally a small public report. It contains no prompts,
  * responses, paths, provider errors, or credentials.
@@ -83,6 +105,9 @@ export interface BetaSmokeArtifact {
   readonly costUsd: number | null;
   readonly status: BetaSmokeStatus;
   readonly commit: string;
+  readonly elapsedMs: number;
+  readonly failureCategory: BetaFailureCategory | null;
+  readonly nextOwner: BetaNextOwner | null;
 }
 
 export class BetaBudgetError extends Error {
@@ -329,6 +354,7 @@ export function betaSmokeArtifact(
   status: BetaSmokeStatus,
   meter: BetaBudgetMeter,
   commit: string,
+  evidence: Partial<BetaSmokeEvidence> = {},
 ): BetaSmokeArtifact {
   const snapshot = meter.snapshot();
   return {
@@ -340,6 +366,9 @@ export function betaSmokeArtifact(
     costUsd: snapshot.costUsd,
     status,
     commit: sanitizeCommit(commit),
+    elapsedMs: sanitizeElapsedMs(evidence.elapsedMs ?? 0),
+    failureCategory: evidence.failureCategory ?? null,
+    nextOwner: evidence.nextOwner ?? null,
   };
 }
 
@@ -347,20 +376,40 @@ export async function writeBetaSmokeArtifact(
   artifact: BetaSmokeArtifact,
   cwd = process.cwd(),
 ): Promise<string> {
+  const safeArtifact = verifyBetaSmokeArtifact(artifact);
   const directory = resolve(cwd, ".nausicaa", "evals");
   const filename = `openrouter-beta-${new Date().toISOString().replaceAll(/[:.]/g, "-")}.json`;
   const path = join(directory, filename);
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(artifact, null, 2)}\n`, "utf8");
+  await writeFile(path, `${JSON.stringify(safeArtifact, null, 2)}\n`, "utf8");
   return path;
 }
 
-export async function readBetaSmokeArtifact(path: string): Promise<BetaSmokeArtifact> {
+export async function readBetaSmokeArtifact(
+  path: string,
+  cwd = process.cwd(),
+): Promise<BetaSmokeArtifact> {
+  if (!betaArtifactPathIsScoped(path, cwd)) {
+    throw new Error("OpenRouter beta artifact path is outside .nausicaa/evals");
+  }
   return verifyBetaSmokeArtifact(JSON.parse(await readFile(resolve(path), "utf8")) as unknown);
 }
 
 export function verifyBetaSmokeArtifact(value: unknown): BetaSmokeArtifact {
   if (!isRecord(value)
+    || !hasExactKeys(value, [
+      "schemaVersion",
+      "provider",
+      "model",
+      "requestCount",
+      "usage",
+      "costUsd",
+      "status",
+      "commit",
+      "elapsedMs",
+      "failureCategory",
+      "nextOwner",
+    ])
     || value.schemaVersion !== 1
     || value.provider !== BETA_PROVIDER
     || value.model !== BETA_MODEL_SELECTOR
@@ -371,7 +420,10 @@ export function verifyBetaSmokeArtifact(value: unknown): BetaSmokeArtifact {
     || typeof value.commit !== "string"
     || value.commit.length === 0
     || value.commit.length > 128
-    || !/^(?:[0-9a-f]+|unknown)$/u.test(value.commit)) {
+    || !/^(?:[0-9a-f]+|unknown)$/u.test(value.commit)
+    || !isElapsedMs(value.elapsedMs)
+    || !isFailureCategory(value.failureCategory)
+    || !isNextOwner(value.nextOwner)) {
     throw new Error("Malformed OpenRouter beta smoke artifact");
   }
   if (value.status === "pass" && (value.costUsd === null || value.requestCount === 0)) {
@@ -379,6 +431,12 @@ export function verifyBetaSmokeArtifact(value: unknown): BetaSmokeArtifact {
   }
   if (value.costUsd !== null && value.costUsd > BETA_HARD_BUDGET_USD) {
     throw new Error("Beta smoke artifact exceeds the hard budget");
+  }
+  if (value.status === "failed" && (value.failureCategory === null || value.nextOwner === null)) {
+    throw new Error("A failed beta smoke artifact requires a failure category and next owner");
+  }
+  if (value.status !== "failed" && (value.failureCategory !== null || value.nextOwner !== null)) {
+    throw new Error("Only a failed beta smoke artifact may contain failure ownership");
   }
   return value as unknown as BetaSmokeArtifact;
 }
@@ -392,11 +450,53 @@ export function publicBetaSmokeSummary(artifact: BetaSmokeArtifact): string {
     costUsd: safe.costUsd,
     status: safe.status,
     commit: safe.commit,
+    elapsedMs: safe.elapsedMs,
+    failureCategory: safe.failureCategory,
+    nextOwner: safe.nextOwner,
   });
 }
 
 export function redactedBetaFailure(error: unknown): string {
   return redactSensitiveText(persistedErrorText(error, "Beta smoke failed", 512));
+}
+
+/** Map local control/protocol errors without persisting untrusted provider text. */
+export function classifyBetaFailure(error: unknown): BetaSmokeEvidence {
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  let failureCategory: BetaFailureCategory;
+  if (error instanceof BetaBudgetError) {
+    failureCategory = "budget-guard";
+  } else if (message.includes("timeout") || message.includes("aborted")) {
+    failureCategory = "timeout";
+  } else if (error instanceof BetaUsageError
+    || /(?:model|tool|function|schema|unsupported)/u.test(message)) {
+    failureCategory = "model-tool-call-incompatibility";
+  } else if (/(?:401|403|unauthor|forbidden|api key|credential|quota|rate limit)/u.test(message)) {
+    failureCategory = "provider-auth-failure";
+  } else {
+    failureCategory = "harness-defect";
+  }
+
+  let nextOwner: BetaNextOwner;
+  switch (failureCategory) {
+    case "budget-guard":
+      nextOwner = "release-owner";
+      break;
+    case "provider-auth-failure":
+      nextOwner = "provider-owner";
+      break;
+    case "model-tool-call-incompatibility":
+      nextOwner = "runtime-owner";
+      break;
+    case "timeout":
+    case "harness-defect":
+      nextOwner = "harness-owner";
+      break;
+    default:
+      nextOwner = "evaluation-owner";
+      break;
+  }
+  return { elapsedMs: 0, failureCategory, nextOwner };
 }
 
 export function betaArtifactPathIsScoped(path: string, cwd = process.cwd()): boolean {
@@ -430,6 +530,7 @@ function emptyUsage(): BetaUsageTotals {
 
 function isUsageTotals(value: unknown): value is BetaUsageTotals {
   return isRecord(value)
+    && hasExactKeys(value, ["input", "output", "cacheRead", "cacheWrite"])
     && finiteOrFalse(value.input)
     && finiteOrFalse(value.output)
     && finiteOrFalse(value.cacheRead)
@@ -452,6 +553,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
 function nonBlank(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed === undefined || trimmed.length === 0 ? undefined : trimmed;
@@ -460,4 +567,35 @@ function nonBlank(value: string | undefined): string | undefined {
 function sanitizeCommit(value: string): string {
   const commit = value.trim();
   return /^[0-9a-f]+$/u.test(commit) ? commit : "unknown";
+}
+
+function sanitizeElapsedMs(value: number): number {
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function isElapsedMs(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value >= 0;
+}
+
+function isFailureCategory(value: unknown): value is BetaFailureCategory | null {
+  return value === null || [
+    "provider-auth-failure",
+    "model-tool-call-incompatibility",
+    "timeout",
+    "budget-guard",
+    "harness-defect",
+    "nondeterministic-quality-result",
+  ].includes(value as BetaFailureCategory);
+}
+
+function isNextOwner(value: unknown): value is BetaNextOwner | null {
+  return value === null || [
+    "provider-owner",
+    "runtime-owner",
+    "harness-owner",
+    "release-owner",
+    "evaluation-owner",
+  ].includes(value as BetaNextOwner);
 }

@@ -17,6 +17,7 @@ import {
   betaArtifactPathIsScoped,
   betaSmokeArtifact,
   betaSmokePreflight,
+  classifyBetaFailure,
   inspectBetaRepository,
   publicBetaSmokeSummary,
   readBetaSmokeConfig,
@@ -69,6 +70,8 @@ describe("OpenRouter beta smoke harness", () => {
     const model = new CappedBetaModel(createOpenRouterModelPort(), meter);
     const events: import("../../src/domain/index.js").AnyEvent[] = [];
     let status: "pass" | "failed" = "failed";
+    const startedAt = Date.now();
+    let failureEvidence: import("./openrouter-beta-harness.js").BetaSmokeEvidence | undefined;
     try {
       const result = await executeRun({
         workspace,
@@ -103,10 +106,14 @@ describe("OpenRouter beta smoke harness", () => {
       expect(metrics.total.modelRequests).toBeGreaterThan(0);
       status = "pass";
     } catch (error: unknown) {
+      failureEvidence = classifyBetaFailure(error);
       process.stderr.write(`OpenRouter beta smoke compatibility result: ${redactedBetaFailure(error)}\n`);
       throw error;
     } finally {
-      const artifact = betaSmokeArtifact(status, meter, repository.executionCommit);
+      const artifact = betaSmokeArtifact(status, meter, repository.executionCommit, {
+        ...(failureEvidence ?? {}),
+        elapsedMs: Date.now() - startedAt,
+      });
       const artifactPath = await writeBetaSmokeArtifact(artifact);
       expect(betaArtifactPathIsScoped(artifactPath)).toBe(true);
       process.stdout.write(`${publicBetaSmokeSummary(artifact)}\n`);
