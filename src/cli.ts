@@ -488,10 +488,16 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
   const observer = new DaemonRunObserver({
     source: new FileDaemonRunEventSource({ dataDir: options.settings.dataDir }),
   });
-  const control = new DaemonControlServer({ host: daemon.host, socketPath, observer });
   let resolveShutdown!: () => void;
   const shutdown = new Promise<void>((resolvePromise) => {
     resolveShutdown = resolvePromise;
+  });
+  const control = new DaemonControlServer({
+    host: daemon.host,
+    lifecycle: daemon,
+    onStopResponse: resolveShutdown,
+    socketPath,
+    observer,
   });
   const onSignal = (): void => resolveShutdown();
   process.once("SIGINT", onSignal);

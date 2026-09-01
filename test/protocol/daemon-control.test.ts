@@ -123,6 +123,59 @@ describe("DaemonControlServer", () => {
     await host.stop();
   });
 
+  it("uses an injected runtime lifecycle and notifies shutdown after stop response", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-daemon-control-"));
+    roots.push(root);
+    const host = new DaemonHost({
+      ownerId: "control-runtime-host",
+      admitWake: async (request) => ({
+        status: "admitted",
+        inputId: request.wakeId ?? "input",
+      }),
+      activate: async () => undefined,
+    });
+    const calls: string[] = [];
+    let stopResponseQueued = false;
+    const control = new DaemonControlServer({
+      host,
+      socketPath: join(root, "control.sock"),
+      lifecycle: {
+        start: async () => {
+          calls.push("runtime.start");
+          return { ...host.snapshot(), status: "running" };
+        },
+        stop: async () => {
+          calls.push("runtime.stop");
+          return { ...host.snapshot(), status: "stopped" };
+        },
+      },
+      onStopResponse: () => {
+        stopResponseQueued = true;
+      },
+    });
+    await control.listen();
+    const client = await connect(control.socketPath);
+
+    await expect(sendAndWait(client, { id: "runtime-start", method: "start" }))
+      .resolves.toMatchObject({
+        id: "runtime-start",
+        ok: true,
+        result: { status: "running" },
+      });
+    const stop = await sendAndWait(client, { id: "runtime-stop", method: "stop" });
+    expect(stop).toMatchObject({
+      id: "runtime-stop",
+      ok: true,
+      result: { status: "stopped" },
+    });
+    expect(calls).toEqual(["runtime.start", "runtime.stop"]);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(stopResponseQueued).toBe(true);
+
+    await client.end();
+    await control.close();
+  });
+
   it("rejects malformed requests and never replaces a live or non-socket path", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-daemon-control-"));
     roots.push(root);

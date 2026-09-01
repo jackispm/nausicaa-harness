@@ -1,7 +1,7 @@
 # Prompt Archive and Nausicaa Runtime Prompt Review
 
 Version: `prompt-review-2026-09-01.v1`
-Baseline: `main@c9bf684` (`update beta documentation status`)
+Baseline: `main@f87bd15` (`refine mowe edge ecosystem report`)
 Scope: offline source audit only. No provider, network, MCP, or runtime code was changed.
 
 This report separates three things that are easy to conflate: (1) copied source
@@ -261,15 +261,14 @@ copy Prime RLM/IPython or DeepSeek Cordis semantics.
 
 ## S6 Handoff
 
-- Baseline is `main@c9bf684`. This S2 change is documentation-only and should
-  include this report plus the small archive-status clarification in
-  `docs/reference-prompts/README.md`; no runtime, test, schema, or generated
-  catalog change belongs in the commit.
-- Please re-check the Teto-safe projection P1 against
+- Integrated baseline is `main@f87bd15`. This report and the archive-status
+  clarification remain offline research material; no prompt archive is a
+  runtime import or expected request fixture.
+- S6 re-checked the Teto-safe projection P1 against
   `docs/architecture/03-context-contracts.md:122-128`, and confirm that the
   capability/batch P1/P2 recommendations remain model-guidance changes rather
   than hidden permission changes.
 - Offline evidence used here: `git diff --check` and path/source searches with
   `rg`. No provider, network, MCP, browser, cloud, OpenRouter, or key-bearing
   command was run. The existing worktree edits in the package/live-smoke lanes
-  are intentionally outside this S2 commit.
+  are covered by the integrated beta harness and its offline contract tests.

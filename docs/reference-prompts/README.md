@@ -2,14 +2,15 @@
 
 This directory is a point-in-time, read-only harvest of model-facing prompts from the three local reference harnesses. The files under `snapshots/` are copied source files, not rewritten prompt variants. Use the catalog for the intent and trigger, then open the snapshot for the exact template and interpolation rules.
 
-It lives under this repository's intentionally ignored `docs/` working-material tree, so the archive remains available locally without entering product builds or the normal source diff. A review branch may force-add selected archive pages for evidence; that does not change the runtime import graph.
+It lives under a repository-local `docs/` working-material tree. New working material is ignored, and the npm package allow-list excludes the entire tree; selected archive pages may be force-added for review evidence, so a tracked page still never enters the runtime import graph.
 
 ## 先记住：归档不是运行时 Prompt
 
 本目录**不会**被 Nausicaa 自动读取，也不会因为文件名包含 `system-prompt` 就发送给模型。
 这里的文件是我们从 Pi、Prime Agent 和 DeepSeek Harness 复制的研究快照，作用是阅读、比较和
-追踪上游变化。它们位于 `docs/reference-prompts/`，不在 `src/` 的运行时导入图中；`docs/` 也被
-本仓库的 `.gitignore` 排除。`docs/prompt-archive/` 当前包含简短的整理页和生成的上游工具目录；
+追踪上游变化。它们位于 `docs/reference-prompts/`，不在 `src/` 的运行时导入图中；新增的
+`docs/` 工作材料由本仓库的 `.gitignore` 排除，少数为证据保留的归档页即使被跟踪也不会进入
+运行时。`docs/prompt-archive/` 当前包含简短的整理页和生成的上游工具目录；
 这些同样属于归档材料，不是运行时资源。
 
 模型真正收到的是**运行时按当前状态组装的一次请求**，通常由下面几部分组成：

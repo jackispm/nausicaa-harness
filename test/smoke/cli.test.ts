@@ -1,7 +1,9 @@
-import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Readable } from "node:stream";
 import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
@@ -149,4 +151,142 @@ describe("built CLI", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("returns a stop response before the built daemon exits and removes its socket", async () => {
+    // Darwin limits sockaddr_un paths to 104 bytes; keep this real-socket
+    // smoke path short even when tmpdir() expands under /var/folders.
+    const root = await mkdtemp("/tmp/nausicaa-daemon-stop-");
+    const stateDir = join(root, "state");
+    const socketPath = join(root, "control.sock");
+    const child = spawn(process.execPath, [
+      builtCli,
+      "--daemon",
+      "--workspace",
+      root,
+      "--data-dir",
+      stateDir,
+      "--daemon-socket",
+      socketPath,
+    ], {
+      cwd: process.cwd(),
+      env: { PATH: process.env.PATH, NAUSICAA_MODEL: "scripted" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+
+    try {
+      await waitForOutput(child.stdout, child, "Nausicaa daemon listening", 5_000)
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : "daemon failed to start";
+          throw new Error(`${message}: ${stderr || "no stderr"}`);
+        });
+      expect((await stat(socketPath)).isSocket()).toBe(true);
+
+      const response = await sendControlStop(socketPath);
+      expect(response).toMatchObject({
+        version: 1,
+        kind: "response",
+        id: "smoke-stop",
+        ok: true,
+        result: { status: "stopped" },
+      });
+      await expect(waitForExit(child, 5_000)).resolves.toEqual({ code: 0, signal: null });
+      expect(stderr).toBe("");
+      await expect(stat(socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      await waitForExit(child, 2_000).catch(async () => {
+        child.kill("SIGKILL");
+        await waitForExit(child, 2_000).catch(() => undefined);
+      });
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
+
+async function waitForOutput(
+  stream: Readable,
+  child: ChildProcess,
+  needle: string,
+  timeoutMs: number,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let output = "";
+    const timer = setTimeout(() => finish(new Error(`timed out waiting for ${needle}`)), timeoutMs);
+    const onData = (chunk: string | Buffer): void => {
+      output += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      if (output.includes(needle)) finish();
+    };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      finish(new Error(`daemon exited before listening (${code ?? signal ?? "unknown"})`));
+    };
+    const finish = (error?: Error): void => {
+      clearTimeout(timer);
+      stream.off("data", onData);
+      child.off("exit", onExit);
+      if (error === undefined) resolve();
+      else reject(error);
+    };
+    stream.setEncoding("utf8");
+    stream.on("data", onData);
+    child.once("exit", onExit);
+  });
+}
+
+async function sendControlStop(socketPath: string): Promise<Record<string, unknown>> {
+  return new Promise<Record<string, unknown>>((resolve, reject) => {
+    const socket = createConnection(socketPath);
+    let buffer = "";
+    let settled = false;
+    const timer = setTimeout(() => finish(new Error("timed out waiting for stop response")), 3_000);
+    const finish = (error?: Error, response?: Record<string, unknown>): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (error !== undefined) reject(error);
+      else if (response !== undefined) resolve(response);
+      else reject(new Error("stop response was missing"));
+    };
+    socket.setEncoding("utf8");
+    socket.once("connect", () => {
+      socket.write(`${JSON.stringify({ version: 1, id: "smoke-stop", method: "stop" })}\n`);
+    });
+    socket.on("data", (chunk: string | Buffer) => {
+      buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      try {
+        finish(undefined, JSON.parse(buffer.slice(0, newline)) as Record<string, unknown>);
+      } catch (error: unknown) {
+        finish(error instanceof Error ? error : new Error("invalid stop response"));
+      }
+    });
+    socket.once("error", (error) => finish(error));
+    socket.once("close", () => {
+      if (!settled) finish(new Error("control socket closed before stop response"));
+    });
+  });
+}
+
+async function waitForExit(
+  child: ChildProcess,
+  timeoutMs: number,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.off("exit", onExit);
+      reject(new Error("timed out waiting for daemon exit"));
+    }, timeoutMs);
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    };
+    child.once("exit", onExit);
+  });
+}

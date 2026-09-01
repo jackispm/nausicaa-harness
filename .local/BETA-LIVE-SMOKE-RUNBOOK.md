@@ -1,7 +1,7 @@
 # OpenRouter Beta Smoke Runbook
 
 状态：受控一次性操作清单（2026-09-01）
-基线：`main@c9bf684`；真实运行必须使用 S6 审查后的集成提交。
+基线：`main@f87bd15`；真实运行必须使用 S6 审查后的集成提交。
 
 ## Launch checklist
 

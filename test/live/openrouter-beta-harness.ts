@@ -268,6 +268,14 @@ export class BetaBudgetMeter {
     if (!Number.isFinite(limitUsd) || limitUsd <= 0 || limitUsd > BETA_HARD_BUDGET_USD) {
       throw new BetaBudgetError("Invalid beta smoke budget");
     }
+    if (!Number.isInteger(maxRequests) || maxRequests <= 0 || maxRequests > BETA_MAX_REQUESTS) {
+      throw new BetaBudgetError("Invalid beta smoke request limit");
+    }
+    if (!Number.isInteger(maxOutputTokens)
+      || maxOutputTokens <= 0
+      || maxOutputTokens > BETA_MAX_OUTPUT_TOKENS) {
+      throw new BetaBudgetError("Invalid beta smoke output limit");
+    }
   }
 
   beforeRequest(request: Pick<ModelRequest, "maxOutputTokens" | "signal">): void {
@@ -285,11 +293,22 @@ export class BetaBudgetMeter {
     if (!Number.isInteger(request.maxOutputTokens) || request.maxOutputTokens <= 0) {
       throw new BetaBudgetError("Beta smoke maxOutputTokens must be a positive integer");
     }
+    if (request.maxOutputTokens > this.maxOutputTokens) {
+      throw new BetaBudgetError(
+        `Beta smoke maxOutputTokens must not exceed ${this.maxOutputTokens}`,
+      );
+    }
     this.requestCountValue += 1;
   }
 
   charge(usage: ModelResponse["usage"]): void {
     const checked = parseUsage(usage);
+    if (checked.output > this.maxOutputTokens
+      || this.usageValue.output + checked.output > this.maxOutputTokens * this.requestCountValue) {
+      throw new BetaUsageError(
+        `Provider output exceeds the beta limit of ${this.maxOutputTokens} tokens per request`,
+      );
+    }
     this.usageValue = {
       input: this.usageValue.input + checked.input,
       output: this.usageValue.output + checked.output,
@@ -428,6 +447,14 @@ export function verifyBetaSmokeArtifact(value: unknown): BetaSmokeArtifact {
   }
   if (value.status === "pass" && (value.costUsd === null || value.requestCount === 0)) {
     throw new Error("A passing beta smoke artifact requires request cost");
+  }
+  if (value.requestCount > BETA_MAX_REQUESTS) {
+    throw new Error(`Beta smoke artifact exceeds the ${BETA_MAX_REQUESTS}-request limit`);
+  }
+  if (value.usage.output > BETA_MAX_OUTPUT_TOKENS * value.requestCount) {
+    throw new Error(
+      `Beta smoke artifact exceeds the ${BETA_MAX_OUTPUT_TOKENS}-token output limit per request`,
+    );
   }
   if (value.costUsd !== null && value.costUsd > BETA_HARD_BUDGET_USD) {
     throw new Error("Beta smoke artifact exceeds the hard budget");

@@ -1,6 +1,6 @@
 # Mowe Edge Ecosystem Compatibility Report
 
-基线：`main@c9bf684`
+基线：`main@f87bd15`（S6 集成审查起点）
 范围：Skills、MCP、未来插件的兼容性和导入路线。本文是 beta 设计决策，不实现
 marketplace、下载器、热加载或新的运行时。
 
@@ -98,16 +98,16 @@ admission；当前没有自动安装器，也没有 marketplace 发布承诺。
 | 未来 declarative plugin package | **后续薄适配；beta 拒绝自动加载** | 仅借用 manifest/provenance、版本兼容和可逆生命周期思想 | 包先在受控外部环境解析为 Mowe manifest，再由 host 注入 adapter。没有签名/信任、依赖锁定、更新/回滚/移除合同前，不执行包代码或自动安装。 |
 
 参考快照是研究资料，不是运行时依赖。它们的本地版本和提交记录见
-`docs/reference-prompts/README.md:46-54`（Pi `0.0.3`、Prime `0.7.2`、DeepSeek
+`docs/reference-prompts/README.md:52-60`（Pi `0.0.3`、Prime `0.7.2`、DeepSeek
 `0.1.1-rc.2`）。归档没有替代上游许可证审查；采用任何外部包前必须从其发行物确认
 SPDX/license、作者和来源 URI，并写入 manifest。Mowe 当前在缺少 MCP 许可证信息时保留
 `UNKNOWN`（`src/mowe/edges/mcp.ts:704-708`），这不是“已批准”标记。
 
 | 研究来源 | 仓库内可核实的 revision | 许可证证据 | 本报告采用边界 |
 | --- | --- | --- | --- |
-| Pi | `docs/reference-prompts/README.md:50` 的 `1defa151...` | 快照目录未包含 `LICENSE`；发行前需核实上游 SPDX | 只借用 Skill metadata/progressive disclosure；不引入 Pi extension runtime。 |
-| Prime Agent | `docs/reference-prompts/README.md:51` 的 `7787f074...` | 快照目录未包含 `LICENSE`；发行前需核实上游 SPDX | 只借用 Skill 目录和显式调用提示；不引入 Python/RLM kernel 或 credential store。 |
-| DeepSeek Harness | `docs/reference-prompts/README.md:52` 的 `b150a551...` | 快照目录未包含 `LICENSE`；发行前需核实上游 SPDX | 只借用 provider/catalog 分层；不引入 Cordis plugin graph。 |
+| Pi | `docs/reference-prompts/README.md:56` 的 `1defa151...` | 快照目录未包含 `LICENSE`；发行前需核实上游 SPDX | 只借用 Skill metadata/progressive disclosure；不引入 Pi extension runtime。 |
+| Prime Agent | `docs/reference-prompts/README.md:57` 的 `7787f074...` | 快照目录未包含 `LICENSE`；发行前需核实上游 SPDX | 只借用 Skill 目录和显式调用提示；不引入 Python/RLM kernel 或 credential store。 |
+| DeepSeek Harness | `docs/reference-prompts/README.md:58` 的 `b150a551...` | 快照目录未包含 `LICENSE`；发行前需核实上游 SPDX | 只借用 provider/catalog 分层；不引入 Cordis plugin graph。 |
 | MCP SDK | 当前依赖和 adapter 见 `src/mowe/edges/mcp.ts:146-154` | 依赖许可证由本仓库 package/lockfile 管理；具体 server 许可证仍是 source provenance | 复用 SDK transport/list/call，不复制协议或 server 实现。 |
 
 ## 工具类别的具体含义和最小形态
@@ -202,7 +202,7 @@ remove 及其审计事件。之后才可以做搜索、安装、更新和卸载 
 | `src/config/settings.ts:158-187`, `:280-309` | 用户设置/受信项目设置，edge loading 默认关闭，grant 独立 | “导入”当前是手动配置，不是安装。 |
 | `src/config/edge-factory.ts:83-117` | constructor 注入；plugin 记录 unsupported；缺 constructor 记录 planned | 没有自动 plugin loader 或 marketplace，不能在文档中声称已实现。 |
 | `src/cli.ts:525-592` | CLI 只在启动 composition 时注入现有 Skill/MCP adapter；选择和状态仍由 host provider 投影 | 可复用生产接线；不要把它扩展成扫描、下载或安装控制面。 |
-| `docs/reference-prompts/README.md:3-13`, `:46-67` | Pi/Prime/DeepSeek 是只读研究快照，带本地版本/commit | 可借用行为和边界，不复制上游 runtime；许可证仍需发行物审查。 |
+| `docs/reference-prompts/README.md:3-13`, `:52-67` | Pi/Prime/DeepSeek 是只读研究快照，带本地版本/commit | 可借用行为和边界，不复制上游 runtime；许可证仍需发行物审查。 |
 | `docs/architecture/adr/0010-edge-ecosystem-contract.md:76-117` | 已确定 edge、provenance、snapshot、admission 和 non-goals | 本报告细化 beta 互操作和产品路线，不改写既有 ADR。 |
 
 ### Remaining risks
@@ -218,11 +218,9 @@ remove 及其审计事件。之后才可以做搜索、安装、更新和卸载 
 
 ## S6 handoff
 
-- 交付文件：`.local/MOWE-EDGE-ECOSYSTEM-REPORT.md`；没有修改 `src/mowe/**`、依赖、
-  package、CLI 或现有架构文档。
+- 审查起点：`main@f87bd15`；本报告已由 S6 对照当前 Mowe、CLI、发布和 smoke 边界复核。
+  报告没有修改 `src/mowe/**`、依赖、package、CLI 或现有架构文档。
 - 离线证据：`git diff --check` 通过；报告引用的 source/test/reference 路径均已在本地
   检查存在。文档改动不需要 typecheck 或测试套件。
-- S6 应复核：与 README 的 beta 排除项、S4/S5 的发布和 smoke 边界是否一致；尤其不要把
-  HTTP MCP 的技术可用性写成 marketplace 信任或自动安装。
-- 未生成 commit hash：当前 sandbox 不允许写 `.git/refs`，且工作树含其他 session 的
-  并行改动；请由集成 session 在干净分支中提交本文件。
+- 已复核：与 README 的 beta 排除项、npm 包预检和 OpenRouter smoke 边界一致；HTTP MCP
+  的技术可用性仍不代表 marketplace 信任或自动安装。

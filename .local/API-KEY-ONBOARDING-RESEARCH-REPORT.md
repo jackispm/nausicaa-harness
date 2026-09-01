@@ -1,7 +1,7 @@
 # Nausicaa 首次启动与 API Key Onboarding 研究报告
 
 版本：`onboarding-research-2026-09-01.v1`
-基线：`main@c9bf6841f08f7d04afa646c92814c17b7a2fb6b5`（`update beta documentation status`）
+基线：`main@f87bd15`（`refine mowe edge ecosystem report`）
 范围：只做本地代码/文档研究，不联网、不读取或写入真实 key，不修改运行时代码。
 
 ## 结论摘要

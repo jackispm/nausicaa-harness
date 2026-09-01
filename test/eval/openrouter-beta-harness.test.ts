@@ -6,6 +6,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   BETA_HARD_BUDGET_USD,
+  BETA_MAX_OUTPUT_TOKENS,
+  BETA_MAX_REQUESTS,
   BETA_MODEL_SELECTOR,
   BETA_SOFT_BUDGET_USD,
   BetaBudgetError,
@@ -62,7 +64,18 @@ describe("OpenRouter beta smoke offline contract", () => {
   });
 
   it("caps requests and requires finite provider cost/usage", () => {
+    expect(() => new BetaBudgetMeter(
+      BETA_SOFT_BUDGET_USD,
+      BETA_MAX_REQUESTS + 1,
+      BETA_MAX_OUTPUT_TOKENS,
+    )).toThrow(BetaBudgetError);
+    expect(() => new BetaBudgetMeter(
+      BETA_SOFT_BUDGET_USD,
+      BETA_MAX_REQUESTS,
+      BETA_MAX_OUTPUT_TOKENS + 1,
+    )).toThrow(BetaBudgetError);
     const meter = new BetaBudgetMeter(BETA_SOFT_BUDGET_USD, 1, 8);
+    expect(() => meter.beforeRequest({ maxOutputTokens: 9 })).toThrow(BetaBudgetError);
     meter.beforeRequest({ maxOutputTokens: 8 });
     expect(() => meter.beforeRequest({ maxOutputTokens: 8 })).toThrow(BetaBudgetError);
     expect(() => meter.charge({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }))
@@ -78,6 +91,13 @@ describe("OpenRouter beta smoke offline contract", () => {
     }
     meter.charge({ input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: 0.01 });
     expect(meter.snapshot()).toMatchObject({ requestCount: 1, costUsd: 0.01 });
+    expect(() => meter.charge({
+      input: 1,
+      output: 9,
+      cacheRead: 0,
+      cacheWrite: 0,
+      costUsd: 0.01,
+    })).toThrow(BetaUsageError);
   });
 
   it("accepts only redacted, hard-budget-bounded artifacts", () => {
@@ -97,6 +117,14 @@ describe("OpenRouter beta smoke offline contract", () => {
     expect(verifyBetaSmokeArtifact(artifact)).toEqual(artifact);
     expect(() => verifyBetaSmokeArtifact({ ...artifact, costUsd: BETA_HARD_BUDGET_USD + 0.01 }))
       .toThrow();
+    expect(() => verifyBetaSmokeArtifact({
+      ...artifact,
+      requestCount: BETA_MAX_REQUESTS + 1,
+    })).toThrow(/request limit/u);
+    expect(() => verifyBetaSmokeArtifact({
+      ...artifact,
+      usage: { ...artifact.usage, output: BETA_MAX_OUTPUT_TOKENS + 1 },
+    })).toThrow(/output limit/u);
     expect(() => verifyBetaSmokeArtifact({ ...artifact, commit: "../../secret" }))
       .toThrow();
     expect(() => verifyBetaSmokeArtifact({ ...artifact, usage: { ...artifact.usage, input: Number.NaN } }))

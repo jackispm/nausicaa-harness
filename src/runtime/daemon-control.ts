@@ -76,9 +76,18 @@ export class DaemonControlProtocolError extends Error {
   override readonly name = "DaemonControlProtocolError";
 }
 
+export interface DaemonControlLifecycle {
+  start(): Promise<DaemonHostSnapshot>;
+  stop(): Promise<DaemonHostSnapshot>;
+}
+
 export interface DaemonControlServerOptions {
   /** The in-process host exposed by this control socket. */
   readonly host: DaemonHost;
+  /** Optional complete runtime lifecycle, including supervisor/edge cleanup. */
+  readonly lifecycle?: DaemonControlLifecycle;
+  /** Invoked on the next turn after a successful stop response is queued. */
+  readonly onStopResponse?: () => void;
   /** Absolute Unix socket path. The parent is created with mode 0700 when absent. */
   readonly socketPath: string;
   /** Maximum JSONL request frame, including the newline. */
@@ -126,6 +135,8 @@ export class DaemonControlServer {
   readonly socketPath: string;
 
   private readonly host: DaemonHost;
+  private readonly lifecycle: DaemonControlLifecycle;
+  private readonly onStopResponse: (() => void) | undefined;
   private readonly maxFrameBytes: number;
   private readonly maxPendingWriteBytes: number;
   private readonly createClientId: () => string;
@@ -148,6 +159,22 @@ export class DaemonControlServer {
     }
     this.socketPath = controlPath(options.socketPath);
     this.host = options.host;
+    if (
+      options.lifecycle !== undefined
+      && (
+        options.lifecycle === null
+        || typeof options.lifecycle !== "object"
+        || typeof options.lifecycle.start !== "function"
+        || typeof options.lifecycle.stop !== "function"
+      )
+    ) {
+      throw new DaemonControlProtocolError("lifecycle must provide start and stop functions");
+    }
+    this.lifecycle = options.lifecycle ?? this.host;
+    if (options.onStopResponse !== undefined && typeof options.onStopResponse !== "function") {
+      throw new DaemonControlProtocolError("onStopResponse must be a function");
+    }
+    this.onStopResponse = options.onStopResponse;
     this.maxFrameBytes = positiveInteger(
       options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES,
       "maxFrameBytes",
@@ -187,8 +214,9 @@ export class DaemonControlServer {
   }
 
   /**
-   * Stop the control plane only. The Host keeps running; use the `stop`
-   * command (or call host.stop()) when execution should be drained.
+   * Stop the control plane only. The Host/runtime keeps running; use the
+   * `stop` command (or call the injected lifecycle stop) when execution
+   * should be drained.
    */
   async close(): Promise<void> {
     if (this.closePromise !== undefined) return this.closePromise;
@@ -365,6 +393,17 @@ export class DaemonControlServer {
         ok: true,
         result,
       });
+      if (request.method === "stop") {
+        // Keep the response writable before a composition root tears down the
+        // control server and resolves its foreground daemon process.
+        setImmediate(() => {
+          try {
+            this.onStopResponse?.();
+          } catch {
+            // A composition notification cannot change the completed command.
+          }
+        });
+      }
     } catch (error: unknown) {
       const code = error instanceof DaemonHostProtocolError
         ? "host_rejected"
@@ -388,10 +427,10 @@ export class DaemonControlServer {
     switch (request.method) {
       case "start":
         expectNoParams(request.params);
-        return this.host.start();
+        return this.lifecycle.start();
       case "stop":
         expectNoParams(request.params);
-        return this.host.stop();
+        return this.lifecycle.stop();
       case "status":
         expectNoParams(request.params);
         return this.host.snapshot();

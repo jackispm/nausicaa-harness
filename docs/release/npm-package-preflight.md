@@ -3,7 +3,7 @@
 Status: audit only. This note does not publish, install globally, reserve a
 name, or change registry state.
 
-Baseline audited: `main@c9bf684` (`update beta documentation status`).
+Baseline audited: `main@f87bd15` (`refine mowe edge ecosystem report`).
 
 ## Current package contract
 

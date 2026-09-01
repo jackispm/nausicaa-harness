@@ -97,6 +97,7 @@ describe("npm package surface", () => {
     ) as {
       name: string;
       version: string;
+      scripts?: Record<string, string>;
       private?: boolean;
       license?: string;
       bin?: Record<string, string>;
@@ -115,6 +116,10 @@ describe("npm package surface", () => {
     expect(packageJson.files).toEqual(
       expect.arrayContaining(["dist", "README.md", "THIRD_PARTY_NOTICES"]),
     );
+    for (const scriptName of ["test:live", "eval:worker:live", "eval:live"]) {
+      expect(packageJson.scripts?.[scriptName]).toBeDefined();
+      expect(packageJson.scripts?.[scriptName]).not.toContain("--env-file");
+    }
 
     const npmCache = await mkdtemp(join(tmpdir(), "nausicaa-npm-cache-"));
     try {

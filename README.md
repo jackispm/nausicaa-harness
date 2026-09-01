@@ -10,7 +10,7 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 
 - Main + Teto 的 TUI、print 和 JSON 入口，共用同一个 Run/Ledger 恢复边界。
 - Mowe 内置工具、`apply_patch`、Skills/MCP edge（显式配置后）以及 capability boundary。
-- Worker 和跨 Run A2A 仅在显式启用、且由 host 提供身份/roster/router 时出现；缺少授权 composition 时 fail closed。
+- Worker 和跨 Run A2A 仅在显式启用、且由 host 提供身份/roster/router 时出现；stock CLI/daemon 不默认暴露 `agent_message`，缺少授权 composition 时 fail closed。
 - Awareness 的 `/agents`、`/topology` 和 `--topology` 只读投影；没有可见来源时报告 `unavailable`，不伪造 active 节点。
 - 本地 daemon Host、Ledger-backed wake、Run lease、显式 `--daemon-worker-command` detached worker composition，以及同机只读 `--attach` 回放。
 
@@ -34,7 +34,7 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 - TTY 默认进入持续 Session：一个 Run 可包含多个 Turn，支持 steering、取消、恢复和 `--continue`。
 - 运行中按 Enter 注入 steering，按 Alt+Enter 排队 follow-up；输入和 ACK 都写入 Ledger。
 - `pi-tui` 只负责终端 surface；SessionController、Ledger 和模型执行保持独立，未来可接桌面 UI。
-- `--daemon` 启动最小长期 Host，并在 `<data-dir>/daemon/control.sock` 提供 Unix JSONL 控制面；客户端可发送 `start`、`stop`、`status`、`attach`、`detach`、`wake` 和 `events.subscribe`。Host 会在启动时及运行期间串行扫描 `<data-dir>/runs`，重新排队已持久化但尚未投递的输入和被进程中断的活动 Turn；它不会抢占正被交互 TUI 持有的 Run。显式配置 worker command 时，supervisor 通过版本化 stdio 协议管理 detached worker，并用 descriptor、lease 和 fencing token 保护生命周期。`--attach <run-id>` 可从另一个本地进程打开只读 TUI，按 Ledger cursor 分页追赶、衔接实时事件，并在 socket 重启后重连/resync；transcript 仍从同一个 Ledger/Store 投影。daemon 与普通可写 TUI/print 入口分离，Host/control 保持本地进程，worker 作为显式子进程运行。
+- `--daemon` 启动最小长期 Host，并在 `<data-dir>/daemon/control.sock` 提供 Unix JSONL 控制面；客户端可发送 `start`、`stop`、`status`、`attach`、`detach`、`wake` 和 `events.subscribe`。Host 会在启动时及运行期间串行扫描 `<data-dir>/runs`，重新排队已持久化但尚未投递的输入和被进程中断的活动 Turn；它不会抢占正被交互 TUI 持有的 Run。显式配置 worker command 时，supervisor 通过版本化 stdio 协议管理 detached worker，并用 lease 和 fencing token 保护生命周期。底层 worker process 支持注入 descriptor publisher，但 stock CLI 尚未统一 worker/supervisor descriptor schema 或执行 restart reconcile，因此不承诺 descriptor 驱动的跨重启恢复。`--attach <run-id>` 可从另一个本地进程打开只读 TUI，按 Ledger cursor 分页追赶、衔接实时事件，并在 socket 重启后重连/resync；transcript 仍从同一个 Ledger/Store 投影。daemon 与普通可写 TUI/print 入口分离，Host/control 保持本地进程，worker 作为显式子进程运行。
 
 当前没有通用 graph DSL 或插件市场；Mowe 的 `MoweCatalog` 提供窄的本地注册 seam，便于接入自定义 AgentTool，而不要求引入 Cordis 级插件运行时。
 
