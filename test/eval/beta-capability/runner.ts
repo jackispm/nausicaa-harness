@@ -427,21 +427,41 @@ async function runResumeCase(options: {
   if (!options.trace.some((entry) => entry.name === "write_file" && !entry.isError)) {
     throw new BetaCaseExecutionError("resume-write-not-observed");
   }
-  const second = await executeRun({
-    workspace: options.fixture.workspace,
-    dataDir: join(options.caseRoot, "state"),
-    model: options.modelName,
-    resumeRunId: first.runId,
-    message: "Resume this same Run. Read resume.txt to confirm the persisted fact, then replace its contents with exactly resume-ready followed by complete on the next line. Report the final state.",
-    goal: options.fixture.goal,
-    allowWrite: true,
-    allowShell: false,
-    auxiliaryMode: "none",
-    maxOutputTokens: Math.min(options.manifest.limits.maxOutputTokens, BETA_CAPABILITY_MAX_OUTPUT_TOKENS),
-    signal: options.signal,
-  }, { mainModel: options.model, tools: options.tools, createRunId: () => first.runId, onEvent: () => undefined });
-  if (second.runId !== first.runId) throw new BetaCaseExecutionError("resume-run-id-changed");
-  return { ...second, steps: first.steps + second.steps };
+  let latest = first;
+  let totalSteps = first.steps;
+  let totalUsage = first.usage;
+  const maxResumeActivations = Math.max(1, options.manifest.limits.requestBudgetHint - 1);
+  for (let activation = 0; activation < maxResumeActivations; activation += 1) {
+    if (latest.completed) break;
+    const resumed = await executeRun({
+      workspace: options.fixture.workspace,
+      dataDir: join(options.caseRoot, "state"),
+      model: options.modelName,
+      resumeRunId: first.runId,
+      message: "Continue this same Run. Read resume.txt and inspect its current state. If it is still pending, perform the next required edit; once it contains exactly resume-ready followed by complete on the next line, report the final state with no further tools. Do not change any other file.",
+      goal: options.fixture.goal,
+      allowWrite: true,
+      allowShell: false,
+      auxiliaryMode: "none",
+      maxOutputTokens: Math.min(options.manifest.limits.maxOutputTokens, BETA_CAPABILITY_MAX_OUTPUT_TOKENS),
+      signal: options.signal,
+    }, { mainModel: options.model, tools: options.tools, createRunId: () => first.runId, onEvent: () => undefined });
+    if (resumed.runId !== first.runId) throw new BetaCaseExecutionError("resume-run-id-changed");
+    latest = resumed;
+    totalSteps += resumed.steps;
+    totalUsage = addUsage(totalUsage, resumed.usage);
+  }
+  if (!latest.completed) throw new BetaCaseExecutionError("resume-not-completed");
+  return { ...latest, steps: totalSteps, usage: totalUsage };
+}
+
+function addUsage(left: Awaited<ReturnType<typeof executeRun>>["usage"], right: Awaited<ReturnType<typeof executeRun>>["usage"]): Awaited<ReturnType<typeof executeRun>>["usage"] {
+  return {
+    input: left.input + right.input,
+    output: left.output + right.output,
+    cacheRead: left.cacheRead + right.cacheRead,
+    cacheWrite: left.cacheWrite + right.cacheWrite,
+  };
 }
 
 async function ledgerHasResume(stateDir: string): Promise<boolean> {

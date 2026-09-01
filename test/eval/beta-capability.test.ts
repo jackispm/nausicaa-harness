@@ -103,7 +103,7 @@ describe("Beta Capability MiniEval offline contract", () => {
       const model = new ScriptedModel([
         { content: "", toolCalls: [], stopReason: "stop", usage: undefined as never },
       ]);
-      const run = await runBetaCapabilityBatch({ config, model, rootDirectory: root, repository: { executionCommit: "abc123", repositoryDirty: false } });
+      const run = await runBetaCapabilityBatch({ config, model, rootDirectory: root, repository: { executionCommit: "abc123", repositoryDirty: false }, writeArtifact: true, artifactCwd: root });
       expect(run.artifact?.budget.costUsd).toBeNull();
       expect(run.artifact?.cases[0]?.failureCode).toBe("uncertain-cost");
       expect(run.artifact?.cases[1]?.status).toBe("not-run-budget");
@@ -161,8 +161,45 @@ describe("Beta Capability MiniEval offline contract", () => {
         model: new ScriptedModel([answer("completed")]),
         rootDirectory: root,
         repository: { executionCommit: "abc123", repositoryDirty: false },
+        writeArtifact: true,
+        artifactCwd: root,
       });
       expect(run.artifact?.cases[0]?.failureCode).toBe("resume-boundary-not-reached");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("completes resume across multiple resumable activations and validates its artifact", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-resume-complete-"));
+    try {
+      const config = {
+        liveRequested: true,
+        apiKeyConfigured: true,
+        modelInput: "openrouter:tencent/hy3",
+        model: "openrouter:tencent/hy3",
+        caseInputs: ["resume"],
+        cases: ["resume"] as const,
+        budgetUsd: 0.02,
+        maxRequests: 4,
+        deadlineMs: 10_000,
+      };
+      const model = new ScriptedModel([
+        call("write-1", "write_file", { path: "resume.txt", content: "resume-ready\n" }),
+        call("read-1", "read_file", { path: "resume.txt" }),
+        call("write-2", "write_file", { path: "resume.txt", content: "resume-ready\ncomplete\n" }),
+        answer("Final state: resume-ready complete"),
+      ]);
+      const run = await runBetaCapabilityBatch({
+        config,
+        model,
+        rootDirectory: root,
+        repository: { executionCommit: "abc123", repositoryDirty: false },
+        writeArtifact: true,
+        artifactCwd: root,
+      });
+      expect(run.artifact?.cases[0]?.status).toBe("pass");
+      expect(run.artifact?.cases[0]?.completed).toBe(true);
+      expect(run.artifact?.cases[0]?.requestCount).toBe(4);
+      expect(verifyBetaCapabilityArtifact(run.artifact!)).toEqual(run.artifact);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

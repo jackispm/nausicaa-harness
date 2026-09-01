@@ -115,8 +115,8 @@ export async function gradeResume(
     fixtureHash: await fixtureMetadataIntact(fixture),
     sessionResumed: options.resumed === true,
     resumedFactWritten: content === "resume-ready\ncomplete\n",
-    readToolUsed: toolTrace.some((entry) => entry.name === "read_file" && !entry.isError),
-    mutationToolUsed: toolTrace.some((entry) => ["edit", "write_file"].includes(entry.name) && !entry.isError),
+    readToolUsed: collectObservedReadPaths(toolTrace).has("resume.txt"),
+    mutationToolUsed: toolTrace.some((entry) => ["edit", "write_file", "apply_patch"].includes(entry.name) && !entry.isError),
     finalTextMentionsFact: canonical(finalText).includes("resume-ready"),
   };
   return gradeFromAssertions(assertions);
