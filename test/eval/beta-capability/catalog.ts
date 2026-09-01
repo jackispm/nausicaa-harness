@@ -152,7 +152,7 @@ const definitions: readonly CaseDefinition[] = [
     manifest: manifest(
       "resume",
       "P1",
-      false,
+      true,
       true,
       "Persist a non-sensitive work fact, resume the same session, and complete a small file change.",
       [file("resume.txt", "evidence", "pending\n")],
@@ -173,7 +173,7 @@ const definitions: readonly CaseDefinition[] = [
     manifest: manifest(
       "incident-triage",
       "P1",
-      false,
+      true,
       true,
       "Diagnose the checkout incident from independent evidence without modifying files.",
       [

@@ -9,6 +9,7 @@ import {
   readBetaCapabilityConfig,
   runBetaCapabilityBatch,
 } from "../eval/beta-capability/runner.js";
+import { getBetaCaseManifest } from "../eval/beta-capability/catalog.js";
 
 const config = readBetaCapabilityConfig();
 const eligibleForLive = config.liveRequested
@@ -18,7 +19,7 @@ const eligibleForLive = config.liveRequested
   && config.cases !== undefined
   && config.cases.length > 0
   && config.cases.length <= 3
-  && config.cases.every((id) => id === "compatibility" || id === "bugfix")
+  && config.cases.every((id) => getBetaCaseManifest(id).enabledTonight)
   && config.budgetUsd !== undefined
   && Number.isFinite(config.budgetUsd)
   && config.budgetUsd > 0

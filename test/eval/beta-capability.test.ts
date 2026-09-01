@@ -132,7 +132,7 @@ describe("Beta Capability MiniEval offline contract", () => {
   it("rejects a case that is not enabled tonight", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-resume-"));
     try {
-      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: "openrouter:tencent/hy3", model: "openrouter:tencent/hy3", caseInputs: ["resume"], cases: ["resume"] as const, budgetUsd: 0.02, maxRequests: 4, deadlineMs: 10_000 };
+      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: "openrouter:tencent/hy3", model: "openrouter:tencent/hy3", caseInputs: ["edge-extension"], cases: ["edge-extension"] as const, budgetUsd: 0.02, maxRequests: 1, deadlineMs: 10_000 };
       const model = new ScriptedModel([]);
       const run = await runBetaCapabilityBatch({ config, model, rootDirectory: root, repository: { executionCommit: "abc123", repositoryDirty: false } });
       expect(run.preflight.code).toBe("invalid-cases");
