@@ -10,6 +10,7 @@ import { BETA_CAPABILITY_CATALOG, BETA_CAPABILITY_MANIFEST_HASH, BETA_CAPABILITY
 import { createBetaFixture } from "./beta-capability/fixtures.js";
 import { gradeBetaCase } from "./beta-capability/graders.js";
 import { betaCapabilityPreflight, readBetaCapabilityConfig, runBetaCapabilityBatch, verifyBetaCapabilityArtifact } from "./beta-capability/runner.js";
+import { observedReadPathsFromToolResult } from "./beta-capability/trace.js";
 
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: 0.001 };
 const answer = (content = "done", toolCalls: ModelResponse["toolCalls"] = []): ModelResponse => ({ content, toolCalls, stopReason: "stop", usage });
@@ -35,7 +36,7 @@ describe("Beta Capability MiniEval offline contract", () => {
       expect(before.passed).toBe(false);
       await writeFile(join(fixture.workspace, "add.js"), "export function add(a, b) {\n  return a + b;\n}\n", "utf8");
       const passed = await gradeBetaCase(fixture, "fixed", [
-        { laneId: "main", name: "read_file", arguments: { path: "add.js" }, isError: false },
+        { laneId: "main", name: "read_file", arguments: { path: "add.js" }, isError: false, observedPaths: ["add.js"] },
         { laneId: "main", name: "edit", arguments: { path: "add.js" }, isError: false },
       ], {
         workspaceCommandSandbox: {
@@ -141,6 +142,52 @@ describe("Beta Capability MiniEval offline contract", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
+  it("reports a missing resume boundary instead of a generic runner error", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-resume-boundary-"));
+    try {
+      const config = {
+        liveRequested: true,
+        apiKeyConfigured: true,
+        modelInput: "openrouter:tencent/hy3",
+        model: "openrouter:tencent/hy3",
+        caseInputs: ["resume"],
+        cases: ["resume"] as const,
+        budgetUsd: 0.02,
+        maxRequests: 4,
+        deadlineMs: 10_000,
+      };
+      const run = await runBetaCapabilityBatch({
+        config,
+        model: new ScriptedModel([answer("completed")]),
+        rootDirectory: root,
+        repository: { executionCommit: "abc123", repositoryDirty: false },
+      });
+      expect(run.artifact?.cases[0]?.failureCode).toBe("resume-boundary-not-reached");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("derives read evidence only from successful structured tool results", () => {
+    const allowed = new Set(["a.log", "b.log", "c.log"]);
+    expect(observedReadPathsFromToolResult(
+      "read_many",
+      JSON.stringify({ results: [{ path: "a.log", ok: true }, { path: "b.log", ok: false }] }),
+      false,
+      allowed,
+    )).toEqual(["a.log"]);
+    expect(observedReadPathsFromToolResult(
+      "grep",
+      JSON.stringify({ matches: [{ path: "b.log" }], files: ["c.log", "../a.log"] }),
+      false,
+      allowed,
+    )).toEqual(["b.log", "c.log"]);
+    expect(observedReadPathsFromToolResult(
+      "read_many",
+      JSON.stringify({ results: [{ path: "a.log", ok: true }] }),
+      true,
+      allowed,
+    )).toEqual([]);
+  });
+
   it("grades incident triage only from complete read evidence and safe action", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-incident-"));
     try {
@@ -148,19 +195,19 @@ describe("Beta Capability MiniEval offline contract", () => {
       const grade = await gradeBetaCase(
         fixture,
         "The payment service first failed at 09:14:03 because PAYMENT_REGION was missing; the gateway saw an upstream timed out error. Restore the validated regional value and restart only the payment service.",
-        ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path: `./${path}` }, isError: false })),
+        ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path: `./${path}` }, isError: false, observedPaths: [path] })),
       );
       expect(grade.passed).toBe(true);
       const equivalentActionGrade = await gradeBetaCase(
         fixture,
         "The payment service failed at 09:14:03 because the payment region was missing; the gateway saw an upstream timed out error. Restore the validated value, then restart the payment service.",
-        ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false })),
+        ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false, observedPaths: [path] })),
       );
       expect(equivalentActionGrade.passed).toBe(true);
       const unsafeActionGrade = await gradeBetaCase(
         fixture,
         "Restore the payment region, but do not restart the payment service.",
-        ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false })),
+        ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false, observedPaths: [path] })),
       );
       expect(unsafeActionGrade.passed).toBe(false);
       const batchGrade = await gradeBetaCase(
@@ -174,6 +221,7 @@ describe("Beta Capability MiniEval offline contract", () => {
               .map((path) => ({ path: `./${path}` })),
           },
           isError: false,
+          observedPaths: ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"],
         }],
       );
       expect(batchGrade.passed).toBe(true);

@@ -16,6 +16,10 @@ import {
 import { createBetaFixture } from "./fixtures.js";
 import { gradeBetaCase } from "./graders.js";
 import {
+  collectObservedReadPaths,
+  observedReadPathsFromToolResult,
+} from "./trace.js";
+import {
   BETA_CAPABILITY_SCHEMA_VERSION,
   type BetaBatchArtifact,
   type BetaCaseId,
@@ -348,6 +352,9 @@ export async function runBetaCapabilityBatch(options: BetaBatchRunOptions): Prom
       } catch (error: unknown) {
         const snapshot = meter.snapshot();
         const budgetError = error instanceof BetaBudgetError;
+        const executionFailureCode = error instanceof BetaCaseExecutionError
+          ? error.failureCode
+          : "runner-error";
         const delta = usageDelta(caseBefore.usage, snapshot.usage);
         const requestDelta = deltaRequests(caseBefore, snapshot);
         const uncertainCost = requestDelta > 0 && snapshot.costUsd === null;
@@ -358,7 +365,7 @@ export async function runBetaCapabilityBatch(options: BetaBatchRunOptions): Prom
           mutationTools: unique(trace.filter((entry) => !entry.isError && ["edit", "write_file", "apply_patch"].includes(entry.name)).map((entry) => entry.name)),
           readPaths: safeReadPaths(fixture, trace),
           executionCommit, fixtureHash: fixture.fixtureHash, manifestHash: fixture.manifestHash,
-          scorerHash: fixture.manifest.graderHash, failureCode: uncertainCost ? "uncertain-cost" : budgetError ? "budget" : "runner-error",
+          scorerHash: fixture.manifest.graderHash, failureCode: uncertainCost ? "uncertain-cost" : budgetError ? "budget" : executionFailureCode,
         });
         if (requestDelta > 0 || (snapshot.requestCount > 0 && snapshot.costUsd === null)) {
           haltReason = snapshot.costUsd === null ? "uncertain-cost" : (budgetError ? "budget" : "uncertain-cost");
@@ -405,16 +412,21 @@ async function runResumeCase(options: {
     workspace: options.fixture.workspace,
     dataDir: join(options.caseRoot, "state"),
     model: options.modelName,
-    message: options.fixture.message,
+    message: "Use write_file to write exactly 'resume-ready\\n' to resume.txt. Perform that tool call as the only action in this activation; do not provide a final answer yet.",
     goal: options.fixture.goal,
     allowWrite: true,
     allowShell: false,
     auxiliaryMode: "none",
-    policy: { maxMainStepsPerActivation: options.manifest.limits.maxMainSteps, maxModelTokens: 20_000, tetoEnabled: false },
+    policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
     maxOutputTokens: Math.min(options.manifest.limits.maxOutputTokens, BETA_CAPABILITY_MAX_OUTPUT_TOKENS),
     signal: options.signal,
   }, { mainModel: options.model, tools: options.tools, createRunId: () => "resume-run", onEvent: () => undefined });
-  if (first.completed) throw new Error("Resume first phase completed before a resumable boundary");
+  if (first.completed || first.blocker !== "resumable-boundary") {
+    throw new BetaCaseExecutionError("resume-boundary-not-reached");
+  }
+  if (!options.trace.some((entry) => entry.name === "write_file" && !entry.isError)) {
+    throw new BetaCaseExecutionError("resume-write-not-observed");
+  }
   const second = await executeRun({
     workspace: options.fixture.workspace,
     dataDir: join(options.caseRoot, "state"),
@@ -428,7 +440,7 @@ async function runResumeCase(options: {
     maxOutputTokens: Math.min(options.manifest.limits.maxOutputTokens, BETA_CAPABILITY_MAX_OUTPUT_TOKENS),
     signal: options.signal,
   }, { mainModel: options.model, tools: options.tools, createRunId: () => first.runId, onEvent: () => undefined });
-  if (second.runId !== first.runId) throw new Error("Resume changed Run identity");
+  if (second.runId !== first.runId) throw new BetaCaseExecutionError("resume-run-id-changed");
   return { ...second, steps: first.steps + second.steps };
 }
 
@@ -458,7 +470,19 @@ function createTracingTools(fixture: { workspace: string; rootDirectory: string;
         return result;
       }
       const result = await tool.execute(arguments_, context);
-      trace.push({ laneId: "main", name: tool.definition.name, arguments: structuredClone(arguments_), isError: result.isError });
+      const observedPaths = observedReadPathsFromToolResult(
+        tool.definition.name,
+        result.content,
+        result.isError,
+        new Set(fixture.manifest.fixtureFiles.map((entry) => entry.path)),
+      );
+      trace.push({
+        laneId: "main",
+        name: tool.definition.name,
+        arguments: structuredClone(arguments_),
+        isError: result.isError,
+        ...(observedPaths.length === 0 ? {} : { observedPaths }),
+      });
       return result;
     },
   }));
@@ -499,21 +523,16 @@ function safeReadPaths(
   trace: readonly BetaToolTraceEntry[],
 ): string[] {
   const allowed = new Set(fixture.manifest.fixtureFiles.map((entry) => entry.path));
-  return unique(trace
-    .filter((entry) => entry.name === "read_file" && !entry.isError)
-    .map((entry) => normalizeFixturePath(entry.arguments.path, allowed))
-    .filter((value): value is string => value !== undefined));
+  return unique([...collectObservedReadPaths(trace)].filter((path) => allowed.has(path)));
 }
 
-function normalizeFixturePath(value: unknown, allowed: ReadonlySet<string>): string | undefined {
-  if (typeof value !== "string" || value.length === 0 || value.length > 256 || value.includes("\0") || /[^A-Za-z0-9._\\/-]/u.test(value)) return undefined;
-  const replaced = value.replaceAll("\\", "/");
-  if (replaced.startsWith("/") || /^[A-Za-z]:\//u.test(replaced)) return undefined;
-  const parts = replaced.split("/");
-  if (parts.some((part) => part === "..")) return undefined;
-  const normalized = parts.filter((part) => part.length > 0 && part !== ".").join("/");
-  return allowed.has(normalized) ? normalized : undefined;
+class BetaCaseExecutionError extends Error {
+  constructor(readonly failureCode: string) {
+    super(failureCode);
+    this.name = "BetaCaseExecutionError";
+  }
 }
+
 function mutationArgumentsAllowed(name: string, arguments_: Record<string, unknown>, allowedPaths: readonly string[]): boolean {
   if (name === "apply_patch") {
     if (typeof arguments_.patch !== "string") return false;

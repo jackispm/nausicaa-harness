@@ -9,6 +9,7 @@ import { hashJson } from "../fingerprint.js";
 import { BETA_CAPABILITY_SCORER_HASH, getBetaCaseDefinition, verifyBetaCaseManifest } from "./catalog.js";
 import type { BetaFixture } from "./fixtures.js";
 import type { BetaCaseId, BetaGrade, BetaToolTraceEntry } from "./types.js";
+import { collectObservedReadPaths } from "./trace.js";
 import {
   WorkspaceCommandSandbox,
   type WorkspaceCommandSandboxOptions,
@@ -86,7 +87,7 @@ export async function gradeIncidentTriage(
   toolTrace: readonly BetaToolTraceEntry[] = [],
 ): Promise<BetaGrade> {
   const answer = canonical(finalText);
-  const observedReadPaths = traceReadPaths(toolTrace);
+  const observedReadPaths = collectObservedReadPaths(toolTrace);
   const assertions = {
     fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
     reads: ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"]
@@ -267,21 +268,3 @@ function normalizeWorkspacePath(value: unknown): string {
 }
 
 /** Accept the equivalent bounded batch-read tool as evidence. */
-function traceReadPaths(toolTrace: readonly BetaToolTraceEntry[]): Set<string> {
-  const paths = new Set<string>();
-  for (const entry of toolTrace) {
-    if (entry.isError) continue;
-    if (entry.name === "read_file") {
-      const path = normalizeWorkspacePath(entry.arguments.path);
-      if (path.length > 0) paths.add(path);
-      continue;
-    }
-    if (entry.name !== "read_many" || !Array.isArray(entry.arguments.targets)) continue;
-    for (const target of entry.arguments.targets) {
-      if (target === null || typeof target !== "object" || Array.isArray(target)) continue;
-      const path = normalizeWorkspacePath((target as Record<string, unknown>).path);
-      if (path.length > 0) paths.add(path);
-    }
-  }
-  return paths;
-}

@@ -57,6 +57,8 @@ export interface BetaToolTraceEntry {
   readonly name: string;
   readonly arguments: Readonly<Record<string, unknown>>;
   readonly isError: boolean;
+  /** Paths confirmed by a successful structured tool result; never raw content. */
+  readonly observedPaths?: readonly string[];
 }
 
 export interface BetaGrade {
