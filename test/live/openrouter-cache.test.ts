@@ -24,7 +24,8 @@ const budgetUsd = Number(
   process.env.NAUSICAA_CACHE_EVAL_BUDGET_USD
     ?? process.env.NAUSICAA_EVAL_BUDGET_USD,
 );
-const liveEnabled = process.env.NAUSICAA_LIVE_TESTS === "1"
+const liveEnabled = process.env.NAUSICAA_LIVE_SCENARIO === "legacy"
+  && process.env.NAUSICAA_LIVE_TESTS === "1"
   && apiKey !== undefined
   && apiKey.trim().length > 0
   && configuredModel !== undefined

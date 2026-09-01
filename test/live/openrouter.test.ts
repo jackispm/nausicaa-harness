@@ -20,14 +20,20 @@ const configuredModel = process.env.NAUSICAA_LIVE_MODEL
 const budgetUsd = Number(process.env.NAUSICAA_EVAL_BUDGET_USD);
 const configuredVisionModel = process.env.NAUSICAA_VISION_MODEL;
 const visionBudgetUsd = Number(process.env.NAUSICAA_VISION_BUDGET_USD);
-const liveEnabled = process.env.NAUSICAA_LIVE_TESTS === "1"
+// Keep the older comparison/vision probes opt-in. The beta command exercises
+// one bounded Main tool loop; it must not silently spend the historical seven
+// request Main-only/Main+Teto comparison budget.
+const legacyLiveEnabled = process.env.NAUSICAA_LIVE_SCENARIO === "legacy";
+const liveEnabled = legacyLiveEnabled
+  && process.env.NAUSICAA_LIVE_TESTS === "1"
   && apiKey !== undefined
   && apiKey.trim().length > 0
   && configuredModel !== undefined
   && configuredModel.trim().length > 0
   && Number.isFinite(budgetUsd)
   && budgetUsd > 0;
-const visionLiveEnabled = process.env.NAUSICAA_LIVE_TESTS === "1"
+const visionLiveEnabled = legacyLiveEnabled
+  && process.env.NAUSICAA_LIVE_TESTS === "1"
   && apiKey !== undefined
   && apiKey.trim().length > 0
   && configuredVisionModel !== undefined
