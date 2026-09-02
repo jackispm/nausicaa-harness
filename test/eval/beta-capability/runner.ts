@@ -5,7 +5,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import type { ModelPort } from "../../../src/domain/index.js";
 import { hashJson } from "../fingerprint.js";
 import { executeRun } from "../../../src/runtime/index.js";
-import { createWorkspaceTools } from "../../../src/tools/index.js";
+import { createWorkspaceTools, WorkspaceCommandSandbox } from "../../../src/tools/index.js";
 import {
   BETA_CAPABILITY_SCORER_HASH,
   betaCaseOrder,
@@ -324,7 +324,7 @@ export async function runBetaCapabilityBatch(options: BetaBatchRunOptions): Prom
               message: fixture.message,
               goal: fixture.goal,
               allowWrite: true,
-              allowShell: false,
+              allowShell: manifest.allowedCapabilities.includes("bash"),
               auxiliaryMode: "none",
               policy: { maxMainStepsPerActivation: manifest.limits.maxMainSteps, maxModelTokens: 20_000, tetoEnabled: false },
               maxOutputTokens: Math.min(manifest.limits.maxOutputTokens, BETA_CAPABILITY_MAX_OUTPUT_TOKENS),
@@ -478,7 +478,18 @@ async function ledgerHasResume(stateDir: string): Promise<boolean> {
 }
 
 function createTracingTools(fixture: { workspace: string; rootDirectory: string; manifest: BetaCaseManifest }, trace: BetaToolTraceEntry[]) {
-  return createWorkspaceTools({ allowWrite: true, allowPathOperations: false, allowShell: false, protectedPaths: [join(fixture.rootDirectory, "state")] })
+  const shellRequested = fixture.manifest.allowedCapabilities.includes("bash");
+  const shellSandbox = shellRequested
+    ? new WorkspaceCommandSandbox({ protectedPaths: [join(fixture.rootDirectory, "state")] })
+    : undefined;
+  const shellAvailable = shellSandbox?.availability().available === true;
+  return createWorkspaceTools({
+    allowWrite: true,
+    allowPathOperations: false,
+    allowShell: shellAvailable,
+    ...(shellAvailable ? { bashCommandExecutor: shellSandbox.execute } : {}),
+    protectedPaths: [join(fixture.rootDirectory, "state")],
+  })
     .filter((tool) => fixture.manifest.allowedCapabilities.includes(tool.definition.name))
     .map((tool) => ({
     definition: tool.definition,
@@ -496,12 +507,18 @@ function createTracingTools(fixture: { workspace: string; rootDirectory: string;
         result.isError,
         new Set(fixture.manifest.fixtureFiles.map((entry) => entry.path)),
       );
+      const observedOutputMarkers = tool.definition.name === "bash"
+        && !result.isError
+        && result.content.includes("e2e-ok")
+        ? ["e2e-ok"]
+        : [];
       trace.push({
         laneId: "main",
         name: tool.definition.name,
         arguments: structuredClone(arguments_),
         isError: result.isError,
         ...(observedPaths.length === 0 ? {} : { observedPaths }),
+        ...(observedOutputMarkers.length === 0 ? {} : { observedOutputMarkers }),
       });
       return result;
     },

@@ -8,6 +8,8 @@ export type BetaCaseId =
   | "bugfix"
   | "resume"
   | "incident-triage"
+  | "bash-roundtrip"
+  | "file-rewrite"
   | "edge-extension"
   | "multi-agent"
   | "fukai-compaction"
@@ -59,6 +61,8 @@ export interface BetaToolTraceEntry {
   readonly isError: boolean;
   /** Paths confirmed by a successful structured tool result; never raw content. */
   readonly observedPaths?: readonly string[];
+  /** Bounded non-secret markers confirmed in successful tool output. */
+  readonly observedOutputMarkers?: readonly string[];
 }
 
 export interface BetaGrade {

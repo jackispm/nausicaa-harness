@@ -39,6 +39,8 @@ export async function gradeBetaCase(
   if (fixture.manifest.id === "compatibility") return gradeCompatibility(fixture, finalText, toolTrace);
   if (fixture.manifest.id === "incident-triage") return gradeIncidentTriage(fixture, finalText, toolTrace);
   if (fixture.manifest.id === "resume") return gradeResume(fixture, finalText, toolTrace, options);
+  if (fixture.manifest.id === "bash-roundtrip") return gradeBashRoundtrip(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "file-rewrite") return gradeFileRewrite(fixture, finalText, toolTrace);
   return failed("case-not-implemented");
 }
 
@@ -120,6 +122,43 @@ export async function gradeResume(
     readToolUsed: collectObservedReadPaths(toolTrace).has("resume.txt"),
     mutationToolUsed: toolTrace.some((entry) => ["edit", "write_file", "apply_patch"].includes(entry.name) && !entry.isError),
     finalTextMentionsFact: canonical(finalText).includes("resume-ready"),
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradeBashRoundtrip(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const bashCalls = toolTrace.filter((entry) => entry.name === "bash" && !entry.isError);
+  const assertions = {
+    fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
+    bashToolUsed: bashCalls.length > 0,
+    commandScoped: bashCalls.length === 1 && /^\s*echo\s+(?:['"])?e2e-ok(?:['"])?\s*$/u.test(String(bashCalls[0]?.arguments.command ?? "")),
+    outputObserved: bashCalls.some((entry) => entry.observedOutputMarkers?.includes("e2e-ok") === true),
+    finalTextExactOutput: canonical(finalText).includes("e2e-ok"),
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradeFileRewrite(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const content = await readFile(join(fixture.workspace, "task.txt"), "utf8").catch(() => "");
+  const reads = toolTrace.filter((entry) => entry.name === "read_file"
+    && !entry.isError
+    && entry.observedPaths?.includes("task.txt") === true);
+  const mutations = toolTrace.filter((entry) => ["edit", "write_file", "apply_patch"].includes(entry.name) && !entry.isError);
+  const assertions = {
+    fixtureHash: await fixtureMetadataIntact(fixture),
+    workspaceBoundary: await workspaceMatchesAllowed(fixture),
+    exactFileContent: content === "value=after\n",
+    readBeforeAndAfter: reads.length >= 2,
+    mutationToolUsed: mutations.length > 0,
+    finalTextMentionsResult: canonical(finalText).includes("value=after") || canonical(finalText).includes("updated"),
   };
   return gradeFromAssertions(assertions);
 }

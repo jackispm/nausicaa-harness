@@ -23,6 +23,22 @@ const deepSeekResume: BetaAttribution = {
   adopted: ["world-state verification", "separate resume phase design"],
   rejected: ["Cordis", "live recovery runtime"],
 };
+const deepSeekFullLoop: BetaAttribution = {
+  project: "DeepSeek Harness",
+  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/headless-agent/tests/full-loop.e2e.ts",
+  commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  license: "MIT",
+  adopted: ["real model", "real bash round trip", "tool-result and final-answer verification"],
+  rejected: ["Cordis", "DeepSeek provider binding", "runtime implementation"],
+};
+const deepSeekRealModel: BetaAttribution = {
+  project: "DeepSeek Harness",
+  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/headless-agent/tests/real-model.e2e.ts",
+  commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  license: "MIT",
+  adopted: ["temporary workspace", "exact file rewrite", "post-agent world verification"],
+  rejected: ["Cordis", "loader smoke wrapper", "DeepSeek provider binding"],
+};
 const pi: BetaAttribution = {
   project: "Pi",
   sourcePath: "/Users/gongdongjie/Downloads/pi/packages/evals/README.md",
@@ -59,6 +75,8 @@ const scorerContract = {
     "forbidden test bytes and workspace boundary are immutable",
     "at least one successful read and one successful mutation are required",
     "resume completion accepts one optional terminal newline after the two required lines",
+    "bash roundtrip requires successful tool output and a grounded final answer",
+    "file rewrite verifies exact world state and a post-mutation read",
   ],
 } as const;
 
@@ -200,6 +218,49 @@ const definitions: readonly CaseDefinition[] = [
       statement: "Synthesize independent incident evidence into one grounded triage note.",
       successCriteria: ["Identify cause and effect", "Recommend only the approved immediate action"],
       hardConstraints: ["Do not modify files", "Use only repository evidence"],
+    },
+  },
+  {
+    manifest: manifest(
+      "bash-roundtrip",
+      "P0",
+      true,
+      true,
+      "Run echo e2e-ok with the bash tool and report its exact output.",
+      [],
+      [],
+      [deepSeekFullLoop],
+      { maxMainSteps: 100, requestBudgetHint: 100, maxOutputTokens: 10_200, timeoutMs: 600_000 },
+      ["bash"],
+    ),
+    files: {},
+    message: "Run `echo e2e-ok` with the bash tool and tell me its exact output.",
+    goal: {
+      version: 1,
+      statement: "Complete one real workspace-confined Bash round trip.",
+      successCriteria: ["Use the bash tool", "Report the observed exact output"],
+      hardConstraints: ["Do not write files", "Do not run any command other than echo e2e-ok"],
+    },
+  },
+  {
+    manifest: manifest(
+      "file-rewrite",
+      "P0",
+      true,
+      true,
+      "Read task.txt, replace its complete contents, read it again, and report briefly.",
+      [file("task.txt", "source", "value=before\n")],
+      ["task.txt"],
+      [deepSeekRealModel],
+      { maxMainSteps: 100, requestBudgetHint: 100, maxOutputTokens: 10_200, timeoutMs: 600_000 },
+    ),
+    files: { "task.txt": "value=before\n" },
+    message: "Read task.txt, replace its complete contents with exactly \"value=after\" followed by a newline, read it again, and report briefly.",
+    goal: {
+      version: 1,
+      statement: "Perform and verify the exact task.txt rewrite.",
+      successCriteria: ["task.txt contains exactly value=after followed by a newline", "Read the file after mutation"],
+      hardConstraints: ["Do not change or create any other file"],
     },
   },
   ...(["edge-extension", "multi-agent", "fukai-compaction", "permission-boundary"] as const).map((id) => ({
