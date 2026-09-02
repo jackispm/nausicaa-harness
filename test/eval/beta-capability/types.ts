@@ -18,7 +18,8 @@ export type BetaCaseId =
   | "pi-find-scope"
   | "pi-bash-tail"
   | "pi-delete-action"
-  | "edge-extension"
+  | "deepseek-fs-cwd"
+  | "deepseek-instructions"
   | "multi-agent"
   | "fukai-compaction"
   | "permission-boundary";

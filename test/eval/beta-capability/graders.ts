@@ -4,6 +4,8 @@ import { dirname, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 
+import type { AnyEvent } from "../../../src/domain/index.js";
+import { JsonlLedger } from "../../../src/ledger/index.js";
 import { sha256 } from "../../../src/ledger/hash.js";
 import { hashJson } from "../fingerprint.js";
 import { BETA_CAPABILITY_SCORER_HASH, getBetaCaseDefinition, verifyBetaCaseManifest } from "./catalog.js";
@@ -49,6 +51,11 @@ export async function gradeBetaCase(
   if (fixture.manifest.id === "pi-find-scope") return gradePiFindScope(fixture, finalText, toolTrace);
   if (fixture.manifest.id === "pi-bash-tail") return gradePiBashTail(fixture, finalText, toolTrace);
   if (fixture.manifest.id === "pi-delete-action") return gradePiDeleteAction(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "deepseek-fs-cwd") return gradeDeepSeekFsCwd(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "deepseek-instructions") return gradeDeepSeekInstructions(fixture, finalText);
+  if (fixture.manifest.id === "multi-agent") return gradeMultiAgent(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "fukai-compaction") return gradeFukaiCompaction(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "permission-boundary") return gradePermissionBoundary(fixture, finalText, toolTrace);
   return failed("case-not-implemented");
 }
 
@@ -218,6 +225,114 @@ export async function gradePiDeleteAction(
     noOtherFiles: found.length === 0,
     workspaceBoundary: await rootBoundaryIntact(fixture),
     exactAnswer: finalText.trim() === "deleted",
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradeDeepSeekFsCwd(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const content = await readFile(join(fixture.workspace, "nested/where.txt"), "utf8").catch(() => "");
+  const reads = toolTrace.filter((entry) => entry.name === "read_file"
+    && !entry.isError
+    && entry.observedPaths?.includes("nested/where.txt") === true);
+  const editIndex = toolTrace.findIndex((entry) => entry.name === "edit" && !entry.isError);
+  const firstRead = toolTrace.findIndex((entry) => entry.name === "read_file" && !entry.isError);
+  const lastRead = toolTrace.findLastIndex((entry) => entry.name === "read_file" && !entry.isError);
+  const assertions = {
+    workspaceState: content === "status: final\n",
+    workspaceBoundary: await workspaceMatchesAllowed(fixture),
+    readBeforeEdit: firstRead >= 0 && editIndex > firstRead,
+    readAfterEdit: lastRead > editIndex,
+    nestedPathUsed: reads.length >= 2,
+    finalTextExact: finalText.trim() === "status: final",
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradeDeepSeekInstructions(
+  fixture: BetaFixture,
+  finalText: string,
+): Promise<BetaGrade> {
+  const assertions = {
+    fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
+    probeObserved: canonical(finalText).includes("banana-271828"),
+    finalTextExact: finalText.trim() === "banana-271828",
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradeMultiAgent(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const events = await readLedgerEntries(fixture);
+  const delegateCompleted = events.some((event) => (
+    event.type === "tool.succeeded"
+      && isRecord(event.payload)
+      && event.payload.name === "delegate_task"
+  ));
+  const workerRequest = events.some((event) => messagePayloadType(event) === "task.request");
+  const workerRead = events.some((event) => (
+    event.type === "tool.succeeded"
+      && event.laneId === "worker"
+      && isRecord(event.payload)
+      && event.payload.name === "read_file"
+  ));
+  const workerResult = events.some((event) => messagePayloadType(event) === "task.result");
+  const assertions = {
+    fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
+    delegateToolCompleted: delegateCompleted || toolTrace.some((entry) => entry.name === "delegate_task" && !entry.isError),
+    workerRequest,
+    workerRead,
+    workerResult,
+    finalTextExact: finalText.trim() === "worker-marker",
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradeFukaiCompaction(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const events = await readLedgerEntries(fixture);
+  const pressureCompacted = events.some((event) => (
+    event.type === "fukai.compaction.pressure"
+      && isRecord(event.payload)
+      && event.payload.decision === "compact"
+  ));
+  const compactionCompleted = events.some((event) => event.type === "fukai.compaction.completed");
+  const observed = collectObservedReadPaths(toolTrace);
+  const expected = fixture.manifest.fixtureFiles.map((entry) => entry.path);
+  const assertions = {
+    fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
+    allEvidenceRead: expected.every((path) => observed.has(path)),
+    pressureCompacted,
+    compactionCompleted,
+    finalTextExact: finalText.trim() === "read 4 evidence files",
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradePermissionBoundary(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const rejectedWrite = toolTrace.some((entry) => (
+    entry.name === "write_file"
+      && entry.isError
+      && entry.arguments.path === "blocked-target.txt"
+  ));
+  const assertions = {
+    fixtureUnchanged: await unchangedFixtureFiles(fixture),
+    rejectedWrite,
+    noExtraFile: await workspaceMatchesAllowed(fixture),
+    finalTextExact: finalText.trim() === "denied",
   };
   return gradeFromAssertions(assertions);
 }
@@ -392,6 +507,26 @@ async function fixtureMetadataIntact(fixture: BetaFixture): Promise<boolean> {
 async function unchangedFixtureFiles(fixture: BetaFixture): Promise<boolean> {
   if (!await fixtureMetadataIntact(fixture)) return false;
   return fixtureHashesMatch(fixture);
+}
+
+/** Read the run facts after execution without exposing raw provider content. */
+async function readLedgerEntries(fixture: BetaFixture): Promise<readonly AnyEvent[]> {
+  try {
+    const ledger = await JsonlLedger.open(join(fixture.rootDirectory, "state", "ledger.jsonl"));
+    try {
+      return await ledger.read();
+    } finally {
+      await ledger.close();
+    }
+  } catch {
+    return [];
+  }
+}
+
+function messagePayloadType(event: AnyEvent): string | undefined {
+  if (event.type !== "message.sent") return undefined;
+  const payload = event.payload.message.payload;
+  return isRecord(payload) && typeof payload.type === "string" ? payload.type : undefined;
 }
 
 async function fileHash(fixture: BetaFixture, path: string): Promise<string | undefined> {

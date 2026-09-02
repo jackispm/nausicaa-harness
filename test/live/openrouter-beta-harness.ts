@@ -349,7 +349,18 @@ export class CappedBetaModel implements ModelPort {
     private readonly delegate: ModelPort,
     readonly budget: BetaBudgetMeter,
     readonly wallClockTimeoutMs = BETA_WALL_CLOCK_TIMEOUT_MS,
+    private readonly contextWindowTokensOverride?: number,
   ) {}
+
+  capabilities(model: string) {
+    const base = this.delegate.capabilities?.(model);
+    return {
+      imageInput: base?.imageInput ?? true,
+      ...(this.contextWindowTokensOverride === undefined
+        ? (base?.contextWindowTokens === undefined ? {} : { contextWindowTokens: base.contextWindowTokens })
+        : { contextWindowTokens: this.contextWindowTokensOverride }),
+    };
+  }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     const maxOutputTokens = Math.min(request.maxOutputTokens, this.budget.maxOutputTokens);

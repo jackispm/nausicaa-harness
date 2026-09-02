@@ -46,7 +46,8 @@ export const BETA_CASES_ENV = "NAUSICAA_BETA_CASES" as const;
 export const BETA_EVAL_BUDGET_ENV = "NAUSICAA_EVAL_BUDGET_USD" as const;
 export const BETA_EVAL_MAX_REQUESTS_ENV = "NAUSICAA_EVAL_MAX_REQUESTS" as const;
 export const BETA_EVAL_DEADLINE_ENV = "NAUSICAA_EVAL_DEADLINE_MS" as const;
-export const BETA_CAPABILITY_MAX_CASES = 3 as const;
+/** The full catalog is bounded by the global request cap; `all` selects it. */
+export const BETA_CAPABILITY_MAX_CASES = BETA_MAX_REQUESTS;
 export const BETA_CAPABILITY_BATCH_TIMEOUT_MS = 10 * 60 * 1_000;
 export const BETA_CAPABILITY_MAX_OUTPUT_TOKENS = BETA_MAX_OUTPUT_TOKENS;
 
@@ -220,7 +221,9 @@ export function readBetaCapabilityConfig(env: NodeJS.ProcessEnv = process.env): 
   const caseInput = nonBlank(env[BETA_CASES_ENV]);
   let cases: readonly BetaCaseId[] | undefined;
   const caseInputs = caseInput?.split(",").map((value) => value.trim()) ?? [];
-  if (caseInput !== undefined && caseInputs.every((value) => value.length > 0)) {
+  if (caseInput === "all") {
+    cases = betaCaseOrder().filter((id) => getBetaCaseManifest(id).enabledTonight);
+  } else if (caseInput !== undefined && caseInputs.every((value) => value.length > 0)) {
     const known = new Set(betaCaseOrder());
     if (caseInputs.every((value): value is BetaCaseId => known.has(value as BetaCaseId))) {
       cases = caseInputs as BetaCaseId[];
@@ -252,9 +255,9 @@ export function betaCapabilityPreflight(
   if (config.modelInput !== BETA_MODEL_SELECTOR || config.model !== BETA_MODEL_SELECTOR) {
     return rejected("invalid-model", `${BETA_EVAL_MODEL_ENV} must be exactly ${BETA_MODEL_SELECTOR}`, config);
   }
-  if (config.caseInputs === undefined) return rejected("missing-cases", `${BETA_CASES_ENV} must select 1 to 3 cases`, config);
+  if (config.caseInputs === undefined) return rejected("missing-cases", `${BETA_CASES_ENV} must select one or more cases, or all`, config);
   if (config.cases === undefined || config.cases.length === 0) return rejected("invalid-cases", `${BETA_CASES_ENV} contains an unknown or empty case`, config);
-  if (config.cases.length > BETA_CAPABILITY_MAX_CASES) return rejected("too-many-cases", `${BETA_CASES_ENV} must select at most 3 cases`, config);
+  if (config.cases.length > BETA_CAPABILITY_MAX_CASES) return rejected("too-many-cases", `${BETA_CASES_ENV} exceeds the catalog bound`, config);
   if (new Set(config.cases).size !== config.cases.length || config.cases.some((id) => !getBetaCaseManifest(id).enabledTonight)) {
     return rejected("invalid-cases", `${BETA_CASES_ENV} contains a duplicate or tonight-disabled case`, config);
   }
@@ -309,7 +312,12 @@ export async function runBetaCapabilityBatch(options: BetaBatchRunOptions): Prom
       const tools = createTracingTools(fixture, trace);
       const model = options.modelFactory?.({ caseId: id, manifest, live: options.model === undefined }) ?? options.model;
       if (model === undefined) throw new Error("Beta capability runner requires a model port");
-      const capped = new CappedBetaModel(model, meter, manifest.limits.timeoutMs);
+      const capped = new CappedBetaModel(
+        model,
+        meter,
+        manifest.limits.timeoutMs,
+        id === "fukai-compaction" ? 16_384 : undefined,
+      );
       const caseSignal = AbortSignal.any([batchController.signal, AbortSignal.timeout(manifest.limits.timeoutMs)]);
       const caseStarted = Date.now();
       const caseBefore = meter.snapshot();
@@ -325,9 +333,27 @@ export async function runBetaCapabilityBatch(options: BetaBatchRunOptions): Prom
               goal: fixture.goal,
               allowWrite: true,
               allowShell: manifest.allowedCapabilities.includes("bash"),
+              ...(id === "multi-agent" ? { workerEnabled: true } : {}),
+              ...(id === "fukai-compaction"
+                ? {
+                    fukaiCompaction: {
+                      enabled: true,
+                      provider: "pi-ai" as const,
+                      maxInputTokens: 8_000,
+                      maxOutputTokens: 512,
+                      maxWallClockMs: 120_000,
+                      thresholdRatio: 0.4,
+                      retainRatio: 0.12,
+                      minimumGainTokens: 1,
+                    },
+                  }
+                : {}),
               auxiliaryMode: "none",
               policy: { maxMainStepsPerActivation: manifest.limits.maxMainSteps, maxModelTokens: 20_000, tetoEnabled: false },
-              maxOutputTokens: Math.min(manifest.limits.maxOutputTokens, BETA_CAPABILITY_MAX_OUTPUT_TOKENS),
+              maxOutputTokens: Math.min(
+                manifest.limits.maxOutputTokens,
+                id === "fukai-compaction" ? 1_024 : BETA_CAPABILITY_MAX_OUTPUT_TOKENS,
+              ),
               signal: caseSignal,
             }, { mainModel: capped, tools, createRunId: () => `${id}-run`, onEvent: () => undefined });
         runId = execution.runId;

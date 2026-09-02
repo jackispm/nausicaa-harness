@@ -22,7 +22,6 @@ const eligibleForLive = config.liveRequested
   && config.modelInput === BETA_MODEL_SELECTOR
   && config.cases !== undefined
   && config.cases.length > 0
-  && config.cases.length <= 3
   && config.cases.every((id) => getBetaCaseManifest(id).enabledTonight)
   && config.budgetUsd !== undefined
   && Number.isFinite(config.budgetUsd)

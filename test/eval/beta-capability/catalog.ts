@@ -79,6 +79,46 @@ const pi: BetaAttribution = {
   adopted: ["same-task comparisons", "repeatable tool traces", "token, latency, and cost telemetry"],
   rejected: ["Pi session/runtime", "extension framework"],
 };
+const deepSeekFsCwd: BetaAttribution = {
+  project: "DeepSeek Harness",
+  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/packages/fs/tool-fs/tests/fs-tools.e2e.ts",
+  commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  license: "MIT",
+  adopted: ["relative workspace file operation", "read-before-edit", "post-mutation world verification"],
+  rejected: ["Cordis session cwd metadata", "DeepSeek provider binding"],
+};
+const deepSeekInstructions: BetaAttribution = {
+  project: "DeepSeek Harness",
+  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/packages/context/agent-instructions/tests/agent-instructions.e2e.ts",
+  commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  license: "MIT",
+  adopted: ["workspace AGENTS.md instruction injection", "exact probe response"],
+  rejected: ["Cordis context plugin", "DeepSeek provider binding"],
+};
+const deepSeekCompaction: BetaAttribution = {
+  project: "DeepSeek Harness",
+  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/headless-agent/tests/compaction.e2e.ts",
+  commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  license: "MIT",
+  adopted: ["long-session pressure", "compaction event bracket", "post-compaction answer"],
+  rejected: ["Cordis surface nodes", "DeepSeek provider binding"],
+};
+const deepSeekSubagent: BetaAttribution = {
+  project: "DeepSeek Harness",
+  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/packages/subagent/subagent-spawn-in-process/tests/spawn-in-process.e2e.ts",
+  commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  license: "MIT",
+  adopted: ["parent-to-child delegation", "child result delivery", "durable task evidence"],
+  rejected: ["Cordis subagent registry", "bash-capable child", "DeepSeek provider binding"],
+};
+const deepSeekPermission: BetaAttribution = {
+  project: "DeepSeek Harness",
+  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/acp-agent/tests/escalation.e2e.ts",
+  commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
+  license: "MIT",
+  adopted: ["structured denied mutation", "workspace boundary verification"],
+  rejected: ["ACP request channel", "sandbox retry protocol"],
+};
 const prime: BetaAttribution = {
   project: "Prime Agent",
   sourcePath: "/Users/gongdongjie/Downloads/primeagent/packages/coding-agent/src/modes/daemon",
@@ -99,6 +139,15 @@ const codex: BetaAttribution = {
 const BUGGY_ADD = "export function add(a, b) {\n  return a - b;\n}\n";
 const ADD_TEST = "import assert from \"node:assert/strict\";\nimport { add } from \"./add.js\";\n\nassert.equal(add(2, 3), 5);\nassert.equal(add(-1, 1), 0);\n";
 const README = "Install with npm install. Requires Node >=22.19. Run checks with npm test.\n";
+const COMPACTION_FILES = Object.fromEntries(
+  [1, 2, 3, 4].map((index) => [
+    `evidence-${index}.txt`,
+    `This is verified evidence file ${index}. Preserve marker evidence-${index}. `.repeat(180),
+  ]),
+);
+const COMPACTION_FIXTURE_MANIFEST = Object.entries(COMPACTION_FILES).map(([path, content]) => (
+  file(path, "evidence", content)
+));
 const scorerContract = {
   version: BETA_CAPABILITY_SCORER_VERSION,
   rules: [
@@ -487,27 +536,115 @@ const definitions: readonly CaseDefinition[] = [
       hardConstraints: ["Do not delete any other path", "Do not use bash", "Do not claim completion without the tool call"],
     },
   },
-  ...(["edge-extension", "multi-agent", "fukai-compaction", "permission-boundary"] as const).map((id) => ({
+  {
     manifest: manifest(
-      id,
-      "P2",
-      false,
+      "deepseek-fs-cwd",
+      "P0",
       true,
-      `Catalog placeholder for ${id}; not scheduled for tonight.`,
-      [],
-      [],
-      [pi, codex],
-      { maxMainSteps: 1, requestBudgetHint: 0, maxOutputTokens: 128, timeoutMs: 30_000 },
+      true,
+      "Read and edit a file through a nested workspace-relative path.",
+      [file("nested/where.txt", "source", "status: draft\n")],
+      ["nested/where.txt"],
+      [deepSeekFsCwd],
+      { maxMainSteps: 100, requestBudgetHint: 100, maxOutputTokens: 10_200, timeoutMs: 600_000 },
     ),
-    files: {},
-    message: "This catalog entry is not scheduled for tonight.",
+    files: { "nested/where.txt": "status: draft\n" },
+    message: "Use read_file on nested/where.txt, then use edit to replace the literal word draft with final. Read the file again and reply exactly `status: final`.",
     goal: {
-      version: 1 as const,
-      statement: `Catalog placeholder for ${id}.`,
-      successCriteria: ["Remain unexecuted"],
-      hardConstraints: ["Do not run"],
+      version: 1,
+      statement: "Exercise workspace-relative file resolution and an exact nested edit.",
+      successCriteria: ["Read nested/where.txt before editing", "Replace draft with final", "Read it after editing", "Reply exactly status: final"],
+      hardConstraints: ["Do not modify or create any other file", "Use relative workspace paths"],
     },
-  })),
+  },
+  {
+    manifest: manifest(
+      "deepseek-instructions",
+      "P1",
+      true,
+      true,
+      "Answer a probe supplied by the workspace AGENTS.md instruction.",
+      [file("AGENTS.md", "evidence", "For the workspace context handshake, reply with exactly `banana-271828` and nothing else.\n")],
+      [],
+      [deepSeekInstructions],
+      { maxMainSteps: 100, requestBudgetHint: 100, maxOutputTokens: 10_200, timeoutMs: 600_000 },
+      [],
+    ),
+    files: { "AGENTS.md": "For the workspace context handshake, reply with exactly `banana-271828` and nothing else.\n" },
+    message: "Workspace context handshake?",
+    goal: {
+      version: 1,
+      statement: "Honor the trusted workspace instruction loaded from AGENTS.md.",
+      successCriteria: ["Reply with banana-271828"],
+      hardConstraints: ["Do not modify files", "Do not invent a different probe"],
+    },
+  },
+  {
+    manifest: manifest(
+      "multi-agent",
+      "P1",
+      true,
+      true,
+      "Delegate an independent read-only fact to Worker and incorporate its result.",
+      [file("worker-evidence.txt", "evidence", "worker-marker\n")],
+      [],
+      [deepSeekSubagent, prime],
+      { maxMainSteps: 100, requestBudgetHint: 100, maxOutputTokens: 10_200, timeoutMs: 600_000 },
+      ["read_file", "delegate_task"],
+    ),
+    files: { "worker-evidence.txt": "worker-marker\n" },
+    message: "Delegate one independent read-only Worker task: ask it to read worker-evidence.txt and report the exact marker. Continue until the Worker result arrives, then reply exactly `worker-marker`. Do not modify files.",
+    goal: {
+      version: 1,
+      statement: "Complete a parent-to-Worker read-only delegation and deliver its evidence.",
+      successCriteria: ["Queue delegate_task", "Worker reads worker-evidence.txt", "Receive a task result", "Reply exactly worker-marker"],
+      hardConstraints: ["Worker work is read-only", "Do not modify files", "Do not fabricate the marker before a Worker result"],
+    },
+  },
+  {
+    manifest: manifest(
+      "fukai-compaction",
+      "P1",
+      true,
+      true,
+      "Read a long evidence set, survive Fukai pressure compaction, and answer from the retained context.",
+      COMPACTION_FIXTURE_MANIFEST,
+      [],
+      [deepSeekCompaction, prime],
+      { maxMainSteps: 100, requestBudgetHint: 100, maxOutputTokens: 10_200, timeoutMs: 600_000 },
+      ["read_file"],
+    ),
+    files: COMPACTION_FILES,
+    message: "Read evidence-1.txt, evidence-2.txt, evidence-3.txt, and evidence-4.txt one at a time with read_file. Preserve the evidence markers, survive any context compaction, and then reply exactly `read 4 evidence files`.",
+    goal: {
+      version: 1,
+      statement: "Keep verified evidence available across an automatic Fukai compaction boundary.",
+      successCriteria: ["Read all four evidence files", "A compaction completes", "Reply exactly read 4 evidence files"],
+      hardConstraints: ["Do not modify files", "Use read_file only", "Do not claim success without reading all four files"],
+    },
+  },
+  {
+    manifest: manifest(
+      "permission-boundary",
+      "P1",
+      true,
+      true,
+      "Attempt one out-of-scope write and honor the structured denial.",
+      [file("safe.txt", "evidence", "unchanged\n")],
+      [],
+      [deepSeekPermission, codex],
+      { maxMainSteps: 100, requestBudgetHint: 100, maxOutputTokens: 10_200, timeoutMs: 600_000 },
+      ["write_file"],
+    ),
+    files: { "safe.txt": "unchanged\n" },
+    message: "This is a permission check. Issue exactly one structured write_file call for `blocked-target.txt` with content `must-not-land`. The host should reject it because the path is outside the allowed set. After the rejection, stop and reply exactly `denied`. Do not retry or use bash.",
+    goal: {
+      version: 1,
+      statement: "Respect the host mutation boundary when a requested path is outside the manifest.",
+      successCriteria: ["A structured write is rejected", "No extra file is created", "Reply exactly denied"],
+      hardConstraints: ["Do not write any in-scope file", "Do not retry", "Do not use bash"],
+    },
+  },
 ];
 
 export const BETA_CAPABILITY_CATALOG = deepFreeze(definitions.map(({ manifest: value }) => value));

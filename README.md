@@ -184,15 +184,15 @@ npm run check         # 执行完整本地门禁
 3. 若 root 决定执行唯一一次 live smoke，先确认模型、软预算、`$1` 硬限额 key 和干净工作树；否则将 provider compatibility 标为 pending。
 4. 发布说明不得声称 Phase 2.4、Worker uplift、真实 marketplace MCP、远程/集群 daemon 或长期生产稳定性已经验证。
 
-真实 OpenRouter 测试不会默认运行。普通 `npm run test:live` 是 legacy provider/tool smoke，仍使用 `NAUSICAA_LIVE_MODEL`；它与首批 beta capability suite 分开。首批 beta suite 固定使用 `openrouter:tencent/hy3`，只有同时设置 `NAUSICAA_LIVE_TESTS=1`、`OPENROUTER_API_KEY`、`NAUSICAA_BETA_EVAL_MODEL=openrouter:tencent/hy3`、显式 `NAUSICAA_BETA_CASES`、正数 `NAUSICAA_EVAL_BUDGET_USD` 和 `NAUSICAA_EVAL_MAX_REQUESTS` 时才会发起请求；预检还要求工作树干净。请求最多 5 次、单次输出最多 128 token、wall-clock 10 分钟批次上限，默认软预算为 `$0.85`；provider 未返回可解析的非负 usage/cost 时立即失败关闭。运行形态如下，key 只存在于当前进程环境，不会写入文件或产物：
+真实 OpenRouter 测试不会默认运行。普通 `npm run test:live` 是 legacy provider/tool smoke，仍使用 `NAUSICAA_LIVE_MODEL`；它与 beta capability suite 分开。beta suite 固定使用 `openrouter:deepseek/deepseek-v4-pro-0813`，只有同时设置 `NAUSICAA_LIVE_TESTS=1`、`OPENROUTER_API_KEY`、`NAUSICAA_BETA_EVAL_MODEL=openrouter:deepseek/deepseek-v4-pro-0813`、显式 `NAUSICAA_BETA_CASES`、正数 `NAUSICAA_EVAL_BUDGET_USD` 和 `NAUSICAA_EVAL_MAX_REQUESTS` 时才会发起请求；预检还要求工作树干净。一次批次最多 100 次请求、单次输出最多 10,200 token、wall-clock 10 分钟批次上限，默认软预算为 `$0.85`；provider 未返回可解析的非负 usage/cost 时立即失败关闭。运行形态如下，key 只存在于当前进程环境，不会写入文件或产物：
 
 ```bash
 OPENROUTER_API_KEY='(只放进当前进程环境)' \
 NAUSICAA_LIVE_TESTS=1 \
-NAUSICAA_BETA_EVAL_MODEL=openrouter:tencent/hy3 \
-NAUSICAA_BETA_CASES=compatibility,bugfix \
+NAUSICAA_BETA_EVAL_MODEL=openrouter:deepseek/deepseek-v4-pro-0813 \
+NAUSICAA_BETA_CASES=all \
 NAUSICAA_EVAL_BUDGET_USD=0.85 \
-NAUSICAA_EVAL_MAX_REQUESTS=5 \
+NAUSICAA_EVAL_MAX_REQUESTS=100 \
 npm run test:beta:live
 ```
 

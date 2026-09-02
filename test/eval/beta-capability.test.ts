@@ -11,6 +11,7 @@ import { createBetaFixture } from "./beta-capability/fixtures.js";
 import { gradeBetaCase } from "./beta-capability/graders.js";
 import { betaCapabilityPreflight, readBetaCapabilityConfig, runBetaCapabilityBatch, verifyBetaCapabilityArtifact } from "./beta-capability/runner.js";
 import { observedReadPathsFromToolResult } from "./beta-capability/trace.js";
+import type { BetaCaseId } from "./beta-capability/types.js";
 import { BETA_MODEL_SELECTOR } from "../live/openrouter-beta-harness.js";
 
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, costUsd: 0.001 };
@@ -20,7 +21,7 @@ const call = (id: string, name: string, arguments_: Record<string, unknown>): Mo
 describe("Beta Capability MiniEval offline contract", () => {
   it("freezes deterministic P0/P1 catalog metadata and attribution", () => {
     expect(BETA_CAPABILITY_CATALOG.map((value) => value.id)).toEqual([
-      "compatibility", "bugfix", "resume", "incident-triage", "bash-roundtrip", "file-rewrite", "pi-smoke", "pi-extension", "pi-read-window", "pi-parallel-tools", "pi-edit-disjoint", "pi-find-scope", "pi-bash-tail", "pi-delete-action", "edge-extension", "multi-agent", "fukai-compaction", "permission-boundary",
+      "compatibility", "bugfix", "resume", "incident-triage", "bash-roundtrip", "file-rewrite", "pi-smoke", "pi-extension", "pi-read-window", "pi-parallel-tools", "pi-edit-disjoint", "pi-find-scope", "pi-bash-tail", "pi-delete-action", "deepseek-fs-cwd", "deepseek-instructions", "multi-agent", "fukai-compaction", "permission-boundary",
     ]);
     expect(BETA_CAPABILITY_MANIFEST_HASH).toBeDefined();
     expect(BETA_CAPABILITY_SCORER_HASH).toMatch(/^sha256:[0-9a-f]{64}$/u);
@@ -74,9 +75,11 @@ describe("Beta Capability MiniEval offline contract", () => {
     const base = readBetaCapabilityConfig({ NAUSICAA_LIVE_TESTS: "1", OPENROUTER_API_KEY: "x", NAUSICAA_BETA_EVAL_MODEL: BETA_MODEL_SELECTOR, NAUSICAA_BETA_CASES: "compatibility,bugfix", NAUSICAA_EVAL_BUDGET_USD: "0.1", NAUSICAA_EVAL_MAX_REQUESTS: "4" });
     expect((await betaCapabilityPreflight(base, { executionCommit: "abc", repositoryDirty: true })).code).toBe("dirty-worktree");
     expect((await betaCapabilityPreflight(base)).ok).toBe(true);
-    expect((await betaCapabilityPreflight({ ...base, cases: ["compatibility", "bugfix", "resume", "incident-triage"], caseInputs: ["compatibility", "bugfix", "resume", "incident-triage"] })).code).toBe("too-many-cases");
+    const overCatalogLimit = Array.from({ length: 101 }, () => "compatibility" as BetaCaseId);
+    expect((await betaCapabilityPreflight({ ...base, cases: overCatalogLimit, caseInputs: overCatalogLimit })).code).toBe("too-many-cases");
     expect((await betaCapabilityPreflight({ ...base, cases: ["compatibility", "compatibility"], caseInputs: ["compatibility", "compatibility"] })).code).toBe("invalid-cases");
-    expect((await betaCapabilityPreflight({ ...base, cases: ["edge-extension"], caseInputs: ["edge-extension"] })).code).toBe("invalid-cases");
+    const { cases: _baseCases, ...baseWithoutCases } = base;
+    expect((await betaCapabilityPreflight({ ...baseWithoutCases, caseInputs: ["future-case"] })).code).toBe("invalid-cases");
     expect((await betaCapabilityPreflight({ ...base, modelInput: "tencent/hy3", model: "tencent/hy3" })).code).toBe("invalid-model");
     expect((await betaCapabilityPreflight({ ...base, budgetUsd: 0.86 })).code).toBe("invalid-budget");
     expect((await betaCapabilityPreflight({ ...base, maxRequests: 101 })).code).toBe("invalid-max-requests");
@@ -131,10 +134,10 @@ describe("Beta Capability MiniEval offline contract", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
-  it("rejects a case that is not enabled tonight", async () => {
+  it("rejects an unknown case before execution", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-resume-"));
     try {
-      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: BETA_MODEL_SELECTOR, model: BETA_MODEL_SELECTOR, caseInputs: ["edge-extension"], cases: ["edge-extension"] as const, budgetUsd: 0.02, maxRequests: 1, deadlineMs: 10_000 };
+      const config = { liveRequested: true, apiKeyConfigured: true, modelInput: BETA_MODEL_SELECTOR, model: BETA_MODEL_SELECTOR, caseInputs: ["future-case"], budgetUsd: 0.02, maxRequests: 1, deadlineMs: 10_000 };
       const model = new ScriptedModel([]);
       const run = await runBetaCapabilityBatch({ config, model, rootDirectory: root, repository: { executionCommit: "abc123", repositoryDirty: false } });
       expect(run.preflight.code).toBe("invalid-cases");
