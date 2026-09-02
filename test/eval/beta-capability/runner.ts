@@ -483,9 +483,12 @@ function createTracingTools(fixture: { workspace: string; rootDirectory: string;
     ? new WorkspaceCommandSandbox({ protectedPaths: [join(fixture.rootDirectory, "state")] })
     : undefined;
   const shellAvailable = shellSandbox?.availability().available === true;
+  const pathOperationsRequested = fixture.manifest.allowedCapabilities.some((name) => (
+    ["directory_create", "path_copy", "path_move", "path_delete"].includes(name)
+  ));
   return createWorkspaceTools({
     allowWrite: true,
-    allowPathOperations: false,
+    allowPathOperations: pathOperationsRequested,
     allowShell: shellAvailable,
     ...(shellAvailable ? { bashCommandExecutor: shellSandbox.execute } : {}),
     protectedPaths: [join(fixture.rootDirectory, "state")],
@@ -494,7 +497,7 @@ function createTracingTools(fixture: { workspace: string; rootDirectory: string;
     .map((tool) => ({
     definition: tool.definition,
     async execute(arguments_: Record<string, unknown>, context: Parameters<typeof tool.execute>[1]) {
-      if (["edit", "write_file", "apply_patch"].includes(tool.definition.name)
+      if (["edit", "write_file", "apply_patch", "directory_create", "path_copy", "path_move", "path_delete"].includes(tool.definition.name)
         && (!mutationArgumentsAllowed(tool.definition.name, arguments_, fixture.manifest.allowedModifyPaths))) {
         const result = { content: JSON.stringify({ error: "Mutation path is not allowed for this case" }), isError: true } as const;
         trace.push({ laneId: "main", name: tool.definition.name, arguments: structuredClone(arguments_), isError: true });
@@ -604,6 +607,10 @@ function mutationArgumentsAllowed(name: string, arguments_: Record<string, unkno
     if (typeof arguments_.patch !== "string") return false;
     const paths = [...arguments_.patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gmu)].map((match) => match[1] ?? "");
     return paths.length > 0 && paths.every((path) => allowedPaths.includes(path));
+  }
+  if (name === "path_move" || name === "path_copy") {
+    return typeof arguments_.from === "string" && typeof arguments_.to === "string"
+      && allowedPaths.includes(arguments_.from) && allowedPaths.includes(arguments_.to);
   }
   return typeof arguments_.path === "string" && allowedPaths.includes(arguments_.path);
 }
