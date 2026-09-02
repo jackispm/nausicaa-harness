@@ -85,6 +85,59 @@ describe("workspace search tools", () => {
     });
   });
 
+  it("normalizes ripgrep paths before path globs and scopes nested ignores", async () => {
+    const workspace = await temporaryDirectory("nausicaa-find-ignore-scope-");
+    await mkdir(path.join(workspace, "a"), { recursive: true });
+    await mkdir(path.join(workspace, "b"), { recursive: true });
+    await writeFile(path.join(workspace, "a", ".gitignore"), "ignored.txt\n");
+    await writeFile(path.join(workspace, "a", "ignored.txt"), "hidden by a/.gitignore\n");
+    await writeFile(path.join(workspace, "a", "kept.txt"), "kept\n");
+    await writeFile(path.join(workspace, "b", "ignored.txt"), "visible sibling\n");
+    await writeFile(path.join(workspace, "b", "kept.txt"), "kept\n");
+    await writeFile(path.join(workspace, "root.txt"), "root\n");
+
+    const tool = createFindTool();
+    const recursive = await tool.execute({ pattern: "**/*.txt" }, context(workspace));
+    expect(recursive.isError).toBe(false);
+    expect(JSON.parse(recursive.content)).toMatchObject({
+      files: ["a/kept.txt", "b/ignored.txt", "b/kept.txt", "root.txt"],
+      count: 4,
+      truncated: false,
+    });
+
+    const pathGlob = await tool.execute({ pattern: "a/**/*.txt" }, context(workspace));
+    expect(pathGlob.isError).toBe(false);
+    expect(JSON.parse(pathGlob.content)).toMatchObject({
+      files: ["a/kept.txt"],
+      count: 1,
+      truncated: false,
+    });
+  });
+
+  it("applies deeper ignore files only within their own subtree", async () => {
+    const workspace = await temporaryDirectory("nausicaa-find-deep-ignore-");
+    await mkdir(path.join(workspace, "a", "deep"), { recursive: true });
+    await mkdir(path.join(workspace, "b"), { recursive: true });
+    await writeFile(path.join(workspace, "a", ".gitignore"), "ignored.txt\n");
+    await writeFile(path.join(workspace, "a", "deep", ".gitignore"), "secret.txt\n");
+    await writeFile(path.join(workspace, "a", "ignored.txt"), "ignored\n");
+    await writeFile(path.join(workspace, "a", "kept.txt"), "kept\n");
+    await writeFile(path.join(workspace, "a", "deep", "ignored.txt"), "ignored\n");
+    await writeFile(path.join(workspace, "a", "deep", "secret.txt"), "secret\n");
+    await writeFile(path.join(workspace, "a", "deep", "kept.txt"), "kept\n");
+    await writeFile(path.join(workspace, "b", "ignored.txt"), "visible sibling\n");
+    await writeFile(path.join(workspace, "b", "kept.txt"), "kept\n");
+    await writeFile(path.join(workspace, "root.txt"), "root\n");
+
+    const result = await createFindTool().execute({ pattern: "**/*.txt" }, context(workspace));
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content)).toMatchObject({
+      files: ["a/deep/kept.txt", "a/kept.txt", "b/ignored.txt", "b/kept.txt", "root.txt"],
+      count: 5,
+      truncated: false,
+    });
+  });
+
   it("supports literal, case-insensitive, globbed grep with context", async () => {
     const workspace = await temporaryDirectory("nausicaa-grep-");
     await mkdir(path.join(workspace, "src"));

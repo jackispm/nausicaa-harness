@@ -60,6 +60,7 @@ export async function discoverSearchFiles(
     "--hidden",
     "--null",
     "--no-config",
+    "--no-require-git",
     "--sort=path",
     "--path-separator=/",
   ];

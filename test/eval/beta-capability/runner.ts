@@ -562,7 +562,7 @@ function caseResult(id: BetaCaseId, status: "pass" | "fail", grade: Awaited<Retu
   return {
     id, status, capabilityScore: fixture.manifest.capabilityScore, grade, runId: execution.runId, completed: execution.completed,
     steps: execution.steps, requestCount: snapshot.requestCount - before.requestCount, usage: usageDelta(before.usage, snapshot.usage), costUsd: snapshot.costUsd === null || before.costUsd === null ? snapshot.costUsd : snapshot.costUsd - before.costUsd,
-    wallClockMs, tools: unique(trace.map((entry) => entry.name)), mutationTools: unique(trace.filter((entry) => !entry.isError && ["edit", "write_file", "apply_patch"].includes(entry.name)).map((entry) => entry.name)),
+    wallClockMs, tools: unique(trace.map((entry) => entry.name)), mutationTools: unique(trace.filter((entry) => !entry.isError && ["edit", "write_file", "apply_patch", "directory_create", "path_copy", "path_move", "path_delete"].includes(entry.name)).map((entry) => entry.name)),
     readPaths: safeReadPaths(fixture, trace),
     executionCommit: commit, fixtureHash: fixture.fixtureHash, manifestHash: fixture.manifestHash, scorerHash: fixture.manifest.graderHash, failureCode: failureCodeOverride ?? (grade.passed ? null : grade.failureCodes[0] ?? "grader-failed"),
   };

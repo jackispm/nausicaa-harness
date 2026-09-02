@@ -204,6 +204,40 @@ describe("Beta Capability MiniEval offline contract", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
+  it("records successful path mutations in case telemetry", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-mutation-telemetry-"));
+    try {
+      const config = {
+        liveRequested: true,
+        apiKeyConfigured: true,
+        modelInput: BETA_MODEL_SELECTOR,
+        model: BETA_MODEL_SELECTOR,
+        caseInputs: ["pi-delete-action"],
+        cases: ["pi-delete-action"] as const,
+        budgetUsd: 0.02,
+        maxRequests: 3,
+        deadlineMs: 10_000,
+      };
+      const run = await runBetaCapabilityBatch({
+        config,
+        model: new ScriptedModel([
+          call("delete", "path_delete", { path: "temp-threejs-landing.html" }),
+          call("verify", "list_files", { path: "." }),
+          answer("deleted"),
+        ]),
+        rootDirectory: root,
+        repository: { executionCommit: "abc123", repositoryDirty: false },
+        writeArtifact: true,
+        artifactCwd: root,
+      });
+      const result = run.artifact?.cases[0];
+      expect(result?.status).toBe("pass");
+      expect(result?.mutationTools).toEqual(["path_delete"]);
+      expect(result?.tools).toContain("path_delete");
+      expect(verifyBetaCapabilityArtifact(run.artifact!)).toEqual(run.artifact);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("accepts a completed resume fact without requiring an extra terminal newline", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-resume-newline-"));
     try {
