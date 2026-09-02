@@ -4,6 +4,25 @@ This is the public testing contract for the Nausicaa beta. It keeps model
 quality, tool behavior, provider compatibility, and daemon protocols as separate
 measurements so one result cannot hide another.
 
+## Public Reference Benchmarks
+
+There is no single universal harness score. Public suites measure different
+interfaces, so a useful report names the suite, model, tools, budget, and host
+revision instead of collapsing them into one number.
+
+| Reference | What it measures | Nausicaa use |
+| --- | --- | --- |
+| SWE-bench / SWE-bench Verified | Repository issue resolution with a patch and tests | Use the same external-test and unchanged-test pattern for coding fixtures |
+| Terminal-Bench | Terminal workflows with observable filesystem/process state | Use bounded Bash, read, write, and post-action checks |
+| τ-bench / ToolBench-style suites | Multi-step tool/API selection under a policy | Use typed tool traces and independent boundary assertions |
+| WebArena / BrowserGym | Browser navigation and web state | Optional browser integration only; not a core local-workspace score |
+| AgentBench / GAIA | Multi-domain assistant workflows | Useful task-design references, not a drop-in Nausicaa protocol |
+
+These references are benchmark families, not claims that their exact runners are
+compatible with this repository. The portable catalog below is deliberately
+smaller and keeps each task's world state, trace, answer shape, and provider
+health independent.
+
 ## Required artifact fields
 
 Each live batch records only bounded metadata:

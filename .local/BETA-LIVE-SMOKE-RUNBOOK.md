@@ -15,7 +15,7 @@
 
   ```text
   NAUSICAA_LIVE_TESTS=1
-  NAUSICAA_BETA_EVAL_MODEL=openrouter:tencent/hy3
+  NAUSICAA_BETA_EVAL_MODEL=openrouter:deepseek/deepseek-v4-pro-0813
   NAUSICAA_BETA_CASES=compatibility,bugfix
   NAUSICAA_EVAL_BUDGET_USD=<positive finite batch budget>
   NAUSICAA_EVAL_MAX_REQUESTS=<selected-manifest ceiling; compatibility+bugfix=5>
