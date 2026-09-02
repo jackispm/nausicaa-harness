@@ -507,11 +507,12 @@ function createTracingTools(fixture: { workspace: string; rootDirectory: string;
         result.isError,
         new Set(fixture.manifest.fixtureFiles.map((entry) => entry.path)),
       );
-      const observedOutputMarkers = tool.definition.name === "bash"
-        && !result.isError
-        && result.content.includes("e2e-ok")
-        ? ["e2e-ok"]
-        : [];
+      const observedOutputMarkers = safeObservedOutputMarkers(
+        tool.definition.name,
+        result.content,
+        result.isError,
+        fixture.manifest.fixtureFiles.map((entry) => entry.path),
+      );
       trace.push({
         laneId: "main",
         name: tool.definition.name,
@@ -523,6 +524,34 @@ function createTracingTools(fixture: { workspace: string; rootDirectory: string;
       return result;
     },
   }));
+}
+
+function safeObservedOutputMarkers(
+  toolName: string,
+  content: string,
+  isError: boolean,
+  allowedPaths: readonly string[],
+): string[] {
+  if (isError) return [];
+  const markers: string[] = [];
+  let payload: unknown;
+  try {
+    payload = JSON.parse(content) as unknown;
+  } catch {
+    payload = undefined;
+  }
+  if (toolName === "bash" && isRecord(payload)) {
+    const stdout = typeof payload.stdout === "string" ? payload.stdout : "";
+    if (stdout.includes("e2e-ok")) markers.push("e2e-ok");
+    if (stdout.includes("line-3000")) markers.push("line-3000");
+    if (payload.truncated === true) markers.push("truncated");
+  }
+  if (toolName === "find" && isRecord(payload) && Array.isArray(payload.files)) {
+    for (const path of payload.files) {
+      if (typeof path === "string" && allowedPaths.includes(path)) markers.push(path);
+    }
+  }
+  return [...new Set(markers)];
 }
 
 function caseResult(id: BetaCaseId, status: "pass" | "fail", grade: Awaited<ReturnType<typeof gradeBetaCase>>, execution: Awaited<ReturnType<typeof executeRun>>, meter: BetaBudgetMeter, before: ReturnType<BetaBudgetMeter["snapshot"]>, trace: readonly BetaToolTraceEntry[], commit: string, fixture: Awaited<ReturnType<typeof createBetaFixture>>, wallClockMs: number, failureCodeOverride?: string): BetaCaseResult {

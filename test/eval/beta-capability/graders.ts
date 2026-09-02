@@ -43,6 +43,12 @@ export async function gradeBetaCase(
   if (fixture.manifest.id === "file-rewrite") return gradeFileRewrite(fixture, finalText, toolTrace);
   if (fixture.manifest.id === "pi-smoke") return gradePiSmoke(fixture, finalText, toolTrace);
   if (fixture.manifest.id === "pi-extension") return gradePiExtension(fixture, finalText, toolTrace, options);
+  if (fixture.manifest.id === "pi-read-window") return gradePiReadWindow(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "pi-parallel-tools") return gradePiParallelTools(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "pi-edit-disjoint") return gradePiEditDisjoint(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "pi-find-scope") return gradePiFindScope(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "pi-bash-tail") return gradePiBashTail(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "pi-delete-action") return gradePiDeleteAction(fixture, finalText, toolTrace);
   return failed("case-not-implemented");
 }
 
@@ -97,6 +103,121 @@ export async function gradePiExtension(
     bashToolUsed: bashCalls.some((entry) => String(entry.arguments.command ?? "").includes(".pi/extensions/hello.js")),
     externalCommandPasses: externalPass,
     finalTextExactGreeting: finalText.trim() === "Hello, Bob!",
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradePiReadWindow(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const reads = toolTrace.filter((entry) => entry.name === "read_file" && !entry.isError);
+  const usedContinuation = reads.some((entry) => entry.arguments.offset === 2001);
+  const assertions = {
+    fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
+    readToolUsed: reads.length >= 2 && reads.every((entry) => entry.arguments.path === "large.txt"),
+    continuationUsed: usedContinuation,
+    exactAnswer: finalText.trim() === "Line 1 | Line 2050",
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradePiParallelTools(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const reads = toolTrace.filter((entry) => entry.name === "read_file" && !entry.isError);
+  const assertions = {
+    fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
+    alphaRead: reads.some((entry) => entry.arguments.path === "alpha.txt"),
+    betaRead: reads.some((entry) => entry.arguments.path === "beta.txt"),
+    exactAnswer: finalText.trim() === "alpha-value | beta-value",
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradePiEditDisjoint(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const reads = toolTrace.filter((entry) => entry.name === "read_file" && !entry.isError);
+  const edits = toolTrace.filter((entry) => entry.name === "edit" && !entry.isError);
+  const editArgs = edits[0]?.arguments.edits;
+  const hasBothEdits = edits.length === 1
+    && Array.isArray(editArgs)
+    && editArgs.length === 2
+    && editArgs.some((entry) => isRecord(entry) && entry.oldText === "alpha" && entry.newText === "ALPHA")
+    && editArgs.some((entry) => isRecord(entry) && entry.oldText === "gamma" && entry.newText === "GAMMA");
+  const content = await readFile(join(fixture.workspace, "edit.txt"), "utf8").catch(() => "");
+  const firstRead = toolTrace.findIndex((entry) => entry.name === "read_file" && !entry.isError);
+  const editIndex = toolTrace.findIndex((entry) => entry.name === "edit" && !entry.isError);
+  const lastRead = toolTrace.findLastIndex((entry) => entry.name === "read_file" && !entry.isError);
+  const assertions = {
+    workspaceState: content === "ALPHA\nbeta\nGAMMA\ndelta\n",
+    workspaceBoundary: await workspaceMatchesAllowed(fixture),
+    readBeforeEdit: firstRead >= 0 && editIndex > firstRead,
+    readAfterEdit: lastRead > editIndex,
+    oneDisjointEditCall: hasBothEdits,
+    exactAnswer: finalText.trim() === "ALPHA | GAMMA",
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradePiFindScope(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const find = toolTrace.find((entry) => entry.name === "find" && !entry.isError);
+  const expected = ["a/kept.txt", "b/ignored.txt", "b/kept.txt", "root.txt"];
+  const markers = find?.observedOutputMarkers ?? [];
+  const answerLines = finalText.trim().split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+  const assertions = {
+    fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
+    findToolUsed: find !== undefined && find.arguments.pattern === "**/*.txt",
+    scopedResult: expected.every((path) => markers.includes(path)) && !markers.includes("a/ignored.txt"),
+    exactVisiblePaths: answerLines.length === expected.length && answerLines.every((line, index) => line === expected[index]),
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradePiBashTail(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const bash = toolTrace.filter((entry) => entry.name === "bash" && !entry.isError);
+  const markers = bash.flatMap((entry) => entry.observedOutputMarkers ?? []);
+  const expectedCommand = "i=1; while [ $i -le 3000 ]; do echo line-$i; i=$((i + 1)); done";
+  const assertions = {
+    fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
+    exactCommandOnce: bash.length === 1 && bash[0]?.arguments.command === expectedCommand,
+    observedTail: markers.includes("line-3000"),
+    reportedTruncation: markers.includes("truncated") && /line-3000/u.test(finalText) && /truncat/u.test(finalText),
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradePiDeleteAction(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const target = join(fixture.workspace, "temp-threejs-landing.html");
+  const deleted = await readFile(target).then(() => false).catch(() => true);
+  const deleteCall = toolTrace.find((entry) => entry.name === "path_delete" && !entry.isError);
+  const verified = toolTrace.some((entry) => entry.name === "list_files" && !entry.isError);
+  const found = await listRelativeFiles(fixture.workspace).catch(() => ["__workspace-unreadable__"]);
+  const assertions = {
+    targetDeleted: deleted,
+    deleteToolUsed: deleteCall?.arguments.path === "temp-threejs-landing.html",
+    absenceVerified: verified,
+    noOtherFiles: found.length === 0,
+    workspaceBoundary: await rootBoundaryIntact(fixture),
+    exactAnswer: finalText.trim() === "deleted",
   };
   return gradeFromAssertions(assertions);
 }
@@ -354,6 +475,11 @@ async function workspaceMatchesAllowed(fixture: BetaFixture): Promise<boolean> {
   return rootEntries.length === 2 && rootEntries.includes("workspace") && rootEntries.includes("state");
 }
 
+async function rootBoundaryIntact(fixture: BetaFixture): Promise<boolean> {
+  const rootEntries = await readdir(fixture.rootDirectory);
+  return rootEntries.length === 2 && rootEntries.includes("workspace") && rootEntries.includes("state");
+}
+
 async function listRelativeFiles(root: string): Promise<string[]> {
   const output: string[] = [];
   const visit = async (directory: string): Promise<void> => {
@@ -384,6 +510,10 @@ function normalizeWorkspacePath(value: unknown): string {
     parts.push(part);
   }
   return parts.join("/");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Accept the equivalent bounded batch-read tool as evidence. */
