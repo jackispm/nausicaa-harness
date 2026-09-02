@@ -57,14 +57,12 @@ export async function discoverSearchFiles(
 
   const arguments_ = [
     "--files",
+    "--hidden",
     "--null",
     "--no-config",
     "--sort=path",
     "--path-separator=/",
   ];
-  if (glob !== undefined) {
-    arguments_.push("--glob", glob);
-  }
   arguments_.push("--", ".");
 
   const result = await executeRipgrep(arguments_, root.absolute, signal, MAX_DISCOVERY_BYTES);
@@ -74,7 +72,8 @@ export async function discoverSearchFiles(
   }
   await revalidateExistingWorkspacePath(root);
 
-  const entries = splitNullTerminated(result.stdout, result.outputTruncated);
+  const entries = splitNullTerminated(result.stdout, result.outputTruncated)
+    .filter((entry) => glob === undefined || path.matchesGlob(entry, glob));
   const files: SearchFile[] = [];
   for (const entry of entries) {
     throwIfAborted(signal);
