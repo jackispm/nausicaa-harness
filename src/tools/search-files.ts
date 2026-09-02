@@ -73,6 +73,7 @@ export async function discoverSearchFiles(
   await revalidateExistingWorkspacePath(root);
 
   const entries = splitNullTerminated(result.stdout, result.outputTruncated)
+    .map((entry) => entry.startsWith("./") ? entry.slice(2) : entry)
     .filter((entry) => glob === undefined || path.matchesGlob(entry, glob));
   const files: SearchFile[] = [];
   for (const entry of entries) {
