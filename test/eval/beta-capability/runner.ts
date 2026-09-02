@@ -362,7 +362,7 @@ export async function runBetaCapabilityBatch(options: BetaBatchRunOptions): Prom
           id, status: "fail", capabilityScore: manifest.capabilityScore, grade: null, runId,
           completed: false, steps: 0, requestCount: snapshot.requestCount - caseBefore.requestCount, usage: delta,
           costUsd: snapshot.costUsd === null || caseBefore.costUsd === null ? snapshot.costUsd : snapshot.costUsd - caseBefore.costUsd, wallClockMs: Date.now() - caseStarted, tools: unique(trace.map((entry) => entry.name)),
-          mutationTools: unique(trace.filter((entry) => !entry.isError && ["edit", "write_file", "apply_patch"].includes(entry.name)).map((entry) => entry.name)),
+    mutationTools: unique(trace.filter((entry) => !entry.isError && ["edit", "write_file", "apply_patch", "directory_create", "path_copy", "path_move", "path_delete"].includes(entry.name)).map((entry) => entry.name)),
           readPaths: safeReadPaths(fixture, trace),
           executionCommit, fixtureHash: fixture.fixtureHash, manifestHash: fixture.manifestHash,
           scorerHash: fixture.manifest.graderHash, failureCode: uncertainCost ? "uncertain-cost" : budgetError ? "budget" : executionFailureCode,
