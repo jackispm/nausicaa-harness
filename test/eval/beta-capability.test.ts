@@ -96,7 +96,7 @@ describe("Beta Capability MiniEval offline contract", () => {
       expect(run.requestsMade).toBe(1);
       expect(run.artifact?.cases[1]?.status).toBe("not-run-budget");
       expect(verifyBetaCapabilityArtifact(run.artifact!)).toEqual(run.artifact);
-      expect(() => verifyBetaCapabilityArtifact({ ...run.artifact!, prompt: "secret" })).toThrow();
+      expect(() => verifyBetaCapabilityArtifact({ ...run.artifact!, prompt: "masked-marker" })).toThrow();
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
@@ -241,6 +241,27 @@ describe("Beta Capability MiniEval offline contract", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
+  it("reports behavioral success separately from an answer-format miss", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-grade-dimensions-"));
+    try {
+      const fixture = await createBetaFixture("file-rewrite", root);
+      await writeFile(join(fixture.workspace, "task.txt"), "value=after\n", "utf8");
+      const grade = await gradeBetaCase(
+        fixture,
+        "completed",
+        [
+          { laneId: "main", name: "read_file", arguments: { path: "task.txt" }, isError: false, observedPaths: ["task.txt"] },
+          { laneId: "main", name: "edit", arguments: { path: "task.txt" }, isError: false },
+          { laneId: "main", name: "read_file", arguments: { path: "task.txt" }, isError: false, observedPaths: ["task.txt"] },
+        ],
+      );
+      expect(grade.passed).toBe(false);
+      expect(grade.behavioralPassed).toBe(true);
+      expect(grade.formatPassed).toBe(false);
+      expect(grade.failureCodes).toEqual(["final-text-mentions-result"]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("accepts a completed resume fact without requiring an extra terminal newline", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-resume-newline-"));
     try {
@@ -287,40 +308,40 @@ describe("Beta Capability MiniEval offline contract", () => {
       const fixture = await createBetaFixture("incident-triage", root);
       const grade = await gradeBetaCase(
         fixture,
-        "The payment service first failed at 09:14:03 because PAYMENT_REGION was missing; the gateway saw an upstream timed out error. Restore the validated regional value and restart only the payment service.",
-        ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path: `./${path}` }, isError: false, observedPaths: [path] })),
+        "The processor service first failed at 09:14:03 because REGION_CODE was missing; the router saw an upstream timed out error. Restore the validated regional value and restart only the processor service.",
+        ["logs/router.log", "logs/processor.log", "config/processor.example", "runbooks/rendering.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path: `./${path}` }, isError: false, observedPaths: [path] })),
       );
       expect(grade.passed).toBe(true);
       const equivalentActionGrade = await gradeBetaCase(
         fixture,
-        "The payment service failed at 09:14:03 because the payment region was missing; the gateway saw an upstream timed out error. Restore the validated value, then restart the payment service.",
-        ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false, observedPaths: [path] })),
+        "The processor service failed at 09:14:03 because the region code was missing; the router saw an upstream timed out error. Restore the validated value, then restart the processor service.",
+        ["logs/router.log", "logs/processor.log", "config/processor.example", "runbooks/rendering.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false, observedPaths: [path] })),
       );
       expect(equivalentActionGrade.passed).toBe(true);
       const runbookWarningGrade = await gradeBetaCase(
         fixture,
-        "The payment service failed at 09:14:03 because the payment region was missing; the gateway saw an upstream timed out error. Restore the validated value, restart only the payment service, and do not retry captured charges manually.",
-        ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false, observedPaths: [path] })),
+        "The processor service failed at 09:14:03 because the region code was missing; the router saw an upstream timed out error. Restore the validated value, restart only the processor service, and do not replay completed operations manually.",
+        ["logs/router.log", "logs/processor.log", "config/processor.example", "runbooks/rendering.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false, observedPaths: [path] })),
       );
       expect(runbookWarningGrade.passed).toBe(true);
       const unsafeActionGrade = await gradeBetaCase(
         fixture,
-        "Restore the payment region, but do not restart the payment service.",
-        ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false, observedPaths: [path] })),
+        "Restore the region code, but do not restart the processor service.",
+        ["logs/router.log", "logs/processor.log", "config/processor.example", "runbooks/rendering.md"].map((path) => ({ laneId: "main", name: "read_file", arguments: { path }, isError: false, observedPaths: [path] })),
       );
       expect(unsafeActionGrade.passed).toBe(false);
       const batchGrade = await gradeBetaCase(
         fixture,
-        "The payment service first failed at 09:14:03 because PAYMENT_REGION was missing; the gateway saw an upstream timed out error. Restore the validated regional value and restart only the payment service.",
+        "The processor service first failed at 09:14:03 because REGION_CODE was missing; the router saw an upstream timed out error. Restore the validated regional value and restart only the processor service.",
         [{
           laneId: "main",
           name: "read_many",
           arguments: {
-            targets: ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"]
+            targets: ["logs/router.log", "logs/processor.log", "config/processor.example", "runbooks/rendering.md"]
               .map((path) => ({ path: `./${path}` })),
           },
           isError: false,
-          observedPaths: ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"],
+          observedPaths: ["logs/router.log", "logs/processor.log", "config/processor.example", "runbooks/rendering.md"],
         }],
       );
       expect(batchGrade.passed).toBe(true);
@@ -351,7 +372,7 @@ describe("Beta Capability MiniEval offline contract", () => {
       });
       const result = run.artifact?.cases[0];
       expect(result?.status).toBe("fail");
-      expect(result?.grade?.failureCodes).toContain("payment-service");
+      expect(result?.grade?.failureCodes).toContain("processor-service");
       expect(result?.grade?.failureCodes).toContain("no-unsafe-action");
       expect(result?.grade?.failureCodes.every((code) => /^[a-z][a-z0-9_-]{0,127}$/u.test(code))).toBe(true);
       expect(verifyBetaCapabilityArtifact(run.artifact!)).toEqual(run.artifact);

@@ -343,7 +343,6 @@ export async function gradeBugfix(
   options: BetaGraderOptions = {},
 ): Promise<BetaGrade> {
   const assertions: Record<string, boolean> = {};
-  const failures: string[] = [];
   const definition = getBetaCaseDefinition("bugfix");
   assertions.manifestUnchanged = hashJson(fixture.manifest) === hashJson(definition.manifest);
   assertions.fixtureHashesMatch = await fixtureMetadataIntact(fixture)
@@ -356,10 +355,7 @@ export async function gradeBugfix(
   assertions.readToolUsed = toolTrace.some((entry) => entry.name === "read_file" && !entry.isError);
   assertions.mutationToolUsed = toolTrace.some((entry) => ["edit", "write_file", "apply_patch"].includes(entry.name) && !entry.isError);
   assertions.sourcePathAllowed = definition.manifest.allowedModifyPaths.includes("add.js");
-  for (const [code, passed] of Object.entries(assertions)) {
-    if (!passed) failures.push(assertionFailureCode(code));
-  }
-  return { passed: failures.length === 0, failureCodes: failures, assertions };
+  return gradeFromAssertions(assertions);
 }
 
 export async function gradeCompatibility(
@@ -387,13 +383,13 @@ export async function gradeIncidentTriage(
   const observedReadPaths = collectObservedReadPaths(toolTrace);
   const assertions = {
     fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
-    reads: ["logs/gateway.log", "logs/payment.log", "config/payment.example", "runbooks/checkout.md"]
+    reads: ["logs/router.log", "logs/processor.log", "config/processor.example", "runbooks/rendering.md"]
       .every((path) => observedReadPaths.has(path)),
-    paymentService: answer.includes("payment"),
+    processorService: answer.includes("processor"),
     timestamp: answer.includes("09:14:03"),
     timeout: answer.includes("upstream timed out") || answer.includes("gateway timeout"),
-    configuration: answer.includes("payment region") || answer.includes("paymentregion"),
-    action: /\brestart(?: only)?(?: the)? payment service\b/u.test(answer)
+    configuration: answer.includes("region code") || answer.includes("regioncode"),
+    action: /\brestart(?: only)?(?: the)? processor service\b/u.test(answer)
       && !answer.includes("do not restart")
       && !answer.includes("don't restart"),
     noUnsafeAction: !containsUnsafeAction(answer),
@@ -459,14 +455,40 @@ export async function gradeFileRewrite(
 export const gradeBugFix = gradeBugfix;
 
 function failed(code: string): BetaGrade {
-  return { passed: false, failureCodes: [code], assertions: { [code]: false } };
+  return {
+    passed: false,
+    behavioralPassed: false,
+    formatPassed: false,
+    failureCodes: [code],
+    assertions: { [code]: false },
+  };
 }
 
 function gradeFromAssertions(assertions: Record<string, boolean>): BetaGrade {
   const failureCodes = Object.entries(assertions)
     .filter(([, passed]) => !passed)
     .map(([code]) => assertionFailureCode(code));
-  return { passed: failureCodes.length === 0, failureCodes, assertions };
+  const formatAssertions = Object.entries(assertions).filter(([code]) => isFormatAssertion(code));
+  const behavioralAssertions = Object.entries(assertions).filter(([code]) => !isFormatAssertion(code));
+  return {
+    passed: failureCodes.length === 0,
+    behavioralPassed: behavioralAssertions.every(([, passed]) => passed),
+    formatPassed: formatAssertions.every(([, passed]) => passed),
+    failureCodes,
+    assertions,
+  };
+}
+
+/** Strict answer checks are useful diagnostics, but should not hide state success. */
+function isFormatAssertion(code: string): boolean {
+  return code === "exactAnswer"
+    || code === "exactVisiblePaths"
+    || code === "finalTextExact"
+    || code === "finalTextExactGreeting"
+    || code === "finalTextExactOutput"
+    || code === "finalTextMentionsFact"
+    || code === "finalTextMentionsResult"
+    || code === "reportedTruncation";
 }
 
 function assertionFailureCode(assertion: string): string {
@@ -474,7 +496,7 @@ function assertionFailureCode(assertion: string): string {
 }
 
 function containsUnsafeAction(answer: string): boolean {
-  const unsafePhrases = ["restart all services", "retry captured charges"];
+  const unsafePhrases = ["restart all services", "replay completed operations"];
   return unsafePhrases.some((phrase) => {
     let offset = answer.indexOf(phrase);
     while (offset >= 0) {

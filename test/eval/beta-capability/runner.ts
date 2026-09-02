@@ -201,6 +201,8 @@ export function publicBetaCapabilitySummary(artifact: BetaBatchArtifact): string
       id: entry.id,
       status: entry.status,
       capabilityScore: entry.capabilityScore,
+      behavioralPassed: entry.grade?.behavioralPassed ?? null,
+      formatPassed: entry.grade?.formatPassed ?? null,
       completed: entry.completed,
       requestCount: entry.requestCount,
       costUsd: entry.costUsd,
@@ -707,13 +709,31 @@ function isCaseResult(value: unknown): boolean {
 }
 
 function isGrade(value: unknown): value is Record<string, unknown> {
-  if (!isRecord(value) || !hasExactKeys(value, ["passed", "failureCodes", "assertions"])) return false;
-  if (typeof value.passed !== "boolean" || !Array.isArray(value.failureCodes) || value.failureCodes.length > 64) return false;
+  if (!isRecord(value) || !hasExactKeys(value, ["passed", "behavioralPassed", "formatPassed", "failureCodes", "assertions"])) return false;
+  if (typeof value.passed !== "boolean" || typeof value.behavioralPassed !== "boolean" || typeof value.formatPassed !== "boolean"
+    || !Array.isArray(value.failureCodes) || value.failureCodes.length > 64) return false;
   if (!value.failureCodes.every((entry) => typeof entry === "string" && /^[a-z][a-z0-9_-]{0,127}$/u.test(entry))) return false;
   if (!isRecord(value.assertions)) return false;
   const assertionKeys = Object.keys(value.assertions);
   const assertions = value.assertions as Record<string, unknown>;
   return assertionKeys.length <= 128
     && assertionKeys.every((key) => /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/u.test(key) && typeof assertions[key] === "boolean")
-    && value.passed === (value.failureCodes.length === 0);
+    && value.passed === (value.failureCodes.length === 0)
+    && value.behavioralPassed === Object.entries(assertions)
+      .filter(([key]) => !isFormatAssertionKey(key))
+      .every(([, passed]) => passed)
+    && value.formatPassed === Object.entries(assertions)
+      .filter(([key]) => isFormatAssertionKey(key))
+      .every(([, passed]) => passed);
+}
+
+function isFormatAssertionKey(key: string): boolean {
+  return key === "exactAnswer"
+    || key === "exactVisiblePaths"
+    || key === "finalTextExact"
+    || key === "finalTextExactGreeting"
+    || key === "finalTextExactOutput"
+    || key === "finalTextMentionsFact"
+    || key === "finalTextMentionsResult"
+    || key === "reportedTruncation";
 }

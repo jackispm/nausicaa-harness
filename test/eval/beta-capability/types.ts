@@ -1,7 +1,7 @@
 import type { ModelPort } from "../../../src/domain/index.js";
 
-export const BETA_CAPABILITY_SCHEMA_VERSION = 1 as const;
-export const BETA_CAPABILITY_SCORER_VERSION = "beta-capability-scorer-v1" as const;
+export const BETA_CAPABILITY_SCHEMA_VERSION = 2 as const;
+export const BETA_CAPABILITY_SCORER_VERSION = "beta-capability-scorer-v2" as const;
 
 export type BetaCaseId =
   | "compatibility"
@@ -76,6 +76,10 @@ export interface BetaToolTraceEntry {
 
 export interface BetaGrade {
   readonly passed: boolean;
+  /** Objective state and structured tool assertions, excluding answer format. */
+  readonly behavioralPassed: boolean;
+  /** Final response shape/content assertions, reported independently. */
+  readonly formatPassed: boolean;
   readonly failureCodes: readonly string[];
   readonly assertions: Readonly<Record<string, boolean>>;
 }

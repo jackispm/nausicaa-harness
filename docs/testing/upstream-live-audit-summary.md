@@ -37,6 +37,11 @@ request. Offline checks cover the new graders and ledger evidence. A future live
 artifact should report the selected model, case ids, status, usage, and stable
 failure codes only.
 
+Each graded case also reports `behavioralPassed` and `formatPassed` separately.
+This preserves evidence that a model completed the file/tool work even when its
+final sentence does not match an exact-output instruction; the strict aggregate
+`passed` field remains available for release gates.
+
 The next separate work items are daemon/A2A awareness tests, provider adapter
 matrix checks, and optional live compaction/Worker quality probes. They should
 not be folded into the core capability score until their corresponding runtime

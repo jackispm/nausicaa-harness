@@ -13,6 +13,7 @@ Each live batch records only bounded metadata:
 - request count, token totals, cost when the provider supplied it, and elapsed time;
 - tools and read paths observed by the grader;
 - per-case status, completion state, and stable failure code.
+- independent behavioral and answer-format outcomes for each graded case.
 
 Prompts, full model responses, local absolute paths, and account material do not
 belong in a public artifact.
@@ -29,6 +30,8 @@ For every workflow task, report these independently:
 
 A formatting miss must not erase a successful world-state result. Conversely, a
 polished sentence must not pass when the required state change never happened.
+The artifact keeps both `behavioralPassed` and `formatPassed`; the aggregate
+`passed` flag remains strict and is true only when both are true.
 
 ## Recommended run shapes
 

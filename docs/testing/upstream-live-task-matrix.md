@@ -100,3 +100,8 @@ executed. Missing provider accounts, model availability, browser/daemon setup,
 and provider-specific protocols explain the unrun groups. The next live run
 should use the Nausicaa catalog and record its own artifact; it must not label a
 source-only or replay test as a successful real-model run.
+
+For the next portable additions and their acceptance boundaries, see
+[`portable-gap-audit.md`](./portable-gap-audit.md). It deliberately keeps
+session-tree, attach continuity, goal continuation, awareness, and daemon
+restart work distinct from the current 19-case capability batch.

@@ -160,6 +160,7 @@ const scorerContract = {
     "file rewrite verifies exact world state and a post-mutation read",
     "Pi-derived tool cases require structured tool evidence and final world-state verification",
     "delete action requires a successful path_delete call and absent target, not a textual promise",
+    "behavioral and final-answer format outcomes are reported independently",
   ],
 } as const;
 
@@ -277,12 +278,12 @@ const definitions: readonly CaseDefinition[] = [
       "P1",
       true,
       true,
-      "Diagnose the checkout incident from independent evidence without modifying files.",
+      "Diagnose the rendering incident from independent evidence without modifying files.",
       [
-        file("logs/gateway.log", "evidence", "2026-08-27T09:14:02Z checkout request accepted\n2026-08-27T09:14:05Z payment upstream timed out\n"),
-        file("logs/payment.log", "evidence", "2026-08-27T09:14:03Z ERROR missing PAYMENT_REGION; refusing authorization\n"),
-        file("config/payment.example", "evidence", "PAYMENT_REGION=eu-west\n"),
-        file("runbooks/checkout.md", "evidence", "For a missing PAYMENT_REGION, restore the validated regional value and restart only the payment service. Do not retry captured charges manually.\n"),
+        file("logs/router.log", "evidence", "2026-08-27T09:14:02Z render request accepted\n2026-08-27T09:14:05Z processor upstream timed out\n"),
+        file("logs/processor.log", "evidence", "2026-08-27T09:14:03Z ERROR missing REGION_CODE; refusing operation\n"),
+        file("config/processor.example", "evidence", "REGION_CODE=eu-west\n"),
+        file("runbooks/rendering.md", "evidence", "For a missing REGION_CODE, restore the validated regional value and restart only the processor service. Do not replay completed operations manually.\n"),
       ],
       [],
       [prime, pi],
@@ -290,12 +291,12 @@ const definitions: readonly CaseDefinition[] = [
       ["read_file", "read_many", "list_files", "grep", "find", "file_info"],
     ),
     files: {
-      "logs/gateway.log": "2026-08-27T09:14:02Z checkout request accepted\n2026-08-27T09:14:05Z payment upstream timed out\n",
-      "logs/payment.log": "2026-08-27T09:14:03Z ERROR missing PAYMENT_REGION; refusing authorization\n",
-      "config/payment.example": "PAYMENT_REGION=eu-west\n",
-      "runbooks/checkout.md": "For a missing PAYMENT_REGION, restore the validated regional value and restart only the payment service. Do not retry captured charges manually.\n",
+      "logs/router.log": "2026-08-27T09:14:02Z render request accepted\n2026-08-27T09:14:05Z processor upstream timed out\n",
+      "logs/processor.log": "2026-08-27T09:14:03Z ERROR missing REGION_CODE; refusing operation\n",
+      "config/processor.example": "REGION_CODE=eu-west\n",
+      "runbooks/rendering.md": "For a missing REGION_CODE, restore the validated regional value and restart only the processor service. Do not replay completed operations manually.\n",
     },
-    message: "Triage the checkout incident from the available evidence. Identify the first failing service and timestamp, the downstream symptom, the likely configuration cause, and the safest immediate action.",
+    message: "Triage the rendering incident from the available evidence. Identify the first failing service and timestamp, the downstream symptom, the likely configuration cause, and the safest immediate action.",
     goal: {
       version: 1,
       statement: "Synthesize independent incident evidence into one grounded triage note.",
@@ -465,7 +466,7 @@ const definitions: readonly CaseDefinition[] = [
       "Use a path-aware glob while respecting nested ignore scope.",
       [
         file("a/.gitignore", "evidence", "ignored.txt\n"),
-        file("a/ignored.txt", "evidence", "a-secret\n"),
+        file("a/ignored.txt", "evidence", "a-hidden-marker\n"),
         file("a/kept.txt", "evidence", "a-kept\n"),
         file("b/ignored.txt", "evidence", "b-visible\n"),
         file("b/kept.txt", "evidence", "b-kept\n"),
@@ -478,7 +479,7 @@ const definitions: readonly CaseDefinition[] = [
     ),
     files: {
       "a/.gitignore": "ignored.txt\n",
-      "a/ignored.txt": "a-secret\n",
+      "a/ignored.txt": "a-hidden-marker\n",
       "a/kept.txt": "a-kept\n",
       "b/ignored.txt": "b-visible\n",
       "b/kept.txt": "b-kept\n",
