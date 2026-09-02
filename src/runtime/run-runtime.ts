@@ -44,7 +44,6 @@ import {
   FileContentAddressedStore,
   type ContentAddressedStore,
 } from "../store/index.js";
-import { IntentNavigator, ObservationFrameBuilder } from "../teto/index.js";
 import {
   createWorkspaceTools,
   ProcessJobManager,
@@ -53,7 +52,6 @@ import {
   type WebFetchProvider,
   type WebSearchProvider,
 } from "../tools/index.js";
-import { createAdviceResponseTool } from "./advice-tool.js";
 import {
   MainLoop,
   MainRunTokenBudgetExhaustedError,
@@ -80,9 +78,14 @@ import {
   type RuntimeFukaiCompactionFactory,
 } from "./fukai-compaction-runtime.js";
 import { RunTokenBudget } from "./run-token-budget.js";
-import { recoverRunTokenUsage } from "./run-token-budget-recovery.js";
-import { TetoScheduler } from "./teto-scheduler.js";
-import type { TetoAdviceDelivery } from "./teto-scheduler.js";
+import {
+  recoverRunTokenUsage,
+  recoverRunTokenUsageByLane,
+} from "./run-token-budget-recovery.js";
+import { IntentNavigator, ObservationFrameBuilder } from "../teto/index.js";
+import { createAdviceResponseTool } from "./advice-tool.js";
+import { TetoScheduler, type TetoAdviceDelivery } from "./teto-scheduler.js";
+import { TetoLaneScheduler } from "./teto-lane-scheduler.js";
 import { ReflectionScheduler } from "./reflection-scheduler.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
 import { TaskDispatcher } from "./task-dispatcher.js";
@@ -233,7 +236,7 @@ export const executeRun = async (
     }
     throw error;
   }
-  let scheduler: TetoScheduler | ReflectionScheduler | undefined;
+  let scheduler: TetoLaneScheduler | TetoScheduler | ReflectionScheduler | undefined;
   let workerScheduler: WorkerLaneScheduler | undefined;
   let processJobManager: ProcessJobManager | undefined;
 
@@ -282,6 +285,11 @@ export const executeRun = async (
         )
       : await resumeExistingRun(sink, recovered, clock);
     const policy = setup.policy;
+    // `maxMainSteps` is the schema-v1 compatibility arm. New callers use the
+    // activation field and receive the ordinary continuous Teto lane.
+    const recoveredLegacyPolicy = "maxMainSteps" in policy;
+    const useUnifiedTeto = request.policy?.maxMainSteps === undefined
+      && !recoveredLegacyPolicy;
     const auxiliaryMode = request.auxiliaryMode
       ?? policy.auxiliaryMode
       ?? (policy.tetoEnabled ? "teto" : "none");
@@ -315,7 +323,9 @@ export const executeRun = async (
     ) {
       throw new Error("Cannot change workerEnabled while resuming a Run");
     }
-    const recoveredUsage = recoverRunTokenUsage(setup.events, runId);
+    const recoveredUsage = useUnifiedTeto && policy.tetoEnabled
+      ? usageExceptLane(setup.events, runId, "teto")
+      : recoverRunTokenUsage(setup.events, runId);
     const runTokenBudget = new RunTokenBudget(
       policy.maxModelTokens,
       totalTokens(recoveredUsage),
@@ -457,30 +467,72 @@ export const executeRun = async (
       tools.push(crossRunTool);
     }
     if (auxiliaryMode === "teto") {
-      if (adviceDelivery === "live") tools.push(createAdviceResponseTool(inbox));
       const tetoModel = deps.tetoModel ?? mainModel;
-      scheduler = new TetoScheduler({
-        eventSink: sink,
-        inbox,
-        navigator: new IntentNavigator({
-          modelPort: tetoModel,
-          model: request.tetoModel ?? request.model,
+      const tetoModelName = request.tetoModel ?? request.model;
+      if (!useUnifiedTeto) {
+        if (adviceDelivery === "live") tools.push(createAdviceResponseTool(inbox));
+        scheduler = new TetoScheduler({
+          eventSink: sink,
+          inbox,
+          navigator: new IntentNavigator({
+            modelPort: tetoModel,
+            model: tetoModelName,
+            clock,
+            maxAdviceOutputTokens: policy.tetoMaxOutputTokens,
+          }),
+          frameBuilder: new ObservationFrameBuilder({
+            maxAdviceOutputTokens: policy.tetoMaxOutputTokens,
+          }),
+          runId,
+          goal: setup.goal,
+          model: tetoModelName,
+          policy: { ...policy, tetoEnabled: true },
+          events: setup.events,
           clock,
-          maxAdviceOutputTokens: policy.tetoMaxOutputTokens,
-        }),
-        frameBuilder: new ObservationFrameBuilder({
-          maxAdviceOutputTokens: policy.tetoMaxOutputTokens,
-        }),
-        runId,
-        goal: setup.goal,
-        model: request.tetoModel ?? request.model,
-        policy: { ...policy, tetoEnabled: true },
-        events: setup.events,
-        clock,
-        runTokenBudget,
-        ...(request.signal === undefined ? {} : { signal: request.signal }),
-        adviceDelivery,
-      });
+          runTokenBudget,
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
+          adviceDelivery,
+        });
+      } else {
+        const tetoTokenBudget = new RunTokenBudget(
+          policy.maxModelTokens,
+          totalTokens(laneUsage(setup.events, runId, "teto")),
+        );
+        const tetoCompactionRuntime = instantiateRuntimeFukaiCompaction(
+          policy,
+          deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
+          {
+            ledger: sink,
+            store,
+            modelPort: tetoModel,
+            model: tetoModelName,
+            tokenBudget: tetoTokenBudget,
+            clock,
+            policy,
+          },
+        );
+        scheduler = new TetoLaneScheduler({
+          eventSink: sink,
+          inbox,
+          store,
+          model: tetoModel,
+          modelName: tetoModelName,
+          runId,
+          goal: setup.goal,
+          policy: { ...policy, tetoEnabled: true },
+          workspace,
+          events: setup.events,
+          clock,
+          tokenBudget: tetoTokenBudget,
+          ...(tetoCompactionRuntime === undefined
+            ? {}
+            : { compactionRuntime: tetoCompactionRuntime }),
+          policyVersion,
+          readWatermark: () => sink.ledger.watermark(),
+          replayPublicEvents: request.resumeRunId !== undefined,
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
+        });
+      }
     } else if (auxiliaryMode === "reflection") {
       scheduler = new ReflectionScheduler({
         eventSink: sink,
@@ -580,6 +632,11 @@ export const executeRun = async (
       tools: admittedTools,
       clock,
       runTokenBudget,
+      eventObserver: (event) => {
+        if (event.laneId === "main" && scheduler instanceof TetoLaneScheduler) {
+          scheduler.observeMainEvent(event);
+        }
+      },
       ...(edgeProjection.contextContributions.length === 0
         ? {}
         : { edgeContext: edgeProjection.contextContributions }),
@@ -1143,6 +1200,26 @@ async function canonicalWorkspace(workspace: string): Promise<string> {
 
 const totalTokens = (usage: TokenUsage): number =>
   usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+
+const laneUsage = (
+  events: readonly AnyEvent[],
+  runId: string,
+  laneId: string,
+): TokenUsage => recoverRunTokenUsageByLane(events, runId)
+  .find((lane) => lane.laneId === laneId)?.usage ?? emptyUsage();
+
+const usageExceptLane = (
+  events: readonly AnyEvent[],
+  runId: string,
+  excludedLaneId: string,
+): TokenUsage => recoverRunTokenUsageByLane(events, runId)
+  .filter((lane) => lane.laneId !== excludedLaneId)
+  .reduce((total, lane) => ({
+    input: total.input + lane.usage.input,
+    output: total.output + lane.usage.output,
+    cacheRead: total.cacheRead + lane.usage.cacheRead,
+    cacheWrite: total.cacheWrite + lane.usage.cacheWrite,
+  }), emptyUsage());
 
 const emptyUsage = (): TokenUsage => ({
   input: 0,

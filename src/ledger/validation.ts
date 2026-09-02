@@ -1097,6 +1097,8 @@ const payloadValidators = {
   "user.message": (value, path) => {
     const item = payloadObject(value, path, ["messageRef"]);
     artifactRef(item.messageRef, `${path}.messageRef`);
+    optionalString(item.sourceEventId, `${path}.sourceEventId`);
+    optionalString(item.sourceLane, `${path}.sourceLane`);
     const hasInputId = Object.hasOwn(item, "inputId");
     const hasKind = Object.hasOwn(item, "kind");
     if (hasInputId !== hasKind) {

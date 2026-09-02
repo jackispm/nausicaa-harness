@@ -25,7 +25,9 @@ effective system prompt
 每次 Main 请求都会重新计算有效的 system prompt、工具集合和消息视图，但这不等于把本目录的
 所有 Markdown 或所有历史全文塞回模型。未启用的工具、未选择的 Skill 和不属于当前 lane 的
 上下文不会进入请求；稳定前缀可以保持缓存亲和。Teto 和 Fukai 摘要 provider 各自有独立的
-model request，不能把它们的提示词误认为 Main 每轮都会附带的文本。
+model request，不能把它们的提示词误认为 Main 每轮都会附带的文本。统一 Teto lane 仍通过
+同一个 MainLoop/Fukai contract 组装请求，只是它的 system prompt、工具集合和 Main public
+projection 不同。
 
 ### 文件、用途和发送时机
 
@@ -38,7 +40,9 @@ model request，不能把它们的提示词误认为 Main 每轮都会附带的�
 | `catalog.txt` | 本归档的文件索引 | 否 |
 | Nausicaa `src/runtime/main-loop.ts` / `src/fukai/context-provider.ts` | Nausicaa 自己的运行时 prompt/context 组装代码 | 会影响实际请求 |
 | 当前 `AgentTool.definition` | 当前 Turn 的工具 schema 和说明 | 只发送本轮允许的工具 |
-| `src/teto/navigator.ts` | Teto 独立 observer prompt | 仅在 Teto pass 发送 |
+| `src/runtime/teto-lane-scheduler.ts` | 统一 Teto lane 的 system prompt 和 activation 入口 | 每个公开 Main event 最多一次 |
+| `src/runtime/main-public-projection.ts` | 用户输入、Main 输出和工具请求的脱敏投影 | 在 Teto activation 前编译 |
+| `src/teto/navigator.ts` | 旧 sparse observer prompt | 仅在 legacy `maxMainSteps` replay 路径发送 |
 | `src/fukai/pi-ai-compaction-summary.ts` | Fukai 摘要 provider prompt | 仅在显式启用且压力门触发时发送 |
 
 因此，“Pi 的 system prompt 在一个文件里”“DeepSeek 没有单一 prompt 文件”描述的是**上游

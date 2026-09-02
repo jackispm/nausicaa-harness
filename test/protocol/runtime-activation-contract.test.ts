@@ -277,7 +277,7 @@ describe("runtime activation parity", () => {
     ]);
   });
 
-  it("assembles the same sparse Teto sidecar contract around Main", async () => {
+  it("assembles the same unified Teto lane contract around Main", async () => {
     const root = await temporaryRoot();
     const runId = "activation-teto-contract";
     const task = "Complete six bounded decisions";
@@ -345,20 +345,21 @@ describe("runtime activation parity", () => {
       oneShotTeto,
       oneShotEvents,
     ));
-    expect(projectSidecarContract(oneShotMain, oneShotTeto, oneShotEvents)).toEqual({
+    const contract = projectSidecarContract(oneShotMain, oneShotTeto, oneShotEvents);
+    expect(contract).toMatchObject({
       mainCalls: 6,
       mainModels: ["scripted-main"],
       mainSessionIds: [`${runId}:main`],
-      mainTools: ["noop", "respond_to_advice"],
-      tetoCalls: 1,
+      mainTools: ["noop"],
       tetoModels: ["scripted-teto"],
       tetoSessionIds: [`${runId}:teto:scripted-teto`],
       tetoOutputLimits: [64],
       tetoRegistered: 1,
-      observations: 1,
-      tetoCharges: 1,
+      observations: 0,
       adviceMessages: 0,
     });
+    expect(contract.tetoCalls).toBeGreaterThanOrEqual(1);
+    expect(contract.tetoCharges).toBeGreaterThanOrEqual(1);
 
     expect(projectMainRequest(sessionTeto.requests[0]))
       .toEqual(projectMainRequest(oneShotTeto.requests[0]));

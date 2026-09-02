@@ -1,5 +1,6 @@
 export * from "./advice-tool.js";
 export * from "./main-loop.js";
+export * from "./main-public-projection.js";
 export * from "./fukai-compaction-runtime.js";
 export * from "./recovery.js";
 export * from "./run-policy.js";
@@ -24,6 +25,8 @@ export * from "./run-token-budget-recovery.js";
 export * from "./reflection-scheduler.js";
 export * from "./session-controller.js";
 export * from "./teto-scheduler.js";
+export * from "./teto-lane-scheduler.js";
+export * from "./in-run-agent-message-tool.js";
 export * from "./task-dispatcher.js";
 export * from "./delegate-task-tool.js";
 export * from "./agent-message-tool.js";

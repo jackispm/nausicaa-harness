@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 import type {
+  AnyEvent,
   AppendEvent,
   EventPayloadMap,
   EventType,
@@ -41,6 +42,7 @@ import type {
   FukaiCompactionSelection,
   FukaiConversationRef,
   FukaiEdgeContextContribution,
+  FukaiLaneKind,
   FukaiSkillCatalog,
   MainContextProvider,
 } from "../fukai/types.js";
@@ -89,7 +91,21 @@ const MAX_TOOL_RESULT_BYTES = 256 * 1024;
 export interface MainEventSink {
   append<K extends EventType>(
     event: AppendEvent<K>,
-  ): Promise<{ eventId: string; globalOffset: number }>;
+  ): Promise<MainEventReceipt>;
+}
+
+/**
+ * Ledger append receipts historically exposed only the event identity. The
+ * optional event fields let newer hosts provide the committed envelope to an
+ * observer without breaking those minimal sinks.
+ */
+export interface MainEventReceipt {
+  eventId: string;
+  globalOffset: number;
+  runId?: string;
+  laneId?: string;
+  type?: EventType;
+  payload?: unknown;
 }
 
 export interface MainConversationStore {
@@ -197,6 +213,10 @@ export interface MainLoopDeps {
   /** Host/UI approval seam for Mowe tools that declare `requiresApproval`. */
   approve?: MoweExecutionRequest["approve"];
   onStreamEvent?: (event: MainStreamEvent) => void;
+  /** Lightweight event tap used by sibling lanes; never blocks the owner lane. */
+  eventObserver?: (event: AnyEvent) => void;
+  /** Whether this lane may load workspace project instructions. */
+  includeProjectInstructions?: boolean;
 }
 
 export type MainStreamEvent = {
@@ -248,9 +268,16 @@ export interface MainLoopInput {
   policy: RunPolicy;
   initialMessage?: string;
   initialImages?: UserImage[];
+  /** Origin metadata for a lane-projected input; omitted for ordinary Main input. */
+  initialMessageSourceEventId?: string;
+  initialMessageSourceLane?: LaneId;
   laneId?: LaneId;
   sessionId?: string;
   systemPrompt?: string;
+  /** Fukai lane role; defaults to Main for legacy callers. */
+  laneKind?: FukaiLaneKind;
+  /** Override the loop default for workspace instruction visibility. */
+  includeProjectInstructions?: boolean;
   /** Collaboration behavior selected by the interactive surface for this activation. */
   collaborationMode?: "default" | "plan";
   policyVersion?: string;
@@ -268,6 +295,8 @@ export interface MainLoopInput {
   /** Legacy one-shot completes the Run; interactive execution completes only its Turn. */
   completeRun?: boolean;
   signal?: AbortSignal;
+  /** Suppress Run/Turn completion facts for long-lived auxiliary lanes. */
+  completionMode?: "run" | "turn" | "none";
 }
 
 export interface MainLoopResult {
@@ -304,6 +333,8 @@ export class MainLoop {
   private readonly compactForPressure: MainLoopDeps["compactForPressure"];
   private readonly approve: MainLoopDeps["approve"];
   private readonly onStreamEvent: MainLoopDeps["onStreamEvent"];
+  private readonly eventObserver: MainLoopDeps["eventObserver"];
+  private readonly includeProjectInstructions: boolean;
   private readonly edgeContext: readonly FukaiEdgeContextContribution[];
   private readonly skillCatalog: FukaiSkillCatalog | undefined;
   private readonly artifactAuthorization: RunArtifactAuthorization | undefined;
@@ -352,6 +383,8 @@ export class MainLoop {
     this.compactForPressure = deps.compactForPressure;
     this.approve = deps.approve;
     this.onStreamEvent = deps.onStreamEvent;
+    this.eventObserver = deps.eventObserver;
+    this.includeProjectInstructions = deps.includeProjectInstructions ?? true;
     this.edgeContext = deps.edgeContext === undefined
       ? []
       : Object.freeze(deps.edgeContext.map((item) => structuredClone(item)));
@@ -418,6 +451,12 @@ export class MainLoop {
         ...(input.initialImages === undefined
           ? {}
           : { images: structuredClone(input.initialImages) }),
+        ...(input.initialMessageSourceEventId === undefined
+          ? {}
+          : { sourceEventId: input.initialMessageSourceEventId }),
+        ...(input.initialMessageSourceLane === undefined
+          ? {}
+          : { sourceLane: input.initialMessageSourceLane }),
         createdAt: this.clock.now().toISOString(),
       };
       const initialRef = await this.writeMessage(initialMessage);
@@ -431,7 +470,15 @@ export class MainLoop {
       });
       await this.emit(input, laneId, correlationId, eventState, {
         type: "user.message",
-        payload: { messageRef: initialRef },
+        payload: {
+          messageRef: initialRef,
+          ...(input.initialMessageSourceEventId === undefined
+            ? {}
+            : { sourceEventId: input.initialMessageSourceEventId }),
+          ...(input.initialMessageSourceLane === undefined
+            ? {}
+            : { sourceLane: input.initialMessageSourceLane }),
+        },
         idempotencyKey: `${eventPrefix}:input:${startStep}`,
       });
     }
@@ -501,18 +548,21 @@ export class MainLoop {
           definition.name !== "skill" || this.skillCatalog !== undefined
         ));
         let requestToolNames = new Set(requestTools.map((definition) => definition.name));
-        const projectInstructions = await loadProjectInstructions(input.workspace);
+        const projectInstructions = (input.includeProjectInstructions
+          ?? this.includeProjectInstructions)
+          ? await loadProjectInstructions(input.workspace)
+          : undefined;
         throwIfAborted(input.signal);
-        const projectInstructionBundleRef = projectInstructions.files.length === 0
+        const projectInstructionBundleRef = projectInstructions === undefined
+          || projectInstructions.files.length === 0
           ? undefined
           : await this.conversationStore.put(
               serializeProjectInstructionBundle(projectInstructions),
               PROJECT_INSTRUCTIONS_MEDIA_TYPE,
             );
-        const projectInstructionsManifest = projectInstructionManifest(
-          projectInstructions,
-          projectInstructionBundleRef,
-        );
+        const projectInstructionsManifest = projectInstructions === undefined
+          ? undefined
+          : projectInstructionManifest(projectInstructions, projectInstructionBundleRef);
         let compaction: FukaiCompactionSelection | undefined;
         if (this.selectCompaction !== undefined) {
           try {
@@ -535,15 +585,17 @@ export class MainLoop {
         ) => ({
           runId: input.runId,
           laneId,
-          laneKind: "main" as const,
+          laneKind: input.laneKind ?? "main",
           goal: input.goal,
           workspace: input.workspace,
           ...(input.activeObjective === undefined
             ? {}
             : { activeObjective: input.activeObjective }),
           systemPrompt: effectiveSystemPrompt(input, tools),
-          projectInstructions: projectInstructions.files,
-          projectInstructionManifest: projectInstructionsManifest,
+          projectInstructions: projectInstructions?.files ?? [],
+          ...(projectInstructionsManifest === undefined
+            ? {}
+            : { projectInstructionManifest: projectInstructionsManifest }),
           ...(this.edgeContext.length === 0 ? {} : { edgeContext: this.edgeContext }),
           ...(this.edgeContext.length === 0 ? {} : { skillContext: this.edgeContext }),
           ...(includeSkillCatalog && this.skillCatalog !== undefined
@@ -992,7 +1044,21 @@ export class MainLoop {
         });
 
         if (response.toolCalls.length === 0 && response.stopReason === "stop") {
-          if (input.turnId !== undefined && input.completeRun !== true) {
+          const completionMode = input.completionMode
+            ?? (input.turnId !== undefined && input.completeRun !== true ? "turn" : "run");
+          if (completionMode === "none") {
+            return {
+              finalText,
+              steps,
+              usage,
+              completed: true,
+              stopReason: response.stopReason,
+              conversationRefs,
+              navigationDeltas,
+              finalMessageRef,
+            };
+          }
+          if (completionMode === "turn" && input.turnId !== undefined) {
             await this.emit(input, laneId, correlationId, eventState, {
               type: "turn.completed",
               payload: { turnId: input.turnId, answerRef: assistantRef },
@@ -1285,6 +1351,13 @@ export class MainLoop {
       throw new Error("Event sink returned an invalid globalOffset");
     }
     eventState.watermark = Math.max(eventState.watermark, receipt.globalOffset);
+    if (this.eventObserver !== undefined && isCompleteEventReceipt(receipt)) {
+      try {
+        this.eventObserver(receipt);
+      } catch {
+        // Sibling-lane sensing is observational and cannot fail the owner lane.
+      }
+    }
     return receipt;
   }
 
@@ -2011,4 +2084,11 @@ function abortReason(signal: AbortSignal): Error {
   return signal.reason instanceof Error
     ? signal.reason
     : new DOMException("The operation was aborted", "AbortError");
+}
+
+function isCompleteEventReceipt(value: MainEventReceipt): value is AnyEvent {
+  return typeof value.runId === "string"
+    && typeof value.laneId === "string"
+    && typeof value.type === "string"
+    && value.payload !== undefined;
 }

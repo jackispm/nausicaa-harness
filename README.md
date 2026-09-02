@@ -1,6 +1,6 @@
 # Nausicaa
 
-Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注执行的 Main lane 为主线，并让低频辅助 lane 在旁路独立观察、提出建议；辅助线不会复制完整对话，也不会阻塞主线。
+Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注执行的 Main lane 为主线，同时允许普通 lane 并行思考。Teto 是第一条这样的 lane：它拥有自己的 transcript、Fukai 上下文和预算，通过 Main 的公开事件保持连续思考，但不会阻塞 Main。
 
 这是 `0.1.0` 本地 beta。核心运行、恢复和权限合同已有离线测试，但 API、命令行参数和 daemon 协议仍可能调整；不要把它当作生产集群或稳定 SDK。
 
@@ -27,10 +27,10 @@ Nausicaa 是一个面向长程任务的轻量 Agent harness。它以一条专注
 - `--allow-network` 启用 `web_fetch` 和批量 `web_search`。网络工具默认关闭，使用同源重定向、SSRF、响应大小、超时和取消边界；部署可通过 provider seam 替换搜索/抓取后端。
 - 工作区文件工具和沙箱 Bash 保护 `.env*`、`.git`、`.nausicaa`、私钥和常见凭据路径；高权限宿主 `bash` 不受此路径策略约束。
 - JSONL Ledger 与内容寻址 Store 保存事实和大对象，支持 checkpoint 与 Run 恢复。
-- Teto 辅助线读取固定大小的观察帧，低频检查目标偏离、意图缺失和更优方法。
-- Advice 通过持久 Inbox 在 Main 的自然边界进入上下文，可明确接受、延后或拒绝。
+- Teto 使用与 Main 相同的 `MainLoop`、Fukai、Ledger、预算、恢复和 A2A 基础设施。它只接收用户输入、Main 输出以及 Main 请求的工具和参数，不接收工具结果、文件内容、项目指令或 Main 私有上下文；每个公开事件最多开启一个串行的 Teto activation。
+- Teto 可以通过普通的 `message.inform` A2A 工具向 Main 发出 voice。Main 在安全边界看到这段 advisory context，但没有 `accept/defer/reject` 的特殊反馈通道，是否采纳完全由 Main 自己决定。
 - Worker 作为显式 opt-in 的 bounded sub-agent lane，通过 A2A 接收 Main 委派的任务；它共享上述受限只读目录（包括 `read_many` 与 Git 查看工具），最多 2 次模型轮次和 4 次只读工具调用，不能写文件、执行 Shell、访问网络或继续委派；Worker 模型明确声明视觉输入能力时，默认 catalog 还会加入 `read_image`；默认不会增加模型调用。
-- 启用 Worker 时，Main 额外获得 `delegate_task`；Teto live 模式额外获得 `respond_to_advice`。两者仍经过 Mowe 的 catalog、schema admission、operation ID、结果投影和恢复边界。
+- 启用 Worker 时，Main 额外获得 `delegate_task`；Teto 的 `agent_message` 能力由 host 固定绑定到当前 Run 的 Main lane。两者仍经过 Mowe 的 catalog、schema admission、operation ID、结果投影和恢复边界。
 - TTY 默认进入持续 Session：一个 Run 可包含多个 Turn，支持 steering、取消、恢复和 `--continue`。
 - 运行中按 Enter 注入 steering，按 Alt+Enter 排队 follow-up；输入和 ACK 都写入 Ledger。
 - `pi-tui` 只负责终端 surface；SessionController、Ledger 和模型执行保持独立，未来可接桌面 UI。

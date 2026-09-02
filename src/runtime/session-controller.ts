@@ -53,7 +53,6 @@ import {
   FileContentAddressedStore,
   type ContentAddressedStore,
 } from "../store/index.js";
-import { IntentNavigator, ObservationFrameBuilder } from "../teto/index.js";
 import {
   createWorkspaceTools,
   FileProcessJobRegistry,
@@ -63,7 +62,6 @@ import {
   type WebFetchProvider,
   type WebSearchProvider,
 } from "../tools/index.js";
-import { createAdviceResponseTool } from "./advice-tool.js";
 import {
   MainLoop,
   MainRunTokenBudgetExhaustedError,
@@ -95,7 +93,7 @@ import {
   recoverRunTokenUsageByLane,
   type RecoveredLaneUsage,
 } from "./run-token-budget-recovery.js";
-import { TetoScheduler } from "./teto-scheduler.js";
+import { TetoLaneScheduler } from "./teto-lane-scheduler.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
 import {
   createCrossRunRuntimeTool,
@@ -1566,7 +1564,9 @@ export class SessionController {
         policy: projection.run.policy,
         tokenBudget: new RunTokenBudget(
           projection.run.policy.maxModelTokens,
-          totalTokens(recoverRunTokenUsage(events, runId)),
+          totalTokens(projection.run.policy.tetoEnabled
+            ? usageExceptLane(events, runId, "teto")
+            : recoverRunTokenUsage(events, runId)),
         ),
         // Schema-v1 Runs created before model.selected keep the caller's
         // configured selector until the first explicit selection is recorded.
@@ -1718,7 +1718,7 @@ export class SessionController {
 
   private async runTurn(turn: ActiveTurn): Promise<void> {
     const attached = this.requireAttached();
-    let scheduler: TetoScheduler | undefined;
+    let scheduler: TetoLaneScheduler | undefined;
     try {
       const events = await attached.ledger.read({ runId: attached.runId });
       const turnStarted = events.find((event): event is Extract<AnyEvent, {
@@ -1812,26 +1812,44 @@ export class SessionController {
         tools.push(crossRunTool);
       }
       if (attached.policy.tetoEnabled) {
-        tools.push(createAdviceResponseTool(inbox));
-        scheduler = new TetoScheduler({
+        const tetoModel = this.deps.tetoModel ?? model;
+        const tetoModelName = this.tetoModel;
+        const tetoTokenBudget = new RunTokenBudget(
+          attached.policy.maxModelTokens,
+          totalTokens(laneUsage(events, attached.runId, "teto")),
+        );
+        const tetoCompactionRuntime = instantiateRuntimeFukaiCompaction(
+          attached.policy,
+          this.deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
+          {
+            ledger: attached.sink,
+            store: attached.store,
+            modelPort: tetoModel,
+            model: tetoModelName,
+            tokenBudget: tetoTokenBudget,
+            clock: this.clock,
+            policy: attached.policy,
+          },
+        );
+        scheduler = new TetoLaneScheduler({
           eventSink: attached.sink,
           inbox,
-          navigator: new IntentNavigator({
-            modelPort: this.deps.tetoModel ?? model,
-            model: this.tetoModel,
-            clock: this.clock,
-            maxAdviceOutputTokens: attached.policy.tetoMaxOutputTokens,
-          }),
-          frameBuilder: new ObservationFrameBuilder({
-            maxAdviceOutputTokens: attached.policy.tetoMaxOutputTokens,
-          }),
+          store: attached.store,
+          model: tetoModel,
+          modelName: tetoModelName,
           runId: attached.runId,
           goal: attached.goal,
-          model: this.tetoModel,
           policy: attached.policy,
+          workspace: this.workspace,
           events,
           clock: this.clock,
-          runTokenBudget: attached.tokenBudget,
+          tokenBudget: tetoTokenBudget,
+          ...(tetoCompactionRuntime === undefined
+            ? {}
+            : { compactionRuntime: tetoCompactionRuntime }),
+          policyVersion: deriveRuntimePolicyVersion(attached.policy),
+          readWatermark: () => attached.ledger.watermark(),
+          replayPublicEvents: true,
           signal: turn.controller.signal,
         });
       }
@@ -1909,6 +1927,9 @@ export class SessionController {
         tools: admittedTools,
         clock: this.clock,
         runTokenBudget: attached.tokenBudget,
+        eventObserver: (event) => {
+          if (event.laneId === "main") scheduler?.observeMainEvent(event);
+        },
         ...(edgeProjection.contextContributions.length === 0
           ? {}
           : { edgeContext: edgeProjection.contextContributions }),
@@ -2770,6 +2791,31 @@ function latestResumableTurn(
 
 function totalTokens(usage: TokenUsage): number {
   return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+}
+
+function laneUsage(
+  events: readonly AnyEvent[],
+  runId: string,
+  laneId: string,
+): TokenUsage {
+  return recoverRunTokenUsageByLane(events, runId)
+    .find((lane) => lane.laneId === laneId)?.usage
+    ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+}
+
+function usageExceptLane(
+  events: readonly AnyEvent[],
+  runId: string,
+  excludedLaneId: string,
+): TokenUsage {
+  return recoverRunTokenUsageByLane(events, runId)
+    .filter((lane) => lane.laneId !== excludedLaneId)
+    .reduce((total, lane) => ({
+      input: total.input + lane.usage.input,
+      output: total.output + lane.usage.output,
+      cacheRead: total.cacheRead + lane.usage.cacheRead,
+      cacheWrite: total.cacheWrite + lane.usage.cacheWrite,
+    }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 }
 
 function ensureVisibleLanes(

@@ -154,6 +154,9 @@ export type ConversationMessage =
       role: "user";
       content: string;
       images?: UserImage[];
+      /** Optional origin used by lane projections to recover event cursors. */
+      sourceEventId?: EventId;
+      sourceLane?: LaneId;
       createdAt: string;
     }
   | {

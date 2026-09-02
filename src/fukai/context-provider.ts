@@ -1524,14 +1524,17 @@ function projectConversationImages(
   message: ConversationMessage,
   options: ConversationImageProjectionOptions,
 ): ConversationImageProjection {
-  if (message.role === "assistant" || message.images === undefined || message.images.length === 0) {
-    return { message: structuredClone(message), imageBytes: 0, imageCount: 0 };
+  const modelMessage = stripLaneProjectionMetadata(message);
+  if (modelMessage.role === "assistant"
+    || modelMessage.images === undefined
+    || modelMessage.images.length === 0) {
+    return { message: modelMessage, imageBytes: 0, imageCount: 0 };
   }
 
-  const retained = message.images.slice(0, 0);
+  const retained = modelMessage.images.slice(0, 0);
   let imageBytes = 0;
   if (options.imageInputSupported) {
-    for (const image of message.images) {
+    for (const image of modelMessage.images) {
       if (options.retainedImageCount + retained.length >= MAX_USER_IMAGES) continue;
       const bytes = userImageByteLength(image);
       if (options.retainedImageBytes + imageBytes + bytes > MAX_TOTAL_USER_IMAGE_BYTES) continue;
@@ -1540,10 +1543,10 @@ function projectConversationImages(
     }
   }
 
-  const omitted = message.images.length - retained.length;
+  const omitted = modelMessage.images.length - retained.length;
   if (omitted === 0) {
     return {
-      message: structuredClone(message),
+      message: modelMessage,
       imageBytes,
       imageCount: retained.length,
     };
@@ -1553,12 +1556,12 @@ function projectConversationImages(
     ? "request image budget exceeded"
     : "selected model does not support image input";
   const marker = `[${omitted} IMAGE BLOCK${omitted === 1 ? "" : "S"} OMITTED BY FUKAI: ${reason}]`;
-  const cloned = structuredClone(message);
+  const cloned = modelMessage;
   const { images: _images, ...withoutImages } = cloned;
   return {
     message: {
       ...withoutImages,
-      content: `${marker}${message.content.length === 0 ? "" : `\n${message.content}`}`,
+      content: `${marker}${modelMessage.content.length === 0 ? "" : `\n${modelMessage.content}`}`,
       ...(retained.length === 0 ? {} : { images: retained }),
     },
     imageBytes,
@@ -1569,6 +1572,13 @@ function projectConversationImages(
       detail: `${omitted} image block${omitted === 1 ? " was" : "s were"} omitted because ${reason}`,
     },
   };
+}
+
+/** Internal projection metadata is durable for recovery but never model-visible. */
+function stripLaneProjectionMetadata(message: ConversationMessage): ConversationMessage {
+  if (message.role !== "user") return structuredClone(message);
+  const { sourceEventId: _sourceEventId, sourceLane: _sourceLane, ...visible } = message;
+  return structuredClone(visible);
 }
 
 function truncateMessage(

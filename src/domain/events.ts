@@ -125,8 +125,21 @@ export interface EventPayloadMap {
   };
   "turn.resumed": { turnId: TurnId; fromStep: number; stepAllowance: number };
   "user.message":
-    | { messageRef: ArtifactRef; inputId?: never; kind?: never }
-    | { inputId: InputId; messageRef: ArtifactRef; kind: UserMessageKind };
+    | {
+        messageRef: ArtifactRef;
+        inputId?: never;
+        kind?: never;
+        /** Origin Main event when this message was projected into a sibling lane. */
+        sourceEventId?: EventId;
+        sourceLane?: LaneId;
+      }
+    | {
+        inputId: InputId;
+        messageRef: ArtifactRef;
+        kind: UserMessageKind;
+        sourceEventId?: EventId;
+        sourceLane?: LaneId;
+      };
   "assistant.message": { messageRef: ArtifactRef };
   "navigation.updated": { delta: NavigationDelta };
   /** Run-scoped Main-lane selection. Teto and Worker keep independent selectors. */
