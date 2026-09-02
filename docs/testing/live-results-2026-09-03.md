@@ -67,3 +67,41 @@ The source inventories and portable-gap plan remain the authoritative list of
 additional upstream work. Session-tree, attach continuity, goal continuation,
 awareness, and daemon restart are separate future gates because their public
 host contracts are not part of this 19-case batch yet.
+
+## Rerun after inventory consolidation
+
+Run date: 2026-09-03. Execution revision: `1acbaa1`.
+
+The same 19 portable cases were run once more through OpenRouter with
+`openrouter:deepseek/deepseek-v4-pro-0813`. The batch used a shared 100-request
+ceiling and a 10,200-token per-request ceiling. The runner completed every
+selected case before the 100-request ceiling and recorded complete usage.
+
+| Measure | Result |
+| --- | --- |
+| Cases | 19/19 dispatched |
+| Passes | 15 |
+| Fails | 4 |
+| Requests | 53 |
+| Reported cost | `$0.0803966856` |
+| Usage completeness | complete for this batch |
+
+Passing cases: `compatibility`, `bugfix`, `resume`, `bash-roundtrip`,
+`file-rewrite`, `pi-smoke`, `pi-extension`, `pi-parallel-tools`,
+`pi-edit-disjoint`, `pi-find-scope`, `pi-bash-tail`, `pi-delete-action`,
+`deepseek-fs-cwd`, `deepseek-instructions`, and `permission-boundary`.
+
+The four failures were bounded workflow outcomes:
+
+- `incident-triage`: the model stopped after a directory listing, so the
+  required evidence files were not observed.
+- `pi-read-window`: the model answered without starting the bounded read.
+- `multi-agent`: the model ended without queuing `delegate_task`.
+- `fukai-compaction`: the model read only three of the four evidence files
+  before the run stopped.
+
+These are model sequencing or stopping decisions. The same batch passed the
+provider path, file tools, shell round trip, mutation checks, scoped discovery,
+and capability boundary checks. The raw artifact remains under the ignored
+`.nausicaa/evals/` directory and contains no response body or configuration
+value.
