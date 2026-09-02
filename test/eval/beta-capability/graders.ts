@@ -41,7 +41,64 @@ export async function gradeBetaCase(
   if (fixture.manifest.id === "resume") return gradeResume(fixture, finalText, toolTrace, options);
   if (fixture.manifest.id === "bash-roundtrip") return gradeBashRoundtrip(fixture, finalText, toolTrace);
   if (fixture.manifest.id === "file-rewrite") return gradeFileRewrite(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "pi-smoke") return gradePiSmoke(fixture, finalText, toolTrace);
+  if (fixture.manifest.id === "pi-extension") return gradePiExtension(fixture, finalText, toolTrace, options);
   return failed("case-not-implemented");
+}
+
+export async function gradePiSmoke(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+): Promise<BetaGrade> {
+  const assertions = {
+    fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
+    noToolsUsed: toolTrace.length === 0,
+    exactAnswer: finalText.trim() === "Paris",
+  };
+  return gradeFromAssertions(assertions);
+}
+
+export async function gradePiExtension(
+  fixture: BetaFixture,
+  finalText: string,
+  toolTrace: readonly BetaToolTraceEntry[] = [],
+  options: BetaGraderOptions = {},
+): Promise<BetaGrade> {
+  const extensionPath = join(fixture.workspace, ".pi", "extensions", "hello.js");
+  const source = await readFile(extensionPath, "utf8").catch(() => "");
+  const bashCalls = toolTrace.filter((entry) => entry.name === "bash" && !entry.isError);
+  const writeCalls = toolTrace.filter((entry) => entry.name === "write_file" && !entry.isError);
+  const external = options.workspaceCommandSandbox
+    ?? new WorkspaceCommandSandbox(options.workspaceCommandSandboxOptions ?? {
+      protectedPaths: [join(fixture.rootDirectory, "state")],
+    });
+  let externalPass = false;
+  try {
+    if (external.availability().available) {
+      const result = await external.execute({
+        command: "node .pi/extensions/hello.js Bob",
+        cwd: fixture.workspace,
+        timeoutMs: BUGFIX_COMMAND_TIMEOUT_MS,
+      });
+      externalPass = result.spawnError === undefined
+        && result.exitCode === 0
+        && !result.aborted
+        && !result.timedOut
+        && result.stdout.content.trim() === "Hello, Bob!";
+    }
+  } catch {
+    externalPass = false;
+  }
+  const assertions = {
+    fixtureUnchanged: await unchangedFixtureFiles(fixture) && await workspaceMatchesAllowed(fixture),
+    extensionSourcePresent: source.length > 0,
+    writeToolUsed: writeCalls.some((entry) => entry.arguments.path === ".pi/extensions/hello.js"),
+    bashToolUsed: bashCalls.some((entry) => String(entry.arguments.command ?? "").includes(".pi/extensions/hello.js")),
+    externalCommandPasses: externalPass,
+    finalTextExactGreeting: finalText.trim() === "Hello, Bob!",
+  };
+  return gradeFromAssertions(assertions);
 }
 
 export async function gradeBugfix(
@@ -288,9 +345,11 @@ async function initialFixtureFails(fixture: BetaFixture): Promise<boolean> {
 
 async function workspaceMatchesAllowed(fixture: BetaFixture): Promise<boolean> {
   const expected = new Set(Object.keys(fixture.initialFiles));
+  const allowed = new Set([...expected, ...fixture.manifest.allowedModifyPaths]);
   const found = await listRelativeFiles(fixture.workspace).catch(() => undefined);
   if (found === undefined) return false;
-  if (found.length !== expected.size || found.some((path) => !expected.has(path))) return false;
+  if (found.some((path) => !allowed.has(path))) return false;
+  if ([...expected].some((path) => !found.includes(path))) return false;
   const rootEntries = await readdir(fixture.rootDirectory);
   return rootEntries.length === 2 && rootEntries.includes("workspace") && rootEntries.includes("state");
 }

@@ -39,6 +39,22 @@ const deepSeekRealModel: BetaAttribution = {
   adopted: ["temporary workspace", "exact file rewrite", "post-agent world verification"],
   rejected: ["Cordis", "loader smoke wrapper", "DeepSeek provider binding"],
 };
+const piSmoke: BetaAttribution = {
+  project: "Pi",
+  sourcePath: "/Users/gongdongjie/Downloads/pi/packages/evals/src/smoke.eval.ts",
+  commit: "1defa151e0c1dac87d38a2d0ac09d67f817b30f9",
+  license: "MIT",
+  adopted: ["no-tool end-to-end prompt", "exact final answer and usage observation"],
+  rejected: ["Pi session/runtime", "vitest-evals reporter"],
+};
+const piExtension: BetaAttribution = {
+  project: "Pi",
+  sourcePath: "/Users/gongdongjie/Downloads/pi/packages/evals/src/extensions.eval.ts",
+  commit: "1defa151e0c1dac87d38a2d0ac09d67f817b30f9",
+  license: "MIT",
+  adopted: ["extension authoring task", "reload/use phases", "external world verification"],
+  rejected: ["Pi TypeScript extension loader", "system-prompt A/B harness", "vitest-evals reporter"],
+};
 const pi: BetaAttribution = {
   project: "Pi",
   sourcePath: "/Users/gongdongjie/Downloads/pi/packages/evals/README.md",
@@ -261,6 +277,50 @@ const definitions: readonly CaseDefinition[] = [
       statement: "Perform and verify the exact task.txt rewrite.",
       successCriteria: ["task.txt contains exactly value=after followed by a newline", "Read the file after mutation"],
       hardConstraints: ["Do not change or create any other file"],
+    },
+  },
+  {
+    manifest: manifest(
+      "pi-smoke",
+      "compatibility",
+      true,
+      false,
+      "Answer a no-tool factual prompt end to end.",
+      [],
+      [],
+      [piSmoke],
+      { maxMainSteps: 100, requestBudgetHint: 100, maxOutputTokens: 10_200, timeoutMs: 600_000 },
+      [],
+    ),
+    files: {},
+    message: "What's the capital of France? Respond with only the city name.",
+    goal: {
+      version: 1,
+      statement: "Answer the factual prompt without using tools.",
+      successCriteria: ["Reply with exactly Paris"],
+      hardConstraints: ["Do not call tools", "Reply with only the city name"],
+    },
+  },
+  {
+    manifest: manifest(
+      "pi-extension",
+      "P1",
+      true,
+      true,
+      "Author a small workspace extension, execute it, and verify its greeting.",
+      [],
+      [".pi/extensions/hello.js"],
+      [piExtension],
+      { maxMainSteps: 100, requestBudgetHint: 100, maxOutputTokens: 10_200, timeoutMs: 600_000 },
+      ["write_file", "bash"],
+    ),
+    files: {},
+    message: "Create .pi/extensions/hello.js with a hello(name) function that returns exactly `Hello, ${name}!`. Use write_file for the extension source, then run `node .pi/extensions/hello.js Bob` with bash after making the file executable as a CLI. Report exactly the greeting and do not create any other files.",
+    goal: {
+      version: 1,
+      statement: "Author and exercise a workspace extension with a stable greeting contract.",
+      successCriteria: ["hello.js exists", "The external command prints Hello, Bob!", "Final answer is the greeting"],
+      hardConstraints: ["Use write_file for .pi/extensions/hello.js", "Do not create any other files"],
     },
   },
   ...(["edge-extension", "multi-agent", "fukai-compaction", "permission-boundary"] as const).map((id) => ({

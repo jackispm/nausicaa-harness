@@ -10,6 +10,8 @@ export type BetaCaseId =
   | "incident-triage"
   | "bash-roundtrip"
   | "file-rewrite"
+  | "pi-smoke"
+  | "pi-extension"
   | "edge-extension"
   | "multi-agent"
   | "fukai-compaction"
