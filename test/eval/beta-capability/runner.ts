@@ -412,7 +412,11 @@ async function runResumeCase(options: {
     workspace: options.fixture.workspace,
     dataDir: join(options.caseRoot, "state"),
     model: options.modelName,
-    message: "Use write_file to write exactly 'resume-ready\\n' to resume.txt. Perform that tool call as the only action in this activation; do not provide a final answer yet.",
+    // The host owns the pause: maxMainStepsPerActivation=1 guarantees a
+    // resumable boundary after the first tool step. Do not ask the model to
+    // stop itself, otherwise this eval measures instruction-following rather
+    // than durable Run recovery.
+    message: "Begin this task by using write_file to write exactly 'resume-ready\\n' to resume.txt. The host will pause this activation after the first step; do not assume the task is complete.",
     goal: options.fixture.goal,
     allowWrite: true,
     allowShell: false,

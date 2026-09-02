@@ -20,7 +20,7 @@ const deepSeekResume: BetaAttribution = {
   sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/headless-agent/tests/resume.e2e.ts",
   commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
   license: "MIT",
-  adopted: ["world-state verification", "separate resume phase design"],
+  adopted: ["world-state verification", "separate resume phase design", "host-controlled activation boundary"],
   rejected: ["Cordis", "live recovery runtime"],
 };
 const deepSeekFullLoop: BetaAttribution = {
@@ -106,7 +106,7 @@ const scorerContract = {
     "grader reruns the test outside the agent",
     "forbidden test bytes and workspace boundary are immutable",
     "at least one successful read and one successful mutation are required",
-    "resume completion accepts one optional terminal newline after the two required lines",
+    "resume uses a host-controlled first activation boundary and accepts one optional terminal newline after the two required lines",
     "bash roundtrip requires successful tool output and a grounded final answer",
     "file rewrite verifies exact world state and a post-mutation read",
     "Pi-derived tool cases require structured tool evidence and final world-state verification",
