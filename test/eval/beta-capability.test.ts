@@ -20,7 +20,7 @@ const call = (id: string, name: string, arguments_: Record<string, unknown>): Mo
 describe("Beta Capability MiniEval offline contract", () => {
   it("freezes deterministic P0/P1 catalog metadata and attribution", () => {
     expect(BETA_CAPABILITY_CATALOG.map((value) => value.id)).toEqual([
-      "compatibility", "bugfix", "resume", "incident-triage", "edge-extension", "multi-agent", "fukai-compaction", "permission-boundary",
+      "compatibility", "bugfix", "resume", "incident-triage", "bash-roundtrip", "file-rewrite", "edge-extension", "multi-agent", "fukai-compaction", "permission-boundary",
     ]);
     expect(BETA_CAPABILITY_MANIFEST_HASH).toBeDefined();
     expect(BETA_CAPABILITY_SCORER_HASH).toMatch(/^sha256:[0-9a-f]{64}$/u);
