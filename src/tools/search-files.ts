@@ -57,7 +57,6 @@ export async function discoverSearchFiles(
 
   const arguments_ = [
     "--files",
-    "--hidden",
     "--null",
     "--no-config",
     "--sort=path",
