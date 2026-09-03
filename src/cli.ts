@@ -3,6 +3,7 @@
 import { resolve } from "node:path";
 
 import { CliUsageError, parseCliArgs, usage } from "./cli/args.js";
+import { runUtilityCommand } from "./cli/auth.js";
 import { selectNewRecoveryFailures } from "./cli/daemon-recovery-reporting.js";
 import { processImageInputs } from "./cli/image-input.js";
 import { runInteractive } from "./cli/interactive.js";
@@ -58,7 +59,11 @@ import {
   startupGuidance,
   UNCONFIGURED_MODEL,
 } from "./cli/onboarding.js";
-import { createOpenRouterModelPort } from "./model/index.js";
+import {
+  createOpenRouterModelPort,
+  parseModelSelector,
+} from "./model/index.js";
+import { createNausicaaCredentialStore } from "./auth/index.js";
 import {
   createEdgeSelectionController,
   type EdgeSelectionController,
@@ -85,6 +90,14 @@ const main = async (): Promise<number> => {
   if (options.version) {
     process.stdout.write(`${VERSION}\n`);
     return 0;
+  }
+  if (options.command !== undefined) {
+    try {
+      return await runUtilityCommand(options.command);
+    } catch (error: unknown) {
+      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      return 2;
+    }
   }
   if (
     !options.modeExplicit
@@ -224,9 +237,27 @@ const main = async (): Promise<number> => {
         else await session.close().catch(() => undefined);
       }
     }
-    const mainModel = createOpenRouterModelPort();
+    const credentialStore = createNausicaaCredentialStore();
+    const mainModel = createOpenRouterModelPort({ credentials: credentialStore });
     const modelCatalog = mainModel.catalog();
-    const credentialStatus = inspectCredential(resolvedSettings.model, modelCatalog);
+    const credentialProvider = (() => {
+      try {
+        return parseModelSelector(resolvedSettings.model).provider;
+      } catch {
+        return undefined;
+      }
+    })();
+    const storedCredential = credentialProvider === undefined
+      ? undefined
+      : await credentialStore.read(credentialProvider);
+    const credentialStatus = inspectCredential(
+      resolvedSettings.model,
+      modelCatalog,
+      process.env,
+      storedCredential === undefined || credentialProvider === undefined
+        ? undefined
+        : { provider: credentialProvider, type: storedCredential.type },
+    );
     const selectedRunId = options.continue
       ? await findLatestRunId(resolvedSettings.dataDir, workspace)
       : options.resume;
@@ -321,6 +352,7 @@ const main = async (): Promise<number> => {
       return await runDaemonMode({
         workspace,
         settings: resolvedSettings,
+        mainModel,
         edgeRuntime,
         ...(fukaiCompaction === undefined ? {} : { fukaiCompaction }),
         ...(options.workerEnabled === undefined
@@ -413,12 +445,19 @@ const main = async (): Promise<number> => {
           credentialStatus: () => inspectCredential(
             session.model === UNCONFIGURED_MODEL ? undefined : session.model,
             modelCatalog,
+            process.env,
+            storedCredential === undefined || credentialProvider === undefined
+              ? undefined
+              : { provider: credentialProvider, type: storedCredential.type },
           ),
           startupModelMissing,
           showStartupSetup,
           startupNotice: () => startupGuidance({
             model: session.model === UNCONFIGURED_MODEL ? undefined : session.model,
             catalog: modelCatalog,
+            ...(storedCredential === undefined || credentialProvider === undefined
+              ? {}
+              : { savedCredential: { provider: credentialProvider, type: storedCredential.type } }),
           }),
           awareness: () => readWorkspaceAgentAwareness(
             resolvedSettings.dataDir,
@@ -586,6 +625,7 @@ const writeJson = (value: unknown): void => {
 interface DaemonModeOptions {
   workspace: string;
   settings: ResolvedSettings;
+  mainModel: import("./domain/ports.js").ModelPort;
   edgeRuntime: CliEdgeRuntime;
   /** Preserve explicit startup policy when the daemon creates/resumes Runs. */
   fukaiCompaction?: ResolvedSettings["fukaiCompaction"];
@@ -641,6 +681,9 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
       ...(options.settings.allowShell
         ? { processJobRegistryDir: options.settings.dataDir }
         : {}),
+    },
+    sessionDeps: {
+      mainModel: options.mainModel,
     },
     reconciliation: {
       // A short, serialized poll closes the gap between startup recovery and

@@ -83,6 +83,7 @@ describe("CLI onboarding", () => {
   it("labels an unavailable local catalog during first-run guidance", () => {
     const guidance = startupGuidance({ model: undefined, catalog: [], environment: {} });
     expect(guidance).toContain("local model catalog is unavailable/unverified");
+    expect(guidance).not.toContain("/setup");
   });
 
   it("uses a fixed mask and never returns or renders a complete sentinel key", () => {
@@ -114,6 +115,23 @@ describe("CLI onboarding", () => {
     expect(inspectCredential("openrouter:demo", catalog, {
       OPENROUTER_API_KEY: "   ",
     })).not.toHaveProperty("credentialMask");
+  });
+
+  it("treats a saved credential as configured without exposing its value", () => {
+    const status = inspectCredential("openrouter:demo", catalog, {}, { provider: "openrouter", type: "api_key" });
+    expect(status).toMatchObject({ credentialPresent: true, credentialSource: "saved", authStatus: "unverified" });
+    const guidance = startupGuidance({ model: "openrouter:demo", catalog, environment: {}, savedCredential: { provider: "openrouter", type: "api_key" } });
+    expect(guidance).toContain("saved credential");
+    expect(guidance).not.toContain("api_key");
+  });
+
+  it("does not attribute a saved credential from another provider", () => {
+    expect(inspectCredential(
+      "anthropic:demo",
+      [],
+      {},
+      { provider: "openrouter", type: "api_key" },
+    )).toMatchObject({ credentialPresent: false });
   });
 
   it("gives a copyable non-interactive next step without accepting a key argument", () => {

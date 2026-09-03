@@ -1,8 +1,14 @@
 import {
   createModels,
+  type AuthCheck,
+  type AuthContext,
+  type AuthInteraction,
+  type AuthType,
   type Api,
   type AssistantMessage,
   type Context,
+  type Credential,
+  type CredentialStore,
   type FetchFunction,
   type Message,
   type Model,
@@ -39,6 +45,10 @@ export interface PiAiModelPortOptions {
 
 export interface OpenRouterModelPortOptions {
   models?: MutableModels;
+  /** Persistent credentials are injected by the application boundary. */
+  credentials?: CredentialStore;
+  /** Optional auth context seam for embedders and offline tests. */
+  authContext?: AuthContext;
   fetch?: FetchFunction;
 }
 
@@ -98,6 +108,25 @@ export class PiAiModelPort implements ModelPort {
       reasoning: model.reasoning,
       authStatus: "unverified" as const,
     })));
+  }
+
+  /** Check local credential configuration without making a provider request. */
+  async checkAuth(provider = this.defaultProvider): Promise<AuthCheck | undefined> {
+    return this.models.checkAuth(provider);
+  }
+
+  /** Run the provider-owned login flow and persist its credential. */
+  async login(
+    type: AuthType,
+    interaction: AuthInteraction,
+    provider = this.defaultProvider,
+  ): Promise<Credential> {
+    return this.models.login(provider, type, interaction);
+  }
+
+  /** Remove the saved credential for a provider; ambient environment remains untouched. */
+  async logout(provider = this.defaultProvider): Promise<void> {
+    await this.models.logout(provider);
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
@@ -225,7 +254,14 @@ function isPositiveInteger(value: number): boolean {
 export function createOpenRouterModelPort(
   options: OpenRouterModelPortOptions = {},
 ): PiAiModelPort {
-  const models = options.models ?? createModels();
+  const models = options.models ?? createModels(
+    options.credentials === undefined && options.authContext === undefined
+      ? undefined
+      : {
+          ...(options.credentials === undefined ? {} : { credentials: options.credentials }),
+          ...(options.authContext === undefined ? {} : { authContext: options.authContext }),
+        },
+  );
   if (models.getProvider("openrouter") === undefined) {
     models.setProvider(openrouterProvider());
   }

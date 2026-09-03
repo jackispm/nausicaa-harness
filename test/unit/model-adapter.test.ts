@@ -4,6 +4,8 @@ import {
   fauxProvider,
   fauxText,
   fauxToolCall,
+  InMemoryCredentialStore,
+  type ApiKeyAuth,
   type Models,
 } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
@@ -118,6 +120,38 @@ describe("ScriptedModel", () => {
 });
 
 describe("PiAiModelPort", () => {
+  it("resolves an injected credential store at the provider request boundary", async () => {
+    const faux = fauxProvider({ provider: "saved-auth", models: [{ id: "demo" }] });
+    let observedKey: string | undefined;
+    const authMethod: ApiKeyAuth = {
+      name: "Faux API key",
+      resolve: async ({ credential }) => {
+        observedKey = credential?.key;
+        return credential?.key === "stored-key"
+          ? { auth: { apiKey: credential.key }, source: "stored credential" }
+          : undefined;
+      },
+    };
+    const auth = { apiKey: authMethod };
+    const store = new InMemoryCredentialStore();
+    await store.modify("saved-auth", async () => ({ type: "api_key", key: "stored-key" }));
+    const models = createModels({
+      credentials: store,
+      authContext: { env: async () => undefined, fileExists: async () => false },
+    });
+    models.setProvider({ ...faux.provider, auth });
+    faux.setResponses([fauxAssistantMessage("authenticated")]);
+    const adapter = new PiAiModelPort({ models });
+
+    const response = await adapter.complete({
+      ...request(),
+      model: "saved-auth:demo",
+    });
+
+    expect(response.content).toBe("authenticated");
+    expect(observedKey).toBe("stored-key");
+  });
+
   it("reports a validated pi-ai context window capability", () => {
     const faux = fauxProvider({
       provider: "openrouter",

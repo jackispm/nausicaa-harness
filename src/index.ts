@@ -1,4 +1,5 @@
 export * from "./a2a/index.js";
+export * from "./auth/index.js";
 export * from "./config/index.js";
 export * from "./domain/index.js";
 export * from "./fukai/index.js";

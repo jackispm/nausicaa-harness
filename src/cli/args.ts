@@ -7,6 +7,22 @@ import type {
 
 export type OutputMode = "interactive" | "print" | "json";
 
+export type UtilityCommand = AuthCommand | ConfigCommand;
+
+export interface AuthCommand {
+  readonly kind: "auth";
+  readonly action: "login" | "status" | "logout";
+  readonly provider: string;
+  readonly json: boolean;
+}
+
+export interface ConfigCommand {
+  readonly kind: "config";
+  readonly action: "set-model" | "get-model" | "path";
+  readonly model?: string;
+  readonly json: boolean;
+}
+
 export interface CliOptions {
   help: boolean;
   version: boolean;
@@ -46,6 +62,7 @@ export interface CliOptions {
   fukaiCompaction?: FukaiCompactionSettings;
   fileArgs: string[];
   message?: string;
+  command?: UtilityCommand;
 }
 
 export class CliUsageError extends Error {}
@@ -102,6 +119,9 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
     workspace: cwd,
     fileArgs: [],
   };
+  if (args[0] === "auth" || args[0] === "config") {
+    return parseUtilityCommand(args, cwd);
+  }
   const messageParts: string[] = [];
 
   for (let index = 0; index < args.length; index += 1) {
@@ -387,12 +407,70 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   return options;
 };
 
+function parseUtilityCommand(args: string[], cwd: string): CliOptions {
+  const kind = args[0];
+  if (kind !== "auth" && kind !== "config") {
+    throw new CliUsageError("Unknown utility command");
+  }
+  const rest = args.slice(1);
+  const json = rest.includes("--json");
+  const positional = rest.filter((argument) => argument !== "--json");
+  if (positional.some((argument) => argument.startsWith("-"))) {
+    throw new CliUsageError("Unsupported utility command option; use --json only");
+  }
+
+  let command: UtilityCommand;
+  if (kind === "auth") {
+    const action = positional[0];
+    if (action !== "login" && action !== "status" && action !== "logout") {
+      throw new CliUsageError("Usage: nausicaa auth <login|status|logout> [provider]");
+    }
+    const provider = positional[1] ?? "openrouter";
+    if (positional.length > 2) {
+      throw new CliUsageError("Usage: nausicaa auth <login|status|logout> [provider]");
+    }
+    command = { kind, action, provider, json };
+  } else {
+    const action = positional[0];
+    if (action !== "set-model" && action !== "get-model" && action !== "path") {
+      throw new CliUsageError("Usage: nausicaa config <set-model|get-model|path> [value]");
+    }
+    const model = positional[1];
+    if (action === "set-model" && model === undefined) {
+      throw new CliUsageError("Usage: nausicaa config set-model <provider:model>");
+    }
+    if (positional.length > (action === "set-model" ? 2 : 1)) {
+      throw new CliUsageError(`Usage: nausicaa config ${action}${action === "set-model" ? " <provider:model>" : ""}`);
+    }
+    command = {
+      kind,
+      action,
+      ...(model === undefined ? {} : { model }),
+      json,
+    };
+  }
+  return {
+    help: false,
+    version: false,
+    topology: false,
+    daemon: false,
+    mode: json ? "json" : "print",
+    modeExplicit: true,
+    continue: false,
+    workspace: cwd,
+    fileArgs: [],
+    command,
+  };
+}
+
 export const usage = `Nausicaa 0.1
 
 Usage:
   nausicaa [options] [@image ...] [message]
   nausicaa --daemon [options]
   nausicaa --attach <run-id> [options]
+  nausicaa auth <login|status|logout> [provider]
+  nausicaa config <set-model|get-model|path> [value]
 
 Options:
   -p, --print             Run once and print the final answer; reads bounded non-TTY stdin
@@ -440,7 +518,16 @@ Options:
   -h, --help              Show help
   -v, --version           Show version
 
+Commands:
+  auth login [provider]   Save a provider credential through a hidden TTY prompt
+  auth status [provider]  Show credential presence (never verifies over the network)
+  auth logout [provider]  Remove a saved credential; environment credentials remain
+  config set-model <id>   Save the user-level default model selector
+  config get-model        Print the saved user-level default model
+  config path             Print the user-level settings path
+  Add --json to status/get-model/path for machine-readable output.
+
 Environment:
   NAUSICAA_MODEL          Fallback model selector when settings/CLI omit model
-  OPENROUTER_API_KEY      Current-process credential; never saved by setup
+  OPENROUTER_API_KEY      Ambient credential (a saved credential from auth login wins)
 `;

@@ -3,6 +3,14 @@ import { describe, expect, it } from "vitest";
 import { CliUsageError, parseCliArgs, usage } from "../../src/cli/args.js";
 
 describe("parseCliArgs", () => {
+  it("parses auth and config utility commands without a TTY", () => {
+    expect(parseCliArgs(["auth", "status", "--json"], "/work").command).toEqual({ kind: "auth", action: "status", provider: "openrouter", json: true });
+    expect(parseCliArgs(["config", "set-model", "openrouter:demo"], "/work").command).toEqual({ kind: "config", action: "set-model", model: "openrouter:demo", json: false });
+  });
+
+  it("does not accept a key-bearing command-line option", () => {
+    expect(() => parseCliArgs(["auth", "login", "--api-key", "secret"], "/work")).toThrow("use --json only");
+  });
   it("keeps a task as one message", () => {
     expect(parseCliArgs(["inspect", "this", "repo"], "/work")).toMatchObject({
       message: "inspect this repo",

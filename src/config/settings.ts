@@ -235,7 +235,8 @@ export const resolveSettings = (
   };
 };
 
-const readSettingsFile = async (path: string): Promise<Settings> => {
+/** Read one validated settings document; missing files resolve to an empty object. */
+export const readSettingsFile = async (path: string): Promise<Settings> => {
   let source: string;
   try {
     source = await readFile(path, "utf8");

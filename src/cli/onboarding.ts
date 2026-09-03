@@ -11,13 +11,21 @@ export interface CredentialStatus {
   credentialPresent: boolean;
   /** A fixed mask; the complete environment value is never returned. */
   credentialMask?: string;
+  /** Credential source is intentionally non-secret metadata only. */
+  credentialSource?: "saved" | "environment";
   authStatus: "unverified";
+}
+
+export interface SavedCredentialStatus {
+  provider: string;
+  type: "api_key" | "oauth";
 }
 
 export interface StartupGuidanceInput {
   model: string | undefined;
   catalog?: readonly ModelCatalogEntry[];
   environment?: NodeJS.ProcessEnv;
+  savedCredential?: SavedCredentialStatus;
 }
 
 const providerCredentialEnvs: Readonly<Record<string, string>> = {
@@ -32,6 +40,7 @@ export function inspectCredential(
   model: string | undefined,
   catalog: readonly ModelCatalogEntry[] = [],
   environment: NodeJS.ProcessEnv = process.env,
+  savedCredential?: SavedCredentialStatus,
 ): CredentialStatus {
   const trimmed = model?.trim() ?? "";
   const separator = trimmed.indexOf(":");
@@ -51,13 +60,17 @@ export function inspectCredential(
   const credentialEnv = provider === undefined ? undefined : providerCredentialEnvs[provider];
   const raw = credentialEnv === undefined ? undefined : environment[credentialEnv];
   const normalized = typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : undefined;
+  const saved = savedCredential !== undefined
+    && provider !== undefined
+    && savedCredential.provider === provider;
   return {
     provider,
     selectorRecognized,
     catalogKnown,
     credentialEnv,
-    credentialPresent: normalized !== undefined,
+    credentialPresent: normalized !== undefined || saved,
     ...(normalized === undefined ? {} : { credentialMask: maskSecret(normalized) }),
+    ...(saved ? { credentialSource: "saved" as const } : normalized === undefined ? {} : { credentialSource: "environment" as const }),
     authStatus: "unverified",
   };
 }
@@ -74,9 +87,10 @@ export function startupGuidance(input: StartupGuidanceInput): string {
     input.model,
     input.catalog,
     input.environment,
+    input.savedCredential,
   );
   const credentialStatus = input.model === undefined || input.model.trim().length === 0
-    ? inspectCredential("openrouter:__setup__", input.catalog, input.environment)
+    ? inspectCredential("openrouter:__setup__", input.catalog, input.environment, input.savedCredential)
     : status;
   const lines: string[] = [];
   if (input.model === undefined || input.model.trim().length === 0) {
@@ -99,7 +113,9 @@ export function startupGuidance(input: StartupGuidanceInput): string {
       lines.push("Selector: recognized locally; no local catalog was supplied for verification.");
     }
   }
-  if (credentialStatus.credentialEnv === undefined) {
+  if (credentialStatus.credentialSource === "saved") {
+    lines.push("Credential source: saved credential; auth is unverified.");
+  } else if (credentialStatus.credentialEnv === undefined) {
     lines.push("Credential status: provider environment variable is unknown; auth is unverified.");
   } else if (!credentialStatus.credentialPresent) {
     lines.push(
@@ -110,7 +126,9 @@ export function startupGuidance(input: StartupGuidanceInput): string {
       `Credential source: ${credentialStatus.credentialEnv} (${credentialStatus.credentialMask}); auth is unverified.`,
     );
   }
-  lines.push("No credential is saved or sent by setup. Esc skips setup; use /setup to retry later.");
+  lines.push(
+    "Credentials are managed with `nausicaa auth login|status|logout`; this screen never saves or sends a key. Esc skips setup.",
+  );
   return lines.join("\n");
 }
 
@@ -121,7 +139,7 @@ export function nonInteractiveGuidance(model?: string): string {
   return [
     "Next step (non-interactive):",
     `  nausicaa --print --model ${shellQuote(selector)} ${shellQuote("<task>")}`,
-    "Credential source: OPENROUTER_API_KEY (presence only; auth is unverified).",
+    "Credential source: OPENROUTER_API_KEY or `nausicaa auth login` (presence only; auth is unverified).",
   ].join("\n");
 }
 
