@@ -32,7 +32,7 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
   return {
     definition: {
       name: "delegate_task",
-      description: "Queue an independent, bounded read-only Worker task. The Worker can independently use bounded read-only workspace tools and returns its result asynchronously at a later Main step or turn; continue other work after queueing. Batch independent tasks when useful. Do not use for trivial, tightly coupled, mutating, shell, or immediate-result work.",
+      description: "Queue a bounded read-only Worker task. The Worker may use bounded read-only workspace tools and returns a result asynchronously at a later Main step or turn.",
       parameters: {
         type: "object",
         properties: {

@@ -31,7 +31,7 @@ describe("delegate_task tool", () => {
     expect(tool.definition.parameters.required).toEqual(["statement"]);
     expect(tool.definition.description).toMatch(/asynchronously/i);
     expect(tool.definition.description).toMatch(/read-only workspace tools/i);
-    expect(tool.definition.description).toMatch(/continue other work/i);
+    expect(tool.definition.description).not.toMatch(/continue other work/i);
   });
 
   it("stores optional input and queues a bounded task request", async () => {

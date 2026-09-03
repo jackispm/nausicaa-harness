@@ -36,7 +36,7 @@ export function createFindTool(policy: WorkspacePathPolicy = {}): AgentTool {
   return {
     definition: {
       name: "find",
-      description: "Find workspace files by glob pattern in stable pages while respecting ignore files and protected paths. Use nextCursor to continue a truncated page.",
+      description: "Find workspace files by glob pattern in stable pages while respecting ignore files and protected paths. A returned nextCursor continues a truncated page.",
       parameters: {
         type: "object",
         properties: {

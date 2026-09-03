@@ -508,7 +508,7 @@ describe("MainLoop", () => {
     );
   });
 
-  it("keeps tool steps quiet until evidence is ready in the latest user language", async () => {
+  it("keeps the default system prompt focused on runtime protocol", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
     const model = new ScriptedModel([{
@@ -535,12 +535,11 @@ describe("MainLoop", () => {
     });
 
     const prompt = model.requests[0]?.systemPrompt ?? "";
-    expect(prompt).toContain("Match all user-visible progress and final answers");
-    expect(prompt).toContain("language of the latest user message");
-    expect(prompt).toContain("tool output and context language do not change it");
-    expect(prompt).toContain("Tool steps emit only tools");
-    expect(prompt).toContain("answer after evidence is complete");
-    expect(prompt).toContain("except for an immediate risk or blocker");
+    expect(prompt).toContain("You are Main, the primary execution lane in Nausicaa.");
+    expect(prompt).toContain("complete tool-call interface");
+    expect(prompt).not.toContain("Match all user-visible progress and final answers");
+    expect(prompt).not.toContain("Search before broad traversal");
+    expect(prompt).not.toContain("Tool steps emit only tools");
   });
 
   it("keeps evidence guidance aligned with the visible grep schema", async () => {
@@ -578,7 +577,7 @@ describe("MainLoop", () => {
     };
 
     await expect(run([createGrepTool()], "grep-files-prompt"))
-      .resolves.toContain("outputMode=files");
+      .resolves.not.toContain("outputMode=files");
     await expect(run([createGrepTool({}, { pagination: "legacy" })], "grep-legacy-prompt"))
       .resolves.not.toContain("outputMode=files");
   });

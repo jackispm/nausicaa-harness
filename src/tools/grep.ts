@@ -121,7 +121,7 @@ export function createGrepTool(
     definition: {
       name: "grep",
       description: cursorPagination
-        ? "Search workspace file contents in stable pages and return bounded structured line matches or matching file paths. Use outputMode=files to discover the relevant file set before reading it, and nextCursor to continue a truncated page."
+        ? "Search workspace file contents in stable pages and return bounded structured line matches or matching file paths. A returned nextCursor continues a truncated page."
         : "Search workspace file contents for a pattern and return bounded structured matches.",
       parameters: {
         type: "object",

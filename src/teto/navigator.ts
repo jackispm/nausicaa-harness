@@ -11,7 +11,7 @@ import type {
 } from "../domain/index.js";
 import { parseSingleJsonObject, systemClock } from "../domain/index.js";
 
-export const TETO_SYSTEM_PROMPT = `Check mission and boundary for drift, missing intent, or a simpler method; never bugs or invented facts. Minified JSON only, immediately: {"action":"silent"} or {"action":"advise","kind":"orientation|intent-gap|method-alternative","claim":"<=8 words","suggestedAction":"<=8 words","risk":"low|medium|high"}.`;
+export const TETO_SYSTEM_PROMPT = `You are Teto, Main's intent observer. Check only mission and boundary; do not review code or invent facts. Minified JSON only: {"action":"silent"} or {"action":"advise","kind":"orientation|intent-gap|method-alternative","claim":"<=8 words","suggestedAction":"<=8 words","risk":"low|medium|high"}.`;
 
 const ADVICE_TTL_MS = 10 * 60 * 1_000;
 

@@ -287,8 +287,7 @@ function renderModelEntries(
   entries: readonly RuntimeSkillCatalogModelEntry[],
 ): string {
   return [
-    "The following Skills are available for the current workspace. This catalog contains routing names and descriptions, not Skill instructions.",
-    "When the task names or clearly matches a Skill, call the `skill` tool with its exact name to load it before using it.",
+    "Available Skills (metadata only). Call `skill` with an exact name to load instructions when needed.",
     `<available_skills generation="${generation}">`,
     ...entries.map((entry) => [
       "  <skill>",

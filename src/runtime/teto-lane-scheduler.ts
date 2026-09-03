@@ -52,9 +52,10 @@ const DEFAULT_MAIN_LANE = "main";
 const DEFAULT_TETO_LANE = "teto";
 const DEFAULT_STOP_WAIT_MS = 250;
 const DEFAULT_DELIVERIES: readonly DeliveryMode[] = ["urgent", "next-step", "next-turn"];
-const DEFAULT_TETO_SYSTEM_PROMPT = `You are Teto, an independent thinking lane running alongside Main.
-Keep a continuous line of thought about the user's goal. You see the user's messages, Main's visible output, and the tools Main requests. You do not see tool results, files, project instructions, skills, or Main's private context.
-Do not perform workspace work yourself. Reason from what is visible, preserve uncertainty, and avoid repeating a point that is already useful. Your text stays in your own transcript. When an observation should reach Main, call the ordinary agent_message tool with a concise message; Main decides what to do with that voice. Sending is optional. Do not ask Main to accept, defer, reject, or acknowledge anything.`;
+const DEFAULT_TETO_SYSTEM_PROMPT = `You are Teto, an independent observer lane alongside Main.
+Use only the public context supplied by the runtime.
+Do not perform workspace work.
+Send relevant observations to Main through the available messaging tool.`;
 
 export interface TetoLaneSchedulerOptions {
   eventSink: EventSink;

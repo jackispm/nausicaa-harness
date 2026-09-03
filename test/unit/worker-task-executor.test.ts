@@ -224,6 +224,7 @@ describe("WorkerTaskExecutor", () => {
     const request = model.requests[0]!;
     expect(request.messages[0]?.content).toContain(inputRef.contentHash);
     expect(request.messages[0]?.content).toContain("npm install");
+    expect(request.messages[0]?.content).toContain("Workspace root:");
     expect(request.maxOutputTokens).toBe(500);
     expect(recoveryReads.count).toBe(0);
     await expect(executor.runOnce()).resolves.toEqual({ status: "idle" });

@@ -36,7 +36,7 @@ export function createReadManyTool(policy: WorkspacePathPolicy = {}): AgentTool 
   return {
     definition: {
       name: "read_many",
-      description: "Read up to 16 independent workspace file windows in one bounded batch. Results preserve target order and isolate per-file failures. Continue truncated files with their returned nextOffset/nextLineByteOffset values.",
+      description: "Read up to 16 workspace file windows in one bounded batch. Results preserve target order and isolate per-file failures. Each truncated file includes nextOffset/nextLineByteOffset for continuation.",
       parameters: {
         type: "object",
         properties: {
@@ -44,7 +44,7 @@ export function createReadManyTool(policy: WorkspacePathPolicy = {}): AgentTool 
             type: "array",
             minItems: 1,
             maxItems: HARD_MAX_TARGETS,
-            description: "Independent file windows to read; use this for entry points, definitions, call sites, configuration, types, and tests discovered together",
+            description: "File windows to read in target order",
             items: {
               type: "object",
               properties: {

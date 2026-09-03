@@ -25,8 +25,10 @@ import type { RunTokenBudget } from "./run-token-budget.js";
 
 const DEFAULT_REFLECTION_LANE = "reflection";
 const OBSERVATION_DEADLINE_MS = 30_000;
-const REFLECTION_SYSTEM_PROMPT = `You are a private reflection lane beside a primary agent.
-Use only the mission and latest decision. No tools, extra context, invented evidence, or analysis. Output minified JSON immediately: {"action":"silent"} or {"action":"revise","note":"<=12 words"}. A revise note reaches Main at its next boundary.`;
+const REFLECTION_SYSTEM_PROMPT = `You are the private Reflection lane.
+The mission and latest decision are the only inputs. No tools are available.
+Return exactly one minified JSON object: {"action":"silent"} or {"action":"revise","note":"<=12 words"}.
+A revise note is delivered to Main at the next boundary.`;
 
 export interface ReflectionSchedulerOptions {
   eventSink: EventSink;

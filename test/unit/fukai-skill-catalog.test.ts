@@ -41,7 +41,7 @@ describe("Fukai runtime Skill catalog", () => {
     expect(view.messages[0]?.content).toContain('<available_skills generation="9">');
     expect(view.messages[0]?.content).toContain("review changes &lt;safe&gt;");
     expect(view.messages[0]?.content).not.toContain("SKILL.md");
-    expect(view.systemPrompt).not.toContain("/tmp/workspace");
+    expect(view.systemPrompt).toContain("/tmp/workspace");
     expect(view.skillCatalog).toMatchObject({
       included: true,
       generation: 9,

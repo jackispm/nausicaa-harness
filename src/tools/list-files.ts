@@ -31,7 +31,7 @@ export function createListFilesTool(policy: WorkspacePathPolicy = {}): AgentTool
   return {
     definition: {
       name: "list_files",
-      description: "List workspace files in stable order without following directory symlinks. Use offset and nextOffset to continue a large listing.",
+      description: "List workspace files in stable order without following directory symlinks. A returned nextOffset continues a large listing.",
       parameters: {
         type: "object",
         properties: {
