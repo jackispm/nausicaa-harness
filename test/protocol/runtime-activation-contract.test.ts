@@ -186,7 +186,11 @@ describe("runtime activation parity", () => {
       "process_start",
       "web_fetch",
     ]));
-    expect(customModel.requests[0]?.tools.map((tool) => tool.name)).toEqual(["noop"]);
+    expect(customModel.requests[0]?.tools.map((tool) => tool.name)).toEqual([
+      "noop",
+      "agent_awareness",
+      "team_create",
+    ]);
   });
 
   it("assembles the same observable Main request for one-shot and Session runtimes", async () => {
@@ -274,6 +278,8 @@ describe("runtime activation parity", () => {
       "process_output",
       "process_kill",
       "process_list",
+      "agent_awareness",
+      "team_create",
     ]);
   });
 
@@ -284,6 +290,7 @@ describe("runtime activation parity", () => {
     const sidecarGoal: Goal = { ...sharedGoal, statement: task };
     const policy = {
       tetoEnabled: true,
+      tetoActivation: "automatic",
       maxMainStepsPerActivation: 6,
       maxModelTokens: 50_000,
     } as const;
@@ -336,21 +343,25 @@ describe("runtime activation parity", () => {
       join(root, "session-teto-state", "runs", runId),
       runId,
     );
-    expect(projectSidecarContract(
-      sessionMain,
-      sessionTeto,
-      sessionEvents,
-    )).toEqual(projectSidecarContract(
-      oneShotMain,
-      oneShotTeto,
-      oneShotEvents,
-    ));
+    const sessionContract = projectSidecarContract(sessionMain, sessionTeto, sessionEvents);
+    const oneShotContract = projectSidecarContract(oneShotMain, oneShotTeto, oneShotEvents);
+    // Teto is deliberately non-blocking. Shutdown can observe one extra
+    // provider pass in a persistent Session, so compare the stable lane
+    // contract and assert activity independently below.
+    expect(stripAsyncTailCounts(sessionContract)).toEqual(stripAsyncTailCounts(oneShotContract));
     const contract = projectSidecarContract(oneShotMain, oneShotTeto, oneShotEvents);
     expect(contract).toMatchObject({
       mainCalls: 6,
       mainModels: ["scripted-main"],
       mainSessionIds: [`${runId}:main`],
-      mainTools: ["noop"],
+      mainTools: [
+        "noop",
+        "agent_awareness",
+        "teto_start",
+        "teto_stop",
+        "teto_status",
+        "team_create",
+      ],
       tetoModels: ["scripted-teto"],
       tetoSessionIds: [`${runId}:teto:scripted-teto`],
       tetoOutputLimits: [64],
@@ -360,6 +371,8 @@ describe("runtime activation parity", () => {
     });
     expect(contract.tetoCalls).toBeGreaterThanOrEqual(1);
     expect(contract.tetoCharges).toBeGreaterThanOrEqual(1);
+    expect(sessionContract.tetoCalls).toBeGreaterThanOrEqual(1);
+    expect(sessionContract.tetoCharges).toBeGreaterThanOrEqual(1);
 
     expect(projectMainRequest(sessionTeto.requests[0]))
       .toEqual(projectMainRequest(oneShotTeto.requests[0]));
@@ -416,10 +429,10 @@ function sidecarModels(prefix: string): {
   });
   return {
     main: new ScriptedModel(steps),
-    teto: new ScriptedModel([() => {
-      markTetoStarted?.();
+    teto: new ScriptedModel(Array.from({ length: 16 }, (_, index) => () => {
+      if (index === 0) markTetoStarted?.();
       return response('{"action":"silent"}', 150, 20);
-    }]),
+    })),
   };
 }
 
@@ -434,6 +447,11 @@ async function readEvents(stateDir: string, runId: string): Promise<AnyEvent[]> 
 
 function unique<T>(values: readonly T[]): T[] {
   return [...new Set(values)];
+}
+
+function stripAsyncTailCounts(contract: Record<string, unknown>): Record<string, unknown> {
+  const { tetoCalls: _tetoCalls, tetoCharges: _tetoCharges, ...stable } = contract;
+  return stable;
 }
 
 const noopTool: AgentTool = {

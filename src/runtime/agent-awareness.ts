@@ -32,6 +32,7 @@ export type AgentAwarenessRole =
   | "main"
   | "teto"
   | "worker"
+  | "team"
   | "reflection"
   | "auxiliary"
   | "unknown";
@@ -519,6 +520,7 @@ function mapRole(role: string | undefined, laneKind: string | undefined, laneId:
   if (value === "daemon" || value === "host") return "daemon";
   if (value === "main") return "main";
   if (value === "worker") return "worker";
+  if (value === "team" || value === "branch") return "team";
   if (value === "reflection") return "reflection";
   if (value === "auxiliary" || value === "explorer" || value === "critic") return "auxiliary";
   if (value === "unknown" || value.length === 0) return "unknown";
@@ -856,7 +858,7 @@ function safeTimestamp(value: unknown): string {
 
 function safeRole(value: unknown): AgentAwarenessRole {
   return typeof value === "string" && [
-    "daemon", "main", "teto", "worker", "reflection", "auxiliary", "unknown",
+    "daemon", "main", "teto", "worker", "team", "reflection", "auxiliary", "unknown",
   ].includes(value) ? value as AgentAwarenessRole : "unknown";
 }
 

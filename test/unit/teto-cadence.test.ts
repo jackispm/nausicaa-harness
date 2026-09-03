@@ -74,6 +74,16 @@ describe("TetoCadence", () => {
 });
 
 describe("TokenRatioGate", () => {
+  it("rejects token aggregation overflow instead of corrupting allowance", () => {
+    const gate = new TokenRatioGate(0.1, {
+      mainTokens: Number.MAX_SAFE_INTEGER,
+      tetoTokens: 0,
+      reservations: [],
+    });
+
+    expect(() => gate.chargeMain(1)).toThrow(/safe integer range/u);
+  });
+
   it("reserves before a Teto call and caps Teto at 10% of all model tokens", () => {
     const gate = new TokenRatioGate();
     gate.chargeMain(900);

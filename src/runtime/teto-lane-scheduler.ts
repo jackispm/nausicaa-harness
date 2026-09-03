@@ -207,7 +207,9 @@ export class TetoLaneScheduler {
       now: () => this.clock.now(),
     });
     this.tools = options.tools === undefined
-      ? [defaultTool]
+      // The preregistered auxiliary arm explicitly freezes an empty tool
+      // surface; ordinary unified Teto lanes retain their voice capability.
+      ? options.policy.auxiliaryMode === "teto" ? [] : [defaultTool]
       : [...options.tools];
     if (options.replayPublicEvents === true) {
       for (const event of [...(options.events ?? [])].sort(
@@ -268,6 +270,7 @@ export class TetoLaneScheduler {
       const records = await this.inbox.claim(this.mainLaneId, this.mainLaneId, {
         claimId: `${this.runId}:${this.laneId}:voice:${this.createId()}`,
         limit: 8,
+        runId: this.runId,
         from: this.laneId,
         types: ["message.inform"],
         ...(context === undefined ? {} : { deliveries: deliveriesForStep(context.step) }),

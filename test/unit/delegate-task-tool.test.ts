@@ -17,11 +17,16 @@ const context: ToolExecutionContext = {
   operationId: "operation-1",
 };
 
-function setup(maxInputBytes?: number) {
+function setup(maxInputBytes?: number, policy?: { depth?: number; maxDepth?: number }) {
   const inbox = new A2AInbox();
   const store = new MemoryContentAddressedStore();
   const dispatcher = new TaskDispatcher({ inbox, runId: "run-1" });
-  const tool = createDelegateTaskTool({ dispatcher, store, ...(maxInputBytes === undefined ? {} : { maxInputBytes }) });
+  const tool = createDelegateTaskTool({
+    dispatcher,
+    store,
+    ...(maxInputBytes === undefined ? {} : { maxInputBytes }),
+    ...(policy ?? {}),
+  });
   return { inbox, store, tool };
 }
 
@@ -115,6 +120,18 @@ describe("delegate_task tool", () => {
 
     expect(result.isError).toBe(true);
     expect(result.content).toContain("maxAttempts");
+    expect(inbox.snapshot().records).toEqual([]);
+  });
+
+  it("rejects recursive delegation before writing input or sending a task", async () => {
+    const { inbox, tool } = setup(undefined, { depth: 1, maxDepth: 1 });
+    const result = await tool.execute({
+      statement: "Nested work",
+      input: "must not be persisted",
+    }, context);
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/recursion depth limit/i);
     expect(inbox.snapshot().records).toEqual([]);
   });
 });

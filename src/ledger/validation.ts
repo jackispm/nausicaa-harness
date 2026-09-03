@@ -242,10 +242,10 @@ function runPolicy(value: unknown, path: string): asserts value is RunPolicy {
   if (item.workerEnabled !== undefined) {
     boolean(item.workerEnabled, `${path}.workerEnabled`);
   }
-  integer(item.tetoMaxOutputTokens, `${path}.tetoMaxOutputTokens`);
-  finiteNumber(item.tetoTokenRatio, `${path}.tetoTokenRatio`);
-  if ((item.tetoTokenRatio as number) > 1) {
-    invalid(`${path}.tetoTokenRatio`, "a finite number between 0 and 1");
+  integer(item.tetoMaxOutputTokens, `${path}.tetoMaxOutputTokens`, 1);
+  ratio(item.tetoTokenRatio, `${path}.tetoTokenRatio`);
+  if (item.tetoActivation !== undefined) {
+    oneOf(item.tetoActivation, `${path}.tetoActivation`, ["automatic", "manual"] as const);
   }
   if (item.auxiliaryMode !== undefined) {
     oneOf(item.auxiliaryMode, `${path}.auxiliaryMode`, [
@@ -923,7 +923,8 @@ const payloadValidators = {
   },
   "lane.registered": (value, path) => {
     const item = payloadObject(value, path, ["kind"]);
-    oneOf(item.kind, `${path}.kind`, ["main", "intent-navigator", "reflection", "worker"] as const);
+    oneOf(item.kind, `${path}.kind`, ["main", "intent-navigator", "reflection", "worker", "team"] as const);
+    optionalString(item.teamFingerprint, `${path}.teamFingerprint`);
   },
   "lane.status": (value, path) => {
     const item = payloadObject(value, path, ["status"]);
@@ -937,6 +938,11 @@ const payloadValidators = {
       "cancelled",
     ] as const);
     optionalString(item.reason, `${path}.reason`);
+    if (item.control !== undefined) {
+      const control = payloadObject(item.control, `${path}.control`, ["action", "requestedBy"]);
+      oneOf(control.action, `${path}.control.action`, ["start", "stop"] as const);
+      string(control.requestedBy, `${path}.control.requestedBy`, false);
+    }
   },
   "step.started": (value, path) => {
     const item = payloadObject(value, path, ["step"]);

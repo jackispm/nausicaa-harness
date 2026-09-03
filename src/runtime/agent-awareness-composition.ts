@@ -279,10 +279,12 @@ function addRunSource(
     if (lane === undefined || laneId === "main") continue;
     const laneEndpoint = endpoint(scope, runId, laneId);
     const state = stateForLane(lane.status);
-    const role = laneId === "teto" || lane.kind === "intent-navigator"
+    const role = laneId === "teto" || lane.kind === "intent-navigator" || laneId.endsWith(":teto")
       ? "teto"
       : laneId === "worker" || lane.kind === "worker"
         ? "worker"
+        : lane.kind === "team" || laneId.startsWith("team:")
+          ? "team"
       : lane.kind === "reflection"
           ? "reflection"
           : "auxiliary";
@@ -299,8 +301,12 @@ function addRunSource(
       visible: true,
       lastSeen: source.lastSeen ?? generatedAt,
     }, RECORD_PRIORITY.lane);
+    const parentLane = role === "teto" && laneId.endsWith(":teto")
+      ? laneId.slice(0, -":teto".length)
+      : "main";
+    const parentEndpoint = endpoint(scope, runId, parentLane);
     addEdge({
-      source: main,
+      source: parentEndpoint,
       target: laneEndpoint,
       relation: "parent",
       authorized: true,
@@ -308,7 +314,7 @@ function addRunSource(
     }, edges);
     if (role === "worker") {
       addEdge({
-        source: main,
+        source: parentEndpoint,
         target: laneEndpoint,
         relation: "delegates",
         authorized: true,
@@ -318,7 +324,7 @@ function addRunSource(
     if (role === "teto") {
       addEdge({
         source: laneEndpoint,
-        target: main,
+        target: parentEndpoint,
         relation: "observer",
         authorized: true,
         visible: true,
@@ -786,6 +792,7 @@ function roleForLane(laneId: string): string {
     case "main": return "main";
     case "teto": return "teto";
     case "worker": return "worker";
+    case "team": return "team";
     case "reflection": return "reflection";
     default: return "auxiliary";
   }

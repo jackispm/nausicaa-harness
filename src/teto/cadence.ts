@@ -193,7 +193,7 @@ export class TokenRatioGate {
   }
 
   chargeMain(usage: TokenUsage | number): void {
-    this.mainTokens += usageTokens(usage);
+    this.mainTokens = safeAdd(this.mainTokens, usageTokens(usage), "main token total");
   }
 
   availableTetoTokens(): number {
@@ -232,7 +232,7 @@ export class TokenRatioGate {
       );
     }
     this.reservations.delete(id);
-    this.tetoTokens += actual;
+    this.tetoTokens = safeAdd(this.tetoTokens, actual, "Teto token total");
   }
 
   cancel(id: string): void {
@@ -285,15 +285,24 @@ function usageTokens(usage: TokenUsage | number): number {
   assertNonNegativeInteger(usage.output, "output tokens");
   assertNonNegativeInteger(usage.cacheRead, "cache-read tokens");
   assertNonNegativeInteger(usage.cacheWrite, "cache-write tokens");
-  return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+  return [usage.input, usage.output, usage.cacheRead, usage.cacheWrite]
+    .reduce((total, value) => safeAdd(total, value, "token usage"), 0);
 }
 
 function sum(values: Iterable<number>): number {
   let total = 0;
   for (const value of values) {
-    total += value;
+    total = safeAdd(total, value, "reserved token total");
   }
   return total;
+}
+
+function safeAdd(left: number, right: number, label: string): number {
+  const result = left + right;
+  if (!Number.isSafeInteger(result)) {
+    throw new RangeError(`${label} exceeds the safe integer range`);
+  }
+  return result;
 }
 
 function assertPositiveInteger(value: number, label: string): void {

@@ -176,7 +176,12 @@ export class TetoScheduler {
   async beforeMainStep(
     context?: Pick<MainBeforeStepContext, "step">,
   ): Promise<readonly MainBoundaryMessage[]> {
-    if (!this.policy.tetoEnabled) {
+    if (
+      !this.policy.tetoEnabled
+      || !this.accepting
+      || this.stopController.signal.aborted
+      || this.signal?.aborted === true
+    ) {
       return [];
     }
 
@@ -184,6 +189,7 @@ export class TetoScheduler {
       const records = await this.inbox.claim(this.mainLaneId, this.mainLaneId, {
         claimId: this.createId(),
         limit: MAX_BOUNDARY_ADVICE,
+        runId: this.runId,
         types: ["advice.propose"],
         ...(context === undefined
           ? {}
@@ -330,16 +336,16 @@ export class TetoScheduler {
         signal,
       }), signal);
       providerUsage = result.usage;
-      if (runReservationId !== undefined) {
-        this.runTokenBudget?.settle(runReservationId, result.usage);
-        runReservationSettled = true;
-      }
       await this.recordBudgetCharge(
         decision.mainCallIndex,
         context.delta.boundaryId,
         result.usage,
       );
       budgetChargeRecorded = true;
+      if (runReservationId !== undefined) {
+        this.runTokenBudget?.settle(runReservationId, result.usage);
+        runReservationSettled = true;
+      }
 
       await this.eventSink.append({
         runId: this.runId,
@@ -631,6 +637,14 @@ export function recoverTetoSchedulerState(
     }
   }
 
+  // A crash can leave a durable model.completed without its following
+  // navigation.updated boundary. Preserve that billable usage without
+  // inventing a committed Main call or cadence trigger.
+  const unpairedMainTokens = pendingMainUsage.reduce(
+    (total, usage) => total + totalTokens(usage),
+    0,
+  );
+
   const sortedPassCalls = [...passCalls].sort((left, right) => left - right);
   if ((sortedPassCalls.at(-1) ?? 0) > mainCalls.length) {
     throw new Error("Recovered Teto pass is ahead of the Main call count");
@@ -657,7 +671,7 @@ export function recoverTetoSchedulerState(
       mainTokens: mainCalls.reduce(
         (total, call) => total + totalTokens(call.usage),
         0,
-      ),
+      ) + unpairedMainTokens,
       tetoTokens: chargedTetoTokens + [...observedUsageByCall]
         .filter(([call]) => !chargedCalls.has(call))
         .reduce((total, [, usage]) => total + totalTokens(usage), 0),

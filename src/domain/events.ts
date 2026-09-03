@@ -61,8 +61,13 @@ export interface EventPayloadMap {
   "run.completed": { answerRef?: ArtifactRef };
   "run.failed": { error: string };
   "goal.revised": { goal: Goal };
-  "lane.registered": { kind: LaneKind };
-  "lane.status": { status: LaneStatus; reason?: string };
+  "lane.registered": { kind: LaneKind; teamFingerprint?: string };
+  /** Optional lifecycle marker carried by the existing lane status fact. */
+  "lane.status": {
+    status: LaneStatus;
+    reason?: string;
+    control?: { action: "start" | "stop"; requestedBy: LaneId };
+  };
   "step.started": { step: number };
   "step.completed": {
     step: number;

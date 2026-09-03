@@ -24,6 +24,7 @@ import type {
   Goal,
   LaneStatus,
   RunPolicy,
+  TetoActivationMode,
   TokenUsage,
 } from "../domain/types.js";
 import {
@@ -93,7 +94,12 @@ import {
   recoverRunTokenUsageByLane,
   type RecoveredLaneUsage,
 } from "./run-token-budget-recovery.js";
-import { TetoLaneScheduler } from "./teto-lane-scheduler.js";
+import { TetoLaneController } from "./teto-lane-controller.js";
+import { createAgentAwarenessTool } from "./agent-awareness-tool.js";
+import { createTetoControlTools } from "./teto-control-tool.js";
+import { TeamRuntime } from "./team-runtime.js";
+import { createTeamTool } from "./team-tool.js";
+import { projectRunAwareness } from "./run-awareness.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
 import {
   createCrossRunRuntimeTool,
@@ -298,6 +304,8 @@ export interface SessionControllerOptions {
   workerEnabled?: boolean;
   /** Explicit Fukai capability settings; omitted keeps the legacy disabled path. */
   fukaiCompaction?: FukaiCompactionPolicy;
+  /** Manual leaves Teto dormant until Main calls `teto_start`. */
+  tetoActivation?: TetoActivationMode;
   policy?: Partial<RunPolicy>;
   maxOutputTokens?: number;
   allowWrite?: boolean;
@@ -361,8 +369,11 @@ interface AttachedRun {
   policy: RunPolicy;
   tokenBudget: RunTokenBudget;
   mainModel: string;
+  inbox?: A2AInbox;
   processJobs?: ProcessJobManager;
   worker?: WorkerLaneRuntime;
+  teto?: TetoLaneController;
+  team?: TeamRuntime;
 }
 
 interface WorkerLaneRuntime {
@@ -459,6 +470,17 @@ export class SessionController {
       ...(options.workerEnabled === undefined
         ? {}
         : { workerEnabled: options.workerEnabled }),
+      ...(options.tetoActivation === undefined
+        ? {}
+        : { tetoActivation: options.tetoActivation }),
+      ...(options.tetoActivation !== undefined || options.policy?.tetoActivation !== undefined
+        ? {}
+        : {
+            tetoActivation: options.policy?.maxMainSteps !== undefined
+              || options.policy?.auxiliaryMode === "teto"
+              ? "automatic"
+              : "manual",
+          }),
     });
   }
 
@@ -1431,6 +1453,20 @@ export class SessionController {
           idempotencyKey: "lane:teto:registered",
           visibility: "run",
         });
+        await sink.append({
+          runId,
+          laneId: "teto",
+          type: "lane.status",
+          payload: {
+            status: "dormant",
+            ...(this.policy.tetoActivation === "manual"
+              ? { reason: "Teto available; Main may open it with teto_start" }
+              : {}),
+          },
+          correlationId: `run:${runId}`,
+          idempotencyKey: "lane:teto:status:dormant",
+          visibility: "run",
+        });
       }
       if (this.policy.workerEnabled === true) {
         await sink.append({
@@ -1459,6 +1495,7 @@ export class SessionController {
       if (this.policy.workerEnabled === true) {
         attached.worker = this.createWorkerLaneRuntime(attached);
       }
+      await this.initializeLaneRuntimes(attached);
       this.attached = attached;
       attached.worker?.scheduler.enqueue();
       this.status = "idle";
@@ -1518,6 +1555,116 @@ export class SessionController {
     return { inbox, dispatcher, scheduler };
   }
 
+  private async initializeLaneRuntimes(attached: AttachedRun): Promise<void> {
+    const events = attached.sink.cachedEvents;
+    const inbox = attached.worker?.inbox ?? new A2AInbox({
+      sink: attached.sink,
+      events,
+      clock: this.clock,
+    });
+    attached.inbox = inbox;
+    const tetoModel = this.deps.tetoModel
+      ?? this.deps.mainModel
+      ?? createOpenRouterModelPort();
+    const tetoBudget = new RunTokenBudget(
+      attached.policy.maxModelTokens,
+      totalTokens(laneUsage(events, attached.runId, "teto")),
+      { parent: attached.tokenBudget, scope: "teto" },
+    );
+    if (attached.policy.tetoEnabled) {
+      // A controller may open Teto more than once. Its compaction runtime is
+      // intentionally activation-scoped, so each scheduler gets a fresh one.
+      const createTetoCompactionRuntime = attached.policy.fukaiCompaction?.enabled === true
+        && attached.policy.fukaiCompaction.provider === "pi-ai"
+        ? () => instantiateRuntimeFukaiCompaction(
+            attached.policy,
+            this.deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
+            {
+              ledger: attached.sink,
+              store: attached.store,
+              modelPort: tetoModel,
+              model: this.tetoModel,
+              tokenBudget: tetoBudget,
+              clock: this.clock,
+              policy: attached.policy,
+            },
+          )
+        : undefined;
+      const teto = new TetoLaneController({
+        eventSink: attached.sink,
+        inbox,
+        store: attached.store,
+        model: tetoModel,
+        modelName: this.tetoModel,
+        runId: attached.runId,
+        goal: attached.goal,
+        policy: attached.policy,
+        workspace: this.workspace,
+        events,
+        readEvents: () => attached.ledger.read({ runId: attached.runId }),
+        readWatermark: () => attached.ledger.watermark(),
+        clock: this.clock,
+        tokenBudget: tetoBudget,
+        ...(createTetoCompactionRuntime === undefined
+          ? {}
+          : { createCompactionRuntime: createTetoCompactionRuntime }),
+        policyVersion: deriveRuntimePolicyVersion(attached.policy),
+      });
+      attached.teto = teto;
+      await teto.ensureAvailable();
+      if (attached.policy.tetoActivation !== "manual") {
+        await teto.start({
+          runId: attached.runId,
+          laneId: "main",
+          workspace: this.workspace,
+          operationId: `${attached.runId}:teto:auto-start`,
+        });
+      } else {
+        await teto.restoreIfRequested();
+      }
+    }
+
+    const branchModel = this.deps.workerModel
+      ?? this.deps.mainModel
+      ?? createOpenRouterModelPort();
+    const branchTools = this.deps.workerTools ?? createWorkspaceTools({
+      allowWrite: false,
+      allowShell: false,
+      allowImages: shouldAdvertiseImageTools(branchModel, this.workerModel),
+      protectedPaths: [this.dataDir],
+    });
+    attached.team = new TeamRuntime({
+      eventSink: attached.sink,
+      inbox,
+      store: attached.store,
+      model: branchModel,
+      modelName: this.workerModel,
+      runId: attached.runId,
+      workspace: this.workspace,
+      branchTools,
+      runTokenBudget: attached.tokenBudget,
+      readEvents: () => attached.ledger.read({ runId: attached.runId }),
+      readWatermark: () => attached.ledger.watermark(),
+      readAwareness: () => projectRunAwareness(
+        attached.sink.cachedEvents,
+        attached.runId,
+        this.clock.now().toISOString(),
+        "interactive-session",
+      ),
+      clock: this.clock,
+      policy: attached.policy,
+      policyVersion: deriveRuntimePolicyVersion(attached.policy),
+      ...(attached.policy.fukaiCompaction?.enabled === true
+        && attached.policy.fukaiCompaction.provider === "pi-ai"
+        ? {
+            createCompactionRuntime:
+              this.deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
+          }
+        : {}),
+    });
+    await attached.team.restore();
+  }
+
   private async openAttachment(runId: string): Promise<AttachedRun> {
     const stateDir = resolve(this.dataDir, "runs", runId);
     const ledger = await JsonlLedger.open(resolve(stateDir, "ledger.jsonl"));
@@ -1564,9 +1711,7 @@ export class SessionController {
         policy: projection.run.policy,
         tokenBudget: new RunTokenBudget(
           projection.run.policy.maxModelTokens,
-          totalTokens(projection.run.policy.tetoEnabled
-            ? usageExceptLane(events, runId, "teto")
-            : recoverRunTokenUsage(events, runId)),
+          totalTokens(recoverRunTokenUsage(events, runId)),
         ),
         // Schema-v1 Runs created before model.selected keep the caller's
         // configured selector until the first explicit selection is recorded.
@@ -1578,6 +1723,7 @@ export class SessionController {
       if (projection.run.policy.workerEnabled === true) {
         attached.worker = this.createWorkerLaneRuntime(attached);
       }
+      await this.initializeLaneRuntimes(attached);
       return attached;
     } catch (error: unknown) {
       if (attached !== undefined) {
@@ -1662,7 +1808,7 @@ export class SessionController {
     if (!events.some((event) =>
       event.type === "user.message" && event.payload.inputId === inputId
     )) {
-      await attached.sink.append({
+      const userMessageEvent = await attached.sink.append({
         runId: attached.runId,
         turnId,
         laneId: "main",
@@ -1678,6 +1824,10 @@ export class SessionController {
         visibility: "user",
         occurredAt: this.clock.now().toISOString(),
       });
+      // Session promotion persists the public user message outside MainLoop.
+      // Feed it into an already-active Teto so its transcript matches the
+      // one-shot path, where MainLoop emits this fact before its first step.
+      attached.teto?.observeMainEvent(userMessageEvent);
     }
     return { turnId, inputId };
   }
@@ -1718,7 +1868,6 @@ export class SessionController {
 
   private async runTurn(turn: ActiveTurn): Promise<void> {
     const attached = this.requireAttached();
-    let scheduler: TetoLaneScheduler | undefined;
     try {
       const events = await attached.ledger.read({ runId: attached.runId });
       const turnStarted = events.find((event): event is Extract<AnyEvent, {
@@ -1753,7 +1902,7 @@ export class SessionController {
         turn.turnId,
       );
       const model = this.deps.mainModel ?? createOpenRouterModelPort();
-      const inbox = attached.worker?.inbox ?? new A2AInbox({
+      const inbox = attached.inbox ?? new A2AInbox({
         sink: attached.sink,
         events,
         clock: this.clock,
@@ -1811,50 +1960,24 @@ export class SessionController {
         }
         tools.push(crossRunTool);
       }
-      if (attached.policy.tetoEnabled) {
-        const tetoModel = this.deps.tetoModel ?? model;
-        const tetoModelName = this.tetoModel;
-        const tetoTokenBudget = new RunTokenBudget(
-          attached.policy.maxModelTokens,
-          totalTokens(laneUsage(events, attached.runId, "teto")),
-        );
-        const tetoCompactionRuntime = instantiateRuntimeFukaiCompaction(
-          attached.policy,
-          this.deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
-          {
-            ledger: attached.sink,
-            store: attached.store,
-            modelPort: tetoModel,
-            model: tetoModelName,
-            tokenBudget: tetoTokenBudget,
-            clock: this.clock,
-            policy: attached.policy,
-          },
-        );
-        scheduler = new TetoLaneScheduler({
-          eventSink: attached.sink,
-          inbox,
-          store: attached.store,
-          model: tetoModel,
-          modelName: tetoModelName,
-          runId: attached.runId,
-          goal: attached.goal,
-          policy: attached.policy,
-          workspace: this.workspace,
-          events,
-          clock: this.clock,
-          tokenBudget: tetoTokenBudget,
-          ...(tetoCompactionRuntime === undefined
-            ? {}
-            : { compactionRuntime: tetoCompactionRuntime }),
-          policyVersion: deriveRuntimePolicyVersion(attached.policy),
-          readWatermark: () => attached.ledger.watermark(),
-          replayPublicEvents: true,
-          signal: turn.controller.signal,
-        });
+      pushSessionRuntimeTool(tools, createAgentAwarenessTool({
+        read: () => projectRunAwareness(
+          attached.sink.cachedEvents,
+          attached.runId,
+          this.clock.now().toISOString(),
+          "interactive-session",
+        ),
+      }));
+      if (attached.teto !== undefined) {
+        for (const tool of createTetoControlTools(attached.teto)) {
+          pushSessionRuntimeTool(tools, tool);
+        }
+      }
+      if (attached.team !== undefined) {
+        pushSessionRuntimeTool(tools, createTeamTool(attached.team));
       }
       if (attached.worker !== undefined) {
-        tools.push(createDelegateTaskTool({
+        pushSessionRuntimeTool(tools, createDelegateTaskTool({
           dispatcher: attached.worker.dispatcher,
           store: attached.store,
         }));
@@ -1913,8 +2036,6 @@ export class SessionController {
       }
       const remaining = attached.tokenBudget.availableTokens();
       if (remaining === 0) {
-        await scheduler?.stop();
-        scheduler = undefined;
         await this.failRunBudget(turn.turnId);
         return;
       }
@@ -1928,7 +2049,7 @@ export class SessionController {
         clock: this.clock,
         runTokenBudget: attached.tokenBudget,
         eventObserver: (event) => {
-          if (event.laneId === "main") scheduler?.observeMainEvent(event);
+          if (event.laneId === "main") attached.teto?.observeMainEvent(event);
         },
         ...(edgeProjection.contextContributions.length === 0
           ? {}
@@ -1957,16 +2078,18 @@ export class SessionController {
           return [
             ...continuation,
             ...await this.deliverSteering(turn.turnId, step),
-            ...await (scheduler?.beforeMainStep({ step }) ?? Promise.resolve([])),
+            ...await (attached.teto?.beforeMainStep({ step }) ?? Promise.resolve([])),
             ...await (attached.worker?.scheduler.beforeMainStep({ step }) ?? Promise.resolve([])),
+            ...await (attached.team?.beforeMainStep({ step }) ?? Promise.resolve([])),
           ];
         },
-        ...(scheduler === undefined && attached.worker === undefined
+        ...(attached.teto === undefined && attached.worker === undefined && attached.team === undefined
           ? {}
           : {
               afterStep: (context) => {
-                scheduler?.enqueue(context);
+                attached.teto?.enqueue(context);
                 attached.worker?.scheduler.enqueue(context);
+                attached.team?.enqueue(context);
               },
             }),
         ...(compactionRuntime === undefined
@@ -2003,10 +2126,10 @@ export class SessionController {
         completeRun: false,
         signal: turn.controller.signal,
       });
-      await settlesWithin(scheduler?.drain() ?? Promise.resolve(), 25);
+      await settlesWithin(attached.teto?.drain() ?? Promise.resolve(), 25);
+      await settlesWithin(attached.team?.drain() ?? Promise.resolve(), 25);
       // Worker work remains live after this Turn. Its terminal messages stay in
       // the Inbox until a later Main boundary accepts them.
-      await scheduler?.stop();
       if (!result.completed) {
         const waitingReason = result.stopReason === "length"
           ? "model-output-limit"
@@ -2044,7 +2167,6 @@ export class SessionController {
         );
       }
     } catch (error: unknown) {
-      await scheduler?.stop().catch(() => undefined);
       if (turn.controller.signal.aborted) {
         await this.appendTurnCancelled(turn.turnId, persistedErrorText(
           turn.controller.signal.reason,
@@ -2098,7 +2220,6 @@ export class SessionController {
         );
       }
     } finally {
-      await scheduler?.stop().catch(() => undefined);
       if (this.status !== "closed") {
         await commitRunCheckpoint(attached.sink, attached.runId).catch(() => undefined);
       }
@@ -2426,6 +2547,8 @@ export class SessionController {
 
   private async stopWorkerLane(attached: AttachedRun): Promise<void> {
     await attached.worker?.scheduler.stop().catch(() => undefined);
+    await attached.team?.stop().catch(() => undefined);
+    await attached.teto?.close().catch(() => undefined);
   }
 
   private async createProcessJobManager(runId: string): Promise<ProcessJobManager> {
@@ -2603,6 +2726,14 @@ class SessionEventSink implements Ledger {
 
 function highestGlobalOffset(events: readonly AnyEvent[]): number {
   return events.reduce((highest, event) => Math.max(highest, event.globalOffset), 0);
+}
+
+function pushSessionRuntimeTool(tools: AgentTool[], tool: AgentTool): void {
+  const name = tool.definition.name.trim();
+  if (tools.some((candidate) => candidate.definition.name.trim() === name)) {
+    throw new SessionProtocolError(`Runtime capability collides with an existing tool: ${name}`);
+  }
+  tools.push(tool);
 }
 
 export async function findLatestRunId(
@@ -2801,21 +2932,6 @@ function laneUsage(
   return recoverRunTokenUsageByLane(events, runId)
     .find((lane) => lane.laneId === laneId)?.usage
     ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-}
-
-function usageExceptLane(
-  events: readonly AnyEvent[],
-  runId: string,
-  excludedLaneId: string,
-): TokenUsage {
-  return recoverRunTokenUsageByLane(events, runId)
-    .filter((lane) => lane.laneId !== excludedLaneId)
-    .reduce((total, lane) => ({
-      input: total.input + lane.usage.input,
-      output: total.output + lane.usage.output,
-      cacheRead: total.cacheRead + lane.usage.cacheRead,
-      cacheWrite: total.cacheWrite + lane.usage.cacheWrite,
-    }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 }
 
 function ensureVisibleLanes(

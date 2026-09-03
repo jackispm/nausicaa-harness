@@ -12,6 +12,7 @@ import type {
   DeliveryMode,
   Goal,
   LaneId,
+  RunId,
   TaskBudget,
   TokenUsage,
 } from "../domain/index.js";
@@ -73,6 +74,8 @@ export interface ClaimOptions {
   claimId?: string;
   limit?: number;
   now?: Date;
+  /** Restrict claims to messages belonging to one Run. */
+  runId?: RunId;
   from?: LaneId;
   types?: readonly A2APayload["type"][];
   deliveries?: readonly DeliveryMode[];
@@ -80,7 +83,7 @@ export interface ClaimOptions {
 
 export type ClaimAvailabilityOptions = Pick<
   ClaimOptions,
-  "now" | "from" | "types" | "deliveries"
+  "now" | "runId" | "from" | "types" | "deliveries"
 >;
 
 export interface AdviceAckResult {
@@ -297,6 +300,7 @@ export class A2AInbox {
     options: ClaimAvailabilityOptions = {},
   ): number | undefined {
     nonEmpty(to, "to");
+    if (options.runId !== undefined) nonEmpty(options.runId, "runId");
     if (options.from !== undefined) nonEmpty(options.from, "from");
     const now = options.now ?? this.clock.now();
     const nowMs = now.getTime();
@@ -306,6 +310,7 @@ export class A2AInbox {
       if (
         record.status === "handled"
         || isExpired(record.message, now)
+        || (options.runId !== undefined && record.message.runId !== options.runId)
         || (options.from !== undefined && record.message.from !== options.from)
         || (options.types !== undefined
           && !options.types.includes(record.message.payload.type))
@@ -416,6 +421,7 @@ export class A2AInbox {
     const limit = options.limit ?? 1;
     const claimId = options.claimId ?? randomUUID();
     nonEmpty(claimId, "claimId");
+    if (options.runId !== undefined) nonEmpty(options.runId, "runId");
     if (options.from !== undefined) nonEmpty(options.from, "from");
     if (!Number.isSafeInteger(limit) || limit <= 0) {
       throw new RangeError("claim limit must be a positive integer");
@@ -427,6 +433,7 @@ export class A2AInbox {
     if (repeated.length > 0) {
       if (repeated.some((record) => (
         record.message.to !== to
+        || (options.runId !== undefined && record.message.runId !== options.runId)
         || record.claim?.claimedBy !== claimedBy
         || (options.from !== undefined && record.message.from !== options.from)
         || (options.types !== undefined
@@ -441,6 +448,7 @@ export class A2AInbox {
 
     const eligible = this.projector.list(to)
       .filter((record) => this.isClaimable(record, now))
+      .filter((record) => options.runId === undefined || record.message.runId === options.runId)
       .filter((record) => options.from === undefined || record.message.from === options.from)
       .filter((record) => (
         options.types === undefined

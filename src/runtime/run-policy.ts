@@ -19,6 +19,9 @@ export const DEFAULT_RUN_POLICY: RunPolicy = {
   tetoEnabled: true,
   tetoMaxOutputTokens: 64,
   tetoTokenRatio: 0.1,
+  // New lanes expose Teto as a capability; the owning model opens it when
+  // the task warrants a second line of thought.
+  tetoActivation: "manual",
   workerEnabled: false,
 };
 
@@ -26,7 +29,11 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
   const allowance = input.maxMainStepsPerActivation
     ?? input.maxMainSteps
     ?? mainStepAllowance(DEFAULT_RUN_POLICY);
-  const policy: RunPolicy = {
+  const defaultTetoActivation = input.tetoActivation
+    ?? (input.maxMainSteps !== undefined || input.auxiliaryMode === "teto"
+      ? "automatic"
+      : DEFAULT_RUN_POLICY.tetoActivation);
+  const policy = {
     maxMainStepsPerActivation: allowance,
     maxModelTokens: input.maxModelTokens ?? DEFAULT_RUN_POLICY.maxModelTokens,
     mainRequestTimeoutMs: input.mainRequestTimeoutMs
@@ -34,6 +41,7 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
     tetoEnabled: input.tetoEnabled ?? DEFAULT_RUN_POLICY.tetoEnabled,
     tetoMaxOutputTokens: input.tetoMaxOutputTokens ?? DEFAULT_RUN_POLICY.tetoMaxOutputTokens,
     tetoTokenRatio: input.tetoTokenRatio ?? DEFAULT_RUN_POLICY.tetoTokenRatio,
+    tetoActivation: defaultTetoActivation,
     workerEnabled: input.workerEnabled ?? DEFAULT_RUN_POLICY.workerEnabled ?? false,
     ...(input.auxiliaryMode === undefined ? {} : { auxiliaryMode: input.auxiliaryMode }),
     ...(input.tetoAdviceDelivery === undefined
@@ -42,7 +50,7 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
     ...(input.fukaiCompaction === undefined
       ? {}
       : { fukaiCompaction: normalizeFukaiCompactionPolicy(input.fukaiCompaction) }),
-  };
+  } as RunPolicy;
   if (!Number.isSafeInteger(allowance) || allowance < 1) {
     throw new RangeError("maxMainStepsPerActivation must be a positive integer");
   }
@@ -69,6 +77,11 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
   }
   if (policy.tetoTokenRatio <= 0 || policy.tetoTokenRatio >= 1) {
     throw new RangeError("tetoTokenRatio must be between zero and one");
+  }
+  if (policy.tetoActivation !== undefined
+    && policy.tetoActivation !== "automatic"
+    && policy.tetoActivation !== "manual") {
+    throw new RangeError("tetoActivation must be automatic or manual");
   }
   if (
     policy.auxiliaryMode !== undefined

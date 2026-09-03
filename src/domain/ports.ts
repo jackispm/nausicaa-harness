@@ -66,6 +66,8 @@ export interface ModelPort {
 
 export interface ToolExecutionContext {
   runId: RunId;
+  /** Authenticated owner lane for lane-scoped runtime capabilities. */
+  laneId?: LaneId;
   workspace: string;
   operationId: string;
   signal?: AbortSignal;

@@ -5,6 +5,11 @@ import {
 } from "../domain/types.js";
 import type { ContentAddressedStore } from "../store/index.js";
 import { TaskDispatcher } from "./task-dispatcher.js";
+import {
+  DEFAULT_SUBAGENT_MAX_DEPTH,
+  assertSubagentSpawnAllowed,
+  evaluateSubagentDepth,
+} from "./subagent-policy.js";
 
 const DEFAULT_MAX_INPUT_BYTES = 64 * 1024;
 /** Small defaults keep an unconfigured Worker slice bounded and cheap. */
@@ -17,6 +22,10 @@ export interface DelegateTaskToolOptions {
   dispatcher: TaskDispatcher;
   store: ContentAddressedStore;
   maxInputBytes?: number;
+  /** Current parent depth; root Main uses zero. */
+  depth?: number;
+  /** Absolute recursion limit for this host composition. */
+  maxDepth?: number;
 }
 
 /**
@@ -28,6 +37,9 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
   if (!Number.isSafeInteger(maxInputBytes) || maxInputBytes <= 0) {
     throw new RangeError("maxInputBytes must be a positive integer");
   }
+  const depth = options.depth ?? 0;
+  const maxDepth = options.maxDepth ?? DEFAULT_SUBAGENT_MAX_DEPTH;
+  evaluateSubagentDepth(depth, maxDepth);
 
   return {
     definition: {
@@ -52,6 +64,9 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
 
     async execute(arguments_) {
       try {
+        // Admission happens before input persistence or Inbox mutation. A
+        // denied recursive spawn therefore leaves no orphaned artifacts.
+        assertSubagentSpawnAllowed(depth, maxDepth);
         const statement = requiredString(arguments_.statement, "statement");
         const successCriteria = stringArray(arguments_.successCriteria, "successCriteria");
         const hardConstraints = stringArray(arguments_.hardConstraints, "hardConstraints");

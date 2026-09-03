@@ -18,7 +18,7 @@ import type {
 } from "../domain/context.js";
 import type { ToolDefinition } from "../domain/ports.js";
 
-export type FukaiLaneKind = "main" | "intent-navigator" | "explorer" | "worker";
+export type FukaiLaneKind = "main" | "intent-navigator" | "explorer" | "worker" | "team";
 
 export interface FukaiConversationRef {
   ref: ArtifactRef;

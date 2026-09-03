@@ -439,6 +439,32 @@ describe("TetoScheduler", () => {
     expect(secondModel.callCount).toBe(1);
     expect(second.snapshot().cadenceState.passCalls).toEqual([2, 7]);
   });
+
+  it("retains paired and trailing Main usage after a crash before navigation", async () => {
+    const ledger = new MemoryLedger({ clock });
+    await recordMainBoundary(ledger, mainStep(1, usage(700, 100, 600, 100)));
+    await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "model.completed",
+      payload: {
+        model: "main-model",
+        responseRef: {
+          id: "response-orphan",
+          contentHash: `sha256:${"f".repeat(64)}`,
+          mediaType: "text/plain",
+          byteLength: 1,
+        },
+        stopReason: "toolUse",
+        usage: usage(11, 7, 5, 3),
+      },
+      correlationId: "run-1",
+      idempotencyKey: "main:2:model",
+    });
+
+    const recovered = recoverTetoSchedulerState(await ledger.read(), { runId: "run-1" });
+    expect(recovered.tokenGateState.mainTokens).toBe(1_526);
+  });
 });
 
 function setup(

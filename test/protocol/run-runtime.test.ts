@@ -880,14 +880,22 @@ describe("executeRun", () => {
 
   it("returns Main's answer without waiting for a slow observer tail", async () => {
     const root = await temporaryRoot();
+    let markTetoStarted: (() => void) | undefined;
+    const tetoStarted = new Promise<void>((resolve) => { markTetoStarted = resolve; });
     const mainResponses: ScriptedModelStep[] = Array.from({ length: 5 }, (_, index) => ({
       ...response(`Step ${index + 1}`, 1_000, 200),
       stopReason: "toolUse",
       toolCalls: [{ id: `slow-call-${index + 1}`, name: "noop", arguments: {} }],
     }));
-    mainResponses.push(response("Done", 1_000, 200));
+    mainResponses.push(async () => {
+      // Wait until the sparse observer has actually entered its provider call;
+      // the test then exercises cancellation rather than wall-clock timing.
+      await tetoStarted;
+      return response("Done", 1_000, 200);
+    });
     const slowTeto = new ScriptedModel([async () => {
-      await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+      markTetoStarted?.();
+      await new Promise<void>(() => undefined);
       return response('{"action":"silent"}', 20, 5);
     }]);
     const result = await executeRun({

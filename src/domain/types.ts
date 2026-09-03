@@ -9,7 +9,7 @@ export type ArtifactId = string;
 export type MessageId = string;
 export type OperationId = string;
 
-export type LaneKind = "main" | "intent-navigator" | "reflection" | "worker";
+export type LaneKind = "main" | "intent-navigator" | "reflection" | "worker" | "team";
 export type LaneStatus =
   | "dormant"
   | "ready"
@@ -266,6 +266,8 @@ export interface Advice {
 
 export type DeliveryMode = "next-step" | "next-turn" | "deferred" | "urgent";
 export type AuxiliaryMode = "none" | "teto" | "reflection";
+/** Whether a lane's optional Teto is opened by the host or by the lane tool. */
+export type TetoActivationMode = "automatic" | "manual";
 
 export interface TaskBudget {
   maxModelTokens: number;
@@ -357,6 +359,8 @@ interface RunPolicyBase {
   tetoEnabled: boolean;
   tetoMaxOutputTokens: number;
   tetoTokenRatio: number;
+  /** Optional for legacy Runs; manual makes `teto_start` the only opener. */
+  tetoActivation?: TetoActivationMode;
   /** Optional for schema-v1 compatibility; omitted means the Worker lane is off. */
   workerEnabled?: boolean;
   /** Present only for preregistered evaluation arms. */

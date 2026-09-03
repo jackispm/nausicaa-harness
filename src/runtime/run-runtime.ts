@@ -19,7 +19,9 @@ import type {
   ConversationMessage,
   FukaiCompactionPolicy,
   Goal,
+  LaneStatus,
   RunPolicy,
+  TetoActivationMode,
   TokenUsage,
   AuxiliaryMode,
 } from "../domain/types.js";
@@ -86,6 +88,12 @@ import { IntentNavigator, ObservationFrameBuilder } from "../teto/index.js";
 import { createAdviceResponseTool } from "./advice-tool.js";
 import { TetoScheduler, type TetoAdviceDelivery } from "./teto-scheduler.js";
 import { TetoLaneScheduler } from "./teto-lane-scheduler.js";
+import { TetoLaneController } from "./teto-lane-controller.js";
+import { createAgentAwarenessTool } from "./agent-awareness-tool.js";
+import { createTetoControlTools } from "./teto-control-tool.js";
+import { TeamRuntime } from "./team-runtime.js";
+import { createTeamTool } from "./team-tool.js";
+import { projectRunAwareness } from "./run-awareness.js";
 import { ReflectionScheduler } from "./reflection-scheduler.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
 import { TaskDispatcher } from "./task-dispatcher.js";
@@ -119,6 +127,8 @@ export interface RunExecutionRequest {
   workerModel?: string;
   /** Evaluation-only auxiliary topology. Defaults to Teto when enabled by policy. */
   auxiliaryMode?: AuxiliaryMode;
+  /** Manual leaves Teto dormant until Main calls `teto_start`. */
+  tetoActivation?: TetoActivationMode;
   /** Opt-in bounded Worker lane; omitted or false preserves Main-only behavior. */
   workerEnabled?: boolean;
   /** Explicit Fukai capability settings; omitted keeps the legacy disabled path. */
@@ -236,8 +246,9 @@ export const executeRun = async (
     }
     throw error;
   }
-  let scheduler: TetoLaneScheduler | TetoScheduler | ReflectionScheduler | undefined;
+  let scheduler: TetoLaneController | TetoLaneScheduler | TetoScheduler | ReflectionScheduler | undefined;
   let workerScheduler: WorkerLaneScheduler | undefined;
+  let teamRuntime: TeamRuntime | undefined;
   let processJobManager: ProcessJobManager | undefined;
 
   try {
@@ -271,7 +282,15 @@ export const executeRun = async (
     }
 
     const requestedAuxiliaryMode = request.auxiliaryMode
-      ?? (request.policy?.tetoEnabled === false ? "none" : "teto");
+      ?? (request.policy?.tetoEnabled === false
+        ? "none"
+        : request.tetoActivation !== undefined
+          ? request.tetoActivation === "manual" ? "none" : "teto"
+          : request.policy?.tetoActivation !== undefined
+            ? request.policy.tetoActivation === "manual" ? "none" : "teto"
+            : request.policy?.maxMainSteps !== undefined
+              ? "teto"
+              : "none");
     const requestedWorkerEnabled = request.workerEnabled ?? request.policy?.workerEnabled;
     const setup = recovered === undefined
       ? await createNewRun(
@@ -288,11 +307,12 @@ export const executeRun = async (
     // `maxMainSteps` is the schema-v1 compatibility arm. New callers use the
     // activation field and receive the ordinary continuous Teto lane.
     const recoveredLegacyPolicy = "maxMainSteps" in policy;
-    const useUnifiedTeto = request.policy?.maxMainSteps === undefined
+    const useUnifiedTeto = request.auxiliaryMode === undefined
+      && request.policy?.maxMainSteps === undefined
       && !recoveredLegacyPolicy;
     const auxiliaryMode = request.auxiliaryMode
       ?? policy.auxiliaryMode
-      ?? (policy.tetoEnabled ? "teto" : "none");
+      ?? (policy.tetoEnabled && policy.tetoActivation !== "manual" ? "teto" : "none");
     const adviceDelivery = request.adviceDelivery
       ?? policy.tetoAdviceDelivery
       ?? "live";
@@ -323,9 +343,9 @@ export const executeRun = async (
     ) {
       throw new Error("Cannot change workerEnabled while resuming a Run");
     }
-    const recoveredUsage = useUnifiedTeto && policy.tetoEnabled
-      ? usageExceptLane(setup.events, runId, "teto")
-      : recoverRunTokenUsage(setup.events, runId);
+    // The root budget is the Run-wide aggregate. Auxiliary lanes use child
+    // budgets, so recovered Teto usage must remain accounted for here.
+    const recoveredUsage = recoverRunTokenUsage(setup.events, runId);
     const runTokenBudget = new RunTokenBudget(
       policy.maxModelTokens,
       totalTokens(recoveredUsage),
@@ -466,7 +486,16 @@ export const executeRun = async (
       }
       tools.push(crossRunTool);
     }
-    if (auxiliaryMode === "teto") {
+    const readAwareness = async () => projectRunAwareness(
+      await ledger.read({ runId }),
+      runId,
+      clock.now().toISOString(),
+    );
+    // Explicit auxiliaryMode is the preregistered evaluation seam. Its model
+    // tool matrix is frozen, so only the declared auxiliary capability may
+    // affect the request surface.
+    const evaluationAuxiliaryMode = request.auxiliaryMode !== undefined;
+    if (auxiliaryMode === "teto" || (useUnifiedTeto && policy.tetoEnabled)) {
       const tetoModel = deps.tetoModel ?? mainModel;
       const tetoModelName = request.tetoModel ?? request.model;
       if (!useUnifiedTeto) {
@@ -497,21 +526,27 @@ export const executeRun = async (
         const tetoTokenBudget = new RunTokenBudget(
           policy.maxModelTokens,
           totalTokens(laneUsage(setup.events, runId, "teto")),
+          { parent: runTokenBudget, scope: "teto" },
         );
-        const tetoCompactionRuntime = instantiateRuntimeFukaiCompaction(
-          policy,
-          deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
-          {
-            ledger: sink,
-            store,
-            modelPort: tetoModel,
-            model: tetoModelName,
-            tokenBudget: tetoTokenBudget,
-            clock,
-            policy,
-          },
-        );
-        scheduler = new TetoLaneScheduler({
+        // Teto can be stopped and opened repeatedly within one activation.
+        // Build a fresh compaction runtime for each scheduler instead of
+        // reusing the one-shot instance, whose prepare state is one-shot.
+        const createTetoCompactionRuntime = compactionEnabled
+          ? () => instantiateRuntimeFukaiCompaction(
+              policy,
+              deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
+              {
+                ledger: sink,
+                store,
+                modelPort: tetoModel,
+                model: tetoModelName,
+                tokenBudget: tetoTokenBudget,
+                clock,
+                policy,
+              },
+            )
+          : undefined;
+        const controller = new TetoLaneController({
           eventSink: sink,
           inbox,
           store,
@@ -522,16 +557,27 @@ export const executeRun = async (
           policy: { ...policy, tetoEnabled: true },
           workspace,
           events: setup.events,
+          readEvents: () => ledger.read({ runId }),
           clock,
           tokenBudget: tetoTokenBudget,
-          ...(tetoCompactionRuntime === undefined
+          ...(createTetoCompactionRuntime === undefined
             ? {}
-            : { compactionRuntime: tetoCompactionRuntime }),
+            : { createCompactionRuntime: createTetoCompactionRuntime }),
           policyVersion,
           readWatermark: () => sink.ledger.watermark(),
-          replayPublicEvents: request.resumeRunId !== undefined,
           ...(request.signal === undefined ? {} : { signal: request.signal }),
         });
+        scheduler = controller;
+        if (policy.tetoActivation !== "manual") {
+          await controller.start({
+            runId,
+            laneId: "main",
+            workspace,
+            operationId: `${runId}:teto:auto-start`,
+          });
+        } else {
+          await controller.restoreIfRequested();
+        }
       }
     } else if (auxiliaryMode === "reflection") {
       scheduler = new ReflectionScheduler({
@@ -547,6 +593,47 @@ export const executeRun = async (
         runTokenBudget,
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
+    }
+
+    const teamBranchModel = deps.workerModel ?? mainModel;
+    const teamBranchTools = deps.workerTools ?? createWorkspaceTools({
+      allowWrite: false,
+      allowShell: false,
+      allowImages: shouldAdvertiseImageTools(teamBranchModel, request.workerModel ?? request.model),
+      protectedPaths: [resolve(request.dataDir)],
+    });
+    teamRuntime = new TeamRuntime({
+      eventSink: sink,
+      inbox,
+      store,
+      model: teamBranchModel,
+      modelName: request.workerModel ?? request.model,
+      runId,
+      workspace,
+      branchTools: teamBranchTools,
+      runTokenBudget,
+      readEvents: () => ledger.read({ runId }),
+      readWatermark: () => ledger.watermark(),
+      readAwareness,
+      clock,
+      policy,
+      policyVersion,
+      ...(compactionEnabled
+        ? { createCompactionRuntime: deps.createCompactionRuntime ?? createRuntimeFukaiCompaction }
+        : {}),
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
+    });
+    await teamRuntime.restore();
+    if (!evaluationAuxiliaryMode) {
+      pushRuntimeTool(tools, createAgentAwarenessTool({ read: readAwareness }));
+      if (scheduler instanceof TetoLaneController) {
+        for (const tool of createTetoControlTools(scheduler)) pushRuntimeTool(tools, tool);
+      }
+      pushRuntimeTool(tools, createTeamTool(teamRuntime));
+    } else if (useUnifiedTeto && auxiliaryMode === "teto" && adviceDelivery === "live") {
+      // The unified lane still publishes Advice through the same Main-owned
+      // acknowledgement tool in frozen live evaluation arms.
+      pushRuntimeTool(tools, createAdviceResponseTool(inbox));
     }
 
     if (workerEnabled) {
@@ -633,7 +720,7 @@ export const executeRun = async (
       clock,
       runTokenBudget,
       eventObserver: (event) => {
-        if (event.laneId === "main" && scheduler instanceof TetoLaneScheduler) {
+        if (event.laneId === "main" && scheduler instanceof TetoLaneController) {
           scheduler.observeMainEvent(event);
         }
       },
@@ -652,6 +739,7 @@ export const executeRun = async (
       ...(outputContinuationMessageId === undefined
         && scheduler === undefined
         && workerScheduler === undefined
+        && teamRuntime === undefined
         && selectCompaction === undefined
         && compactForPressure === undefined
         ? {}
@@ -674,15 +762,18 @@ export const executeRun = async (
                     : Promise.resolve([])
                 ),
                 ...await (workerScheduler?.beforeMainStep({ step }) ?? Promise.resolve([])),
+                ...await (teamRuntime?.beforeMainStep({ step }) ?? Promise.resolve([])),
               ];
             },
             ...(scheduler === undefined && workerScheduler === undefined
+              && teamRuntime === undefined
               && selectCompaction === undefined
               ? {}
               : {
                   afterStep: (context) => {
                     scheduler?.enqueue(context);
                     workerScheduler?.enqueue(context);
+                    teamRuntime?.enqueue(context);
                   },
                 }),
             ...(selectCompaction === undefined
@@ -723,6 +814,13 @@ export const executeRun = async (
       if (workerScheduler !== undefined) {
         await settlesWithin(workerScheduler.drain(), 25);
       }
+      if (teamRuntime !== undefined) {
+        // Team branches are task-scoped and their terminal replies are the
+        // useful output of `team_create`. Give already-admitted branches a
+        // bounded grace period to publish those replies before shutting the
+        // one-shot runtime down; Main remains independent of slow observers.
+        await settlesWithin(teamRuntime.drain(), 500);
+      }
       const blocker: RunExecutionResult["blocker"] = result.completed
         ? undefined
         : result.stopReason === "length"
@@ -743,6 +841,7 @@ export const executeRun = async (
       );
       await scheduler?.stop();
       await workerScheduler?.stop();
+      await teamRuntime?.stop();
       await commitRunCheckpoint(ledger, runId);
       const metrics = projectRunMetrics(await ledger.read({ runId }), runId);
       return {
@@ -758,6 +857,7 @@ export const executeRun = async (
     } catch (error: unknown) {
       await scheduler?.stop();
       await workerScheduler?.stop();
+      await teamRuntime?.stop();
       if (error instanceof MainRunTokenBudgetExhaustedError) {
         const watermark = await ledger.watermark();
         await appendLaneStatus(
@@ -821,6 +921,7 @@ export const executeRun = async (
   } finally {
     await scheduler?.stop().catch(() => undefined);
     await workerScheduler?.stop().catch(() => undefined);
+    await teamRuntime?.stop().catch(() => undefined);
     await processJobManager?.close().catch(() => undefined);
     if (closeEdgeCompositionOnClose) {
       try {
@@ -877,11 +978,18 @@ const createNewRun = async (
     ...(request.fukaiCompaction === undefined
       ? {}
       : { fukaiCompaction: request.fukaiCompaction }),
+    tetoActivation: request.tetoActivation
+      ?? request.policy?.tetoActivation
+      ?? (request.policy?.maxMainSteps !== undefined || request.auxiliaryMode === "teto"
+        ? "automatic"
+        : "manual"),
     ...(auxiliaryMode === "teto"
       ? { tetoEnabled: true }
-      : auxiliaryMode === "reflection" || auxiliaryMode === "none"
+      : auxiliaryMode === "reflection"
         ? { tetoEnabled: false }
-        : {}),
+        : request.auxiliaryMode === "none" || request.policy?.auxiliaryMode === "none"
+          ? { tetoEnabled: false }
+          : {}),
   });
   await sink.append({
     runId,
@@ -902,7 +1010,7 @@ const createNewRun = async (
     idempotencyKey: "lane:main:registered",
     visibility: "run",
   });
-  if (auxiliaryMode === "teto") {
+  if (policy.tetoEnabled) {
     await sink.append({
       runId,
       laneId: "teto",
@@ -912,6 +1020,17 @@ const createNewRun = async (
       idempotencyKey: "lane:teto:registered",
       visibility: "run",
     });
+    await appendLaneStatus(
+      sink,
+      runId,
+      "teto",
+      "dormant",
+      policy.tetoActivation === "manual"
+        ? "Teto available; Main may open it with teto_start"
+        : undefined,
+      "lane:teto:status:dormant",
+      clock,
+    );
   }
   if (auxiliaryMode === "reflection") {
     await sink.append({
@@ -1046,7 +1165,7 @@ const appendLaneStatus = async (
   sink: ObservableEventSink,
   runId: string,
   laneId: string,
-  status: "running" | "waiting" | "completed" | "failed",
+  status: LaneStatus,
   reason: string | undefined,
   idempotencyKey: string,
   clock: Clock,
@@ -1208,19 +1327,6 @@ const laneUsage = (
 ): TokenUsage => recoverRunTokenUsageByLane(events, runId)
   .find((lane) => lane.laneId === laneId)?.usage ?? emptyUsage();
 
-const usageExceptLane = (
-  events: readonly AnyEvent[],
-  runId: string,
-  excludedLaneId: string,
-): TokenUsage => recoverRunTokenUsageByLane(events, runId)
-  .filter((lane) => lane.laneId !== excludedLaneId)
-  .reduce((total, lane) => ({
-    input: total.input + lane.usage.input,
-    output: total.output + lane.usage.output,
-    cacheRead: total.cacheRead + lane.usage.cacheRead,
-    cacheWrite: total.cacheWrite + lane.usage.cacheWrite,
-  }), emptyUsage());
-
 const emptyUsage = (): TokenUsage => ({
   input: 0,
   output: 0,
@@ -1239,3 +1345,11 @@ const settlesWithin = async (
   promise.then(() => true, () => true),
   delay(milliseconds).then(() => false),
 ]);
+
+function pushRuntimeTool(tools: AgentTool[], tool: AgentTool): void {
+  const name = tool.definition.name.trim();
+  if (tools.some((candidate) => candidate.definition.name.trim() === name)) {
+    throw new Error(`Runtime capability collides with an existing tool: ${name}`);
+  }
+  tools.push(tool);
+}
