@@ -100,6 +100,7 @@ export interface InteractiveOptions {
   session: SessionController;
   initialMessage?: string;
   initialImages?: UserImage[];
+  /** Embedding/test seam for an explicit startup continuation; CLI leaves this disabled. */
   resumeOnStart?: boolean;
   /** Test/embedding seam; production uses ProcessTerminal. */
   terminal?: Terminal;
@@ -309,7 +310,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     { name: "goal", description: "Show or revise the Run Goal", argumentHint: "[statement]" },
     { name: "session", description: "Switch between workspace Runs", argumentHint: "[run-id]" },
     { name: "new", description: "Start a new Run" },
-    { name: "resume", description: "Resume the current Turn" },
+    { name: "resume", description: "Choose a saved Run, or explicitly continue one", argumentHint: "[run-id]" },
     { name: "cancel", description: "Cancel the active Turn" },
     { name: "resolve", description: "Resolve an unknown tool operation", argumentHint: "<operation-id>" },
     { name: "copy", description: "Copy the last assistant answer" },
@@ -1703,7 +1704,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             "`/permissions [profile]` capability boundary  ·  `/plan [prompt]` enter Plan mode",
             "`/mode [default|plan]` collaboration mode  ·  `/model [selector]` switch Main model",
             "`/theme [auto|light|dark]` change colors",
-            "`/resume` resume the current Turn",
+            "`/resume` choose a saved Run without calling the model  ·  `/resume <run-id>` continue explicitly",
             "`/cancel` cancel active Turn  ·  `/resolve <operation-id>` resolve recovery",
             "`/copy` copy the last assistant answer",
             "`/exit` close session  ·  `Alt+Enter` queue follow-up",
@@ -1849,15 +1850,22 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           appendNotice("New Run ready.", "success");
           break;
         case "/resume":
-          assertProviderReady();
-          if (
-            options.session.snapshot().status === "running"
-            || options.session.snapshot().status === "cancelling"
-          ) {
-            await options.session.waitForIdle();
+          if (argument.length > 0) {
+            if (argument.split(/\s+/u).length !== 1) {
+              throw new Error("Usage: /resume [run-id]");
+            }
+            await switchSession(argument);
+            // An explicit Run ID means the caller asked to continue this
+            // resumable Turn, while completed Runs simply remain attached.
+            assertProviderReady();
+            await options.session.resumeCurrent();
+            appendNotice("Resume requested.", "success");
+            break;
           }
-          await options.session.resumeCurrent();
-          appendNotice("Resume requested.", "success");
+          // History selection is an attachment operation. Continuing a
+          // resumable Turn requires the explicit `/resume <run-id>` form so
+          // opening the picker never causes an unexpected provider request.
+          await showSessionSelector();
           break;
         case "/cancel":
           await options.session.cancel();

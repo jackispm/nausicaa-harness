@@ -1639,6 +1639,113 @@ describe("interactive TUI", () => {
     }
   });
 
+  it("attaches and restores history when /resume receives a saved Run id", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-resume-history-"));
+    const dataDir = join(root, "state");
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const saved = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("RESUME_HISTORY_ANSWER")]),
+        createRunId: () => "resume-history-run",
+      });
+      await saved.submit({ inputId: "resume-history-input", text: "Remember this" });
+      await saved.waitForIdle();
+      await saved.close();
+
+      const current = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([]),
+        createRunId: () => "resume-current-run",
+      });
+      const running = runInteractive({ session: current, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("/resume resume-history-run");
+      terminal.send("\r");
+      await waitForCondition(
+        () => current.snapshot().runId === "resume-history-run",
+        "Run attachment through /resume",
+      );
+      await waitForOutput(terminal, "Attached Run resume-history-run");
+      await waitForOutput(terminal, "RESUME_HISTORY_ANSWER");
+      await expect(current.transcript()).resolves.toEqual([
+        expect.objectContaining({ role: "user", content: "Remember this" }),
+        expect.objectContaining({ role: "assistant", content: "RESUME_HISTORY_ANSWER" }),
+      ]);
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("opens the Run picker without requesting the model when /resume is entered", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-resume-latest-"));
+    const dataDir = join(root, "state");
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const saved = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("LATEST_RESUME_ANSWER")]),
+        createRunId: () => "latest-resume-run",
+      });
+      await saved.submit({ inputId: "latest-resume-input", text: "Latest history" });
+      await saved.waitForIdle();
+      await saved.close();
+
+      const currentModel = new ScriptedModel([]);
+      const current = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: currentModel,
+        createRunId: () => "detached-resume-run",
+      });
+      await current.newRun();
+      const running = runInteractive({ session: current, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("/resume");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Resume a saved Run from this workspace");
+      terminal.type("latest-resume-run");
+      terminal.send("\r");
+      await waitForCondition(
+        () => current.snapshot().runId === "latest-resume-run",
+        "selected Run attachment through /resume",
+      );
+      await waitForOutput(terminal, "Attached Run latest-resume-run");
+      expect(currentModel.callCount).toBe(0);
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("switches saved workspace Runs through the session selector and reloads transcript", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-sessions-"));
     const dataDir = join(root, "state");
@@ -2216,7 +2323,7 @@ describe("interactive TUI", () => {
 
       expect(terminal.output).toContain("PARTIAL_OUTPUT_SENTINEL");
       expect(session.snapshot().blocker).toBe("model-output-limit");
-      terminal.type("/resume");
+      terminal.type("/resume interactive-output-limit-run");
       terminal.send("\r");
       releaseSubmit();
       await waitForOutput(terminal, "CONTINUED_OUTPUT_SENTINEL");

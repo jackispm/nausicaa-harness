@@ -112,7 +112,7 @@ nausicaa --json "检查这个项目的 package 脚本"
 # 没有 positional task 时，print/json 从非 TTY stdin 读取一次有界任务
 printf '%s\n' "查看这个项目如何安装" | nausicaa --print
 
-# 恢复或附着当前项目最近的 Run
+# 交互模式附着当前项目最近的 Run；非交互模式继续它
 nausicaa --resume <run-id>
 nausicaa --continue
 
@@ -158,7 +158,7 @@ nausicaa --topology --json
 
 也可设置 `NAUSICAA_MODEL`，省略每次调用的 `--model`。交互会话默认使用 `workspace` 权限：可读写当前工作区，并可在可用的 OS 沙箱内运行前台 Bash，但不开放宿主 Shell、网络或后台进程。`/permissions` 可在 `read-only`、`workspace`、`full-access` 三档之间切换；`full-access` 等同于明确开放工作区写入、宿主 Shell、网络和后台进程，因此边界会直接显示在底部状态栏。`/plan [prompt]` 进入只读 Plan 模式，`/mode` 可在 Default 与 Plan 间切换。
 
-`/goal` 查看当前 Run 的长期目标，`/goal <statement>` 修订它；`/session` 打开当前工作区的 Run 选择器，`/session <run-id>` 可直接切换；`/copy` 将最后一条 assistant 回答复制到系统剪贴板。普通消息仍是各自 Turn 的当前任务。运行状态默认写入工作区的 `.nausicaa/`；使用 `nausicaa --resume <run-id>` 从已提交边界继续。若恢复时发现结果未知的工具操作，CLI 会打印 operation ID 和显式结算命令；确认其应按失败处理后再执行该命令，运行时不会自动重放副作用。
+`/goal` 查看当前 Run 的长期目标，`/goal <statement>` 修订它；`/session` 打开当前工作区的 Run 选择器，`/session <run-id>` 可直接切换；`/resume` 打开同一个历史选择器并只附着所选 Run，不会因为选择历史而请求模型；`/resume <run-id>` 才会明确继续指定 Run 的挂起 Turn。普通消息仍是各自 Turn 的当前任务。运行状态默认写入工作区的 `.nausicaa/`；非交互模式使用 `nausicaa --resume <run-id>` 从已提交边界继续，交互启动只附着并等待新的输入。若恢复时发现结果未知的工具操作，CLI 会打印 operation ID 和显式结算命令；确认其应按失败处理后再执行该命令，运行时不会自动重放副作用。
 
 交互命令的最小 beta surface 如下：`/agents`（`/topology` 别名）查看只读 Awareness，`/permissions [read-only|workspace|full-access]` 切换 capability，`/plan [prompt]` 进入只读 Plan，`/skills [refresh|select <id>|deselect <id>]` 管理下一 Turn 的 Skill，`/edges [refresh]` 查看 edge 状态。命令只提交 Ledger 允许的状态变更；它们不会绕过当前 Turn 的 snapshot 或权限边界。
 

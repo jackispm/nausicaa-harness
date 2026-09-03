@@ -231,8 +231,9 @@ const main = async (): Promise<number> => {
       ? await findLatestRunId(resolvedSettings.dataDir, workspace)
       : options.resume;
     activeRunId = selectedRunId;
-    // `--continue` resumes only when lookup found a Run. With no candidate it
-    // becomes a new invocation and must pass the same local startup gate.
+    // `--continue` selects a Run only when lookup finds one. Interactive mode
+    // attaches and waits for input; print/JSON mode may continue it. With no
+    // candidate it becomes a new invocation and must pass the startup gate.
     const isNewRun = !options.daemon
       && selectedRunId === undefined
       && options.resume === undefined;
@@ -427,12 +428,6 @@ const main = async (): Promise<number> => {
           ...(processedImages.images.length === 0
             ? {}
             : { initialImages: processedImages.images }),
-          ...(
-            initialMessage === undefined
-            && (options.resume !== undefined || (options.continue && selectedRunId !== undefined))
-              ? { resumeOnStart: true }
-              : {}
-          ),
         });
       } finally {
         await edgeRuntime.composition.close().catch(() => undefined);
