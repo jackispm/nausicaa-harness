@@ -13,7 +13,10 @@ import {
   userImageSummary,
   validateUserImages,
 } from "../domain/images.js";
-import type { ContentAddressedStore } from "../store/index.js";
+import {
+  ArtifactNotFoundError,
+  type ContentAddressedStore,
+} from "../store/index.js";
 import { SessionProtocolError } from "./session-protocol-error.js";
 
 export const MESSAGE_MEDIA_TYPE = "application/vnd.nausicaa.conversation-message+json";
@@ -75,7 +78,7 @@ export async function projectSessionTranscript(
     type: "tool.requested";
   }>>();
   for (const event of events) {
-    if (event.type === "tool.requested") {
+    if (event.runId === runId && event.laneId === "main" && event.type === "tool.requested") {
       requestedTools.set(event.payload.operationId, event);
     }
   }
@@ -83,6 +86,10 @@ export async function projectSessionTranscript(
   const transcript: SessionTranscriptEntry[] = [];
   const toolEntryIndexes = new Map<string, number>();
   for (const event of events) {
+    // This projection feeds the Main-facing transcript surfaces. Sibling
+    // lanes keep their own transcripts for their own context and must not be
+    // replayed as if they were another Main answer.
+    if (event.runId !== runId || event.laneId !== "main") continue;
     if (
       event.type !== "user.message"
       && event.type !== "assistant.message"
@@ -200,7 +207,15 @@ export async function readConversationArtifact(
   store: ContentAddressedStore,
   ref: ArtifactRef,
 ): Promise<ConversationMessage> {
-  const value: unknown = JSON.parse(new TextDecoder().decode(await store.get(ref)));
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder().decode(await store.get(ref)));
+  } catch (error: unknown) {
+    if (error instanceof SessionProtocolError || error instanceof ArtifactNotFoundError) {
+      throw error;
+    }
+    throw new SessionProtocolError("Conversation artifact is not valid JSON", { cause: error });
+  }
   if (
     value === null
     || typeof value !== "object"

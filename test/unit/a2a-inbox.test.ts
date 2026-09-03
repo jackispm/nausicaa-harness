@@ -90,6 +90,111 @@ function taskMessage(
 }
 
 describe("A2AInbox", () => {
+  it("keeps message ids unique and requires a sent predecessor", async () => {
+    const ledger = new MemoryLedger();
+    const message = adviceMessage();
+    await expect(ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "message.claimed",
+      payload: { messageId: message.messageId, claimedBy: "main" },
+      correlationId: "correlation-1",
+      idempotencyKey: "claim-before-send",
+      visibility: "run",
+    })).rejects.toThrow(/before message\.sent/u);
+    await expect(ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "message.handled",
+      payload: { messageId: message.messageId },
+      correlationId: "correlation-1",
+      idempotencyKey: "handle-before-send",
+      visibility: "run",
+    })).rejects.toThrow(/before message\.sent/u);
+
+    await ledger.append({
+      runId: message.runId,
+      laneId: message.from,
+      type: "message.sent",
+      payload: { message },
+      correlationId: message.correlationId,
+      idempotencyKey: "send-event-1",
+      visibility: message.visibility,
+      occurredAt: message.createdAt,
+    });
+    await expect(ledger.append({
+      runId: message.runId,
+      laneId: message.from,
+      type: "message.sent",
+      payload: { message },
+      correlationId: message.correlationId,
+      idempotencyKey: "send-event-2",
+      visibility: message.visibility,
+      occurredAt: message.createdAt,
+    })).rejects.toThrow(/sent more than once/u);
+  });
+
+  it("requires Goal revisions to advance exactly one version", async () => {
+    const ledger = new MemoryLedger();
+    await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "run.created",
+      payload: {
+        goal: {
+          version: 1,
+          statement: "Inspect the workspace",
+          successCriteria: [],
+          hardConstraints: [],
+        },
+        workspace: "/workspace",
+        policy: {
+          maxMainStepsPerActivation: 2,
+          maxModelTokens: 100,
+          tetoEnabled: false,
+          tetoMaxOutputTokens: 10,
+          tetoTokenRatio: 0.1,
+        },
+      },
+      correlationId: "run-1",
+      idempotencyKey: "run-created",
+      visibility: "run",
+    });
+    const revised = {
+      version: 2,
+      statement: "Inspect the workspace carefully",
+      successCriteria: [],
+      hardConstraints: [],
+    };
+    await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "goal.revised",
+      payload: { goal: revised },
+      correlationId: "run-1",
+      idempotencyKey: "goal-2",
+      visibility: "run",
+    });
+    await expect(ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "goal.revised",
+      payload: { goal: { ...revised, version: 4 } },
+      correlationId: "run-1",
+      idempotencyKey: "goal-4",
+      visibility: "run",
+    })).rejects.toThrow(/increment from 2 to 3/u);
+    await expect(ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "goal.revised",
+      payload: { goal: { ...revised, version: 2 } },
+      correlationId: "run-1",
+      idempotencyKey: "goal-2-again",
+      visibility: "run",
+    })).rejects.toThrow(/increment from 2 to 3/u);
+  });
+
   it("makes send, claim, and handle idempotent", async () => {
     const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
     const inbox = new A2AInbox({ clock });
@@ -114,6 +219,23 @@ describe("A2AInbox", () => {
     const handledAgain = await inbox.handle("message-1", "main");
     expect(handled.status).toBe("handled");
     expect(handledAgain).toEqual(handled);
+  });
+
+  it("resets the ephemeral sink together with the projection on rehydrate", async () => {
+    const inbox = new A2AInbox();
+    await inbox.send(taskMessage(
+      { type: "task.accept", taskId: "task-before" },
+      { messageId: "message-before", idempotencyKey: "shared-key" },
+    ));
+
+    inbox.rehydrate([]);
+
+    await expect(inbox.send(taskMessage(
+      { type: "task.accept", taskId: "task-after" },
+      { messageId: "message-after", idempotencyKey: "shared-key" },
+    ))).resolves.toEqual({ status: "queued", messageId: "message-after" });
+    expect(inbox.snapshot().records.map((record) => record.message.messageId))
+      .toEqual(["message-after"]);
   });
 
   it("redelivers an unhandled claim after its lease", async () => {
@@ -193,6 +315,37 @@ describe("A2AInbox", () => {
     });
     expect(claimed.map((record) => record.message.messageId)).toEqual(["accept-b"]);
     expect(inbox.snapshot().records.find((record) => record.message.messageId === "accept-a")?.status)
+      .toBe("pending");
+  });
+
+  it("filters claims and lease wakeups by Run when requested", async () => {
+    const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock, claimLeaseMs: 1_000 });
+    await inbox.send(taskMessage(
+      { type: "task.accept", taskId: "foreign" },
+      {
+        messageId: "foreign-run-message",
+        idempotencyKey: "foreign-run-message",
+        runId: "run-foreign",
+      },
+    ));
+    await inbox.send(taskMessage(
+      { type: "task.accept", taskId: "current" },
+      {
+        messageId: "current-run-message",
+        idempotencyKey: "current-run-message",
+        runId: "run-current",
+      },
+    ));
+
+    expect(inbox.nextClaimableDelayMs("worker-1", { runId: "run-current" })).toBe(0);
+    const claimed = await inbox.claim("worker-1", "worker-1", {
+      claimId: "current-run-claim",
+      runId: "run-current",
+    });
+    expect(claimed.map((record) => record.message.messageId)).toEqual(["current-run-message"]);
+    expect(inbox.nextClaimableDelayMs("worker-1", { runId: "run-current" })).toBe(1_000);
+    expect(inbox.snapshot().records.find((record) => record.message.messageId === "foreign-run-message")?.status)
       .toBe("pending");
   });
 
@@ -498,5 +651,40 @@ describe("A2AInbox", () => {
       "message.claimed",
     ]);
     expect(projectInbox(finalEvents).records[0]?.claim?.claimedBy).toBe("worker-b");
+  });
+
+  it("rejects handled or cross-Run claim facts during projection", async () => {
+    const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
+    const ledger = new MemoryLedger({ clock });
+    const inbox = new A2AInbox({ sink: ledger, clock });
+    await inbox.send(adviceMessage());
+
+    await ledger.append({
+      runId: "run-1",
+      laneId: "main",
+      type: "message.handled",
+      payload: { messageId: "message-1" },
+      correlationId: "correlation-1",
+      idempotencyKey: "forged-handle",
+      visibility: "run",
+      occurredAt: clock.now().toISOString(),
+    });
+    const forgedHandleEvents = await ledger.read();
+    expect(() => projectInbox(forgedHandleEvents)).toThrow(/unclaimed message/u);
+
+    const claimedLedger = new MemoryLedger({ clock });
+    const claimedInbox = new A2AInbox({ sink: claimedLedger, clock });
+    await claimedInbox.send(adviceMessage());
+    await claimedInbox.claim("main", "main", { claimId: "claim-1" });
+    await expect(claimedLedger.append({
+      runId: "other-run",
+      laneId: "main",
+      type: "message.handled",
+      payload: { messageId: "message-1" },
+      correlationId: "correlation-1",
+      idempotencyKey: "cross-run-handle",
+      visibility: "run",
+      occurredAt: clock.now().toISOString(),
+    })).rejects.toThrow(/before message\.sent/u);
   });
 });

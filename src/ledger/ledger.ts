@@ -94,7 +94,12 @@ function inputAdmissionFingerprint(
   event: AppendEvent<"input.admitted"> | EventEnvelope<"input.admitted">,
 ): string {
   return sha256(stableJson({
+    // The artifact id is transport metadata and may change across a
+    // lost-ack retry, but media type and byte length affect how the payload
+    // is interpreted and must remain stable for the same input id.
     contentHash: event.payload.messageRef.contentHash,
+    mediaType: event.payload.messageRef.mediaType,
+    byteLength: event.payload.messageRef.byteLength,
     delivery: event.payload.delivery,
     targetTurnId: event.payload.targetTurnId,
   }));
@@ -256,6 +261,9 @@ export class LedgerState {
   readonly #events: AnyEvent[] = [];
   readonly #idempotency = new Map<string, AnyEvent>();
   readonly #eventIds = new Set<string>();
+  readonly #runCreations = new Set<RunId>();
+  readonly #goalVersions = new Map<RunId, number>();
+  readonly #sentMessages = new Map<string, EventEnvelope<"message.sent">>();
   readonly #laneSequences = new Map<string, number>();
   readonly #inputAdmissions = new Map<string, EventEnvelope<"input.admitted">>();
   readonly #inputStates = new Map<string, LedgerInputState>();
@@ -374,6 +382,14 @@ export class LedgerState {
     const stored = cloneJson(event);
     this.#events.push(stored);
     this.#eventIds.add(stored.eventId);
+    if (stored.type === "run.created") {
+      this.#runCreations.add(stored.runId);
+      this.#goalVersions.set(stored.runId, stored.payload.goal.version);
+    } else if (stored.type === "goal.revised") {
+      this.#goalVersions.set(stored.runId, stored.payload.goal.version);
+    } else if (stored.type === "message.sent") {
+      this.#sentMessages.set(messageScope(stored.runId, stored.payload.message.messageId), stored);
+    }
     this.#laneSequences.set(laneScope, stored.laneSeq);
     this.#idempotency.set(idempotencyScope, stored);
     if (stored.type === "input.admitted") {
@@ -423,6 +439,53 @@ export class LedgerState {
 
     if (this.#eventIds.has(event.eventId)) {
       throw new LedgerCorruptionError(`Duplicate eventId ${event.eventId}`);
+    }
+
+    if (event.type === "run.created" && this.#runCreations.has(event.runId)) {
+      throw new LedgerCorruptionError(`Run ${event.runId} has more than one run.created event`);
+    }
+
+    if (event.type === "goal.revised") {
+      const currentVersion = this.#goalVersions.get(event.runId);
+      if (currentVersion === undefined) {
+        throw new LedgerCorruptionError(
+          `Run ${event.runId} has no goal to revise`,
+        );
+      }
+      const nextVersion = event.payload.goal.version;
+      if (nextVersion !== currentVersion + 1) {
+        throw new LedgerCorruptionError(
+          `Goal version must increment from ${currentVersion} to ${currentVersion + 1}, received ${nextVersion}`,
+        );
+      }
+    }
+
+    if (event.type === "message.sent") {
+      const messageId = event.payload.message.messageId;
+      if (this.#sentMessages.has(messageScope(event.runId, messageId))) {
+        throw new LedgerCorruptionError(`Message ${messageId} was sent more than once`);
+      }
+    }
+
+    if (event.type === "message.claimed" || event.type === "message.handled") {
+      const messageId = event.payload.messageId;
+      const scope = messageScope(event.runId, messageId);
+      if (!this.#sentMessages.has(scope)) {
+        throw new LedgerCorruptionError(
+          `${event.type} references message ${messageId} before message.sent`,
+        );
+      }
+      if (event.type === "message.claimed" && event.payload.claimedBy !== event.laneId) {
+        throw new LedgerCorruptionError(
+          `Claim for ${messageId} must be emitted by its claiming lane`,
+        );
+      }
+    }
+
+    if (event.type === "budget.charged" && event.payload.laneId !== event.laneId) {
+      throw new LedgerCorruptionError(
+        "budget.charged laneId must equal the event laneId",
+      );
     }
 
     const laneScope = `${event.runId}\u0000${event.laneId}`;
@@ -682,4 +745,8 @@ export class LedgerState {
     }
     stableJson(input.payload);
   }
+}
+
+function messageScope(runId: RunId, messageId: string): string {
+  return `${runId}\u0000${messageId}`;
 }
