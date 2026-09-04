@@ -22,6 +22,7 @@ interface PackResult {
 
 const REQUIRED_PACK_FILES = [
   "README.md",
+  "LICENSE",
   "THIRD_PARTY_NOTICES",
   "dist/cli.js",
   "dist/index.js",
@@ -31,6 +32,7 @@ const REQUIRED_PACK_FILES = [
 
 const ALLOWED_PACK_PATHS = new Set<string>([
   "README.md",
+  "LICENSE",
   "THIRD_PARTY_NOTICES",
   "package.json",
 ]);
@@ -109,7 +111,7 @@ describe("npm package surface", () => {
     expect(packageJson.private).toBe(true);
     expect(packageJson.name).toMatch(/^@[a-z0-9._-]+\/[a-z0-9._-]+$|^[a-z0-9._-]+$/u);
     expect(packageJson.version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
-    expect(packageJson.license).toBe("UNLICENSED");
+    expect(packageJson.license).toBe("MIT");
     expect(packageJson.engines?.node).toBe(">=22.19.0");
     expect(packageJson.bin?.nausicaa).toBe("dist/cli.js");
     expect(packageJson.exports?.["."]).toBeDefined();

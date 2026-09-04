@@ -20,6 +20,12 @@ const MAX_TASKS_PER_ACTIVATION = 64;
 const DEFAULT_STOP_WAIT_MS = 250;
 const MAX_STOP_WAIT_MS = 10_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+// A claim can remain visible when its acknowledgement append fails.  Give a
+// hand-off race one immediate retry, then move retries onto timers with a
+// finite backoff so a broken sink cannot monopolize the event loop.
+const ZERO_DELAY_WAKE_RETRY_BASE_MS = 25;
+const MAX_ZERO_DELAY_WAKE_RETRY_MS = 1_000;
+const MAX_ZERO_DELAY_WAKE_RETRIES = 8;
 
 function mainBoundaryDeliveries(step: number): readonly DeliveryMode[] {
   return step === 1
@@ -80,6 +86,7 @@ export class WorkerLaneScheduler {
   private receiptTail: Promise<void> = Promise.resolve();
   private leaseWakeTimer: ReturnType<typeof setTimeout> | undefined;
   private leaseWakeRequested = false;
+  private zeroDelayWakeRetries = 0;
   private pendingActivationCount = 0;
   private droppedWakeups = 0;
   private accepting = true;
@@ -164,6 +171,10 @@ export class WorkerLaneScheduler {
   /** Called from Main's synchronous afterStep hook. */
   enqueue(context?: MainAfterStepContext): void {
     if (!this.accepting) return;
+    // An explicit Main boundary is a fresh wake signal.  It may be the first
+    // opportunity for a previously failed persistence operation to recover.
+    this.zeroDelayWakeRetries = 0;
+    this.clearLeaseWakeup();
     if (context !== undefined) {
       if (context.runId !== this.runId || context.laneId !== this.mainLaneId) {
         this.failures.push(new Error(
@@ -195,6 +206,7 @@ export class WorkerLaneScheduler {
       const records = await this.inbox.claim(this.mainLaneId, this.mainLaneId, {
         claimId: `${this.runId}:worker:delivery:${this.createId()}`,
         limit: this.maxResultsPerBoundary,
+        runId: this.runId,
         from: this.workerLaneId,
         types: ["task.accept", "task.result", "task.failed"],
         ...(context === undefined
@@ -266,11 +278,13 @@ export class WorkerLaneScheduler {
   private scheduleActivation(): void {
     if (!this.accepting || this.pendingActivationCount >= this.maxPendingActivations) return;
     this.pendingActivationCount += 1;
+    let madeProgress = false;
     const operation = this.tail.then(async () => {
       if (this.stopController.signal.aborted || this.signal?.aborted) return;
       for (let index = 0; index < this.maxTasksPerActivation; index += 1) {
         const result = await this.executor.runOnce();
         if (result.status === "idle") break;
+        madeProgress = true;
         if (this.stopController.signal.aborted || this.signal?.aborted) break;
       }
     });
@@ -278,6 +292,7 @@ export class WorkerLaneScheduler {
       this.failures.push(asError(error));
     }).finally(() => {
       this.pendingActivationCount -= 1;
+      if (madeProgress) this.zeroDelayWakeRetries = 0;
       if (this.leaseWakeRequested) {
         this.leaseWakeRequested = false;
         this.scheduleActivation();
@@ -291,11 +306,31 @@ export class WorkerLaneScheduler {
     this.clearLeaseWakeup();
     if (!this.accepting || this.stopController.signal.aborted || this.signal?.aborted) return;
     const delay = this.inbox.nextClaimableDelayMs(this.workerLaneId, {
+      runId: this.runId,
       types: ["task.request"],
     });
-    // An idle executor and an already-claimable record disagree. Do not spin;
-    // a future Main boundary or Inbox mutation can provide the next wakeup.
-    if (delay === undefined || delay <= 0) return;
+    if (delay === undefined) return;
+    // A zero delay can be a real hand-off race: enqueue may have coalesced a
+    // wakeup while the previous runOnce was still checking the Inbox. Start
+    // one bounded activation now so that task is not stranded until Main's
+    // next boundary. The executor's idle result still bounds the work.
+    let wakeDelay = delay;
+    if (wakeDelay <= 0) {
+      if (this.zeroDelayWakeRetries >= MAX_ZERO_DELAY_WAKE_RETRIES) return;
+      const retry = this.zeroDelayWakeRetries;
+      this.zeroDelayWakeRetries += 1;
+      // Preserve the one immediate retry needed for a task admitted while an
+      // activation was finishing.  Further retries yield to the event loop
+      // and back off; an explicit enqueue resets this bound.
+      if (retry === 0) {
+        this.scheduleActivation();
+        return;
+      }
+      wakeDelay = Math.min(
+        MAX_ZERO_DELAY_WAKE_RETRY_MS,
+        ZERO_DELAY_WAKE_RETRY_BASE_MS * 2 ** (retry - 1),
+      );
+    }
 
     const timer = setTimeout(() => {
       if (this.leaseWakeTimer !== timer) return;
@@ -306,7 +341,7 @@ export class WorkerLaneScheduler {
         return;
       }
       this.scheduleActivation();
-    }, Math.min(delay, MAX_TIMER_DELAY_MS));
+    }, Math.min(wakeDelay, MAX_TIMER_DELAY_MS));
     timer.unref?.();
     this.leaseWakeTimer = timer;
   }

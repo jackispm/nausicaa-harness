@@ -9,6 +9,27 @@ export interface ContentAddressedStore {
   has(ref: ArtifactRef): Promise<boolean>;
 }
 
+/** Read-only metadata exposed by stores that support explicit maintenance. */
+export interface StoredArtifact {
+  readonly contentHash: string;
+  readonly byteLength: number;
+  readonly modifiedAt: string;
+}
+
+/** Optional maintenance seam; normal runtime paths only need ContentAddressedStore. */
+export interface ContentAddressedStoreMaintenance {
+  listObjects(): Promise<readonly StoredArtifact[]>;
+  /**
+   * Delete an object only when it still matches the optional enumeration
+   * snapshot. The caller must prevent concurrent CAS writes and authoritative
+   * root publication for the complete destructive collection pass.
+   */
+  deleteObject(
+    contentHash: string,
+    expected?: Pick<StoredArtifact, "byteLength" | "modifiedAt">,
+  ): Promise<boolean>;
+}
+
 export class StoreError extends Error {
   override readonly name: string = "StoreError";
 }
@@ -52,6 +73,12 @@ export function assertArtifactRef(ref: ArtifactRef): void {
   }
   if (!Number.isSafeInteger(ref.byteLength) || ref.byteLength < 0) {
     throw new ArtifactIntegrityError("Artifact byteLength is invalid");
+  }
+}
+
+export function assertContentHash(value: unknown): asserts value is string {
+  if (typeof value !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value)) {
+    throw new ArtifactIntegrityError("Artifact contentHash is not a SHA-256 digest");
   }
 }
 

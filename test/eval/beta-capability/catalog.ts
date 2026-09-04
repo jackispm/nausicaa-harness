@@ -9,7 +9,7 @@ import {
 
 const deepSeek: BetaAttribution = {
   project: "DeepSeek Harness",
-  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/headless-agent/tests/coding-task.e2e.ts",
+  sourcePath: "DeepSeek Harness: examples/headless-agent/tests/coding-task.e2e.ts",
   commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
   license: "MIT",
   adopted: ["temporary workspace", "real bug-fix task", "external test execution", "immutable test file"],
@@ -17,7 +17,7 @@ const deepSeek: BetaAttribution = {
 };
 const deepSeekResume: BetaAttribution = {
   project: "DeepSeek Harness",
-  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/headless-agent/tests/resume.e2e.ts",
+  sourcePath: "DeepSeek Harness: examples/headless-agent/tests/resume.e2e.ts",
   commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
   license: "MIT",
   adopted: ["world-state verification", "separate resume phase design", "host-controlled activation boundary"],
@@ -25,7 +25,7 @@ const deepSeekResume: BetaAttribution = {
 };
 const deepSeekFullLoop: BetaAttribution = {
   project: "DeepSeek Harness",
-  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/headless-agent/tests/full-loop.e2e.ts",
+  sourcePath: "DeepSeek Harness: examples/headless-agent/tests/full-loop.e2e.ts",
   commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
   license: "MIT",
   adopted: ["real model", "real bash round trip", "tool-result and final-answer verification"],
@@ -33,7 +33,7 @@ const deepSeekFullLoop: BetaAttribution = {
 };
 const deepSeekRealModel: BetaAttribution = {
   project: "DeepSeek Harness",
-  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/headless-agent/tests/real-model.e2e.ts",
+  sourcePath: "DeepSeek Harness: examples/headless-agent/tests/real-model.e2e.ts",
   commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
   license: "MIT",
   adopted: ["temporary workspace", "exact file rewrite", "post-agent world verification"],
@@ -41,7 +41,7 @@ const deepSeekRealModel: BetaAttribution = {
 };
 const piSmoke: BetaAttribution = {
   project: "Pi",
-  sourcePath: "/Users/gongdongjie/Downloads/pi/packages/evals/src/smoke.eval.ts",
+  sourcePath: "Pi: packages/evals/src/smoke.eval.ts",
   commit: "1defa151e0c1dac87d38a2d0ac09d67f817b30f9",
   license: "MIT",
   adopted: ["no-tool end-to-end prompt", "exact final answer and usage observation"],
@@ -49,7 +49,7 @@ const piSmoke: BetaAttribution = {
 };
 const piExtension: BetaAttribution = {
   project: "Pi",
-  sourcePath: "/Users/gongdongjie/Downloads/pi/packages/evals/src/extensions.eval.ts",
+  sourcePath: "Pi: packages/evals/src/extensions.eval.ts",
   commit: "1defa151e0c1dac87d38a2d0ac09d67f817b30f9",
   license: "MIT",
   adopted: ["extension authoring task", "reload/use phases", "external world verification"],
@@ -57,7 +57,7 @@ const piExtension: BetaAttribution = {
 };
 const piToolBehavior: BetaAttribution = {
   project: "Pi",
-  sourcePath: "/Users/gongdongjie/Downloads/pi/packages/agent/test/harness/tools.test.ts",
+  sourcePath: "Pi: packages/agent/test/harness/tools.test.ts",
   commit: "1defa151e0c1dac87d38a2d0ac09d67f817b30f9",
   license: "MIT",
   adopted: ["bounded read continuation", "multiple independent tool calls", "disjoint edit semantics", "large-output handling"],
@@ -65,7 +65,7 @@ const piToolBehavior: BetaAttribution = {
 };
 const piFindBehavior: BetaAttribution = {
   project: "Pi",
-  sourcePath: "/Users/gongdongjie/Downloads/pi/packages/coding-agent/test/suite/regressions/3302-find-path-glob.test.ts",
+  sourcePath: "Pi: packages/coding-agent/test/suite/regressions/3302-find-path-glob.test.ts",
   commit: "1defa151e0c1dac87d38a2d0ac09d67f817b30f9",
   license: "MIT",
   adopted: ["path-aware glob discovery", "observable workspace result"],
@@ -73,7 +73,7 @@ const piFindBehavior: BetaAttribution = {
 };
 const pi: BetaAttribution = {
   project: "Pi",
-  sourcePath: "/Users/gongdongjie/Downloads/pi/packages/evals/README.md",
+  sourcePath: "Pi: packages/evals/README.md",
   commit: "1defa151e0c1dac87d38a2d0ac09d67f817b30f9",
   license: "MIT",
   adopted: ["same-task comparisons", "repeatable tool traces", "token, latency, and cost telemetry"],
@@ -81,7 +81,7 @@ const pi: BetaAttribution = {
 };
 const deepSeekFsCwd: BetaAttribution = {
   project: "DeepSeek Harness",
-  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/packages/fs/tool-fs/tests/fs-tools.e2e.ts",
+  sourcePath: "DeepSeek Harness: packages/fs/tool-fs/tests/fs-tools.e2e.ts",
   commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
   license: "MIT",
   adopted: ["relative workspace file operation", "read-before-edit", "post-mutation world verification"],
@@ -89,7 +89,7 @@ const deepSeekFsCwd: BetaAttribution = {
 };
 const deepSeekInstructions: BetaAttribution = {
   project: "DeepSeek Harness",
-  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/packages/context/agent-instructions/tests/agent-instructions.e2e.ts",
+  sourcePath: "DeepSeek Harness: packages/context/agent-instructions/tests/agent-instructions.e2e.ts",
   commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
   license: "MIT",
   adopted: ["workspace AGENTS.md instruction injection", "exact probe response"],
@@ -97,7 +97,7 @@ const deepSeekInstructions: BetaAttribution = {
 };
 const deepSeekCompaction: BetaAttribution = {
   project: "DeepSeek Harness",
-  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/headless-agent/tests/compaction.e2e.ts",
+  sourcePath: "DeepSeek Harness: examples/headless-agent/tests/compaction.e2e.ts",
   commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
   license: "MIT",
   adopted: ["long-session pressure", "compaction event bracket", "post-compaction answer"],
@@ -105,7 +105,7 @@ const deepSeekCompaction: BetaAttribution = {
 };
 const deepSeekSubagent: BetaAttribution = {
   project: "DeepSeek Harness",
-  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/packages/subagent/subagent-spawn-in-process/tests/spawn-in-process.e2e.ts",
+  sourcePath: "DeepSeek Harness: packages/subagent/subagent-spawn-in-process/tests/spawn-in-process.e2e.ts",
   commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
   license: "MIT",
   adopted: ["parent-to-child delegation", "child result delivery", "durable task evidence"],
@@ -113,7 +113,7 @@ const deepSeekSubagent: BetaAttribution = {
 };
 const deepSeekPermission: BetaAttribution = {
   project: "DeepSeek Harness",
-  sourcePath: "/Users/gongdongjie/Downloads/deepseek-harness/examples/acp-agent/tests/escalation.e2e.ts",
+  sourcePath: "DeepSeek Harness: examples/acp-agent/tests/escalation.e2e.ts",
   commit: "b150a551b8d465e31e418e1b2eaf5e79bbb7d28e",
   license: "MIT",
   adopted: ["structured denied mutation", "workspace boundary verification"],
@@ -121,7 +121,7 @@ const deepSeekPermission: BetaAttribution = {
 };
 const prime: BetaAttribution = {
   project: "Prime Agent",
-  sourcePath: "/Users/gongdongjie/Downloads/primeagent/packages/coding-agent/src/modes/daemon",
+  sourcePath: "Prime Agent: packages/coding-agent/src/modes/daemon",
   commit: "7787f07415d843b9a800f6a4720e0c739bd608e5",
   license: "MIT",
   adopted: ["observable session and artifact metrics"],
@@ -129,7 +129,7 @@ const prime: BetaAttribution = {
 };
 const codex: BetaAttribution = {
   project: "Codex",
-  sourcePath: "/Users/gongdongjie/Downloads/codex/codex-rs/protocol/src/permission_profile_intersection_tests.rs",
+  sourcePath: "Codex: codex-rs/protocol/src/permission_profile_intersection_tests.rs",
   commit: "31d338a1ea89cd65a48d8ac07f50bb3917009806",
   license: "Apache-2.0",
   adopted: ["fail-closed checks", "isolated reproducible tests"],

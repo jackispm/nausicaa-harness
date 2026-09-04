@@ -5,7 +5,6 @@ import {
   mkdir,
   open,
   lstat,
-  readFile,
   rename,
   stat,
   unlink,
@@ -135,6 +134,7 @@ export class FileCredentialStore implements CredentialStore {
     options?: AuthOperationOptions,
   ): Promise<void> {
     assertProviderId(providerId);
+    throwIfAborted(options?.signal);
     const previous = this.providerChains.get(providerId) ?? Promise.resolve();
     const operation = previous.then(async () => {
       throwIfAborted(options?.signal);
@@ -158,21 +158,31 @@ export class FileCredentialStore implements CredentialStore {
 
   private async readDocument(): Promise<CredentialDocument> {
     let source: string;
+    let handle: FileHandle | undefined;
     try {
       await assertPrivateDirectory(dirname(this.filePath));
-      const info = await lstat(this.filePath);
-      if (info.isSymbolicLink() || !info.isFile()) {
+      // Open without following symlinks, then validate and read the same
+      // descriptor. This closes the lstat/readFile TOCTOU window.
+      handle = await open(this.filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const info = await handle.stat();
+      if (!info.isFile()) {
         throw new CredentialStoreError("Credential store is not a regular file");
       }
       assertCurrentUserOwner(info, "Credential store");
-      if ((info.mode & 0o077) !== 0) await chmod(this.filePath, DEFAULT_FILE_MODE);
-      source = await readFile(this.filePath, "utf8");
+      if ((info.mode & 0o077) !== 0) await handle.chmod(DEFAULT_FILE_MODE);
+      const contents = await handle.readFile({ encoding: "utf8" });
+      source = contents;
     } catch (error: unknown) {
       if (isNodeError(error) && error.code === "ENOENT") {
         return emptyDocument();
       }
+      if (isNodeError(error) && error.code === "ELOOP") {
+        throw new CredentialStoreError("Credential store is not a regular file");
+      }
       if (error instanceof CredentialStoreError) throw error;
       throw new CredentialStoreError("Cannot read credential store", { cause: error });
+    } finally {
+      await handle?.close().catch(() => undefined);
     }
 
     let value: unknown;

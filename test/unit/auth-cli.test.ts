@@ -40,6 +40,28 @@ describe("auth/config CLI", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
+  it("cancels a hidden prompt with Escape without saving a credential", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-cancel-"));
+    try {
+      const input = new FakeSecretInput();
+      const output = new MemoryOutput();
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      const modelPort = createOpenRouterModelPort({
+        credentials: store,
+        authContext: { env: async () => undefined, fileExists: async () => false },
+      });
+      const pending = runAuthCommand(
+        { action: "login", provider: "openrouter", json: false },
+        { credentialStore: store, modelPort, input, output },
+      );
+      input.emitSecret("\x1b");
+      await expect(pending).rejects.toThrow("Login cancelled");
+      await expect(store.read("openrouter")).resolves.toBeUndefined();
+      expect(output.value).not.toContain("Login cancelled");
+      expect(input.modes).toEqual([true, false]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it("reports local status and removes only saved credentials", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-status-"));
     try {
@@ -55,6 +77,25 @@ describe("auth/config CLI", () => {
       await expect(runAuthCommand({ action: "logout", provider: "openrouter", json: false }, { credentialStore: store, modelPort, output, environment: { OPENROUTER_API_KEY: "ambient-key" } })).resolves.toBe(0);
       expect(output.value).toContain("Environment credentials remain available");
       await expect(store.read("openrouter")).resolves.toBeUndefined();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("does not claim an environment credential remains when none is configured", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-logout-no-env-"));
+    try {
+      const output = new MemoryOutput();
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      await store.modify("openrouter", async () => ({ type: "api_key", key: "or-secret-no-env" }));
+      const modelPort = createOpenRouterModelPort({
+        credentials: store,
+        authContext: { env: async () => undefined, fileExists: async () => false },
+      });
+      await expect(runAuthCommand(
+        { action: "logout", provider: "openrouter", json: false },
+        { credentialStore: store, modelPort, output, environment: {} },
+      )).resolves.toBe(0);
+      expect(output.value).toContain("No environment credential is configured");
+      expect(output.value).not.toContain("remain available");
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

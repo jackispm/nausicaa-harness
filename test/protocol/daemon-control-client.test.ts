@@ -10,6 +10,7 @@ import {
   DaemonControlClientError,
   DaemonControlServer,
   DaemonHost,
+  MemoryDaemonCommandRecoveryJournal,
   type DaemonWakeRequest,
 } from "../../src/runtime/index.js";
 
@@ -279,6 +280,48 @@ describe("DaemonControlClient", () => {
     await new Promise<void>((resolve, reject) => {
       server.close((error) => error === undefined ? resolve() : reject(error));
     });
+  });
+
+  it("allows a caller to retry a command with an explicit ID after reconnect", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-daemon-client-command-id-"));
+    roots.push(root);
+    const host = new DaemonHost({
+      admitWake: async (request) => ({ status: "admitted", inputId: request.wakeId ?? "input" }),
+      activate: async () => undefined,
+    });
+    let starts = 0;
+    const journal = new MemoryDaemonCommandRecoveryJournal();
+    const server = new DaemonControlServer({
+      host,
+      socketPath: join(root, "control.sock"),
+      commandJournal: journal,
+      lifecycle: {
+        start: async () => {
+          starts += 1;
+          return { ...host.snapshot(), status: "running" };
+        },
+        stop: () => host.stop(),
+      },
+    });
+    await server.listen();
+    const client = new DaemonControlClient({
+      socketPath: server.socketPath,
+      clientId: "retry-client",
+    });
+    await expect(client.request("start", undefined, "start-retry")).resolves.toMatchObject({
+      status: "running",
+    });
+    client.close();
+    const replacement = new DaemonControlClient({
+      socketPath: server.socketPath,
+      clientId: "retry-client",
+    });
+    await expect(replacement.request("start", undefined, "start-retry")).resolves.toMatchObject({
+      status: "running",
+    });
+    expect(starts).toBe(1);
+    replacement.close();
+    await server.close();
   });
 
   it("clears an invalid protocol stream before an immediate reconnect", async () => {

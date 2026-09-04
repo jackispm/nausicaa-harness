@@ -285,6 +285,86 @@ describe("WorkerLaneScheduler", () => {
     await bounded.stop();
   });
 
+  it("does not strand a task queued while an activation is finishing", async () => {
+    const ledger = new MemoryLedger();
+    const inbox = new A2AInbox({ sink: ledger });
+    const dispatcher = new TaskDispatcher({ inbox, runId: "run-1", to: "worker" });
+    let releaseFirst: (() => void) | undefined;
+    const firstRun = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let calls = 0;
+    const scheduler = new WorkerLaneScheduler({
+      executor: {
+        runOnce: async () => {
+          calls += 1;
+          if (calls === 1) {
+            await firstRun;
+            return { status: "idle" as const };
+          }
+          const records = await inbox.claim("worker", "worker", {
+            claimId: `late-claim-${calls}`,
+            types: ["task.request"],
+          });
+          if (records.length > 0) {
+            await inbox.handle(records[0]!.message.messageId, "worker");
+            return { status: "completed" as const };
+          }
+          return { status: "idle" as const };
+        },
+      },
+      inbox,
+      runId: "run-1",
+      maxPendingActivations: 1,
+    });
+
+    scheduler.enqueue();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await dispatcher.dispatch({
+      taskId: "late-task",
+      goal,
+      budget: { maxModelTokens: 500, maxWallClockMs: 5_000 },
+    });
+    scheduler.enqueue();
+    releaseFirst?.();
+    await scheduler.drain();
+
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(scheduler.pendingActivations).toBe(0);
+    await scheduler.stop();
+  });
+
+  it("backs off when a visible claim cannot be persisted instead of spinning", async () => {
+    const inbox = new A2AInbox();
+    const dispatcher = new TaskDispatcher({ inbox, runId: "run-1", to: "worker" });
+    await dispatcher.dispatch({
+      taskId: "persistence-failure-task",
+      goal,
+      budget: { maxModelTokens: 500, maxWallClockMs: 5_000 },
+    });
+    let calls = 0;
+    const scheduler = new WorkerLaneScheduler({
+      executor: {
+        runOnce: async () => {
+          calls += 1;
+          throw new Error("claim persistence unavailable");
+        },
+      },
+      inbox,
+      runId: "run-1",
+      maxPendingActivations: 1,
+    });
+
+    scheduler.enqueue();
+    await scheduler.drain();
+
+    // One hand-off retry is allowed, but the scheduler must yield to a timer
+    // instead of recursively queueing microtasks forever.
+    expect(calls).toBe(2);
+    expect(scheduler.pendingActivations).toBe(0);
+    await scheduler.stop();
+  });
+
   it("acknowledges delivered results without waiting for a slow Worker activation", async () => {
     const inbox = new A2AInbox();
     await inbox.send(workerResultMessage());

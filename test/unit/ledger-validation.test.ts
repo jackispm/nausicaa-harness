@@ -187,6 +187,11 @@ const validPayloads = {
   "run.completed": { answerRef: artifact },
   "run.failed": { error: "model failed" },
   "goal.revised": { goal: { ...goal, version: 2 } },
+  "todo.updated": {
+    revision: 1,
+    items: [{ id: "todo-1", content: "Inspect the repository", status: "in_progress" }],
+    source: "operator",
+  },
   "lane.registered": { kind: "main" },
   "lane.status": { status: "running", reason: "scheduled" },
   "step.started": { step: 1 },
@@ -279,6 +284,18 @@ const validPayloads = {
     toolCallId: "call-1",
     name: "read",
     argumentsRef: artifact,
+  },
+  "approval.requested": {
+    operationId: "operation-1",
+    toolCallId: "call-1",
+    name: "write",
+    argumentsHash: `sha256:${"a".repeat(64)}`,
+  },
+  "approval.decided": {
+    operationId: "operation-1",
+    toolCallId: "call-1",
+    name: "write",
+    decision: "approved",
   },
   "tool.succeeded": {
     operationId: "operation-1",
@@ -429,6 +446,10 @@ const invalidPayloads = {
   "run.completed": { answerRef: null },
   "run.failed": {},
   "goal.revised": { goal: { ...goal, version: 0 } },
+  "todo.updated": {
+    revision: 0,
+    items: [{ id: "todo-1", content: "", status: "unknown" }],
+  },
   "lane.registered": { kind: "unknown" },
   "lane.status": { status: "unknown" },
   "step.started": { step: 0 },
@@ -485,6 +506,18 @@ const invalidPayloads = {
   "model.failed": { model: "", error: "failed" },
   "model.cancelled": { requestId: "", reason: "user" },
   "tool.requested": { operationId: "op", toolCallId: "call", name: "read" },
+  "approval.requested": {
+    operationId: "op",
+    toolCallId: "call",
+    name: "read",
+    argumentsHash: "bad-hash",
+  },
+  "approval.decided": {
+    operationId: "op",
+    toolCallId: "call",
+    name: "read",
+    decision: "unknown",
+  },
   "tool.succeeded": {
     operationId: "",
     toolCallId: "call",

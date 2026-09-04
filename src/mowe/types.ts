@@ -139,6 +139,8 @@ export interface MoweExecutionRequest {
   allowedScopes?: readonly MoweToolScope[];
   /** Explicit approval seam for tools whose metadata requires approval. */
   approve?: (context: MoweApprovalContext) => MoweApprovalDecision | Promise<MoweApprovalDecision>;
+  /** Durable lifecycle recorder for approval requests and decisions. */
+  approvalLifecycle?: MoweApprovalLifecycle;
 }
 
 export interface MoweApprovalContext {
@@ -154,6 +156,21 @@ export type MoweApprovalDecision = boolean | {
   approved: boolean;
   reason?: string;
 };
+
+export type MoweApprovalOutcome = "approved" | "denied" | "cancelled";
+
+export interface MoweApprovalDecisionRecord {
+  decision: MoweApprovalOutcome;
+  reason?: string;
+}
+
+export interface MoweApprovalLifecycle {
+  requested: (context: MoweApprovalContext, argumentsHash: string) => void | Promise<void>;
+  decided: (
+    context: MoweApprovalContext,
+    decision: MoweApprovalDecisionRecord,
+  ) => void | Promise<void>;
+}
 
 export type MoweCallStatus = "succeeded" | "failed" | "cancelled";
 

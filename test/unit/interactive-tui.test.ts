@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { stripTerminalSequences, type Terminal } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 
+import { FileCredentialStore } from "../../src/auth/index.js";
+import { createOpenRouterModelPort } from "../../src/model/index.js";
 import {
   clipboardImagePasteKey,
   runInteractive,
@@ -40,6 +42,199 @@ const TINY_PNG = Buffer.from(
 );
 
 describe("interactive TUI", () => {
+  it("supports hidden /login and /logout without entering the Run transcript", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-auth-"));
+    const previousExitCode = process.exitCode;
+    try {
+      const mainModel = new ScriptedModel([]);
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted/main",
+        policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      }, {
+        mainModel,
+        createRunId: () => "interactive-auth-run",
+      });
+      const credentialStore = new FileCredentialStore({
+        filePath: join(root, "credentials.json"),
+      });
+      const authModel = createOpenRouterModelPort({
+        credentials: credentialStore,
+        authContext: {
+          env: async () => undefined,
+          fileExists: async () => false,
+        },
+      });
+      let credentialSaved = false;
+      const terminal = new MemoryTerminal(100, 28);
+      const running = runInteractive({
+        session,
+        terminal,
+        forceAltScreen: true,
+        auth: {
+          credentialStore,
+          modelPort: authModel,
+          environment: {},
+          onChanged: async () => {
+            credentialSaved = (await credentialStore.read("openrouter")) !== undefined;
+          },
+        },
+        credentialStatus: () => ({
+          provider: "openrouter",
+          selectorRecognized: true,
+          catalogKnown: true,
+          credentialEnv: "OPENROUTER_API_KEY",
+          credentialPresent: credentialSaved,
+          ...(credentialSaved ? { credentialSource: "saved" as const } : {}),
+          authStatus: "unverified" as const,
+        }),
+      });
+
+      await terminal.started;
+      terminal.type("/login");
+      terminal.send("\r");
+      await waitForOutput(terminal, "input is hidden");
+      // Terminals wrap clipboard input in bracketed-paste markers. The
+      // hidden prompt must store the payload without treating the ESC bytes
+      // as cancellation.
+      terminal.send("\x1b[200~tui-secret-value\x1b[201~");
+      terminal.send("\r");
+      await waitForCondition(
+        async () => (await credentialStore.read("openrouter"))?.type === "api_key",
+        "saved TUI credential",
+      );
+      await waitForOutput(terminal, "Signed in to openrouter");
+      expect(terminal.output).not.toContain("tui-secret-value");
+      expect(session.snapshot().runId).toBeUndefined();
+      terminal.type("/status");
+      terminal.send("\r");
+      await waitForOutput(terminal, "saved credential (unverified)");
+
+      terminal.type("/logout");
+      terminal.send("\r");
+      await waitForCondition(
+        async () => (await credentialStore.read("openrouter")) === undefined,
+        "removed TUI credential",
+      );
+      await waitForOutput(terminal, "No environment credential is configured");
+      expect(mainModel.callCount).toBe(0);
+
+      terminal.type("/login");
+      terminal.send("\r");
+      await waitForOutput(terminal, "input is hidden");
+      terminal.send("\x1b");
+      await waitForOutput(terminal, "Login cancelled.");
+      await expect(credentialStore.read("openrouter")).resolves.toBeUndefined();
+
+      terminal.type("/quit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("cancels a hidden login prompt when the TUI receives SIGTERM", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-auth-signal-"));
+    const previousExitCode = process.exitCode;
+    try {
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted/main",
+        policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      }, { mainModel: new ScriptedModel([]), createRunId: () => "auth-signal-run" });
+      const credentialStore = new FileCredentialStore({
+        filePath: join(root, "credentials.json"),
+      });
+      const authModel = createOpenRouterModelPort({
+        credentials: credentialStore,
+        authContext: { env: async () => undefined, fileExists: async () => false },
+      });
+      const terminal = new MemoryTerminal(100, 28);
+      const running = runInteractive({
+        session,
+        terminal,
+        forceAltScreen: true,
+        auth: {
+          credentialStore,
+          modelPort: authModel,
+          environment: {},
+        },
+      });
+
+      await terminal.started;
+      terminal.type("/login");
+      terminal.send("\r");
+      await waitForOutput(terminal, "input is hidden");
+      process.emit("SIGTERM", "SIGTERM");
+      await expect(running).resolves.toBe(0);
+      await expect(credentialStore.read("openrouter")).resolves.toBeUndefined();
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps Teto's sibling transcript out of the Main presentation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-teto-transcript-"));
+    const previousExitCode = process.exitCode;
+    try {
+      const mainModel = new ScriptedModel([response("MAIN_ANSWER_SENTINEL")]);
+      const tetoModel = new ScriptedModel([response("TETO_ANSWER_SENTINEL")]);
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted/main",
+        tetoModel: "scripted/teto",
+        policy: {
+          maxMainStepsPerActivation: 2,
+          maxModelTokens: 10_000,
+          tetoEnabled: true,
+          tetoActivation: "automatic",
+          tetoMaxOutputTokens: 64,
+          tetoTokenRatio: 0.1,
+        },
+      }, {
+        mainModel,
+        tetoModel,
+        createRunId: () => "interactive-teto-transcript-run",
+      });
+      const terminal = new MemoryTerminal(100, 28);
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      await delay(120);
+      terminal.type("hello");
+      terminal.send("\r");
+      await session.waitForIdle();
+      await waitForOutput(terminal, "MAIN_ANSWER_SENTINEL");
+      await waitForCondition(
+        () => tetoModel.callCount > 0,
+        "Teto sibling activation",
+      );
+      await delay(40);
+
+      const visible = normalizeTerminalOutput(terminal.output);
+      expect(visible).toContain("MAIN_ANSWER_SENTINEL");
+      expect(visible).not.toContain("TETO_ANSWER_SENTINEL");
+      expect(visible).not.toContain("Main output:");
+      await expect(session.transcript()).resolves.toEqual([
+        expect.objectContaining({ role: "user", content: "hello" }),
+        expect.objectContaining({ role: "assistant", content: "MAIN_ANSWER_SENTINEL" }),
+      ]);
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("treats same-tick Enter submissions as steering and preserves explicit follow-up", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-queue-delivery-"));
     const previousExitCode = process.exitCode;
@@ -1182,7 +1377,7 @@ describe("interactive TUI", () => {
     }
   });
 
-  it.each(["/context", "/usage"])(
+  it.each(["/context"])(
     "renders %s locally without model or Ledger mutation",
     async (command) => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-context-"));
@@ -1229,7 +1424,7 @@ describe("interactive TUI", () => {
     }
   });
 
-  it.each(["/agents", "/topology"])(
+  it.each(["/agents"])(
     "renders %s as a read-only Awareness topology",
     async (command) => {
       const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-awareness-"));
@@ -1353,6 +1548,13 @@ describe("interactive TUI", () => {
         terminal.send("\r");
         await waitForOutput(terminal, "Permissions set to full-access");
         expect(session.snapshot().permissionProfile).toBe("full-access");
+
+        terminal.type("/mode pl");
+        await waitForOutput(terminal, "Plan");
+        terminal.send("\r");
+        terminal.send("\r");
+        await waitForOutput(terminal, "Plan mode selected");
+        expect(session.snapshot().collaborationMode).toBe("plan");
 
         terminal.type("/goal Keep the first line");
         terminal.send("\n");
@@ -1495,17 +1697,6 @@ describe("interactive TUI", () => {
         allowNetwork: false,
       });
 
-      terminal.type("/mode");
-      terminal.send("\r");
-      await waitForOutput(terminal, "Default can act; Plan investigates");
-      terminal.send("\x1b[B");
-      terminal.send("\r");
-      await waitForOutput(terminal, "Plan mode selected");
-      expect(session.snapshot().collaborationMode).toBe("plan");
-
-      terminal.type("/mode default");
-      terminal.send("\r");
-      await waitForOutput(terminal, "Default mode selected");
       terminal.type("/plan Propose a focused migration");
       terminal.send("\r");
       await waitForOutput(terminal, "PLAN_ANSWER");
@@ -1591,6 +1782,14 @@ describe("interactive TUI", () => {
       await waitForOutput(terminal, "ONBOARDING_ANSWER");
       expect(model.callCount).toBe(1);
 
+      terminal.type("/status");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Auth:");
+      const statusOutput = normalizeTerminalOutput(terminal.output);
+      expect(statusOutput).toContain("OPENROUTER_API_KEY");
+      expect(statusOutput).toContain("****9876");
+      expect(statusOutput).not.toContain(sentinelKey);
+
       terminal.type("/exit");
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
@@ -1600,7 +1799,7 @@ describe("interactive TUI", () => {
     }
   });
 
-  it("keeps setup queryable without interrupting a configured startup", async () => {
+  it("keeps the setup diagnostic available as a slash command", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-setup-command-"));
     const terminal = new MemoryTerminal(100, 28);
     const previousExitCode = process.exitCode;
@@ -1631,6 +1830,41 @@ describe("interactive TUI", () => {
       await waitForOutput(terminal, "CONFIGURED_SETUP_STATUS");
 
       terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reserve established compatibility commands as unapproved", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-unapproved-commands-"));
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const model = new ScriptedModel([]);
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: model,
+        createRunId: () => "unapproved-command-run",
+      });
+      const events: SessionRuntimeEvent[] = [];
+      session.subscribe((event) => events.push(event));
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("/unknown-command");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Unknown command: /unknown-command");
+      expect(model.callCount).toBe(0);
+      expect(events.filter((event) => event.kind === "event")).toHaveLength(0);
+
+      terminal.type("/quit");
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
     } finally {
@@ -1727,7 +1961,8 @@ describe("interactive TUI", () => {
       await terminal.started;
       terminal.type("/resume");
       terminal.send("\r");
-      await waitForOutput(terminal, "Resume a saved Run from this workspace");
+      await waitForOutput(terminal, "Resume a previous session");
+      expect(normalizeTerminalOutput(terminal.output)).toContain("Run ID latest-resume-run");
       terminal.type("latest-resume-run");
       terminal.send("\r");
       await waitForCondition(
@@ -1746,7 +1981,7 @@ describe("interactive TUI", () => {
     }
   });
 
-  it("switches saved workspace Runs through the session selector and reloads transcript", async () => {
+  it("switches saved workspace Runs through the resume selector and reloads transcript", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-sessions-"));
     const dataDir = join(root, "state");
     const terminal = new MemoryTerminal(100, 28);
@@ -1781,9 +2016,9 @@ describe("interactive TUI", () => {
       const running = runInteractive({ session: current, terminal, forceAltScreen: true });
 
       await terminal.started;
-      terminal.type("/session");
+      terminal.type("/resume");
       terminal.send("\r");
-      await waitForOutput(terminal, "Resume a saved Run from this workspace");
+      await waitForOutput(terminal, "Resume a previous session");
       terminal.send("\x1b");
       terminal.type("/status");
       terminal.send("\r");
@@ -1792,16 +2027,16 @@ describe("interactive TUI", () => {
 
       const selectorCount = countOccurrences(
         terminal.output,
-        "Resume a saved Run from this workspace",
+        "Resume a previous session",
       );
-      terminal.type("/session");
+      terminal.type("/resume");
       terminal.send("\r");
       await waitForCondition(
         () => countOccurrences(
           terminal.output,
-          "Resume a saved Run from this workspace",
+          "Resume a previous session",
         ) > selectorCount,
-        "second session selector",
+        "second resume selector",
       );
       terminal.type("older-session-run");
       await waitForOutput(terminal, "OLDER_SESSION_GOAL");
@@ -1822,7 +2057,7 @@ describe("interactive TUI", () => {
         expect.objectContaining({ role: "assistant", content: "OLDER_TRANSCRIPT_ANSWER" }),
       ]);
 
-      terminal.type("/session current-session-run");
+      terminal.type("/resume current-session-run");
       terminal.send("\r");
       await waitForCondition(
         () => current.snapshot().runId === "current-session-run",
@@ -1879,7 +2114,7 @@ describe("interactive TUI", () => {
 
       await terminal.started;
       await waitForOutput(terminal, "CURRENT_ARTIFACT_ANSWER");
-      terminal.type("/session damaged-artifact-run");
+      terminal.type("/resume damaged-artifact-run");
       const chunkCountBeforeSwitch = terminal.outputChunks.length;
       terminal.send("\r");
       await waitForCondition(
@@ -1936,16 +2171,16 @@ describe("interactive TUI", () => {
       terminal.send("\r");
       await waitForCondition(() => current.snapshot().status === "running", "active Turn");
 
-      terminal.type("/session saved-session-run");
+      terminal.type("/resume saved-session-run");
       terminal.send("\r");
-      await waitForOutput(terminal, "/session is unavailable while Main is working");
+      await waitForOutput(terminal, "/resume is unavailable while Main is working");
       expect(current.snapshot().runId).toBe("active-session-run");
-      terminal.type("/session");
+      terminal.type("/resume");
       terminal.send("\r");
       await waitForCondition(
         () => countOccurrences(
           terminal.output,
-          "/session is unavailable while Main is working",
+          "/resume is unavailable while Main is working",
         ) >= 2,
         "selector rejection during active Turn",
       );

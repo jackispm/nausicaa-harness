@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { AgentTool, ModelPort, ModelResponse, UserImage } from "../../src/domain/index.js";
+import type { AgentTool, AnyEvent, ModelPort, ModelResponse, UserImage } from "../../src/domain/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import { computeEventContentHash, JsonlLedger } from "../../src/ledger/index.js";
 import {
@@ -15,8 +15,10 @@ import {
 import type { EdgeContextContributionSummary } from "../../src/mowe/edge-types.js";
 import {
   MESSAGE_MEDIA_TYPE,
+  readConversationArtifact,
   projectSessionTranscript,
 } from "../../src/runtime/session-artifacts.js";
+import { SessionProtocolError } from "../../src/runtime/session-protocol-error.js";
 import type { RuntimeFukaiCompactionFactory } from "../../src/runtime/fukai-compaction-runtime.js";
 import { FileContentAddressedStore } from "../../src/store/index.js";
 import { WorkspaceCommandSandbox } from "../../src/tools/index.js";
@@ -31,6 +33,15 @@ afterEach(async () => {
 });
 
 describe("SessionController", () => {
+  it("wraps malformed conversation artifacts as a SessionProtocolError", async () => {
+    const root = await temporaryRoot();
+    const artifacts = await FileContentAddressedStore.open(join(root, "store"));
+    const ref = await artifacts.put("{not-json", MESSAGE_MEDIA_TYPE);
+
+    await expect(readConversationArtifact(artifacts, ref))
+      .rejects.toBeInstanceOf(SessionProtocolError);
+  });
+
   it("projects assistant tool-call presence from its durable message", async () => {
     const root = await temporaryRoot();
     const runId = "assistant-tool-call-projection";
@@ -66,6 +77,32 @@ describe("SessionController", () => {
       turnId: "turn-1",
     }]);
     await ledger.close();
+  });
+
+  it("keeps transcript projection scoped to the requested Run and Main lane", async () => {
+    const root = await temporaryRoot();
+    const store = await FileContentAddressedStore.open(join(root, "store"));
+    const targetRef = await store.put(JSON.stringify({
+      role: "user",
+      content: "target message",
+      createdAt: "2026-08-30T00:00:00.000Z",
+    }), MESSAGE_MEDIA_TYPE);
+    const foreignRef = await store.put(JSON.stringify({
+      role: "user",
+      content: "foreign message",
+      createdAt: "2026-08-30T00:00:00.000Z",
+    }), MESSAGE_MEDIA_TYPE);
+    const events = [
+      { runId: "target", laneId: "main", type: "user.message", payload: { messageRef: targetRef } },
+      { runId: "foreign", laneId: "main", type: "user.message", payload: { messageRef: foreignRef } },
+      { runId: "target", laneId: "worker", type: "user.message", payload: { messageRef: foreignRef } },
+    ] as unknown as AnyEvent[];
+
+    await expect(projectSessionTranscript(store, events, "target")).resolves.toEqual([{
+      role: "user",
+      content: "target message",
+      turnId: "legacy:target:0",
+    }]);
   });
 
   it("lists workspace Runs newest first with projected status and Goal", async () => {

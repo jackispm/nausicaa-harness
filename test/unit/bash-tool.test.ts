@@ -220,6 +220,47 @@ describe("bash tool", () => {
     expect(Buffer.byteLength(output.stdout, "utf8")).toBeLessThanOrEqual(50 * 1024);
   });
 
+  it("streams complete output to an injected sink while keeping the result bounded", async () => {
+    const workspace = await temporaryDirectory();
+    const captured: string[] = [];
+    const result = await createBashTool({
+      outputSink: { stdout: (chunk) => captured.push(chunk) },
+    }).execute(
+      { command: "node -e 'for(let i=0;i<3000;i++) process.stdout.write(`line-${i}\\n`)'" },
+      toolContext(workspace),
+    );
+    const output = parse(result);
+
+    expect(result.isError).toBe(false);
+    expect(captured.join("")).toBe(
+      Array.from({ length: 3_000 }, (_, index) => `line-${index}\n`).join(""),
+    );
+    expect(output.stdout).not.toContain("line-0\n");
+    expect(output.stdout).toContain("line-2999");
+    expect(output.truncated).toBe(true);
+    expect(Buffer.byteLength(output.stdout, "utf8")).toBeLessThanOrEqual(50 * 1024);
+  });
+
+  it("reports an injected output sink failure without retrying a successful command", async () => {
+    const workspace = await temporaryDirectory();
+    const result = await createBashTool({
+      outputSink: {
+        stdout: () => {
+          throw new Error("artifact store unavailable");
+        },
+      },
+    }).execute(
+      { command: "printf retained" },
+      toolContext(workspace),
+    );
+
+    expect(result.isError).toBe(false);
+    expect(parse(result)).toMatchObject({
+      stdout: "retained",
+      outputSinkError: "Shell output sink failed",
+    });
+  });
+
   it("bounds stderr by bytes without cutting a UTF-8 character", async () => {
     const workspace = await temporaryDirectory();
     const result = await createBashTool().execute(

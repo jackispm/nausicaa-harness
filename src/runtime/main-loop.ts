@@ -9,12 +9,14 @@ import type {
 import type {
   AgentTool,
   Clock,
+  ModelCapabilities,
   ModelPort,
   ModelRequest,
   ModelResponse,
   ModelStreamEvent,
   ToolResult,
 } from "../domain/ports.js";
+import { prepareModelPort, PreparedModelPort } from "../model/prepared-model.js";
 import { systemClock } from "../domain/ports.js";
 import type {
   ArtifactRef,
@@ -80,6 +82,7 @@ import {
 const DEFAULT_SYSTEM_PROMPT = `You are Main, the primary execution lane in Nausicaa.
 Advance the current Goal with the runtime-provided context and tools.
 The tools attached to this request are the complete tool-call interface; runtime results are authoritative.
+For repository evidence, identify the entry point, definition, call site, configuration, types, and tests. Use grep outputMode=files to establish the file set, follow pagination and truncation cursors, batch independent reads with read_many, and verify the evidence before concluding.
 Return the result when the Goal is complete.`;
 
 /** Conservative per-request input ceiling for custom ports without model metadata. */
@@ -318,7 +321,7 @@ export class MainRunTokenBudgetExhaustedError extends Error {
 }
 
 export class MainLoop {
-  private readonly model: ModelPort;
+  private readonly model: PreparedModelPort;
   private readonly resolveModel: MainLoopDeps["resolveModel"];
   private readonly runTokenBudget: RunTokenBudget | undefined;
   private readonly contextProvider: MainContextProvider;
@@ -343,7 +346,13 @@ export class MainLoop {
   private readonly modelCallAttempts = new Map<string, number>();
 
   constructor(deps: MainLoopDeps) {
-    this.model = deps.model;
+    // Every Main/Teto/Team request passes through one immutable provider
+    // boundary.  The wrapper is local to this loop so provider-owned catalogs
+    // remain free to change between requests while an in-flight request stays
+    // pinned to its captured data and method bindings.
+    this.model = deps.model instanceof PreparedModelPort
+      ? deps.model
+      : prepareModelPort(deps.model);
     this.resolveModel = deps.resolveModel;
     this.runTokenBudget = deps.runTokenBudget;
     this.contextProvider = deps.contextProvider;
@@ -809,6 +818,7 @@ export class MainLoop {
             requestEvent.eventId,
             streamProgress,
             deadline.signal,
+            modelCapabilities,
           );
           // A provider promise and the runtime timer can settle in the same
           // turn of the event loop. Once the deadline has fired, the response
@@ -903,16 +913,22 @@ export class MainLoop {
           deadline.dispose();
         }
         try {
-          this.runTokenBudget?.settle(reservationId, response.usage);
+          await this.emit(input, laneId, correlationId, eventState, {
+            type: "budget.charged",
+            payload: { laneId, usage: response.usage },
+            idempotencyKey: `${eventPrefix}:step:${step}:budget`,
+          });
         } catch (error: unknown) {
+          // A failed charge append did not establish durable accounting. Drop
+          // the admission reservation so a later retry in this Session is not
+          // blocked by capacity that is no longer owned by an in-flight call.
           this.runTokenBudget?.cancel(reservationId);
           throw error;
         }
-        await this.emit(input, laneId, correlationId, eventState, {
-          type: "budget.charged",
-          payload: { laneId, usage: response.usage },
-          idempotencyKey: `${eventPrefix}:step:${step}:budget`,
-        });
+        // Persist the charge before mutating the in-memory gate. Ledger
+        // recovery is the authority if this activation fails immediately
+        // after the provider returns.
+        this.runTokenBudget?.settle(reservationId, response.usage);
         const modelLatencyMs = elapsedMilliseconds(modelStartedAt, this.monotonicNow());
 
         usage = addUsage(usage, response.usage);
@@ -1212,6 +1228,35 @@ export class MainLoop {
         ? { allowedEffects: ["read", "compute"] as const }
         : {}),
       ...(this.approve === undefined ? {} : { approve: this.approve }),
+      approvalLifecycle: {
+        requested: async (context, argumentsHash) => {
+          await this.emit(input, laneId, correlationId, eventState, {
+            type: "approval.requested",
+            payload: {
+              operationId: context.operationId,
+              toolCallId: context.call.id,
+              name: context.call.name,
+              argumentsHash,
+            },
+            idempotencyKey: `${eventPrefix}:step:${step}:tool:${context.call.id}:approval:requested`,
+          });
+        },
+        decided: async (context, decision) => {
+          await this.emit(input, laneId, correlationId, eventState, {
+            type: "approval.decided",
+            payload: {
+              operationId: context.operationId,
+              toolCallId: context.call.id,
+              name: context.call.name,
+              decision: decision.decision,
+              ...(decision.reason === undefined
+                ? {}
+                : { reason: boundedRedactedText(decision.reason, 1_024) }),
+            },
+            idempotencyKey: `${eventPrefix}:step:${step}:tool:${context.call.id}:approval:decided`,
+          });
+        },
+      },
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
     const messages: { message: ConversationMessage; ref: ArtifactRef }[] = [];
@@ -1369,17 +1414,22 @@ export class MainLoop {
     requestId: string,
     progress: MainModelStreamProgress,
     cancellationSignal: AbortSignal,
+    modelCapabilities?: ModelCapabilities,
   ): Promise<ModelResponse> {
     // Check before evaluating the provider call expression.  Passing the
     // promise directly to raceAbort would otherwise invoke a ModelPort once
     // even when a slow model.requested append already consumed the deadline.
     throwIfAborted(cancellationSignal);
-    if (this.onStreamEvent === undefined || this.model.stream === undefined) {
-      return raceAbort(this.model.complete(request), cancellationSignal);
+    // `undefined` is intentional here: it records that the capability probe
+    // already happened (or that the provider has no usable metadata), so a
+    // throwing/expensive capability catalog is never queried twice.
+    const prepared = this.model.prepare(request, { capabilities: modelCapabilities });
+    if (this.onStreamEvent === undefined || prepared.stream === undefined) {
+      return raceAbort(prepared.complete(), cancellationSignal);
     }
 
     this.publishStream({ type: "stream.start", input, laneId, requestId });
-    const iterator = this.model.stream(request)[Symbol.asyncIterator]();
+    const iterator = prepared.stream()[Symbol.asyncIterator]();
     try {
       while (true) {
         const next = await raceAbort(iterator.next(), cancellationSignal);

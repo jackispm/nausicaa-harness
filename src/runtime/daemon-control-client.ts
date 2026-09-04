@@ -26,6 +26,8 @@ export interface DaemonControlClientOptions {
   readonly maxFrameBytes?: number;
   /** Request id factory, useful for deterministic protocol tests. */
   readonly createRequestId?: () => string;
+  /** Stable identity included in requests and retained across reconnects. */
+  readonly clientId?: string;
 }
 
 export class DaemonControlClientError extends Error {
@@ -64,6 +66,7 @@ interface PendingRequest {
  */
 export class DaemonControlClient {
   readonly socketPath: string;
+  readonly clientId: string;
 
   private readonly requestTimeoutMs: number;
   private readonly maxFrameBytes: number;
@@ -97,6 +100,7 @@ export class DaemonControlClient {
       );
     }
     this.socketPath = options.socketPath;
+    this.clientId = requiredRequestId(options.clientId ?? `client:${randomUUID()}`);
     this.requestTimeoutMs = boundedInteger(
       options.requestTimeoutMs,
       "requestTimeoutMs",
@@ -210,10 +214,12 @@ export class DaemonControlClient {
   /**
    * Send one control request and resolve its response result. Events received
    * while waiting are delivered to listeners and never consume the response.
+   * Pass an explicit request ID when retrying a command after reconnecting.
    */
   async request<T = unknown>(
     method: DaemonControlMethod,
     params?: unknown,
+    requestId?: string,
   ): Promise<T> {
     await this.connect();
     const socket = this.socket;
@@ -221,7 +227,7 @@ export class DaemonControlClient {
       throw new DaemonControlClientError("disconnected", "daemon control socket is not writable");
     }
     const generation = this.socketGeneration;
-    const id = requiredRequestId(this.createRequestId());
+    const id = requiredRequestId(requestId ?? this.createRequestId());
     if (this.issuedRequestIds.has(id)) {
       throw new DaemonControlClientError(
         "duplicate_request_id",
@@ -232,6 +238,7 @@ export class DaemonControlClient {
     const request: DaemonControlRequest = {
       version: DAEMON_CONTROL_PROTOCOL_VERSION,
       id,
+      clientId: this.clientId,
       method,
       ...(params === undefined ? {} : { params }),
     };

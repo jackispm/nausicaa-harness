@@ -14,6 +14,8 @@ import {
   serializeToolResult,
   toolResultByteLength,
 } from "../../src/mowe/result-projector.js";
+import type { MoweApprovalDecisionRecord } from "../../src/mowe/types.js";
+import { sha256, stableJson } from "../../src/ledger/hash.js";
 import { createWorkspaceMoweCatalog } from "../../src/mowe/workspace-catalog.js";
 
 function echoTool(): AgentTool {
@@ -36,6 +38,17 @@ function echoTool(): AgentTool {
 
 function sampleImage(): UserImage {
   return { type: "image", mimeType: "image/png", data: "aGVsbG8=" };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 describe("Mowe", () => {
@@ -693,6 +706,286 @@ describe("Mowe", () => {
       approve: () => true,
     });
     expect(scopeDenied.results[0]?.error).toContain("scope is not allowed");
+  });
+
+  it("records approval lifecycle in order with a stable hash and approved decision", async () => {
+    let executions = 0;
+    const order: string[] = [];
+    const guardedTool: AgentTool = {
+      ...echoTool(),
+      async execute(args) {
+        order.push("execute");
+        executions += 1;
+        return { content: String(args.text), isError: false };
+      },
+    };
+    const catalog = new MoweCatalog();
+    catalog.register(guardedTool, { effect: "external", requiresApproval: true });
+    const records: Array<{
+      type: "requested" | "decided";
+      operationId: string;
+      toolCallId: string;
+      name: string;
+      argumentsHash?: string;
+      decision?: MoweApprovalDecisionRecord;
+    }> = [];
+    const response = await new MoweExecutor({ catalog }).execute({
+      runId: "run-approval-lifecycle",
+      laneId: "main",
+      workspace: "/tmp",
+      calls: [{
+        id: "guarded-call",
+        name: "echo",
+        arguments: { text: "sensitive-value" },
+      }],
+      approve: () => {
+        order.push("callback");
+        return true;
+      },
+      approvalLifecycle: {
+        requested(context, argumentsHash) {
+          order.push("requested");
+          records.push({
+            type: "requested",
+            operationId: context.operationId,
+            toolCallId: context.call.id,
+            name: context.call.name,
+            argumentsHash,
+          });
+          expect(executions).toBe(0);
+        },
+        decided(context, decision) {
+          order.push("decided");
+          records.push({
+            type: "decided",
+            operationId: context.operationId,
+            toolCallId: context.call.id,
+            name: context.call.name,
+            decision,
+          });
+          expect(executions).toBe(0);
+        },
+      },
+    });
+
+    expect(response.results[0]?.status).toBe("succeeded");
+    expect(executions).toBe(1);
+    expect(order).toEqual(["requested", "callback", "decided", "execute"]);
+    expect(records).toHaveLength(2);
+    expect(records[0]).toMatchObject({
+      type: "requested",
+      operationId: records[1]?.operationId,
+      toolCallId: "guarded-call",
+      name: "echo",
+      argumentsHash: sha256(stableJson({ text: "sensitive-value" })),
+    });
+    expect(records[0]?.argumentsHash).not.toContain("sensitive-value");
+    expect(records[1]).toMatchObject({
+      type: "decided",
+      operationId: records[0]?.operationId,
+      toolCallId: "guarded-call",
+      name: "echo",
+      decision: { decision: "approved" },
+    });
+  });
+
+  it("records denied approvals and never invokes the guarded tool", async () => {
+    let executions = 0;
+    const catalog = new MoweCatalog();
+    catalog.register({
+      ...echoTool(),
+      async execute(args) {
+        executions += 1;
+        return { content: String(args.text), isError: false };
+      },
+    }, { effect: "external", requiresApproval: true });
+    const decisions: MoweApprovalDecisionRecord[] = [];
+    const response = await new MoweExecutor({ catalog }).execute({
+      runId: "run-approval-denied",
+      laneId: "main",
+      workspace: "/tmp",
+      calls: [{ id: "denied-call", name: "echo", arguments: { text: "value" } }],
+      approve: () => ({ approved: false, reason: "operator declined" }),
+      approvalLifecycle: {
+        requested: () => undefined,
+        decided: (_context, decision) => {
+          decisions.push(decision);
+        },
+      },
+    });
+
+    expect(response.results[0]).toMatchObject({ status: "failed" });
+    expect(response.results[0]?.error).toContain("operator declined");
+    expect(executions).toBe(0);
+    expect(decisions).toEqual([{ decision: "denied", reason: "operator declined" }]);
+  });
+
+  it("records a denied terminal decision when no approval handler is configured", async () => {
+    let executions = 0;
+    const catalog = new MoweCatalog();
+    catalog.register({
+      ...echoTool(),
+      async execute(args) {
+        executions += 1;
+        return { content: String(args.text), isError: false };
+      },
+    }, { effect: "external", requiresApproval: true });
+    const lifecycle: string[] = [];
+    const decisions: MoweApprovalDecisionRecord[] = [];
+    const response = await new MoweExecutor({ catalog }).execute({
+      runId: "run-approval-no-handler",
+      laneId: "main",
+      workspace: "/tmp",
+      calls: [{ id: "missing-handler", name: "echo", arguments: { text: "value" } }],
+      approvalLifecycle: {
+        requested: () => {
+          lifecycle.push("requested");
+        },
+        decided: (_context, decision) => {
+          lifecycle.push("decided");
+          decisions.push(decision);
+        },
+      },
+    });
+
+    expect(response.results[0]?.status).toBe("failed");
+    expect(response.results[0]?.error).toContain("requires approval");
+    expect(executions).toBe(0);
+    expect(lifecycle).toEqual(["requested", "decided"]);
+    expect(decisions).toEqual([{
+      decision: "denied",
+      reason: "No approval handler configured",
+    }]);
+  });
+
+  it("turns an approval race with cancellation into a cancelled decision", async () => {
+    const controller = new AbortController();
+    const approvalStarted = deferred<void>();
+    const releaseApproval = deferred<boolean>();
+    let executions = 0;
+    const catalog = new MoweCatalog();
+    catalog.register({
+      ...echoTool(),
+      async execute(args) {
+        executions += 1;
+        return { content: String(args.text), isError: false };
+      },
+    }, { effect: "external", requiresApproval: true });
+    const decisions: MoweApprovalDecisionRecord[] = [];
+    const pending = new MoweExecutor({ catalog }).execute({
+      runId: "run-approval-cancelled",
+      laneId: "main",
+      workspace: "/tmp",
+      signal: controller.signal,
+      calls: [{ id: "cancelled-call", name: "echo", arguments: { text: "value" } }],
+      approve: async () => {
+        approvalStarted.resolve();
+        return releaseApproval.promise;
+      },
+      approvalLifecycle: {
+        requested: () => undefined,
+        decided: (_context, decision) => {
+          decisions.push(decision);
+        },
+      },
+    });
+    await approvalStarted.promise;
+    controller.abort(new Error("operator cancelled"));
+    releaseApproval.resolve(true);
+    const response = await pending;
+
+    expect(response.cancelled).toBe(true);
+    expect(response.results[0]?.status).toBe("cancelled");
+    expect(executions).toBe(0);
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.decision).toBe("cancelled");
+    expect(decisions[0]?.reason).toContain("operator cancelled");
+  });
+
+  it("fails closed when the approval callback throws", async () => {
+    let executions = 0;
+    const catalog = new MoweCatalog();
+    catalog.register({
+      ...echoTool(),
+      async execute(args) {
+        executions += 1;
+        return { content: String(args.text), isError: false };
+      },
+    }, { effect: "external", requiresApproval: true });
+    const decisions: MoweApprovalDecisionRecord[] = [];
+    const response = await new MoweExecutor({ catalog }).execute({
+      runId: "run-approval-callback-error",
+      laneId: "main",
+      workspace: "/tmp",
+      calls: [{ id: "error-call", name: "echo", arguments: { text: "value" } }],
+      approve: async () => {
+        throw new Error("approval backend offline");
+      },
+      approvalLifecycle: {
+        requested: () => undefined,
+        decided: (_context, decision) => {
+          decisions.push(decision);
+        },
+      },
+    });
+
+    expect(response.results[0]?.status).toBe("failed");
+    expect(response.results[0]?.error).toContain("approval backend offline");
+    expect(executions).toBe(0);
+    expect(decisions).toEqual([{
+      decision: "denied",
+      reason: "Approval callback failed: approval backend offline",
+    }]);
+  });
+
+  it("fails closed when either approval lifecycle write fails", async () => {
+    let executions = 0;
+    const catalog = new MoweCatalog();
+    catalog.register({
+      ...echoTool(),
+      async execute(args) {
+        executions += 1;
+        return { content: String(args.text), isError: false };
+      },
+    }, { effect: "external", requiresApproval: true });
+    let approveCalls = 0;
+    const requestedFailure = await new MoweExecutor({ catalog }).execute({
+      runId: "run-approval-requested-write-error",
+      laneId: "main",
+      workspace: "/tmp",
+      calls: [{ id: "requested-error", name: "echo", arguments: { text: "value" } }],
+      approve: () => {
+        approveCalls += 1;
+        return true;
+      },
+      approvalLifecycle: {
+        requested: () => {
+          throw new Error("journal unavailable");
+        },
+        decided: () => undefined,
+      },
+    });
+    expect(requestedFailure.results[0]?.status).toBe("failed");
+    expect(requestedFailure.results[0]?.error).toContain("journal unavailable");
+    expect(approveCalls).toBe(0);
+    expect(executions).toBe(0);
+
+    const decidedFailure = await new MoweExecutor({ catalog }).execute({
+      runId: "run-approval-decided-write-error",
+      laneId: "main",
+      workspace: "/tmp",
+      calls: [{ id: "decided-error", name: "echo", arguments: { text: "value" } }],
+      approve: () => true,
+      approvalLifecycle: {
+        requested: () => undefined,
+        decided: () => {
+          throw new Error("journal commit failed");
+        },
+      },
+    });
+    expect(decidedFailure.results[0]?.status).toBe("failed");
+    expect(decidedFailure.results[0]?.error).toContain("journal commit failed");
+    expect(executions).toBe(0);
   });
 
   it("offers a non-invasive metadata adapter for custom capabilities", () => {

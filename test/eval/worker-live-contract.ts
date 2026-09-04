@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import type { ToolDefinition } from "../../src/domain/index.js";
 import { createDelegateTaskTool } from "../../src/runtime/delegate-task-tool.js";
 import { canonicalJson, hashJson } from "./fingerprint.js";
-import { createFrozenWorkspaceFixtureV2Tools } from "./tool-contract.js";
+import {
+  createFrozenWorkspaceFixtureV2Tools,
+  normalizeFrozenToolDefinition,
+} from "./tool-contract.js";
 import {
   WORKER_LIVE_FIXTURE_CATALOG,
   WORKER_LIVE_FIXTURE_HASH,
@@ -277,11 +280,12 @@ const delegateTaskDefinition = createDelegateTaskTool({
   dispatcher: {} as never,
   store: {} as never,
 }).definition;
+const frozenDelegateTaskDefinition = normalizeFrozenToolDefinition(delegateTaskDefinition);
 const workerLiveToolDefinitions: Record<WorkerLiveToolMode, ToolDefinition[]> = {
   "main-only": mainOnlyToolDefinitions,
   "main-worker": [
     ...mainOnlyToolDefinitions.map((definition) => structuredClone(definition)),
-    structuredClone(delegateTaskDefinition),
+    structuredClone(frozenDelegateTaskDefinition),
   ],
   worker: mainOnlyToolDefinitions.map((definition) => structuredClone(definition)),
 };

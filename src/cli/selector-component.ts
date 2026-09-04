@@ -22,6 +22,15 @@ import {
 export interface SelectorOverlayOptions {
   title: string;
   subtitle?: string;
+  /** Search caption; session history uses Codex-style wording. */
+  searchLabel?: string;
+  /** Optional Codex-style filter facets rendered beside the search caption. */
+  filters?: readonly SelectorFilter[];
+  /** Re-project options when a filter facet changes. */
+  filterOptions?: (
+    options: readonly SelectorOption[],
+    values: Readonly<Record<string, string>>,
+  ) => readonly SelectorOption[];
   options: readonly SelectorOption[];
   current?: string;
   initialQuery?: string;
@@ -32,6 +41,18 @@ export interface SelectorOverlayOptions {
   multiSelect?: boolean;
   selectedValues?: readonly string[];
   onConfirm?: (values: readonly string[]) => void;
+}
+
+export interface SelectorFilterOption {
+  value: string;
+  label: string;
+}
+
+export interface SelectorFilter {
+  key: string;
+  label: string;
+  options: readonly SelectorFilterOption[];
+  current?: string;
 }
 
 const SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
@@ -55,6 +76,14 @@ export class SelectorOverlay extends Container implements Focusable {
   private filteredOptions: readonly SelectorOption[];
   private readonly title: string;
   private readonly subtitle: string | undefined;
+  private readonly searchLabel: string;
+  private readonly filters: readonly SelectorFilter[];
+  private readonly filterOptions: ((
+    options: readonly SelectorOption[],
+    values: Readonly<Record<string, string>>,
+  ) => readonly SelectorOption[]) | undefined;
+  private readonly filterValues: Record<string, string>;
+  private filterIndex = 0;
   private readonly onSelect: (value: string) => void;
   private readonly onCancel: () => void;
   private readonly onPreview: ((value: string) => void) | undefined;
@@ -67,6 +96,14 @@ export class SelectorOverlay extends Container implements Focusable {
     super();
     this.title = options.title;
     this.subtitle = options.subtitle;
+    this.searchLabel = options.searchLabel ?? "Search";
+    this.filters = options.filters === undefined ? [] : [...options.filters];
+    this.filterOptions = options.filterOptions;
+    this.filterValues = {};
+    for (const filter of this.filters) {
+      const first = filter.options[0]?.value;
+      if (first !== undefined) this.filterValues[filter.key] = filter.current ?? first;
+    }
     this.onSelect = options.onSelect;
     this.onCancel = options.onCancel;
     this.onPreview = options.onPreview;
@@ -74,18 +111,18 @@ export class SelectorOverlay extends Container implements Focusable {
     this.onConfirm = options.onConfirm;
     for (const value of options.selectedValues ?? []) this.selectedValues.add(value);
     this.allOptions = [...options.options];
-    this.filteredOptions = this.allOptions;
+    this.filteredOptions = this.projectOptions("");
 
     this.list = this.createList(this.filteredOptions);
 
     const currentIndex = options.current === undefined
       ? -1
-      : this.allOptions.findIndex((item) => item.value === options.current);
+      : this.filteredOptions.findIndex((item) => item.value === options.current);
     if (options.initialQuery !== undefined && options.initialQuery.length > 0) {
       this.search.setValue(options.initialQuery);
       this.replaceList(options.initialQuery);
       if (options.current !== undefined) {
-        const filteredIndex = filterSelectorOptions(this.allOptions, options.initialQuery)
+        const filteredIndex = this.projectOptions(options.initialQuery)
           .findIndex((option) => option.value === options.current);
         if (filteredIndex >= 0) this.list.setSelectedIndex(filteredIndex);
       }
@@ -93,6 +130,14 @@ export class SelectorOverlay extends Container implements Focusable {
       this.list.setSelectedIndex(currentIndex);
     }
     this.search.onEscape = () => this.onCancel();
+  }
+
+  private projectOptions(query: string): readonly SelectorOption[] {
+    const projected = this.filterOptions?.(
+      this.allOptions,
+      this.filterValues,
+    ) ?? this.allOptions;
+    return filterSelectorOptions(projected, query);
   }
 
   private createList(options: readonly SelectorOption[]): SelectList {
@@ -126,7 +171,7 @@ export class SelectorOverlay extends Container implements Focusable {
 
   private replaceList(query: string): void {
     const previousValue = this.getSelectedValue();
-    const filtered = filterSelectorOptions(this.allOptions, query);
+    const filtered = this.projectOptions(query);
     this.filteredOptions = filtered;
     this.list = this.createList(filtered);
     const selectedIndex = previousValue === undefined
@@ -174,6 +219,25 @@ export class SelectorOverlay extends Container implements Focusable {
 
   handleInput(data: string): void {
     const keybindings = getKeybindings();
+    if (this.filters.length > 0 && (data === "\t" || data === "\x1b[Z")) {
+      this.filterIndex = (this.filterIndex + (data === "\x1b[Z" ? -1 : 1) + this.filters.length)
+        % this.filters.length;
+      return;
+    }
+    if (this.filters.length > 0 && this.search.getValue().length === 0) {
+      const direction = data === "\x1b[D" ? -1 : data === "\x1b[C" ? 1 : 0;
+      if (direction !== 0) {
+        const filter = this.filters[this.filterIndex];
+        if (filter !== undefined && filter.options.length > 0) {
+          const current = Math.max(0, filter.options.findIndex((option) =>
+            option.value === this.filterValues[filter.key]));
+          const next = (current + direction + filter.options.length) % filter.options.length;
+          this.filterValues[filter.key] = filter.options[next]!.value;
+          this.replaceList("");
+        }
+        return;
+      }
+    }
     if (keybindings.matches(data, "tui.select.pageUp")) {
       this.movePage(-1);
       return;
@@ -224,19 +288,36 @@ export class SelectorOverlay extends Container implements Focusable {
     if (this.subtitle !== undefined && this.subtitle.trim().length > 0) {
       lines.push(truncateToWidth(nausicaaMarkdownTheme.linkUrl(this.subtitle), safeWidth, ""));
     }
+    const filters = this.renderFilters();
     lines.push(
-      truncateToWidth("Search", safeWidth, ""),
+      truncateToWidth(
+        filters.length === 0 ? this.searchLabel : `${this.searchLabel}${" ".repeat(4)}${filters}`,
+        safeWidth,
+        "",
+      ),
       ...this.search.render(safeWidth),
       ...this.list.render(safeWidth),
       truncateToWidth(
         this.multiSelect
           ? "  Up/Down navigate | Space toggle | Enter confirm | Esc cancel"
-          : "  Up/Down navigate | Enter select | Esc cancel",
+          : this.filters.length > 0
+            ? "  Up/Down navigate | Tab filter | Left/Right change | Enter select | Esc cancel"
+            : "  Up/Down navigate | Enter select | Esc cancel",
         safeWidth,
         "",
       ),
     );
     return lines.map((line) => truncateToWidth(line, safeWidth, ""));
+  }
+
+  private renderFilters(): string {
+    return this.filters.map((filter) => {
+      const selected = this.filterValues[filter.key];
+      const values = filter.options.map((option) => option.value === selected
+        ? `[${option.label}]`
+        : option.label);
+      return `${filter.label}: ${values.join(" ")}`;
+    }).join("    ");
   }
 
   override invalidate(): void {

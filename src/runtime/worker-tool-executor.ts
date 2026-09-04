@@ -140,6 +140,45 @@ export class WorkerToolExecutor {
       workspace: this.workspace,
       calls: [moweCall],
       allowedEffects: ["read"],
+      approvalLifecycle: {
+        requested: async (context, argumentsHash) => {
+          await this.append({
+            runId: this.runId,
+            laneId: this.laneId,
+            type: "approval.requested",
+            payload: {
+              operationId: context.operationId,
+              toolCallId: context.call.id,
+              name: context.call.name,
+              argumentsHash,
+            },
+            correlationId: request.correlationId,
+            idempotencyKey: `${toolPrefix}:approval:requested`,
+            visibility: request.visibility,
+            occurredAt: this.clock.now().toISOString(),
+          });
+        },
+        decided: async (context, decision) => {
+          await this.append({
+            runId: this.runId,
+            laneId: this.laneId,
+            type: "approval.decided",
+            payload: {
+              operationId: context.operationId,
+              toolCallId: context.call.id,
+              name: context.call.name,
+              decision: decision.decision,
+              ...(decision.reason === undefined ? {} : {
+                reason: boundedRedactedText(decision.reason, 1_024),
+              }),
+            },
+            correlationId: request.correlationId,
+            idempotencyKey: `${toolPrefix}:approval:decided`,
+            visibility: request.visibility,
+            occurredAt: this.clock.now().toISOString(),
+          });
+        },
+      },
       signal: request.signal,
     });
     let result = execution.results[0]?.result ?? {

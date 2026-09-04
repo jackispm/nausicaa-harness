@@ -25,11 +25,13 @@ import {
 } from "./types.js";
 import type {
   MoweApprovalDecision,
+  MoweApprovalDecisionRecord,
   MoweBatchLimits,
   MoweCall,
   MoweCallResult,
   MoweExecutionRequest,
   MoweExecutionResponse,
+  MoweApprovalContext,
   MoweToolEntry,
   ResultProjectionOptions,
 } from "./types.js";
@@ -364,35 +366,79 @@ export class MoweExecutor {
       return this.failure(call, operationId, errorMessage(error));
     }
     if (entry.metadata.requiresApproval) {
+      const approvalContext: MoweApprovalContext = {
+        runId: request.runId,
+        laneId: request.laneId,
+        operationId,
+        call,
+        tool: entry,
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+      };
+      const argumentsHash = sha256(stableJson(call.arguments));
+      try {
+        await request.approvalLifecycle?.requested(approvalContext, argumentsHash);
+      } catch (error: unknown) {
+        return this.failure(
+          call,
+          operationId,
+          `Tool approval recording failed: ${errorMessage(error)}`,
+        );
+      }
       if (request.approve === undefined) {
+        const decision: MoweApprovalDecisionRecord = {
+          decision: "denied",
+          reason: "No approval handler configured",
+        };
+        try {
+          await request.approvalLifecycle?.decided(approvalContext, decision);
+        } catch (error: unknown) {
+          return this.failure(
+            call,
+            operationId,
+            `Tool approval recording failed: ${errorMessage(error)}`,
+          );
+        }
         return this.failure(call, operationId, "Tool requires approval before execution");
       }
+      let approval: MoweApprovalDecisionRecord;
       try {
-        const decision = await request.approve({
-          runId: request.runId,
-          laneId: request.laneId,
-          operationId,
-          call,
-          tool: entry,
-          ...(request.signal === undefined ? {} : { signal: request.signal }),
-        });
-        if (!approvalGranted(decision)) {
-          return this.failure(call, operationId, approvalReason(decision));
-        }
-        if (isSignalAborted(request.signal)) {
-          return this.cancelled(call, operationId, request.signal?.reason);
-        }
+        const decision = await request.approve(approvalContext);
+        approval = isSignalAborted(request.signal)
+          ? cancellationRecord(reasonText(request.signal.reason))
+          : approvalRecord(decision);
       } catch (error: unknown) {
-        if ((request.signal !== undefined && request.signal.aborted) || isAbortError(error)) {
-          return this.cancelled(call, operationId, request.signal?.reason ?? error);
-        }
-        return this.failure(call, operationId, `Tool approval failed: ${errorMessage(error)}`);
+        approval = ((request.signal !== undefined && request.signal.aborted) || isAbortError(error))
+          ? cancellationRecord(reasonText(request.signal?.reason ?? error))
+          : { decision: "denied", reason: `Approval callback failed: ${errorMessage(error)}` };
+      }
+      try {
+        await request.approvalLifecycle?.decided(approvalContext, approval);
+      } catch (error: unknown) {
+        return this.failure(
+          call,
+          operationId,
+          `Tool approval recording failed: ${errorMessage(error)}`,
+        );
+      }
+      if (approval.decision === "cancelled") {
+        return this.cancelled(call, operationId, request.signal?.reason ?? approval.reason);
+      }
+      if (approval.decision !== "approved") {
+        return this.failure(
+          call,
+          operationId,
+          approval.reason === undefined ? "Tool approval denied" : `Tool approval denied: ${approval.reason}`,
+        );
+      }
+      if (isSignalAborted(request.signal)) {
+        return this.cancelled(call, operationId, request.signal?.reason);
       }
     }
     const deadline = createToolDeadline(request.signal, entry.metadata.timeoutMs);
     try {
       const context = {
         runId: request.runId,
+        laneId: request.laneId,
         workspace: request.workspace,
         operationId,
         ...(deadline.signal === undefined ? {} : { signal: deadline.signal }),
@@ -983,15 +1029,31 @@ function abortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException("The operation was aborted", "AbortError");
 }
 
-function approvalGranted(decision: MoweApprovalDecision): boolean {
-  return decision === true || (typeof decision === "object" && decision.approved === true);
+function approvalRecord(decision: MoweApprovalDecision): MoweApprovalDecisionRecord {
+  if (decision === true) return { decision: "approved" };
+  if (typeof decision === "object" && decision.approved === true) {
+    return {
+      decision: "approved",
+      ...(decision.reason === undefined ? {} : { reason: decision.reason }),
+    };
+  }
+  return {
+    decision: "denied",
+    ...(typeof decision === "object" && decision.reason !== undefined
+      ? { reason: decision.reason }
+      : {}),
+  };
 }
 
-function approvalReason(decision: MoweApprovalDecision): string {
-  if (typeof decision === "object" && decision.reason !== undefined) {
-    return `Tool approval denied: ${decision.reason}`;
-  }
-  return "Tool approval denied";
+function reasonText(reason: unknown): string | undefined {
+  if (reason === undefined) return undefined;
+  return reason instanceof Error ? reason.message : String(reason);
+}
+
+function cancellationRecord(reason: string | undefined): MoweApprovalDecisionRecord {
+  return reason === undefined
+    ? { decision: "cancelled" }
+    : { decision: "cancelled", reason };
 }
 
 /** Short factory for callers that prefer a function over `new MoweExecutor`. */

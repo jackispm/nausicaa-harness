@@ -60,6 +60,7 @@ import {
 import { UNCONFIGURED_MODEL } from "./onboarding.js";
 import type { CredentialStatus } from "./onboarding.js";
 import { SelectorOverlay } from "./selector-component.js";
+import type { SelectorFilter } from "./selector-component.js";
 import type { EdgeSelectionController, EdgeSelectionSnapshot } from "./edge-selection.js";
 import {
   QueueSelection,
@@ -95,6 +96,20 @@ import type {
   AgentAwarenessInputSource,
   AgentAwarenessQuery,
 } from "../runtime/agent-awareness.js";
+import {
+  canonicalInteractiveCommandName,
+  findInteractiveCommand,
+  formatInteractiveCommandHelp,
+  publicInteractiveCommandSpecs,
+} from "./command-registry.js";
+import {
+  environmentCredentialPresent,
+  runAuthCommand,
+  type AuthModelPort,
+  type Output,
+  type SecretInput,
+} from "./auth.js";
+import type { CredentialStore } from "@earendil-works/pi-ai";
 
 export interface InteractiveOptions {
   session: SessionController;
@@ -117,12 +132,14 @@ export interface InteractiveOptions {
   modelChoices?: readonly (string | ModelSelectorCandidate)[];
   /** True when the CLI kept an empty TTY session open for first-run setup. */
   startupModelMissing?: boolean;
-  /** Show setup status at startup while keeping `/setup` independently available. */
+  /** Show setup status at startup; setup is not a public slash command. */
   showStartupSetup?: boolean;
   /** Local-only startup status; never contains a complete credential value. */
   startupNotice?: string | (() => string);
   /** Local credential presence only; it is never an authentication result. */
   credentialStatus?: CredentialStatus | (() => CredentialStatus);
+  /** Optional provider authentication shared with the host/model boundary. */
+  auth?: InteractiveAuthOptions;
   /** Read-only edge status projection supplied by the host/CLI. */
   edgeStatus?: () => EdgeStatusProjection;
   /** Optional host-injected Skill selection seam. */
@@ -132,6 +149,17 @@ export interface InteractiveOptions {
     | AgentAwarenessQuery
     | AgentAwarenessInputSource
     | (() => Promise<AgentAwarenessQuery | AgentAwarenessInputSource>);
+}
+
+export interface InteractiveAuthOptions {
+  readonly credentialStore: CredentialStore;
+  readonly modelPort: AuthModelPort;
+  /** Defaults to OpenRouter for the current beta provider. */
+  readonly provider?: string;
+  /** Environment projection used for conditional logout messaging. */
+  readonly environment?: NodeJS.ProcessEnv;
+  /** Refresh host-owned status projections after a credential mutation. */
+  readonly onChanged?: () => Promise<void> | void;
 }
 
 interface QueuedSubmission {
@@ -145,6 +173,70 @@ interface PromptStash {
   text: string;
   images: readonly (readonly [number, UserImage])[];
 }
+
+/**
+ * Auth prompts run through the already-active TUI input stream. This keeps
+ * secrets out of the Editor and avoids attaching a second raw-stdin reader.
+ */
+class TuiSecretInput implements SecretInput {
+  readonly isTTY = true;
+  private readonly listeners = new Set<(chunk: Buffer | string) => void>();
+  private cancelled = false;
+
+  private static readonly BRACKETED_PASTE_START = "\x1b[200~";
+  private static readonly BRACKETED_PASTE_END = "\x1b[201~";
+
+  setRawMode(_mode: boolean): SecretInput {
+    return this;
+  }
+
+  resume(): void {}
+
+  pause(): void {}
+
+  on(_event: "data", listener: (chunk: Buffer | string) => void): SecretInput {
+    this.listeners.add(listener);
+    // `finish()` can cancel the input between creating the auth request and
+    // the provider attaching its prompt listener. Replay that cancellation so
+    // shutdown cannot leave a hidden prompt pending forever.
+    if (this.cancelled) listener("\u0003");
+    return this;
+  }
+
+  off(_event: "data", listener: (chunk: Buffer | string) => void): SecretInput {
+    this.listeners.delete(listener);
+    return this;
+  }
+
+  push(data: string): void {
+    if (
+      data.startsWith(TuiSecretInput.BRACKETED_PASTE_START)
+      && data.endsWith(TuiSecretInput.BRACKETED_PASTE_END)
+    ) {
+      this.emit(data.slice(
+        TuiSecretInput.BRACKETED_PASTE_START.length,
+        -TuiSecretInput.BRACKETED_PASTE_END.length,
+      ));
+      return;
+    }
+    this.emit(data);
+  }
+
+  cancel(): void {
+    if (this.cancelled) return;
+    this.cancelled = true;
+    this.emit("\u0003");
+  }
+
+  private emit(data: string): void {
+    if (this.cancelled && data !== "\u0003") return;
+    for (const listener of [...this.listeners]) listener(data);
+  }
+}
+
+const quietAuthOutput: Output = {
+  write: () => true,
+};
 
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_INTERRUPT_EXIT_WINDOW_MS = 1_000;
@@ -190,6 +282,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   let queueMutationTail: Promise<void> = Promise.resolve();
   let closing = false;
   let closed = false;
+  let activeSecretInput: TuiSecretInput | undefined;
   let activeSubmission: QueuedSubmission | undefined;
   let submissionDrainPromise: Promise<void> | undefined;
   let finishPromise: Promise<void> | undefined;
@@ -257,65 +350,47 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     tui.addChild(screen);
   }
   tui.setFocus(editor);
-  editor.setAutocompleteProvider(new CombinedAutocompleteProvider([
-    { name: "help", description: "Show commands" },
-    { name: "setup", description: "Show local model and credential setup status" },
-    { name: "status", description: "Show session state" },
-    { name: "agents", description: "Show the read-only agent Awareness topology" },
-    { name: "topology", description: "Alias for /agents" },
-    { name: "edges", description: "Show configured edge sources and refresh" },
-    { name: "skills", description: "Inspect and select Skills for the next Turn", argumentHint: "[refresh|select|deselect]" },
-    { name: "context", description: "Show context capacity and cumulative lane usage" },
-    { name: "usage", description: "Alias for /context" },
-    {
-      name: "model",
-      description: "Switch the Main model",
-      argumentHint: "[model]",
-      getArgumentCompletions: (prefix) => commandArgumentCompletions(
+  const autocompleteCommands = publicInteractiveCommandSpecs().map((spec) => {
+    const completion: {
+      name: string;
+      description: string;
+      argumentHint?: string;
+      getArgumentCompletions?: (prefix: string) => ReturnType<typeof commandArgumentCompletions>;
+    } = {
+      name: spec.name,
+      description: spec.description,
+      ...(spec.argumentHint === undefined ? {} : { argumentHint: spec.argumentHint }),
+    };
+    if (spec.name === "model") {
+      completion.getArgumentCompletions = (prefix) => commandArgumentCompletions(
         readModelOptions(),
         prefix,
-      ),
-    },
-    {
-      name: "permissions",
-      description: "Change the tool capability boundary",
-      argumentHint: "[read-only|workspace|full-access]",
-      getArgumentCompletions: (prefix) => commandArgumentCompletions(
+      );
+    } else if (spec.name === "permissions") {
+      completion.getArgumentCompletions = (prefix) => commandArgumentCompletions(
         permissionProfileOptions(
           options.session.snapshot().permissionProfile,
           options.session.snapshot().workspaceBashAvailability,
         ),
         prefix,
-      ),
-    },
-    {
-      name: "mode",
-      description: "Switch between Default and Plan",
-      argumentHint: "[default|plan]",
-      getArgumentCompletions: (prefix) => commandArgumentCompletions(
+      );
+    } else if (spec.name === "mode") {
+      completion.getArgumentCompletions = (prefix) => commandArgumentCompletions(
         collaborationModeOptions(options.session.snapshot().collaborationMode),
         prefix,
-      ),
-    },
-    { name: "plan", description: "Enter Plan mode, optionally with a prompt", argumentHint: "[prompt]" },
-    {
-      name: "theme",
-      description: "Select the TUI color scheme",
-      argumentHint: "[auto|light|dark]",
-      getArgumentCompletions: (prefix) => commandArgumentCompletions(
+      );
+    } else if (spec.name === "theme") {
+      completion.getArgumentCompletions = (prefix) => commandArgumentCompletions(
         themeSelectorOptions(themePreference),
         prefix,
-      ),
-    },
-    { name: "goal", description: "Show or revise the Run Goal", argumentHint: "[statement]" },
-    { name: "session", description: "Switch between workspace Runs", argumentHint: "[run-id]" },
-    { name: "new", description: "Start a new Run" },
-    { name: "resume", description: "Choose a saved Run, or explicitly continue one", argumentHint: "[run-id]" },
-    { name: "cancel", description: "Cancel the active Turn" },
-    { name: "resolve", description: "Resolve an unknown tool operation", argumentHint: "<operation-id>" },
-    { name: "copy", description: "Copy the last assistant answer" },
-    { name: "exit", description: "Exit Nausicaa" },
-  ], options.session.workspace));
+      );
+    }
+    return completion;
+  });
+  editor.setAutocompleteProvider(new CombinedAutocompleteProvider(
+    autocompleteCommands,
+    options.session.workspace,
+  ));
   const setEditorTextFromQueueSelection = (text: string): void => {
     editor.setText(text);
   };
@@ -1004,6 +1079,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   ): Promise<void> => {
     if (runtimeEvent.kind === "event") {
       const event = runtimeEvent.event;
+      const isTetoAdvice = event.type === "message.sent"
+        && event.payload.message.from === "teto"
+        && event.payload.message.payload.type === "advice.propose";
+      // The transcript renderer owns Main's presentation surface. Teto and
+      // Worker facts stay durable and available to their schedulers, while a
+      // Teto advice message remains an explicit user-facing notice below.
+      if (event.laneId !== "main" && !isTetoAdvice) return;
       if (
         event.type === "message.sent"
         || event.type === "step.completed"
@@ -1135,7 +1217,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           appendNotice(
             event.payload.reason === "model-output-limit"
               ? "The model reached its output limit. The partial answer is preserved; use /resume to continue."
-              : "Turn paused at a safe boundary. Use /resume or /cancel.",
+              : "Turn paused at a safe boundary. Use /resume or /stop.",
             "warning",
           );
           break;
@@ -1151,6 +1233,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       }
     } else if (runtimeEvent.kind === "stream") {
       const event = runtimeEvent.event;
+      if (event.laneId !== "main") return;
       switch (event.type) {
         case "stream.start":
           beginResponse(event.turnId);
@@ -1219,6 +1302,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     // palette before waiting for queued submissions or stopping the renderer.
     closeSelector(true);
     finishPromise = (async () => {
+      // A hidden `/login` prompt owns the active input stream. Cancel it
+      // before draining submissions so SIGINT/SIGTERM/EOF can always settle
+      // the auth request and let the TUI shut down.
+      const secretInput = activeSecretInput;
+      activeSecretInput = undefined;
+      secretInput?.cancel();
       // Enter already accepted these submissions. Stopping admission first
       // makes this a finite drain before the Ledger-backed controller closes.
       await waitForSubmissionDrain();
@@ -1275,6 +1364,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       `- **State:** ${snapshot.status}; ${snapshot.collaborationMode} mode; Teto ${snapshot.tetoEnabled ? "on" : "off"}`,
       `- **Permissions:** ${snapshot.permissionProfile}; ${snapshot.allowWrite ? "write enabled" : "file writes off"}; ${shellStatus}; ${snapshot.allowNetwork ? "network enabled" : "network off"}`,
       `- **Queue / Tokens:** ${snapshot.pendingInputs} pending; ${usage.input + usage.output} used; ${usage.cacheRead} cache-read`,
+      ...(options.credentialStatus === undefined
+        ? []
+        : [`- **Auth:** ${credentialStatusSummary(readCredentialStatus())}`]),
       ...(snapshot.blocker === undefined ? [] : [`- **Blocked:** ${snapshot.blocker}`]),
       ...(options.edgeStatus === undefined && options.edgeSelection === undefined
         ? []
@@ -1285,6 +1377,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     ].join("\n");
     appendBlock(new Markdown(text, 1, 0, nausicaaMarkdownTheme));
   };
+
+  const readCredentialStatus = (): CredentialStatus => (
+    typeof options.credentialStatus === "function"
+      ? options.credentialStatus()
+      : options.credentialStatus!
+  );
 
   const readEdgeSelection = (): EdgeSelectionSnapshot | undefined => options.edgeSelection?.snapshot();
 
@@ -1331,8 +1429,115 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     appendBlock(new Markdown([
       "### Local setup",
       startupNotice ?? "Use `/model` to choose a local catalog entry. Provider auth is unverified until a real request.",
-      "No credential is saved by this screen.",
+      "Use `/login` (or `nausicaa auth login`) to save a credential, or set OPENROUTER_API_KEY for this process.",
     ].join("\n\n"), 1, 0, nausicaaMarkdownTheme));
+  };
+
+  const authProvider = (argument: string, commandName: "login" | "logout"): string => {
+    if (argument.length > 0 && argument.split(/\s+/u).length !== 1) {
+      throw new Error(`Usage: /${commandName} [provider]`);
+    }
+    const provider = argument.length > 0
+      ? argument
+      : options.auth?.provider ?? "openrouter";
+    if (provider !== "openrouter") {
+      throw new Error("Only the openrouter provider is available in this build.");
+    }
+    return provider;
+  };
+
+  const loginInTui = async (argument: string): Promise<void> => {
+    if (options.auth === undefined) {
+      appendNotice(
+        "Authentication is unavailable in this session. Use `nausicaa auth login` instead.",
+        "warning",
+      );
+      return;
+    }
+    const provider = authProvider(argument, "login");
+    const input = new TuiSecretInput();
+    activeSecretInput = input;
+    appendNotice(
+      `${provider} API key input is hidden. Press Enter to save, or Esc/Ctrl+C to cancel.`,
+      "info",
+    );
+    try {
+      await runAuthCommand(
+        { action: "login", provider, json: false },
+        {
+          credentialStore: options.auth.credentialStore,
+          modelPort: options.auth.modelPort,
+          input,
+          output: quietAuthOutput,
+        },
+      );
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendNotice(
+        message === "Login cancelled" ? "Login cancelled." : `Login failed: ${oneLine(message)}`,
+        message === "Login cancelled" ? "info" : "error",
+      );
+      return;
+    } finally {
+      if (activeSecretInput === input) activeSecretInput = undefined;
+    }
+    try {
+      await options.auth.onChanged?.();
+    } catch {
+      // The credential mutation already succeeded; a status refresh is optional.
+    }
+    appendNotice(
+      `Signed in to ${provider}. The credential is saved locally; auth remains unverified until a provider request.`,
+      "success",
+    );
+  };
+
+  const logoutInTui = async (argument: string): Promise<void> => {
+    if (options.auth === undefined) {
+      appendNotice(
+        "Authentication is unavailable in this session. Use `nausicaa auth logout` instead.",
+        "warning",
+      );
+      return;
+    }
+    const provider = authProvider(argument, "logout");
+    let hadSavedCredential = false;
+    try {
+      hadSavedCredential = await options.auth.credentialStore.read(provider) !== undefined;
+      await runAuthCommand(
+        { action: "logout", provider, json: false },
+        {
+          credentialStore: options.auth.credentialStore,
+          modelPort: options.auth.modelPort,
+          output: quietAuthOutput,
+        },
+      );
+    } catch (error: unknown) {
+      appendNotice(
+        `Logout failed: ${oneLine(error instanceof Error ? error.message : String(error))}`,
+        "error",
+      );
+      return;
+    }
+    try {
+      await options.auth.onChanged?.();
+    } catch {
+      // The deletion already succeeded; a status refresh is optional.
+    }
+    const environmentAvailable = environmentCredentialPresent(
+      provider,
+      options.auth.environment ?? process.env,
+    );
+    appendNotice(
+      hadSavedCredential
+        ? environmentAvailable
+          ? `Removed the saved ${provider} credential. Any environment credential remains available.`
+          : `Removed the saved ${provider} credential. No environment credential is configured.`
+        : environmentAvailable
+          ? `No saved ${provider} credential was present. Any environment credential remains available.`
+          : `No saved ${provider} credential was present.`,
+      "success",
+    );
   };
 
   const providerReadinessError = (): string | undefined => {
@@ -1565,12 +1770,19 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
 
   const switchSession = async (runId: string): Promise<void> => {
     const current = options.session.snapshot();
-    if (current.status === "running" || current.status === "cancelling") {
-      throw new Error("/session is unavailable while Main is working");
-    }
+    // An explicit `/resume <current-run>` can arrive on the same tick as the
+    // durable `turn.waiting` fact, before SessionController has published its
+    // final idle state. Wait for that execution to close instead of treating
+    // the current attachment as a cross-Run switch.
     if (current.runId === runId) {
+      if (current.status === "running" || current.status === "cancelling") {
+        await options.session.waitForIdle();
+      }
       appendNotice(`Run ${runId} is already attached.`, "info");
       return;
+    }
+    if (current.status === "running" || current.status === "cancelling") {
+      throw new Error("/resume is unavailable while Main is working");
     }
     await options.session.attachRun(runId);
     resetQueueSelection();
@@ -1586,17 +1798,63 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   const showSessionSelector = async (): Promise<void> => {
     const snapshot = options.session.snapshot();
     if (snapshot.status === "running" || snapshot.status === "cancelling") {
-      throw new Error("/session is unavailable while Main is working");
+      throw new Error("/resume is unavailable while Main is working");
     }
     const runs = await listWorkspaceRuns(options.session.dataDir, options.session.workspace);
     if (runs.length === 0) {
       appendNotice("No saved Runs exist for this workspace.", "info");
       return;
     }
+    const selectorOptions = workspaceResumeOptions(runs);
+    const runById = new Map(runs.map((run) => [run.runId, run]));
+    const filters: readonly SelectorFilter[] = [
+      {
+        key: "status",
+        label: "Status",
+        options: [
+          { value: "all", label: "All" },
+          { value: "active", label: "Active" },
+          { value: "archived", label: "Archived" },
+        ],
+        current: "all",
+      },
+      {
+        key: "sort",
+        label: "Sort",
+        options: [
+          { value: "updated", label: "Updated" },
+          { value: "created", label: "Created" },
+        ],
+        current: "updated",
+      },
+    ];
     const selector = new SelectorOverlay({
-      title: "Runs",
-      subtitle: "Resume a saved Run from this workspace.",
-      options: workspaceRunOptions(runs, snapshot.runId),
+      title: "Resume a previous session",
+      // Codex keeps this surface quiet: the title, search, and facets explain
+      // the operation without a second prose subtitle.
+      searchLabel: "Type to search",
+      filters,
+      options: selectorOptions,
+      filterOptions: (options: readonly SelectorOption[], values: Readonly<Record<string, string>>) => {
+        const status = values.status ?? "active";
+        const selected = options.filter((option) => {
+          const run = runById.get(option.value);
+          if (run === undefined || status === "all") return run !== undefined;
+          const archived = run.status === "completed"
+            || run.status === "failed"
+            || run.status === "cancelled";
+          return status === "archived" ? archived : !archived;
+        });
+        const sort = values.sort ?? "updated";
+        return [...selected].sort((left, right) => {
+          const leftRun = runById.get(left.value);
+          const rightRun = runById.get(right.value);
+          if (leftRun === undefined || rightRun === undefined) return 0;
+          const leftTime = sort === "created" ? leftRun.createdAt : leftRun.updatedAt;
+          const rightTime = sort === "created" ? rightRun.createdAt : rightRun.updatedAt;
+          return rightTime.localeCompare(leftTime) || rightRun.runId.localeCompare(leftRun.runId);
+        });
+      },
       ...(snapshot.runId === undefined ? {} : { current: snapshot.runId }),
       onSelect: (value) => {
         closeSelector(false);
@@ -1688,26 +1946,19 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     commandLine: string,
     commandImages?: readonly UserImage[],
   ): Promise<void> => {
-    const { command, argument } = parseInteractiveCommand(commandLine);
+    const { command: enteredCommand, argument } = parseInteractiveCommand(commandLine);
+    if (findInteractiveCommand(enteredCommand) === undefined) {
+      appendNotice(`Unknown command: ${enteredCommand}. Try /help.`, "warning");
+      return;
+    }
+    const command = `/${canonicalInteractiveCommandName(enteredCommand)}`;
     try {
       switch (command) {
         case "/help":
           appendBlock(new Markdown([
             "### Commands",
-            "`/setup` local model and credential status (auth remains unverified)",
-            "`/status` session details  ·  `/context` context and cumulative usage",
-            "`/agents` read-only Awareness topology  ·  `/topology` alias for `/agents`",
-            "`/edges [refresh]` configured edge sources, Skills, and registry generation",
-            "`/skills [refresh|select <id>|deselect <id>]` next-Turn Skill context",
-            "`/usage` alias for `/context`  ·  `/goal [statement]` show or revise Goal",
-            "`/session [run-id]` switch saved Run  ·  `/new` new Run",
-            "`/permissions [profile]` capability boundary  ·  `/plan [prompt]` enter Plan mode",
-            "`/mode [default|plan]` collaboration mode  ·  `/model [selector]` switch Main model",
-            "`/theme [auto|light|dark]` change colors",
-            "`/resume` choose a saved Run without calling the model  ·  `/resume <run-id>` continue explicitly",
-            "`/cancel` cancel active Turn  ·  `/resolve <operation-id>` resolve recovery",
-            "`/copy` copy the last assistant answer",
-            "`/exit` close session  ·  `Alt+Enter` queue follow-up",
+            formatInteractiveCommandHelp(),
+            "`/exit` remains a hidden Codex-compatible alias for `/quit`.",
             "`Alt+Up/Down` browse and edit queued input",
             `\`${pasteImageLabel}\` paste image  ·  \`Ctrl+S\` stash prompt`,
             "`Ctrl+T` thinking  ·  `Ctrl+O` tool output",
@@ -1715,14 +1966,22 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             "`Ctrl+C` cancel/clear",
           ].join("\n\n"), 1, 0, nausicaaMarkdownTheme));
           break;
+        case "/status":
+          writeStatus(options.session.snapshot());
+          break;
         case "/setup":
           if (argument.length > 0) throw new Error("Usage: /setup");
           showSetup();
           break;
-        case "/status":
-          writeStatus(options.session.snapshot());
+        case "/login":
+          await loginInTui(argument);
+          break;
+        case "/logout":
+          await logoutInTui(argument);
           break;
         case "/agents":
+          await showAgentTopology(argument);
+          break;
         case "/topology":
           await showAgentTopology(argument);
           break;
@@ -1755,8 +2014,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           throw new Error("Usage: /skills [refresh|select <id>|deselect <id>]");
         }
         case "/context":
-        case "/usage":
           if (argument.length > 0) throw new Error("Usage: /context");
+          appendBlock(new ContextUsageBlock(options.session.contextOverview()));
+          break;
+        case "/usage":
+          if (argument.length > 0) throw new Error("Usage: /usage");
           appendBlock(new ContextUsageBlock(options.session.contextOverview()));
           break;
         case "/model": {
@@ -1831,7 +2093,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           if (argument.length === 0) {
             await showSessionSelector();
           } else {
-            await switchSession(argument.trim());
+            if (argument.split(/\s+/u).length !== 1) throw new Error("Usage: /session [run-id]");
+            await switchSession(argument);
           }
           break;
         case "/new":
@@ -1867,12 +2130,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           // opening the picker never causes an unexpected provider request.
           await showSessionSelector();
           break;
+        case "/stop":
+          await options.session.cancel();
+          break;
         case "/cancel":
           await options.session.cancel();
           break;
         case "/resolve":
           if (argument.length === 0) throw new Error("/resolve requires an operation id");
-          await options.session.resolveOperation(argument.split(/\s+/)[0]!);
+          await options.session.resolveOperation(argument.split(/\s+/u)[0]!);
           appendNotice("Operation resolved as failed.", "warning");
           break;
         case "/copy": {
@@ -1892,7 +2158,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           appendNotice("Copied last assistant message to clipboard.", "success");
           break;
         }
-        case "/exit":
+        case "/quit":
           // Finish after this worker drains; awaiting it here would await the
           // worker from inside its own queue item.
           closing = true;
@@ -2011,7 +2277,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     if ((value.length === 0 && submittedImages.length === 0) || closing) return Promise.resolve();
     if (!value.startsWith("/") && options.session.snapshot().model === UNCONFIGURED_MODEL) {
       editor.setText(value);
-      appendNotice("Choose a model with /model before sending a task. Use /setup for local credential status.", "warning");
+      appendNotice("Choose a model with /model before sending a task. Local setup status is shown at startup.", "warning");
       return Promise.resolve();
     }
     if (submittedImages.length > 0 && options.session.modelCapabilities().imageInput === "unsupported") {
@@ -2048,6 +2314,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   editor.onChange = () => { editorRevision += 1; };
   editor.onSubmit = (text) => { void submitText(text); };
   tui.addInputListener((data) => {
+    if (activeSecretInput !== undefined) {
+      activeSecretInput.push(data);
+      return { consume: true };
+    }
     if (activeSelector !== undefined) return undefined;
     const isInterrupt = matchesKey(data, "ctrl+c");
     if (!isInterrupt) clearInterruptExit();
@@ -2136,6 +2406,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   }
   await refreshQueue();
   if (options.showStartupSetup === true || options.startupModelMissing === true) {
+    // Setup status is a startup diagnostic, not a public slash command.
     showSetup();
     if (options.startupModelMissing === true) showModelSelector();
   }
@@ -2196,8 +2467,18 @@ function assistantKey(turnId: string | undefined, content: string): string {
   return `${turnId ?? "legacy"}:${content}`;
 }
 
+function credentialStatusSummary(status: CredentialStatus): string {
+  if (status.provider === undefined) return "no provider selected";
+  if (status.credentialSource === "saved") return "saved credential (unverified)";
+  if (status.credentialSource === "environment") {
+    return `${status.credentialEnv ?? "environment"} ${status.credentialMask ?? "configured"} (unverified)`;
+  }
+  if (status.credentialEnv !== undefined) return `${status.credentialEnv} missing`;
+  return "not configured (unverified)";
+}
+
 function unknownToolDetail(operationId: string): string {
-  return `unresolved ${operationId}; use /resolve`;
+  return `unresolved ${operationId}; restart with --resolve-operation ${operationId} if the operation should be treated as failed`;
 }
 
 function oneLine(value: string, maxWidth = 160): string {
@@ -2221,15 +2502,48 @@ function workspaceRunOptions(
 ): SelectorOption[] {
   return runs.map((run) => ({
     value: run.runId,
-    label: run.runId === currentRunId ? `${run.runId} (current)` : run.runId,
-    description: `${capitalize(run.status)} · ${formatRunTime(run.updatedAt)} · ${oneLine(terminalSafeText(run.goal), 72)}`,
+    label: run.title === undefined
+      ? (run.runId === currentRunId ? `${run.runId} (current)` : run.runId)
+      : terminalSafeText(run.title),
+    description: [
+      run.runId === currentRunId ? "current" : undefined,
+      capitalize(run.status),
+      formatRunRelativeTime(run.updatedAt),
+      run.runId,
+      run.title === undefined ? undefined : oneLine(terminalSafeText(run.goal), 72),
+    ].filter((value): value is string => value !== undefined).join(" · "),
   }));
 }
 
-function formatRunTime(value: string): string {
-  const normalized = value.trim();
-  if (normalized.length < 16) return normalized;
-  return normalized.slice(0, 16).replace("T", " ");
+/** Codex-style history rows lead with recency and keep the task title primary. */
+function workspaceResumeOptions(
+  runs: readonly WorkspaceRunSummary[],
+): SelectorOption[] {
+  return runs.map((run) => ({
+    value: run.runId,
+    label: formatRunRelativeTime(run.updatedAt),
+    description: [
+      terminalSafeText(run.title ?? run.goal),
+      capitalize(run.status),
+      `Run ID ${run.runId}`,
+    ].join(" · "),
+  }));
+}
+
+function formatRunRelativeTime(value: string, now = Date.now()): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return oneLine(value, 24);
+  const seconds = Math.max(0, Math.floor((now - timestamp) / 1_000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  const weeks = Math.floor(days / 7);
+  if (weeks < 5) return `${weeks}w ago`;
+  return new Date(timestamp).toISOString().slice(0, 10);
 }
 
 function parseInteractiveCommand(commandLine: string): {

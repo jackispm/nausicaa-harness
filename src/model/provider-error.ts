@@ -46,7 +46,7 @@ export class ProviderModelError extends Error {
 function safeUsage(value: TokenUsage | undefined): TokenUsage | undefined {
   if (value === undefined) return undefined;
   for (const name of ["input", "output", "cacheRead", "cacheWrite"] as const) {
-    if (!Number.isFinite(value[name]) || value[name] < 0) return undefined;
+    if (!Number.isSafeInteger(value[name]) || value[name] < 0) return undefined;
   }
   if (value.costUsd !== undefined && (!Number.isFinite(value.costUsd) || value.costUsd < 0)) {
     return undefined;

@@ -11,6 +11,7 @@ import {
 import { RunTokenBudget } from "../../src/runtime/run-token-budget.js";
 import { recoverRunTokenUsage } from "../../src/runtime/run-token-budget-recovery.js";
 import {
+  ArtifactNotFoundError,
   type ContentAddressedStore,
   MemoryContentAddressedStore,
 } from "../../src/store/index.js";
@@ -231,6 +232,86 @@ describe("ReflectionScheduler", () => {
       }],
     });
   });
+
+  it("retains a revise note when delivery persistence fails", async () => {
+    const ledger = new FailingReflectionDeliveryLedger();
+    const scheduler = new ReflectionScheduler({
+      eventSink: ledger,
+      modelPort: new RevisionReflectionModel(),
+      store: new MemoryContentAddressedStore(),
+      runId: "run-1",
+      goal,
+      model: "reflection-model",
+      policy,
+    });
+
+    scheduler.enqueue(mainStep(1));
+    scheduler.enqueue(mainStep(2));
+    await scheduler.drain();
+    await expect(scheduler.beforeMainStep()).resolves.toEqual([]);
+    await expect(scheduler.beforeMainStep()).resolves.toEqual([{
+      kind: "reflection",
+      source: "main-reflection",
+      content: "Check the package entry point",
+      messageId: "run-1:reflection:2",
+    }]);
+    expect((await ledger.read({ runId: "run-1" })).filter((event) => (
+      event.type === "reflection.delivered"
+    ))).toHaveLength(1);
+    await scheduler.stop();
+  });
+
+  it("skips a permanently missing artifact so later reflections remain deliverable", async () => {
+    const ledger = new MemoryLedger();
+    const backingStore = new MemoryContentAddressedStore();
+    const validRef = await backingStore.put(
+      JSON.stringify({ action: "revise", note: "Deliver the later observation" }),
+      "application/vnd.nausicaa.reflection+json",
+    );
+    let reads = 0;
+    const store: ContentAddressedStore = {
+      put: (data, mediaType) => backingStore.put(data, mediaType),
+      has: (ref) => backingStore.has(ref),
+      get: async (ref) => {
+        reads += 1;
+        if (reads === 1) throw new ArtifactNotFoundError("reflection artifact disappeared");
+        return backingStore.get(validRef);
+      },
+    };
+
+    const model = new RevisionReflectionModel();
+    const scheduler = new ReflectionScheduler({
+      eventSink: ledger,
+      modelPort: model,
+      store,
+      runId: "run-1",
+      goal,
+      model: "reflection-model",
+      policy,
+    });
+
+    scheduler.enqueue(mainStep(1));
+    scheduler.enqueue(mainStep(2));
+    const hardStep = mainStep(3);
+    scheduler.enqueue({
+      ...hardStep,
+      delta: { ...hardStep.delta, triggerKind: "goal-change" },
+    });
+    for (let step = 4; step <= 6; step += 1) scheduler.enqueue(mainStep(step));
+    await scheduler.drain();
+    await expect(scheduler.beforeMainStep()).resolves.toEqual([]);
+    await expect(scheduler.beforeMainStep()).resolves.toEqual([{
+      kind: "reflection",
+      source: "main-reflection",
+      content: "Deliver the later observation",
+      messageId: "run-1:reflection:6",
+    }]);
+    const events = await ledger.read({ runId: "run-1" });
+    expect(events.some((event) => event.type === "lane.status" && event.payload.status === "failed"))
+      .toBe(true);
+
+    await scheduler.stop();
+  });
 });
 
 class CountingReflectionModel implements ModelPort {
@@ -248,6 +329,31 @@ class PendingReflectionModel implements ModelPort {
   async complete(): Promise<ModelResponse> {
     this.calls += 1;
     return new Promise<ModelResponse>(() => undefined);
+  }
+}
+
+class RevisionReflectionModel implements ModelPort {
+  async complete(): Promise<ModelResponse> {
+    return {
+      content: '{"action":"revise","note":"Check the package entry point"}',
+      toolCalls: [],
+      stopReason: "stop",
+      usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0 },
+    };
+  }
+}
+
+class FailingReflectionDeliveryLedger extends MemoryLedger {
+  private failed = false;
+
+  override async append<K extends import("../../src/domain/index.js").EventType>(
+    input: import("../../src/domain/index.js").AppendEvent<K>,
+  ) {
+    if (!this.failed && input.type === "reflection.delivered") {
+      this.failed = true;
+      throw new Error("reflection delivery persistence unavailable");
+    }
+    return super.append(input);
   }
 }
 

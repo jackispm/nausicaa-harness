@@ -51,6 +51,9 @@ export interface Output {
   write(chunk: string): boolean;
 }
 
+/** The small provider-auth surface needed by both top-level CLI and TUI. */
+export type AuthModelPort = Pick<PiAiModelPort, "checkAuth" | "login" | "logout">;
+
 /** Execute a non-Run command without opening a Ledger or touching the network. */
 export async function runUtilityCommand(
   command: AuthCommandInput | ConfigCommandInput,
@@ -78,9 +81,9 @@ export async function runUtilityCommand(
 
 export async function runAuthCommand(
   command: AuthCommandInput,
-  dependencies: UtilityCommandDependencies & {
+  dependencies: Omit<UtilityCommandDependencies, "modelPort"> & {
     readonly credentialStore: CredentialStore;
-    readonly modelPort: PiAiModelPort;
+    readonly modelPort: AuthModelPort;
   },
 ): Promise<number> {
   const output = dependencies.output ?? process.stdout;
@@ -122,8 +125,12 @@ export async function runAuthCommand(
       command.json,
       result,
       before === undefined
-        ? `No saved ${provider} credential was present.\n`
-        : `Removed the saved ${provider} credential. Environment credentials remain available.\n`,
+        ? result.environmentCredential
+          ? `No saved ${provider} credential was present. Environment credentials remain available.\n`
+          : `No saved ${provider} credential was present.\n`
+        : result.environmentCredential
+          ? `Removed the saved ${provider} credential. Environment credentials remain available.\n`
+          : `Removed the saved ${provider} credential. No environment credential is configured.\n`,
     );
     return 0;
   }
@@ -234,7 +241,7 @@ async function readSecret(
     const onData = (chunk: Buffer | string): void => {
       const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       for (const character of text) {
-        if (character === "\u0003" || character === "\u0004") {
+        if (character === "\u0003" || character === "\u0004" || character === "\u001b") {
           finish(new Error("Login cancelled"));
           return;
         }
@@ -279,7 +286,7 @@ function credentialSummary(credential: Credential): { type: Credential["type"]; 
   };
 }
 
-function environmentCredentialPresent(
+export function environmentCredentialPresent(
   provider: string,
   environment: NodeJS.ProcessEnv,
 ): boolean {

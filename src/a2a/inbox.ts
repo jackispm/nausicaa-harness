@@ -213,6 +213,16 @@ export class InboxProjector {
         `Claim references unknown message ${event.payload.messageId}`,
       );
     }
+    if (event.runId !== record.message.runId) {
+      throw new A2AProtocolError(
+        `Claim for ${event.payload.messageId} belongs to another Run`,
+      );
+    }
+    if (event.laneId !== event.payload.claimedBy) {
+      throw new A2AProtocolError(
+        `Claim for ${event.payload.messageId} is not emitted by its claiming lane`,
+      );
+    }
     if (record.status === "handled") {
       return;
     }
@@ -230,6 +240,21 @@ export class InboxProjector {
     if (record === undefined) {
       throw new A2AProtocolError(
         `Handle references unknown message ${event.payload.messageId}`,
+      );
+    }
+    if (event.runId !== record.message.runId) {
+      throw new A2AProtocolError(
+        `Handle for ${event.payload.messageId} belongs to another Run`,
+      );
+    }
+    if (record.status !== "claimed" || record.claim === undefined) {
+      throw new A2AProtocolError(
+        `Handle references an unclaimed message ${event.payload.messageId}`,
+      );
+    }
+    if (event.laneId !== record.claim.claimedBy) {
+      throw new A2AProtocolError(
+        `Handle for ${event.payload.messageId} is not emitted by its claiming lane`,
       );
     }
     record.status = "handled";
@@ -264,6 +289,7 @@ export function projectInbox(events: readonly AnyEvent[]): InboxProjection {
 export class A2AInbox {
   private readonly projector: InboxProjector;
   private readonly sink: EventSink;
+  private readonly ephemeralSink: EphemeralEventSink | undefined;
   private readonly clock: Clock;
   private readonly claimLeaseMs: number;
   private commandTail: Promise<void> = Promise.resolve();
@@ -276,7 +302,14 @@ export class A2AInbox {
     if (!Number.isSafeInteger(this.claimLeaseMs) || this.claimLeaseMs <= 0) {
       throw new RangeError("claimLeaseMs must be a positive integer");
     }
-    this.sink = options.sink ?? new EphemeralEventSink(events, this.clock);
+    if (options.sink === undefined) {
+      const sink = new EphemeralEventSink(events, this.clock);
+      this.sink = sink;
+      this.ephemeralSink = sink;
+    } else {
+      this.sink = options.sink;
+      this.ephemeralSink = undefined;
+    }
   }
 
   static rehydrate(
@@ -288,6 +321,7 @@ export class A2AInbox {
 
   rehydrate(events: readonly AnyEvent[]): void {
     this.projector.rehydrate(events);
+    this.ephemeralSink?.rehydrate(events);
   }
 
   snapshot(): InboxProjection {
@@ -615,11 +649,18 @@ export class A2AInbox {
 }
 
 class EphemeralEventSink implements EventSink {
-  private offset: number;
+  private offset = 0;
   private readonly laneSequences = new Map<string, number>();
   private readonly eventsByIdempotency = new Map<string, AnyEvent>();
 
   constructor(events: readonly AnyEvent[], private readonly clock: Clock) {
+    this.rehydrate(events);
+  }
+
+  rehydrate(events: readonly AnyEvent[]): void {
+    this.offset = 0;
+    this.laneSequences.clear();
+    this.eventsByIdempotency.clear();
     this.offset = events.reduce(
       (maximum, event) => Math.max(maximum, event.globalOffset),
       0,
@@ -867,7 +908,9 @@ function isExpired(message: A2AMessage, now: Date): boolean {
 }
 
 function compareEvents(left: AnyEvent, right: AnyEvent): number {
-  return left.globalOffset - right.globalOffset;
+  return left.globalOffset - right.globalOffset
+    || left.eventId.localeCompare(right.eventId)
+    || left.type.localeCompare(right.type);
 }
 
 const SCHEDULING_PRIORITY_CEILING = 10;

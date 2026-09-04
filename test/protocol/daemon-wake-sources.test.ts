@@ -91,6 +91,26 @@ describe("daemon wake sources", () => {
     await expect(source.tick()).rejects.toThrow(/stopped/u);
   });
 
+  it("rolls back a failed immediate timer wake", async () => {
+    let attempts = 0;
+    const source = createTimerWakeSource({
+      runId: "run-immediate-failure",
+      scheduleId: "bootstrap",
+      intervalMs: 60_000,
+      startImmediately: true,
+      onWake: () => {
+        attempts += 1;
+        throw new Error("wake unavailable");
+      },
+    });
+
+    await expect(source.start()).rejects.toThrow("wake unavailable");
+    expect(source.running).toBe(false);
+    await expect(source.tick()).rejects.toThrow(/stopped/u);
+    expect(attempts).toBe(1);
+    await source.close();
+  });
+
   it("serializes webhook delivery and keeps event identity independent of payload", async () => {
     const order: string[] = [];
     const source = createWebhookWakeSource({

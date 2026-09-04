@@ -35,6 +35,8 @@ interface LockOwner {
   token: string;
 }
 
+const MAX_WRITER_LOCK_BYTES = 4 * 1024;
+
 interface WriterLock {
   handle: FileHandle;
   path: string;
@@ -66,6 +68,10 @@ async function readLockOwner(path: string): Promise<{
 
   try {
     await assertRegularFile(handle, path);
+    const stats = await handle.stat();
+    if (stats.size > MAX_WRITER_LOCK_BYTES) {
+      throw new LedgerWriterLockedError(`Writer lock is too large: ${path}`);
+    }
     const parsed = JSON.parse(await handle.readFile("utf8")) as Partial<LockOwner>;
     if (
       parsed.version !== 1

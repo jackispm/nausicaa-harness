@@ -1,16 +1,20 @@
 import type { ArtifactRef } from "../domain/types.js";
 import {
+  ArtifactIntegrityError,
   ArtifactNotFoundError,
   assertArtifactRef,
+  assertContentHash,
   createArtifactRef,
+  type ContentAddressedStoreMaintenance,
   type ContentAddressedStore,
   type StoreInput,
+  type StoredArtifact,
   toBytes,
   verifyArtifact,
 } from "./store.js";
 
-export class MemoryContentAddressedStore implements ContentAddressedStore {
-  readonly #objects = new Map<string, Uint8Array>();
+export class MemoryContentAddressedStore implements ContentAddressedStore, ContentAddressedStoreMaintenance {
+  readonly #objects = new Map<string, { bytes: Uint8Array; modifiedAt: string }>();
 
   async put(
     data: StoreInput,
@@ -19,7 +23,10 @@ export class MemoryContentAddressedStore implements ContentAddressedStore {
     const bytes = toBytes(data);
     const ref = createArtifactRef(bytes, mediaType);
     if (!this.#objects.has(ref.contentHash)) {
-      this.#objects.set(ref.contentHash, Uint8Array.from(bytes));
+      this.#objects.set(ref.contentHash, {
+        bytes: Uint8Array.from(bytes),
+        modifiedAt: new Date().toISOString(),
+      });
     }
     return ref;
   }
@@ -30,7 +37,7 @@ export class MemoryContentAddressedStore implements ContentAddressedStore {
     if (stored === undefined) {
       throw new ArtifactNotFoundError(`Artifact ${ref.id} was not found`);
     }
-    const bytes = Uint8Array.from(stored);
+    const bytes = Uint8Array.from(stored.bytes);
     verifyArtifact(bytes, ref);
     return bytes;
   }
@@ -41,7 +48,45 @@ export class MemoryContentAddressedStore implements ContentAddressedStore {
     if (stored === undefined) {
       return false;
     }
-    verifyArtifact(stored, ref);
+    verifyArtifact(stored.bytes, ref);
     return true;
+  }
+
+  async listObjects(): Promise<readonly StoredArtifact[]> {
+    return [...this.#objects.entries()]
+      .map(([contentHash, value]) => Object.freeze({
+        contentHash,
+        byteLength: value.bytes.byteLength,
+        modifiedAt: value.modifiedAt,
+      }))
+      .sort((left, right) => left.contentHash.localeCompare(right.contentHash));
+  }
+
+  async deleteObject(
+    contentHash: string,
+    expected?: Pick<StoredArtifact, "byteLength" | "modifiedAt">,
+  ): Promise<boolean> {
+    assertContentHash(contentHash);
+    if (expected !== undefined) {
+      if (expected === null || typeof expected !== "object" || Array.isArray(expected)) {
+        throw new ArtifactIntegrityError("Expected artifact snapshot is invalid");
+      }
+      if (!Number.isSafeInteger(expected.byteLength) || expected.byteLength < 0
+        || typeof expected.modifiedAt !== "string"
+        || !Number.isFinite(Date.parse(expected.modifiedAt))) {
+        throw new ArtifactIntegrityError("Expected artifact snapshot is invalid");
+      }
+    }
+    const stored = this.#objects.get(contentHash);
+    if (stored === undefined) return false;
+    if (expected !== undefined) {
+      if (
+        stored.bytes.byteLength !== expected.byteLength
+        || stored.modifiedAt !== expected.modifiedAt
+      ) {
+        return false;
+      }
+    }
+    return this.#objects.delete(contentHash);
   }
 }

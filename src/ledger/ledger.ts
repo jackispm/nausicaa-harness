@@ -264,6 +264,9 @@ export class LedgerState {
   readonly #runCreations = new Set<RunId>();
   readonly #goalVersions = new Map<RunId, number>();
   readonly #sentMessages = new Map<string, EventEnvelope<"message.sent">>();
+  readonly #toolRequests = new Map<string, EventEnvelope<"tool.requested">>();
+  readonly #approvalRequests = new Map<string, EventEnvelope<"approval.requested">>();
+  readonly #approvalDecisions = new Set<string>();
   readonly #laneSequences = new Map<string, number>();
   readonly #inputAdmissions = new Map<string, EventEnvelope<"input.admitted">>();
   readonly #inputStates = new Map<string, LedgerInputState>();
@@ -389,6 +392,12 @@ export class LedgerState {
       this.#goalVersions.set(stored.runId, stored.payload.goal.version);
     } else if (stored.type === "message.sent") {
       this.#sentMessages.set(messageScope(stored.runId, stored.payload.message.messageId), stored);
+    } else if (stored.type === "tool.requested") {
+      this.#toolRequests.set(operationScope(stored.runId, stored.payload.operationId), stored);
+    } else if (stored.type === "approval.requested") {
+      this.#approvalRequests.set(operationScope(stored.runId, stored.payload.operationId), stored);
+    } else if (stored.type === "approval.decided") {
+      this.#approvalDecisions.add(operationScope(stored.runId, stored.payload.operationId));
     }
     this.#laneSequences.set(laneScope, stored.laneSeq);
     this.#idempotency.set(idempotencyScope, stored);
@@ -486,6 +495,56 @@ export class LedgerState {
       throw new LedgerCorruptionError(
         "budget.charged laneId must equal the event laneId",
       );
+    }
+
+    if (event.type === "approval.requested") {
+      const scope = operationScope(event.runId, event.payload.operationId);
+      const toolRequest = this.#toolRequests.get(scope);
+      if (toolRequest === undefined) {
+        throw new LedgerCorruptionError(
+          `Approval ${event.payload.operationId} has no preceding tool.requested event`,
+        );
+      }
+      if (
+        toolRequest.laneId !== event.laneId
+        || toolRequest.turnId !== event.turnId
+        || toolRequest.payload.toolCallId !== event.payload.toolCallId
+        || toolRequest.payload.name !== event.payload.name
+      ) {
+        throw new LedgerCorruptionError(
+          `Approval ${event.payload.operationId} does not match its tool request`,
+        );
+      }
+      if (this.#approvalRequests.has(scope)) {
+        throw new LedgerCorruptionError(
+          `Approval ${event.payload.operationId} was requested more than once`,
+        );
+      }
+    }
+
+    if (event.type === "approval.decided") {
+      const scope = operationScope(event.runId, event.payload.operationId);
+      const approvalRequest = this.#approvalRequests.get(scope);
+      if (approvalRequest === undefined) {
+        throw new LedgerCorruptionError(
+          `Approval ${event.payload.operationId} has no preceding approval.requested event`,
+        );
+      }
+      if (
+        approvalRequest.laneId !== event.laneId
+        || approvalRequest.turnId !== event.turnId
+        || approvalRequest.payload.toolCallId !== event.payload.toolCallId
+        || approvalRequest.payload.name !== event.payload.name
+      ) {
+        throw new LedgerCorruptionError(
+          `Approval decision ${event.payload.operationId} does not match its request`,
+        );
+      }
+      if (this.#approvalDecisions.has(scope)) {
+        throw new LedgerCorruptionError(
+          `Approval ${event.payload.operationId} was decided more than once`,
+        );
+      }
     }
 
     const laneScope = `${event.runId}\u0000${event.laneId}`;
@@ -749,4 +808,8 @@ export class LedgerState {
 
 function messageScope(runId: RunId, messageId: string): string {
   return `${runId}\u0000${messageId}`;
+}
+
+function operationScope(runId: RunId, operationId: string): string {
+  return `${runId}\u0000${operationId}`;
 }

@@ -2,13 +2,19 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 
-import { ShellOutputCapture, type ShellOutputSnapshot } from "./shell-output.js";
+import {
+  ShellOutputCapture,
+  type ShellOutputChunkSink,
+  type ShellOutputSink,
+  type ShellOutputSnapshot,
+} from "./shell-output.js";
 
 const EXIT_STDIO_GRACE_MS = 100;
 const EXECUTION_MARKER_ENV = "NAUSICAA_SHELL_EXECUTION_MARKER";
 const MARKER_CLEANUP_PASSES = 2;
 const PROCESS_LIST_MAX_BYTES = 4 * 1024 * 1024;
 const PROCESS_LIST_TIMEOUT_MS = 500;
+const MAX_SHELL_TIMEOUT_MS = 2_147_483_647;
 
 interface ShellConfig {
   executable: string;
@@ -54,9 +60,17 @@ export async function executeShellCommand(input: {
   invocation?: ShellCommandInvocation;
   /** Safe, non-secret environment overrides for the child process. */
   env?: NodeJS.ProcessEnv;
+  /** Optional host-owned observers for complete, sanitized output streams. */
+  outputSink?: ShellOutputSink;
 }): Promise<ShellExecutionResult> {
-  const stdout = new ShellOutputCapture();
-  const stderr = new ShellOutputCapture();
+  if (input.timeoutMs !== undefined
+    && (!Number.isFinite(input.timeoutMs)
+      || input.timeoutMs <= 0
+      || input.timeoutMs > MAX_SHELL_TIMEOUT_MS)) {
+    throw new RangeError(`timeoutMs must be finite, positive, and at most ${MAX_SHELL_TIMEOUT_MS}`);
+  }
+  const stdout = createOutputCapture(input.outputSink?.stdout);
+  const stderr = createOutputCapture(input.outputSink?.stderr);
   if (input.signal?.aborted) {
     return snapshotResult(stdout, stderr, null, true, false);
   }
@@ -165,9 +179,11 @@ export function spawnShellCommand(input: {
   invocation?: ShellCommandInvocation;
   /** Safe, non-secret environment overrides for the child process. */
   env?: NodeJS.ProcessEnv;
+  /** Optional host-owned observers for complete, sanitized output streams. */
+  outputSink?: ShellOutputSink;
 }): StartedShellProcess {
-  const stdout = new ShellOutputCapture();
-  const stderr = new ShellOutputCapture();
+  const stdout = createOutputCapture(input.outputSink?.stdout);
+  const stderr = createOutputCapture(input.outputSink?.stderr);
   const shell = input.invocation ?? resolveShell();
   const executionMarker = randomUUID();
   const commandFromStdin = shell.commandFromStdin === true;
@@ -225,6 +241,12 @@ function snapshotResult(
     timedOut,
     ...(spawnError === undefined ? {} : { spawnError }),
   };
+}
+
+function createOutputCapture(sink: ShellOutputChunkSink | undefined): ShellOutputCapture {
+  return sink === undefined
+    ? new ShellOutputCapture()
+    : new ShellOutputCapture({ onChunk: sink });
 }
 
 // Adapted from pi-agent-core's NodeExecutionEnv so inherited stdio cannot keep

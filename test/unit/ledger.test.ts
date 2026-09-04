@@ -9,6 +9,7 @@ import type { Clock } from "../../src/domain/ports.js";
 import {
   IdempotencyConflictError,
   JsonlLedger,
+  LedgerCorruptionError,
   type Ledger,
   MemoryLedger,
 } from "../../src/ledger/index.js";
@@ -174,6 +175,20 @@ describe("Ledger conformance", () => {
 
         expect(retried).toEqual(admitted);
         expect(await ledger.watermark()).toBe(1);
+        await expect(ledger.append(input("input.admitted", {
+          inputId: "input-1",
+          messageRef: { ...messageRef, mediaType: "application/json" },
+          delivery: "new-turn",
+          sequence: 2,
+        }, { idempotencyKey: "conflicting-input-metadata" })))
+          .rejects.toBeInstanceOf(IdempotencyConflictError);
+        await expect(ledger.append(input("input.admitted", {
+          inputId: "input-1",
+          messageRef: { ...messageRef, byteLength: 6 },
+          delivery: "new-turn",
+          sequence: 2,
+        }, { idempotencyKey: "conflicting-input-length" })))
+          .rejects.toBeInstanceOf(IdempotencyConflictError);
         await expect(ledger.append(input("input.admitted", {
           inputId: "input-1",
           messageRef,
@@ -388,6 +403,84 @@ describe("Ledger conformance", () => {
           ...input("lane.status", { status: "ready" }),
           causationId: "cause\0other",
         })).rejects.toThrow(/causationId/);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
+  it("binds budget charges to the event lane for recovery attribution", async () => {
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        await expect(ledger.append(input("budget.charged", {
+          laneId: "teto",
+          usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 },
+        }))).rejects.toThrow(/budget\.charged laneId.*event laneId/);
+        expect(await ledger.watermark()).toBe(0);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
+  it("binds approval decisions to the preceding tool request", async () => {
+    const argumentsRef = {
+      id: "arguments-1",
+      contentHash: `sha256:${"a".repeat(64)}`,
+      mediaType: "application/json",
+      byteLength: 2,
+    };
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        await expect(ledger.append(input("approval.requested", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          argumentsHash: `sha256:${"b".repeat(64)}`,
+        }, { idempotencyKey: "orphan-approval" })))
+          .rejects.toBeInstanceOf(LedgerCorruptionError);
+
+        await ledger.append(input("tool.requested", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          argumentsRef,
+        }, { turnId: "turn-1", idempotencyKey: "tool-request" }));
+        await expect(ledger.append(input("approval.requested", {
+          operationId: "operation-1",
+          toolCallId: "other-call",
+          name: "write",
+          argumentsHash: `sha256:${"b".repeat(64)}`,
+        }, { turnId: "turn-1", idempotencyKey: "mismatched-approval" })))
+          .rejects.toBeInstanceOf(LedgerCorruptionError);
+
+        await ledger.append(input("approval.requested", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          argumentsHash: `sha256:${"b".repeat(64)}`,
+        }, { turnId: "turn-1", idempotencyKey: "approval-request" }));
+        await expect(ledger.append(input("approval.decided", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "read",
+          decision: "approved",
+        }, { turnId: "turn-1", idempotencyKey: "mismatched-decision" })))
+          .rejects.toBeInstanceOf(LedgerCorruptionError);
+
+        await ledger.append(input("approval.decided", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          decision: "approved",
+        }, { turnId: "turn-1", idempotencyKey: "approval-decision" }));
+        await expect(ledger.append(input("approval.decided", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          decision: "denied",
+        }, { turnId: "turn-1", idempotencyKey: "duplicate-decision" })))
+          .rejects.toBeInstanceOf(LedgerCorruptionError);
       } finally {
         await ledger.close();
       }

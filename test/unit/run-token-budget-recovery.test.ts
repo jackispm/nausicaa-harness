@@ -17,6 +17,24 @@ const unchargedWorker = usage(7, 2, 0, 1, 0.02);
 const unchargedReflection = usage(5, 3, 2, 0);
 
 describe("recoverRunTokenUsage", () => {
+  it("fails closed when recovered usage aggregation overflows", () => {
+    const tokenOverflow = [
+      completed("main", "overflow:one", usage(Number.MAX_SAFE_INTEGER, 0, 0, 0), 1),
+      completed("main", "overflow:two", usage(1, 0, 0, 0), 2),
+    ];
+    expect(() => recoverRunTokenUsage(tokenOverflow, "run-1")).toThrow(
+      /recovered input tokens exceed the safe integer range/u,
+    );
+
+    const costOverflow = [
+      completed("main", "cost:one", usage(1, 0, 0, 0, Number.MAX_VALUE), 3),
+      completed("main", "cost:two", usage(1, 0, 0, 0, Number.MAX_VALUE), 4),
+    ];
+    expect(() => recoverRunTokenUsage(costOverflow, "run-1")).toThrow(
+      /recovered cost exceeds the finite number range/u,
+    );
+  });
+
   it("sums authoritative charges across lanes and closes terminal crash windows", () => {
     const events = [
       completed("main", "run:main:step:1", usage(999, 999, 0, 0), 1),

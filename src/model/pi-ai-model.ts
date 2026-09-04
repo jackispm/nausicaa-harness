@@ -6,6 +6,7 @@ import {
   type AuthType,
   type Api,
   type AssistantMessage,
+  type AssistantMessageEvent,
   type Context,
   type Credential,
   type CredentialStore,
@@ -143,13 +144,19 @@ export class PiAiModelPort implements ModelPort {
 
     let result: AssistantMessage;
     try {
-      result = await this.models.complete(model, context, {
-        maxTokens: request.maxOutputTokens,
-        sessionId: request.sessionId,
-        maxRetries: 0,
-        fetch: probe.fetch,
-        ...(request.signal === undefined ? {} : { signal: request.signal }),
-      });
+      result = await raceAbort(
+        this.models.complete(model, context, {
+          maxTokens: request.maxOutputTokens,
+          sessionId: request.sessionId,
+          maxRetries: 0,
+          fetch: probe.fetch,
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
+        }),
+        request.signal,
+      );
+      // Some provider implementations resolve despite an aborted signal.
+      // Cancellation remains authoritative at this adapter boundary.
+      throwIfAborted(request.signal);
     } catch (error: unknown) {
       throwIfAborted(request.signal);
       throw providerFailure(error, probe, undefined);
@@ -171,6 +178,7 @@ export class PiAiModelPort implements ModelPort {
     let model: Model<Api>;
     let context: Context;
     const probe = new ProviderFailureProbe(this.fetch);
+    let iterator: AsyncIterator<AssistantMessageEvent> | undefined;
     try {
       const selector = parseModelSelector(request.model, this.defaultProvider);
       const selectedModel = this.models.getModel(selector.provider, selector.model);
@@ -195,7 +203,12 @@ export class PiAiModelPort implements ModelPort {
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
       let textBlockCount = 0;
-      for await (const event of stream) {
+      const currentIterator = stream[Symbol.asyncIterator]();
+      iterator = currentIterator;
+      while (true) {
+        const next = await raceAbort(currentIterator.next(), request.signal);
+        if (next.done) break;
+        const event = next.value;
         switch (event.type) {
           case "start":
             yield { type: "start" };
@@ -228,8 +241,14 @@ export class PiAiModelPort implements ModelPort {
               type: "error",
               error: streamError(request.signal, event.reason, event.error, probe),
             };
+            void closeIterator(iterator);
             return;
         }
+      }
+
+      if (request.signal?.aborted) {
+        yield { type: "error", error: abortError(request.signal) };
+        return;
       }
 
       yield {
@@ -237,6 +256,10 @@ export class PiAiModelPort implements ModelPort {
         error: providerFailure(new Error("Model request failed"), probe, undefined),
       };
     } catch (error: unknown) {
+      // Close provider iterators on cancellation/error without making cleanup
+      // part of the user-visible cancellation latency.
+      // `stream` may have failed before an iterator was created.
+      void closeIterator(iterator);
       yield {
         type: "error",
         error: request.signal?.aborted
@@ -454,6 +477,37 @@ function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error
     ? signal.reason
     : new DOMException("The operation was aborted", "AbortError");
+}
+
+/** Make cancellation authoritative even when a provider ignores its signal. */
+function raceAbort<T>(pending: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return pending;
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    pending.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function closeIterator(
+  iterator: AsyncIterator<AssistantMessageEvent> | undefined,
+): Promise<void> {
+  if (iterator === undefined) return;
+  try {
+    await iterator.return?.();
+  } catch {
+    // Preserve the provider/cancellation error if cleanup itself fails.
+  }
 }
 
 function streamError(

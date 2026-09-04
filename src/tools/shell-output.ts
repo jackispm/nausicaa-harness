@@ -4,6 +4,23 @@
 export const SHELL_MAX_OUTPUT_BYTES = 50 * 1024;
 export const SHELL_MAX_OUTPUT_LINES = 2_000;
 
+/**
+ * Host-owned observer for a complete output stream. The callback receives
+ * sanitized chunks and is responsible for any persistence or buffering.
+ * ShellOutputCapture never retains chunks for this callback.
+ */
+export type ShellOutputChunkSink = (chunk: string) => void;
+
+/** Optional sinks for the two independent child-process output streams. */
+export interface ShellOutputSink {
+  stdout?: ShellOutputChunkSink;
+  stderr?: ShellOutputChunkSink;
+}
+
+export interface ShellOutputCaptureOptions {
+  onChunk?: ShellOutputChunkSink;
+}
+
 export interface ShellOutputSnapshot {
   content: string;
   truncated: boolean;
@@ -12,14 +29,22 @@ export interface ShellOutputSnapshot {
   totalLines: number;
   outputBytes: number;
   outputLines: number;
+  /** Set when the optional host sink rejected a chunk. */
+  outputSinkError?: string;
 }
 
 export class ShellOutputCapture {
   private readonly maxRollingBytes = SHELL_MAX_OUTPUT_BYTES * 2;
+  private readonly onChunk: ShellOutputChunkSink | undefined;
   private tail = "";
   private totalBytes = 0;
   private completedLines = 0;
   private hasOpenLine = false;
+  private outputSinkError: string | undefined;
+
+  constructor(options: ShellOutputCaptureOptions = {}) {
+    this.onChunk = options.onChunk;
+  }
 
   append(chunk: string): void {
     const text = sanitizeShellOutput(chunk).replaceAll("\r", "");
@@ -37,6 +62,17 @@ export class ShellOutputCapture {
     this.tail += text;
     if (Buffer.byteLength(this.tail, "utf8") > this.maxRollingBytes * 2) {
       this.tail = utf8Tail(this.tail, this.maxRollingBytes);
+    }
+
+    if (this.onChunk !== undefined && this.outputSinkError === undefined) {
+      try {
+        this.onChunk(text);
+      } catch {
+        // The sink is host-owned and may throw arbitrary or secret-bearing
+        // diagnostics. Keep the tool result useful without reflecting those
+        // details into the model-visible result.
+        this.outputSinkError = "Shell output sink failed";
+      }
     }
   }
 
@@ -62,6 +98,9 @@ export class ShellOutputCapture {
       totalLines,
       outputBytes: Buffer.byteLength(bounded.content, "utf8"),
       outputLines: lineCount(bounded.content),
+      ...(this.outputSinkError === undefined
+        ? {}
+        : { outputSinkError: this.outputSinkError }),
     };
   }
 }

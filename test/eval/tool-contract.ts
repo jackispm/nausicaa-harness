@@ -58,7 +58,7 @@ export function createFrozenWorkspaceFixtureV2Tools(options: {
   return names.map((name) => {
     const tool = toolsByName.get(name);
     if (tool === undefined) throw new Error(`Frozen evaluation tool ${name} is unavailable`);
-    const definition = workspaceFixtureV2Definition(tool.definition);
+    const definition = normalizeFrozenToolDefinition(tool.definition);
     return {
       definition,
       execute: async (arguments_, context): Promise<ToolResult> => {
@@ -115,14 +115,54 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-function workspaceFixtureV2Definition(source: ToolDefinition): ToolDefinition {
+export function normalizeFrozenToolDefinition(source: ToolDefinition): ToolDefinition {
   const definition = structuredClone(source);
-  if (definition.name === "grep") {
+  if (definition.name === "read_many") {
+    definition.description = "Read up to 16 independent workspace file windows in one bounded batch. Results preserve target order and isolate per-file failures. Continue truncated files with their returned nextOffset/nextLineByteOffset values.";
+    const targets = definition.parameters.properties?.targets;
+    if (targets !== null && typeof targets === "object") {
+      (targets as Record<string, unknown>).description = "Independent file windows to read; use this for entry points, definitions, call sites, configuration, types, and tests discovered together";
+    }
+  } else if (definition.name === "list_files") {
+    definition.description = "List workspace files in stable order without following directory symlinks. Use offset and nextOffset to continue a large listing.";
+  } else if (definition.name === "grep") {
     definition.description = "Search workspace file contents for a pattern and return bounded structured matches.";
     delete definition.parameters.properties?.cursor;
   } else if (definition.name === "find") {
     definition.description = "Find workspace files by glob pattern while respecting ignore files and protected paths.";
     delete definition.parameters.properties?.cursor;
+  } else if (definition.name === "delegate_task") {
+    definition.description = "Queue an independent, bounded read-only Worker task. The Worker can independently use bounded read-only workspace tools and returns its result asynchronously at a later Main step or turn; continue other work after queueing. Batch independent tasks when useful. Do not use for trivial, tightly coupled, mutating, shell, or immediate-result work.";
+    const properties = definition.parameters.properties;
+    if (properties !== undefined) {
+      properties.successCriteria = {
+        type: "array",
+        items: { type: "string" },
+        description: "Optional observable completion criteria",
+      };
+      properties.hardConstraints = {
+        type: "array",
+        items: { type: "string" },
+        description: "Optional constraints, such as read-only or path limits",
+      };
+      properties.maxModelTokens = {
+        type: "integer",
+        minimum: 1,
+        description: "Optional model-token budget (default 2000)",
+      };
+      properties.maxWallClockMs = {
+        type: "integer",
+        minimum: 1,
+        description: "Optional wall-clock budget in milliseconds (default 30000)",
+      };
+      properties.maxAttempts = {
+        type: "integer",
+        minimum: 1,
+        maximum: 8,
+        description: "Optional provider-attempt budget (default 2)",
+      };
+      definition.parameters.required = ["statement"];
+    }
   }
   return definition;
 }

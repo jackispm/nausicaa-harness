@@ -27,6 +27,21 @@ const usage = {
 };
 
 describe("ScriptedModel", () => {
+  it("drops malformed fractional provider usage at the error boundary", () => {
+    const error = new ProviderModelError({
+      category: "provider",
+      retryable: false,
+      providerUsage: {
+        input: 1.5,
+        output: 2,
+        cacheRead: 0,
+        cacheWrite: 0,
+      },
+    });
+
+    expect(error.providerUsage).toBeUndefined();
+  });
+
   it("runs deterministic steps and captures requests", async () => {
     const model = new ScriptedModel([{
       content: "done",
@@ -555,6 +570,57 @@ describe("PiAiModelPort", () => {
     if (terminal.value?.type !== "error") throw new Error("Missing error event");
     expect(terminal.value.error.message).toBe("cancelled by caller");
     expect((await iterator.next()).done).toBe(true);
+  });
+
+  it("rejects a provider completion that resolves after cancellation", async () => {
+    const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
+    let release!: (message: ReturnType<typeof fauxAssistantMessage>) => void;
+    const pending = new Promise<ReturnType<typeof fauxAssistantMessage>>((resolve) => {
+      release = resolve;
+    });
+    const models = {
+      getModel: () => faux.getModel(),
+      complete: async () => pending,
+    } as unknown as Models;
+    const adapter = new PiAiModelPort({ models });
+    const controller = new AbortController();
+    const completion = adapter.complete({
+      ...request(),
+      model: "openrouter:demo",
+      signal: controller.signal,
+    });
+
+    controller.abort(new Error("cancelled while provider was pending"));
+    release(fauxAssistantMessage("late"));
+
+    await expect(completion).rejects.toThrow("cancelled while provider was pending");
+  });
+
+  it("discards a provider stream done event delivered after cancellation", async () => {
+    const faux = fauxProvider({ provider: "openrouter", models: [{ id: "demo" }] });
+    const controller = new AbortController();
+    const models = {
+      getModel: () => faux.getModel(),
+      stream: () => (async function* () {
+        yield { type: "start" as const };
+        await Promise.resolve();
+        controller.abort(new Error("cancelled while stream was pending"));
+        yield { type: "done" as const, message: fauxAssistantMessage("late") };
+      })(),
+    } as unknown as Models;
+    const adapter = new PiAiModelPort({ models });
+
+    const events = await collect(adapter.stream({
+      ...request(),
+      model: "openrouter:demo",
+      signal: controller.signal,
+    }));
+
+    expect(events.map((event) => event.type)).toEqual(["start", "error"]);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: "cancelled while stream was pending" },
+    });
   });
 
   it("reduces thrown provider details to a safe structured stream error", async () => {

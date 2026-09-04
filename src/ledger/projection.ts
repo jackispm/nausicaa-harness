@@ -15,6 +15,8 @@ import type {
   TurnId,
 } from "../domain/types.js";
 import { cloneJson } from "./hash.js";
+import { projectTodos, type TodoProjection } from "./todo-projection.js";
+import { projectionCheckpoint, type ProjectionCheckpoint } from "./projection-query.js";
 
 // Cross-Run projections live with the router because they consume its saga
 // facts, but are re-exported here alongside the ordinary Ledger projection
@@ -116,6 +118,21 @@ export interface UnknownOperationView {
   unknownAtOffset: number;
 }
 
+export type ApprovalStatus = "pending" | "approved" | "denied" | "cancelled";
+
+export interface ApprovalView {
+  operationId: string;
+  toolCallId: string;
+  name: string;
+  argumentsHash: string;
+  status: ApprovalStatus;
+  requestedAtOffset: number;
+  decidedAtOffset?: number;
+  reason?: string;
+  laneId: LaneId;
+  turnId?: TurnId;
+}
+
 export type ConversationEntry =
   | {
       role: "user" | "assistant";
@@ -152,6 +169,12 @@ export interface RunProjection {
   turns: Record<TurnId, TurnView>;
   activeTurnId?: TurnId;
   unknownOperations: UnknownOperationView[];
+  /** Durable approval lifecycle, when tools required host approval. */
+  approvals?: ApprovalView[];
+  /** Latest structured Todo snapshot, when one has been committed. */
+  todos?: TodoProjection;
+  /** Stable revision/checksum for this projection's event prefix. */
+  revision?: ProjectionCheckpoint;
   budget: BudgetView;
   conversation: ConversationEntry[];
 }
@@ -184,6 +207,7 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
     inputs: [],
     turns: Object.create(null) as Record<TurnId, TurnView>,
     unknownOperations: [],
+    approvals: [],
     budget: {
       charged: emptyUsage(),
       byLane: Object.create(null) as Record<LaneId, TokenUsage>,
@@ -193,6 +217,7 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
   const inboxById = new Map<string, InboxMessageView>();
   const inputById = new Map<InputId, InputView>();
   const unknownByOperation = new Map<string, UnknownOperationView>();
+  const approvalByOperation = new Map<string, ApprovalView>();
   const legacyTurnId = legacyTurnIdForRun(runId);
 
   const ensureTurn = (
@@ -246,6 +271,8 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
       || event.type === "model.completed"
       || event.type === "model.failed"
       || event.type === "tool.requested"
+      || event.type === "approval.requested"
+      || event.type === "approval.decided"
       || event.type === "tool.succeeded"
       || event.type === "tool.failed"
         ? legacyTurnId
@@ -491,6 +518,30 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
           unknownAtOffset: event.globalOffset,
         });
         break;
+      case "approval.requested": {
+        const approval: ApprovalView = {
+          operationId: event.payload.operationId,
+          toolCallId: event.payload.toolCallId,
+          name: event.payload.name,
+          argumentsHash: event.payload.argumentsHash,
+          status: "pending",
+          requestedAtOffset: event.globalOffset,
+          laneId: event.laneId,
+          ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
+        };
+        approvalByOperation.set(approval.operationId, approval);
+        break;
+      }
+      case "approval.decided": {
+        const approval = approvalByOperation.get(event.payload.operationId);
+        if (approval !== undefined) {
+          approval.status = event.payload.decision;
+          approval.decidedAtOffset = event.globalOffset;
+          if (event.payload.reason === undefined) delete approval.reason;
+          else approval.reason = event.payload.reason;
+        }
+        break;
+      }
       case "tool.succeeded":
       case "tool.failed":
         unknownByOperation.delete(event.payload.operationId);
@@ -569,6 +620,10 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
   ));
   projection.unknownOperations = [...unknownByOperation.values()]
     .sort((left, right) => left.unknownAtOffset - right.unknownAtOffset);
+  projection.approvals = [...approvalByOperation.values()]
+    .sort((left, right) => left.requestedAtOffset - right.requestedAtOffset);
+  projection.todos = projectTodos(ordered, runId);
+  projection.revision = projectionCheckpoint(ordered, runId);
 
   return projection;
 }

@@ -90,6 +90,18 @@ describe("file credential store", () => {
     controller.abort();
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   });
+
+  it("cancels delete while waiting for a cross-process lock", async () => {
+    const root = await makeRoot();
+    const path = join(root, "credentials.json");
+    await writeFile(`${path}.lock`, "held\n");
+    const store = new FileCredentialStore({ filePath: path, lockTimeoutMs: 2_000 });
+    const controller = new AbortController();
+    const pending = store.delete("openrouter", { signal: controller.signal });
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
 });
 
 afterEach(async () => {

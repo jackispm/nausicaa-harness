@@ -25,6 +25,14 @@ import type {
 import { DaemonWorkerStdioTransport } from "./daemon-worker-transport.js";
 import type { Readable, Writable } from "node:stream";
 import { persistedErrorText } from "./redaction.js";
+import {
+  type DaemonWorkerRecoveryJournal,
+  type DaemonWorkerRecoveryRecord,
+  type DaemonWorkerRecoveryStatus,
+  createFileDaemonWorkerRecoveryJournal,
+  daemonWorkerRecoveryFingerprint,
+  validateDaemonWorkerRecoveryHistory,
+} from "./daemon-worker-recovery-journal.js";
 
 const MAX_COMPLETED_ACTIVATIONS = 1_024;
 const MAX_COMMAND_RECORDS = 4_096;
@@ -65,6 +73,8 @@ export interface DaemonWorkerServerOptions {
   readonly maxPendingActivations?: number;
   readonly cancelGraceMs?: number;
   readonly createInstanceToken?: () => string;
+  /** Optional durable activation journal used to fence replay after restart. */
+  readonly recoveryJournal?: DaemonWorkerRecoveryJournal;
 }
 
 export type DaemonWorkerServerLifecycle = "starting" | "ready" | "draining" | "stopped" | "failed";
@@ -83,6 +93,7 @@ interface Activation {
   readonly controller: AbortController;
   readonly commandIds: Set<string>;
   promise: Promise<void>;
+  terminalPromise?: Promise<void>;
   terminal?: DaemonWorkerActivationTerminalFrame;
 }
 
@@ -115,6 +126,7 @@ export class DaemonWorkerServer {
   private readonly maxPendingActivations: number;
   private readonly cancelGraceMs: number;
   private readonly createInstanceToken: () => string;
+  private readonly recoveryJournal: DaemonWorkerRecoveryJournal | undefined;
   private readonly activations = new Map<string, Activation>();
   private readonly completed = new Map<string, CompletedActivation>();
   private readonly commandRecords = new Map<string, CommandRecord>();
@@ -124,10 +136,14 @@ export class DaemonWorkerServer {
   private unsubscribeClose: (() => void) | undefined;
   private initialized = false;
   private closed = false;
+  private closePromise: Promise<void> | undefined;
   private lifecycle: DaemonWorkerServerLifecycle = "starting";
   private instanceToken: string | undefined;
   private lease: DaemonWorkerLeaseIdentity | undefined;
   private leaseStore: DaemonWorkerLeaseStore | undefined;
+  private readonly recovery = new Map<string, DaemonWorkerRecoveryRecord>();
+  private recoveryLoadPromise: Promise<void> | undefined;
+  private recoveryLoaded = false;
 
   constructor(options: DaemonWorkerServerOptions) {
     if (options === null || typeof options !== "object" || Array.isArray(options)) {
@@ -170,6 +186,13 @@ export class DaemonWorkerServer {
       "cancelGraceMs",
     );
     this.createInstanceToken = options.createInstanceToken ?? randomUUID;
+    if (options.recoveryJournal !== undefined
+      && typeof options.recoveryJournal.read !== "function"
+      || options.recoveryJournal !== undefined
+      && typeof options.recoveryJournal.append !== "function") {
+      throw new DaemonWorkerProtocolError("invalid_frame", "worker recovery journal is invalid");
+    }
+    this.recoveryJournal = options.recoveryJournal;
   }
 
   get snapshot(): DaemonWorkerServerSnapshot {
@@ -194,15 +217,39 @@ export class DaemonWorkerServer {
     return this.snapshot;
   }
 
-  async close(reason = "worker closed"): Promise<void> {
-    if (this.closed) return;
+  close(reason = "worker closed"): Promise<void> {
+    if (this.closePromise !== undefined) return this.closePromise;
     this.closed = true;
     this.lifecycle = "stopped";
     this.unsubscribeFrame?.();
     this.unsubscribeClose?.();
     this.unsubscribeFrame = undefined;
     this.unsubscribeClose = undefined;
-    for (const activation of this.activations.values()) activation.controller.abort(new Error(reason));
+    const operation = this.closeInternal(reason);
+    this.closePromise = operation;
+    return operation;
+  }
+
+  private async closeInternal(reason: string): Promise<void> {
+    await this.ensureRecoveryJournal().catch(() => undefined);
+    for (const activation of this.activations.values()) {
+      // A process/transport close is an unknown-side-effect boundary. Record
+      // it before aborting the runner so a replacement worker cannot replay
+      // the activation merely because no terminal frame was observed.
+      // If terminal publication has started, leave its journal operation in
+      // charge; appending interrupted behind it could overwrite a durable
+      // terminal after the close path has already returned.
+      if (
+        activation.terminal === undefined
+        && !isTerminalRecoveryStatus(this.recovery.get(activation.frame.activationId)?.status)
+      ) {
+        // Share the same per-activation promise used by terminal publication.
+        // Otherwise a close-time interrupted append can race a runner's
+        // terminal append and leave an invalid durable history.
+        await settleWithin(this.interruptActivation(activation, reason), this.cancelGraceMs);
+      }
+      activation.controller.abort(new Error(reason));
+    }
     await this.waitForActivations();
     // Preserve runner-before-transport ordering while bounding each hook.
     // A child must finish its own cleanup attempt before its IPC stream is
@@ -218,6 +265,10 @@ export class DaemonWorkerServer {
     this.initialized = false;
     this.instanceToken = undefined;
     this.lease = undefined;
+    const closeJournal = this.recoveryJournal?.close;
+    if (closeJournal !== undefined) {
+      await closeJournal.call(this.recoveryJournal).catch(() => undefined);
+    }
   }
 
   private async handle(value: unknown): Promise<void> {
@@ -238,6 +289,7 @@ export class DaemonWorkerServer {
         await this.sendError(frame.commandId, "invalid_frame", "worker frame is not a host command", false);
         return;
       }
+      await this.ensureRecoveryJournal();
       if (frame.kind === "initialize") {
         this.rememberCommand(frame);
         this.activeCommandIds.add(frame.commandId);
@@ -362,7 +414,11 @@ export class DaemonWorkerServer {
     if (frame.runId !== this.runId || this.lease === undefined || !sameLease(this.lease, frame.lease)) {
       throw new DaemonWorkerProtocolError("lease_mismatch", "worker activation lease does not match initialize");
     }
-    const fingerprint = JSON.stringify({ activationId: frame.activationId, lease: frame.lease, wakes: frame.wakes });
+    const fingerprint = daemonWorkerRecoveryFingerprint({
+      activationId: frame.activationId,
+      lease: frame.lease,
+      wakes: frame.wakes,
+    });
     const existing = this.activations.get(frame.activationId);
     if (existing !== undefined) {
       if (existing.fingerprint !== fingerprint) {
@@ -384,9 +440,37 @@ export class DaemonWorkerServer {
       await this.sendTerminalReplay(completed.terminal, frame.commandId);
       return;
     }
+    const recovered = this.recovery.get(frame.activationId);
+    if (recovered !== undefined) {
+      if (recovered.fingerprint !== fingerprint) {
+        throw new DaemonWorkerProtocolError("command_conflict", "activation ID was reused with different input");
+      }
+      await settleWithin(this.sendAccepted(frame), this.cancelGraceMs);
+      if (isTerminalRecoveryStatus(recovered.status)) {
+        await this.sendTerminalReplay(recoveryTerminal(frame, recovered), frame.commandId);
+        return;
+      }
+      // admitted/started/interrupted records have no durable terminal result.
+      // They are deliberately resolved as uncertain after a worker restart;
+      // executing the runner again could duplicate an external side effect.
+      const uncertainRecord = await this.recordRecoveryStatus(
+        frame,
+        "uncertain",
+        "activation outcome was unresolved when the worker restarted",
+      );
+      if (uncertainRecord === undefined) {
+        throw new DaemonWorkerProtocolError("internal", "worker recovery journal is unavailable");
+      }
+      await this.sendTerminalReplay(recoveryTerminal(frame, uncertainRecord), frame.commandId);
+      return;
+    }
     if (this.activations.size >= this.maxPendingActivations) {
       throw new DaemonWorkerProtocolError("queue_full", "worker activation queue is full", true);
     }
+    await this.recordRecoveryStatus(frame, "accepted");
+    // close() may have raced the durable admission write. Do not add a new
+    // activation after shutdown has already scanned the activation map.
+    if (this.closed) return;
     const controller = new AbortController();
     const activation: Activation = {
       frame,
@@ -412,6 +496,7 @@ export class DaemonWorkerServer {
   private async runActivation(activation: Activation): Promise<void> {
     const { frame, controller } = activation;
     try {
+      await this.recordRecoveryStatus(activation, "started");
       const store = await this.openStore(frame.lease);
       const assertLease = async (): Promise<void> => {
         if (!(await this.leaseIsCurrent(frame.lease, store))) {
@@ -491,7 +576,15 @@ export class DaemonWorkerServer {
   private async shutdown(reason: string, commandId?: string): Promise<void> {
     if (this.closed) return;
     this.lifecycle = "draining";
-    for (const activation of this.activations.values()) activation.controller.abort(new Error(reason));
+    for (const activation of this.activations.values()) {
+      if (
+        activation.terminal === undefined
+        && !isTerminalRecoveryStatus(this.recovery.get(activation.frame.activationId)?.status)
+      ) {
+        await settleWithin(this.interruptActivation(activation, reason), this.cancelGraceMs);
+      }
+      activation.controller.abort(new Error(reason));
+    }
     await this.waitForActivations();
     this.lifecycle = "stopped";
     try {
@@ -508,6 +601,92 @@ export class DaemonWorkerServer {
       Promise.allSettled(pending).then(() => undefined),
       delay(this.cancelGraceMs),
     ]);
+  }
+
+  private async ensureRecoveryJournal(): Promise<void> {
+    if (this.recoveryLoaded || this.recoveryJournal === undefined) {
+      this.recoveryLoaded = true;
+      return;
+    }
+    if (this.recoveryLoadPromise !== undefined) {
+      return this.recoveryLoadPromise;
+    }
+    const load = (async () => {
+      const records = await this.recoveryJournal!.read();
+      try {
+        validateDaemonWorkerRecoveryHistory(records);
+      } catch (error: unknown) {
+        if (error instanceof DaemonWorkerProtocolError) throw error;
+        throw new DaemonWorkerProtocolError(
+          "internal",
+          "worker recovery journal is corrupt",
+          false,
+        );
+      }
+      for (const record of records) {
+        if (record.runId !== this.runId || record.workerId !== this.workerId) {
+          throw new DaemonWorkerProtocolError(
+            "identity_mismatch",
+            "worker recovery journal identity mismatch",
+          );
+        }
+        const prior = this.recovery.get(record.activationId);
+        if (prior !== undefined && prior.sequence >= record.sequence) continue;
+        this.recovery.set(record.activationId, Object.freeze({ ...record }));
+      }
+      this.recoveryLoaded = true;
+    })();
+    this.recoveryLoadPromise = load;
+    try {
+      await load;
+    } finally {
+      if (this.recoveryLoadPromise === load) this.recoveryLoadPromise = undefined;
+    }
+  }
+
+  private async recordRecoveryStatus(
+    source: Activation | DaemonWorkerActivateFrame,
+    status: DaemonWorkerRecoveryStatus,
+    message?: string,
+  ): Promise<DaemonWorkerRecoveryRecord | undefined> {
+    if (this.recoveryJournal === undefined) return undefined;
+    const frame = "frame" in source ? source.frame : source;
+    const fingerprint = "fingerprint" in source
+      ? source.fingerprint
+      : daemonWorkerRecoveryFingerprint({
+          activationId: frame.activationId,
+          lease: frame.lease,
+          wakes: frame.wakes,
+        });
+    const normalizedError = message === undefined ? undefined : errorMessage(message);
+    const prior = this.recovery.get(frame.activationId);
+    if (
+      prior !== undefined
+      && prior.status === status
+      && prior.error === normalizedError
+    ) {
+      return prior;
+    }
+    let record: DaemonWorkerRecoveryRecord;
+    try {
+      record = await this.recoveryJournal.append({
+        runId: this.runId,
+        workerId: this.workerId,
+        activationId: frame.activationId,
+        commandId: frame.commandId,
+        fingerprint,
+        status,
+        ...(normalizedError === undefined ? {} : { error: normalizedError }),
+      });
+    } catch (error: unknown) {
+      throw new DaemonWorkerProtocolError(
+        "internal",
+        "worker recovery journal append failed",
+        false,
+      );
+    }
+    this.recovery.set(frame.activationId, record);
+    return record;
   }
 
   private rememberCompleted(activation: Activation, terminal: DaemonWorkerActivationTerminalFrame): void {
@@ -567,17 +746,92 @@ export class DaemonWorkerServer {
     message?: string,
   ): Promise<void> {
     if (activation.terminal !== undefined) return;
+    if (activation.terminalPromise !== undefined) {
+      await activation.terminalPromise;
+      // A close-time interrupted marker intentionally does not create a
+      // protocol terminal frame. Once that marker settles, continue here and
+      // publish an explicit uncertain terminal if the runner returns.
+      if (activation.terminal !== undefined) return;
+    }
+    const operation = this.sendTerminalInternal(activation, status, message);
+    activation.terminalPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (activation.terminalPromise === operation) delete activation.terminalPromise;
+    }
+  }
+
+  private async interruptActivation(activation: Activation, reason: string): Promise<void> {
+    if (activation.terminal !== undefined) return;
+    if (activation.terminalPromise !== undefined) {
+      await activation.terminalPromise;
+      return;
+    }
+    const operation = this.recordRecoveryStatus(activation, "interrupted", reason)
+      // The close path is best effort; a failed marker must not turn a late
+      // runner return into an unhandled rejection or prevent terminal
+      // publication from reporting an explicit uncertain result.
+      .then(() => undefined, () => undefined);
+    activation.terminalPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (activation.terminalPromise === operation) delete activation.terminalPromise;
+    }
+  }
+
+  private async sendTerminalInternal(
+    activation: Activation,
+    status: DaemonWorkerActivationTerminalFrame["status"],
+    message?: string,
+  ): Promise<void> {
+    if (activation.terminal !== undefined) return;
+    let terminalStatus = status;
+    let terminalMessage = message;
+    const prior = this.recovery.get(activation.frame.activationId);
+    if (prior !== undefined && (prior.status === "interrupted" || prior.status === "uncertain")) {
+      // Once a close/uncertain marker is durable, a late cooperative return
+      // cannot upgrade it to success: the runner may have crossed a side
+      // effect boundary while the transport was unavailable.
+      terminalStatus = "uncertain";
+      terminalMessage = prior.error ?? message ?? "activation outcome is uncertain";
+    } else if (prior !== undefined && isTerminalRecoveryStatus(prior.status)) {
+      terminalStatus = prior.status;
+      terminalMessage = prior.error ?? message;
+    }
+    try {
+      const recorded = await this.recordRecoveryStatus(
+        activation,
+        terminalStatus,
+        terminalMessage,
+      );
+      if (recorded === undefined) {
+        // The recovery journal is optional. Without it, keep the in-memory
+        // terminal status and continue publishing the ordinary frame.
+      } else {
+        const recordedStatus = recorded.status;
+        const recordedError = recorded.error;
+        terminalStatus = recoveryTerminalStatus(recordedStatus, terminalStatus);
+        terminalMessage = recordedError ?? terminalMessage;
+      }
+    } catch {
+      // A terminal result without a durable journal is not replay-safe. The
+      // caller still receives a terminal frame, but it is explicitly unsure.
+      terminalStatus = "uncertain";
+      terminalMessage = "worker recovery journal unavailable; activation outcome is uncertain";
+    }
     const terminal: DaemonWorkerActivationTerminalFrame = {
       kind: "activation.terminal",
       version: DAEMON_WORKER_PROTOCOL_VERSION,
       commandId: activation.frame.commandId,
       runId: this.runId,
       activationId: activation.frame.activationId,
-      status,
-      ...(message === undefined ? {} : {
+      status: terminalStatus,
+      ...(terminalMessage === undefined ? {} : {
         error: {
-          code: status === "uncertain" ? "cancel_timeout" : "runner_failed",
-          message: errorMessage(message),
+          code: terminalStatus === "uncertain" ? "cancel_timeout" : "runner_failed",
+          message: errorMessage(terminalMessage),
         },
       }),
     };
@@ -651,16 +905,32 @@ export function createDaemonWorkerServer(options: DaemonWorkerServerOptions): Da
 export interface DaemonWorkerStdioServerOptions extends Omit<DaemonWorkerServerOptions, "transport"> {
   readonly input?: Readable;
   readonly output?: Writable;
+  /** Optional path for the restart-safe activation journal. */
+  readonly recoveryJournalPath?: string;
 }
 
 /** Bootstrap helper for a child entrypoint using stdin/stdout JSONL. */
 export function runDaemonWorkerStdioServer(options: DaemonWorkerStdioServerOptions): DaemonWorkerServer {
+  if (options.recoveryJournal !== undefined && options.recoveryJournalPath !== undefined) {
+    throw new DaemonWorkerProtocolError(
+      "invalid_frame",
+      "worker recoveryJournal and recoveryJournalPath are mutually exclusive",
+    );
+  }
   const transport = new DaemonWorkerStdioTransport({
     input: options.input ?? process.stdin,
     output: options.output ?? process.stdout,
     ...(options.maxFrameBytes === undefined ? {} : { maxFrameBytes: options.maxFrameBytes }),
   });
-  return createDaemonWorkerServer({ ...options, transport });
+  const recoveryJournal = options.recoveryJournal
+    ?? (options.recoveryJournalPath === undefined
+      ? undefined
+      : createFileDaemonWorkerRecoveryJournal(options.recoveryJournalPath));
+  return createDaemonWorkerServer({
+    ...options,
+    transport,
+    ...(recoveryJournal === undefined ? {} : { recoveryJournal }),
+  });
 }
 
 function sameLease(left: DaemonWorkerLeaseIdentity, right: DaemonWorkerLeaseIdentity): boolean {
@@ -746,4 +1016,45 @@ function commandSignature(frame: DaemonWorkerCommand): string {
     case "shutdown":
       return JSON.stringify({ kind: frame.kind, runId: frame.runId, reason: frame.reason });
   }
+}
+
+function isTerminalRecoveryStatus(
+  status: DaemonWorkerRecoveryStatus | undefined,
+): status is Extract<DaemonWorkerRecoveryStatus, "completed" | "failed" | "cancelled" | "uncertain"> {
+  return status === "completed"
+    || status === "failed"
+    || status === "cancelled"
+    || status === "uncertain";
+}
+
+function recoveryTerminalStatus(
+  recorded: DaemonWorkerRecoveryStatus,
+  fallback: DaemonWorkerActivationTerminalFrame["status"],
+): DaemonWorkerActivationTerminalFrame["status"] {
+  if (recorded === "completed" || recorded === "failed" || recorded === "cancelled" || recorded === "uncertain") {
+    return recorded;
+  }
+  if (recorded === "interrupted") return "uncertain";
+  return fallback;
+}
+
+function recoveryTerminal(
+  frame: DaemonWorkerActivateFrame,
+  record: DaemonWorkerRecoveryRecord,
+): DaemonWorkerActivationTerminalFrame {
+  const status = recoveryTerminalStatus(record.status, "uncertain");
+  return {
+    kind: "activation.terminal",
+    version: DAEMON_WORKER_PROTOCOL_VERSION,
+    commandId: frame.commandId,
+    runId: frame.runId,
+    activationId: frame.activationId,
+    status,
+    ...(record.error === undefined ? {} : {
+      error: {
+        code: status === "uncertain" ? "cancel_timeout" : "runner_failed",
+        message: errorMessage(record.error),
+      },
+    }),
+  };
 }

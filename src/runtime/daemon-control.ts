@@ -22,6 +22,14 @@ import {
   type DaemonRunSubscription,
 } from "./daemon-observer.js";
 import { persistedErrorText } from "./redaction.js";
+import {
+  daemonCommandRecoveryFingerprint,
+  daemonCommandRecoveryKey,
+  projectDaemonCommandRecovery,
+  type DaemonCommandRecoveryJournal,
+  type DaemonCommandRecoveryRecord,
+  type DaemonCommandRecoveryResponse,
+} from "./daemon-command-recovery-journal.js";
 
 /** Version of the local daemon control protocol. */
 export const DAEMON_CONTROL_PROTOCOL_VERSION = 1 as const;
@@ -43,6 +51,8 @@ export type DaemonControlMethod =
 export interface DaemonControlRequest {
   readonly version?: number;
   readonly id: string;
+  /** Stable caller identity used for command recovery across reconnects. */
+  readonly clientId?: string;
   readonly method: DaemonControlMethod;
   readonly params?: unknown;
 }
@@ -96,6 +106,12 @@ export interface DaemonControlServerOptions {
   readonly maxPendingWriteBytes?: number;
   /** Factory for connection-local client IDs, useful for deterministic tests. */
   readonly createClientId?: () => string;
+  /**
+   * Optional durable command journal for restart-safe start/stop/wake retries.
+   * The caller owns this injected journal's lifetime; the control server only
+   * reads and appends records and never closes it.
+   */
+  readonly commandJournal?: DaemonCommandRecoveryJournal;
   /** Optional durable Run observer. Without it only Host events are available. */
   readonly observer?: DaemonRunObserver;
 }
@@ -140,7 +156,10 @@ export class DaemonControlServer {
   private readonly maxFrameBytes: number;
   private readonly maxPendingWriteBytes: number;
   private readonly createClientId: () => string;
+  private readonly commandJournal: DaemonCommandRecoveryJournal | undefined;
   private readonly observer: DaemonRunObserver | undefined;
+  private readonly commandRecovery = new Map<string, DaemonCommandRecoveryRecord>();
+  private commandTail: Promise<void> = Promise.resolve();
   private readonly connections = new Set<Connection>();
   /** Ownership fence for caller-supplied IDs shared by attach/detach. */
   private readonly attachmentOwners = new Map<string, Connection>();
@@ -189,6 +208,17 @@ export class DaemonControlServer {
     if (typeof this.createClientId !== "function") {
       throw new DaemonControlProtocolError("createClientId must be a function");
     }
+    if (options.commandJournal !== undefined) {
+      if (
+        options.commandJournal === null
+        || typeof options.commandJournal !== "object"
+        || typeof options.commandJournal.read !== "function"
+        || typeof options.commandJournal.append !== "function"
+      ) {
+        throw new DaemonControlProtocolError("commandJournal must provide read and append functions");
+      }
+      this.commandJournal = options.commandJournal;
+    }
     if (options.observer !== undefined && !(options.observer instanceof DaemonRunObserver)) {
       throw new DaemonControlProtocolError("observer must be a DaemonRunObserver");
     }
@@ -235,6 +265,7 @@ export class DaemonControlServer {
   }
 
   private async open(): Promise<void> {
+    await this.loadCommandRecovery();
     await prepareSocketPath(this.socketPath);
     const server = createServer((socket) => this.handleConnection(socket));
     // A server error after bind must not become an uncaught process error.
@@ -280,6 +311,7 @@ export class DaemonControlServer {
     this.connections.clear();
 
     await closeServer(server);
+    await this.commandTail;
     this.server = undefined;
     const identity = this.boundIdentity;
     this.boundIdentity = undefined;
@@ -287,8 +319,15 @@ export class DaemonControlServer {
   }
 
   private handleConnection(socket: Socket): void {
+    let connectionId: string;
+    try {
+      connectionId = requiredString(this.createClientId(), "clientId");
+    } catch {
+      socket.destroy();
+      return;
+    }
     const connection: Connection = {
-      id: this.createClientId(),
+      id: connectionId,
       socket,
       buffer: "",
       tail: Promise.resolve(),
@@ -384,6 +423,20 @@ export class DaemonControlServer {
       return;
     }
 
+    if (this.commandJournal !== undefined && isRecoverableMethod(request.method)) {
+      try {
+        await this.enqueueRecoverable(connection, request);
+      } catch (error: unknown) {
+        this.sendError(
+          connection,
+          request.id,
+          "command_failed",
+          persistedErrorText(error, "control command failed", 512),
+        );
+      }
+      return;
+    }
+
     try {
       const result = await this.dispatch(connection, request);
       this.sendResponse(connection, {
@@ -418,6 +471,154 @@ export class DaemonControlServer {
         persistedErrorText(error, "control command failed", 512),
       );
     }
+  }
+
+  private async loadCommandRecovery(): Promise<void> {
+    if (this.commandJournal === undefined) return;
+    this.commandRecovery.clear();
+    const projected = projectDaemonCommandRecovery(await this.commandJournal.read());
+    for (const [key, record] of projected) this.commandRecovery.set(key, record);
+  }
+
+  private enqueueRecoverable(
+    connection: Connection,
+    request: DaemonControlRequest,
+  ): Promise<void> {
+    const operation = this.commandTail.then(() => this.processRecoverable(connection, request));
+    this.commandTail = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  private async processRecoverable(
+    connection: Connection,
+    request: DaemonControlRequest,
+  ): Promise<void> {
+    const journal = this.commandJournal;
+    if (journal === undefined) return;
+    const clientId = request.clientId ?? connection.id;
+    const fingerprint = daemonCommandRecoveryFingerprint(request.method, request.params);
+    const key = daemonCommandRecoveryKey(clientId, request.id);
+    const prior = this.commandRecovery.get(key);
+    if (prior !== undefined) {
+      if (prior.method !== request.method || prior.fingerprint !== fingerprint) {
+        this.sendError(
+          connection,
+          request.id,
+          "command_conflict",
+          "command id was already used with different method or params",
+        );
+        return;
+      }
+      if (prior.status === "received") {
+        this.sendError(
+          connection,
+          request.id,
+          "command_uncertain",
+          "command was received before the daemon stopped; it was not replayed",
+        );
+        return;
+      }
+      if (prior.response === undefined) {
+        throw new DaemonControlProtocolError("command recovery result has no response");
+      }
+      this.sendRecordedResponse(connection, request.id, prior.response);
+      return;
+    }
+
+    const received = await journal.append({
+      clientId,
+      commandId: request.id,
+      method: request.method,
+      fingerprint,
+      status: "received",
+    });
+    this.commandRecovery.set(key, received);
+
+    let response: DaemonCommandRecoveryResponse;
+    try {
+      const result = await this.dispatch(connection, request);
+      response = {
+        ok: true,
+        ...(result === undefined ? {} : { result }),
+      };
+    } catch (error: unknown) {
+      response = this.errorResponse(error);
+    }
+
+    try {
+      const recorded = await journal.append({
+        clientId,
+        commandId: request.id,
+        method: request.method,
+        fingerprint,
+        status: "result",
+        response,
+      });
+      this.commandRecovery.set(key, recorded);
+    } catch (error: unknown) {
+      this.sendError(
+        connection,
+        request.id,
+        "command_failed",
+        persistedErrorText(error, "command result could not be persisted", 512),
+      );
+      return;
+    }
+
+    this.sendRecordedResponse(connection, request.id, response);
+    if (request.method === "stop" && response.ok) {
+      setImmediate(() => {
+        try {
+          this.onStopResponse?.();
+        } catch {
+          // A composition notification cannot change the completed command.
+        }
+      });
+    }
+    try {
+      const acknowledged = await journal.append({
+        clientId,
+        commandId: request.id,
+        method: request.method,
+        fingerprint,
+        status: "acknowledged",
+        response,
+      });
+      this.commandRecovery.set(key, acknowledged);
+    } catch {
+      // The durable result remains replayable even when the acknowledgement is lost.
+    }
+  }
+
+  private sendRecordedResponse(
+    connection: Connection,
+    id: string,
+    response: DaemonCommandRecoveryResponse,
+  ): void {
+    this.sendResponse(connection, {
+      version: DAEMON_CONTROL_PROTOCOL_VERSION,
+      kind: "response",
+      id,
+      ok: response.ok,
+      ...(response.result === undefined ? {} : { result: response.result }),
+      ...(response.error === undefined ? {} : { error: response.error }),
+    });
+  }
+
+  private errorResponse(error: unknown): DaemonCommandRecoveryResponse {
+    const code = error instanceof DaemonHostProtocolError
+      ? "host_rejected"
+      : error instanceof DaemonControlProtocolError
+        || error instanceof DaemonRunObserverProtocolError
+        ? "invalid_params"
+        : "command_failed";
+    return {
+      ok: false,
+      error: {
+        code,
+        message: persistedErrorText(error, "control command failed", 512),
+      },
+    };
   }
 
   private async dispatch(
@@ -822,9 +1023,14 @@ function parseRequest(value: unknown): DaemonControlRequest {
   return {
     ...(record.version === undefined ? {} : { version: record.version as number }),
     id,
+    ...(record.clientId === undefined ? {} : { clientId: requiredString(record.clientId, "request.clientId") }),
     method,
     ...(record.params === undefined ? {} : { params: record.params }),
   };
+}
+
+function isRecoverableMethod(method: DaemonControlMethod): boolean {
+  return method === "start" || method === "stop" || method === "wake";
 }
 
 function requestId(value: unknown): string | null {

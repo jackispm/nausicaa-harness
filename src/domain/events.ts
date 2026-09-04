@@ -5,6 +5,7 @@ import type {
   ArtifactRef,
   EventId,
   Goal,
+  TodoItem,
   LaneId,
   LaneKind,
   LaneStatus,
@@ -61,6 +62,11 @@ export interface EventPayloadMap {
   "run.completed": { answerRef?: ArtifactRef };
   "run.failed": { error: string };
   "goal.revised": { goal: Goal };
+  "todo.updated": {
+    revision: number;
+    items: TodoItem[];
+    source?: "model" | "operator";
+  };
   "lane.registered": { kind: LaneKind; teamFingerprint?: string };
   /** Optional lifecycle marker carried by the existing lane status fact. */
   "lane.status": {
@@ -192,6 +198,19 @@ export interface EventPayloadMap {
     toolCallId: string;
     name: string;
     argumentsRef: ArtifactRef;
+  };
+  "approval.requested": {
+    operationId: string;
+    toolCallId: string;
+    name: string;
+    argumentsHash: string;
+  };
+  "approval.decided": {
+    operationId: string;
+    toolCallId: string;
+    name: string;
+    decision: "approved" | "denied" | "cancelled";
+    reason?: string;
   };
   "tool.succeeded": {
     operationId: string;

@@ -10,6 +10,7 @@ import type {
   TokenUsage,
 } from "../domain/index.js";
 import { parseSingleJsonObject, systemClock } from "../domain/index.js";
+import { prepareModelPort } from "../model/prepared-model.js";
 
 export const TETO_SYSTEM_PROMPT = `You are Teto, Main's intent observer. Check only mission and boundary; do not review code or invent facts. Minified JSON only: {"action":"silent"} or {"action":"advise","kind":"orientation|intent-gap|method-alternative","claim":"<=8 words","suggestedAction":"<=8 words","risk":"low|medium|high"}.`;
 
@@ -51,7 +52,7 @@ export class IntentNavigator {
   private readonly maxAdviceOutputTokens: number;
 
   constructor(options: IntentNavigatorOptions) {
-    this.modelPort = options.modelPort;
+    this.modelPort = prepareModelPort(options.modelPort, { captureCapabilities: false });
     this.model = options.model;
     this.laneId = options.laneId ?? "teto";
     this.clock = options.clock ?? systemClock;

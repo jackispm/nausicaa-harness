@@ -264,6 +264,9 @@ function runPolicy(value: unknown, path: string): asserts value is RunPolicy {
     const fukai = record(item.fukaiCompaction, `${path}.fukaiCompaction`);
     boolean(fukai.enabled, `${path}.fukaiCompaction.enabled`);
     oneOf(fukai.provider, `${path}.fukaiCompaction.provider`, ["none", "pi-ai"] as const);
+    if (fukai.enabled === true && fukai.provider === "none") {
+      invalid(`${path}.fukaiCompaction.provider`, "pi-ai when Fukai compaction is enabled");
+    }
     integer(fukai.maxInputTokens, `${path}.fukaiCompaction.maxInputTokens`, 1);
     integer(fukai.maxOutputTokens, `${path}.fukaiCompaction.maxOutputTokens`, 1);
     integer(fukai.maxWallClockMs, `${path}.fukaiCompaction.maxWallClockMs`, 1);
@@ -921,6 +924,28 @@ const payloadValidators = {
     const item = payloadObject(value, path, ["goal"]);
     goal(item.goal, `${path}.goal`);
   },
+  "todo.updated": (value, path) => {
+    const item = payloadObject(value, path, ["revision", "items"]);
+    integer(item.revision, `${path}.revision`, 1);
+    if (!Array.isArray(item.items)) invalid(`${path}.items`, "an array");
+    const ids = new Set<string>();
+    item.items.forEach((candidate, index) => {
+      const todo = payloadObject(candidate, `${path}.items[${index}]`, ["id", "content", "status"]);
+      string(todo.id, `${path}.items[${index}].id`, false);
+      string(todo.content, `${path}.items[${index}].content`, false);
+      oneOf(todo.status, `${path}.items[${index}].status`, [
+        "pending",
+        "in_progress",
+        "completed",
+        "cancelled",
+      ] as const);
+      if (ids.has(todo.id as string)) invalid(`${path}.items[${index}].id`, "unique within items");
+      ids.add(todo.id as string);
+    });
+    if (item.source !== undefined) {
+      oneOf(item.source, `${path}.source`, ["model", "operator"] as const);
+    }
+  },
   "lane.registered": (value, path) => {
     const item = payloadObject(value, path, ["kind"]);
     oneOf(item.kind, `${path}.kind`, ["main", "intent-navigator", "reflection", "worker", "team"] as const);
@@ -1230,6 +1255,34 @@ const payloadValidators = {
     string(item.toolCallId, `${path}.toolCallId`, false);
     string(item.name, `${path}.name`, false);
     artifactRef(item.argumentsRef, `${path}.argumentsRef`);
+  },
+  "approval.requested": (value, path) => {
+    const item = payloadObject(value, path, [
+      "operationId",
+      "toolCallId",
+      "name",
+      "argumentsHash",
+    ]);
+    string(item.operationId, `${path}.operationId`, false);
+    string(item.toolCallId, `${path}.toolCallId`, false);
+    string(item.name, `${path}.name`, false);
+    string(item.argumentsHash, `${path}.argumentsHash`, false);
+    if (!/^sha256:[0-9a-f]{64}$/.test(item.argumentsHash as string)) {
+      invalid(`${path}.argumentsHash`, "a SHA-256 digest");
+    }
+  },
+  "approval.decided": (value, path) => {
+    const item = payloadObject(value, path, [
+      "operationId",
+      "toolCallId",
+      "name",
+      "decision",
+    ]);
+    string(item.operationId, `${path}.operationId`, false);
+    string(item.toolCallId, `${path}.toolCallId`, false);
+    string(item.name, `${path}.name`, false);
+    oneOf(item.decision, `${path}.decision`, ["approved", "denied", "cancelled"] as const);
+    optionalString(item.reason, `${path}.reason`);
   },
   "tool.succeeded": (value, path) => {
     const item = payloadObject(value, path, [

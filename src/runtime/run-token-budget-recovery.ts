@@ -180,14 +180,30 @@ function emptyUsage(): TokenUsage {
 
 function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
   return {
-    input: left.input + right.input,
-    output: left.output + right.output,
-    cacheRead: left.cacheRead + right.cacheRead,
-    cacheWrite: left.cacheWrite + right.cacheWrite,
+    input: safeAdd(left.input, right.input, "recovered input tokens"),
+    output: safeAdd(left.output, right.output, "recovered output tokens"),
+    cacheRead: safeAdd(left.cacheRead, right.cacheRead, "recovered cache-read tokens"),
+    cacheWrite: safeAdd(left.cacheWrite, right.cacheWrite, "recovered cache-write tokens"),
     ...(
       left.costUsd === undefined && right.costUsd === undefined
         ? {}
-        : { costUsd: (left.costUsd ?? 0) + (right.costUsd ?? 0) }
+        : { costUsd: safeCostAdd(left.costUsd ?? 0, right.costUsd ?? 0) }
     ),
   };
+}
+
+function safeAdd(left: number, right: number, label: string): number {
+  const result = left + right;
+  if (!Number.isSafeInteger(result)) {
+    throw new RangeError(`${label} exceed the safe integer range`);
+  }
+  return result;
+}
+
+function safeCostAdd(left: number, right: number): number {
+  const result = left + right;
+  if (!Number.isFinite(result)) {
+    throw new RangeError("recovered cost exceeds the finite number range");
+  }
+  return result;
 }

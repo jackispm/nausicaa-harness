@@ -31,6 +31,7 @@ import type {
 } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
 import { sha256, stableJson } from "../ledger/hash.js";
+import { prepareModelPort } from "../model/prepared-model.js";
 import type { ContentAddressedStore } from "../store/index.js";
 import { persistedErrorText } from "./redaction.js";
 import type { RunTokenBudget } from "./run-token-budget.js";
@@ -143,7 +144,7 @@ export class WorkerTaskExecutor {
     this.inbox = options.inbox;
     this.eventSink = options.eventSink;
     this.store = options.store;
-    this.model = options.model;
+    this.model = prepareModelPort(options.model, { captureCapabilities: false });
     this.modelName = options.modelName;
     this.runId = options.runId;
     this.runTokenBudget = options.runTokenBudget;
@@ -197,6 +198,7 @@ export class WorkerTaskExecutor {
     const records = await this.inbox.claim(this.laneId, this.laneId, {
       claimId: `${this.laneId}:claim:${this.createId()}`,
       limit: 1,
+      runId: this.runId,
       types: ["task.request"],
     });
     if (records.length === 0) return { status: "idle" };
@@ -562,6 +564,17 @@ export class WorkerTaskExecutor {
               payload: failed(task.taskId, reason, retryable, evidenceRefs),
             };
           }
+          await this.append({
+            runId: this.runId,
+            laneId: this.laneId,
+            type: "budget.charged",
+            payload: { laneId: this.laneId, usage: structuredClone(response.usage) },
+            correlationId: request.correlationId,
+            idempotencyKey: `${prefix}:budget`,
+            visibility: request.visibility,
+            occurredAt: this.clock.now().toISOString(),
+          });
+
           try {
             this.runTokenBudget?.settle(runReservationId, response.usage);
             runReservationSettled = true;
@@ -584,16 +597,6 @@ export class WorkerTaskExecutor {
               payload: failed(task.taskId, reason, retryable, evidenceRefs),
             };
           }
-          await this.append({
-            runId: this.runId,
-            laneId: this.laneId,
-            type: "budget.charged",
-            payload: { laneId: this.laneId, usage: structuredClone(response.usage) },
-            correlationId: request.correlationId,
-            idempotencyKey: `${prefix}:budget`,
-            visibility: request.visibility,
-            occurredAt: this.clock.now().toISOString(),
-          });
 
           try {
             validateToolCalls(response.toolCalls);

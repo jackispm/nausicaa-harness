@@ -28,6 +28,15 @@ export interface Goal {
   hardConstraints: string[];
 }
 
+export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
+
+/** Structured, host-visible work item kept independent from model prose. */
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: TodoStatus;
+}
+
 export interface TokenUsage {
   input: number;
   output: number;

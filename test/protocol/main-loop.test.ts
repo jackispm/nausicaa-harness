@@ -10,6 +10,7 @@ import type {
   ModelRequest,
   ModelResponse,
 } from "../../src/domain/ports.js";
+import type { AppendEvent, EventType } from "../../src/domain/events.js";
 import type { Goal } from "../../src/domain/types.js";
 import { FUKAI_COMPACTION_MEDIA_TYPE } from "../../src/domain/context.js";
 import {
@@ -20,7 +21,7 @@ import type {
   FukaiCompactionSelection,
   MainContextProvider,
 } from "../../src/fukai/types.js";
-import { MemoryLedger } from "../../src/ledger/index.js";
+import { MemoryLedger, projectRun } from "../../src/ledger/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import {
   MoweCatalog,
@@ -29,6 +30,7 @@ import {
 } from "../../src/mowe/index.js";
 import {
   MainLoop,
+  type MainEventSink,
   MainRunTokenBudgetExhaustedError,
   UNKNOWN_MODEL_REQUEST_INPUT_FALLBACK_TOKENS,
   type MainStreamEvent,
@@ -792,9 +794,20 @@ describe("MainLoop", () => {
     expect(executions).toBe(1);
     expect(approvals).toHaveLength(1);
     expect(approvals[0]).toMatch(/^op:/u);
-    expect((await ledger.read({ runId: "main-tool-approval" })).some((event) => (
+    const events = await ledger.read({ runId: "main-tool-approval" });
+    expect(events.some((event) => (
       event.type === "tool.succeeded" && event.payload.toolCallId === "guarded-call"
     ))).toBe(true);
+    expect(events.filter((event) => event.type === "approval.requested")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "approval.decided")).toHaveLength(1);
+    const approval = projectRun(events, "main-tool-approval").approvals?.[0];
+    expect(approval).toMatchObject({
+      operationId: approvals[0],
+      toolCallId: "guarded-call",
+      status: "approved",
+      requestedAtOffset: expect.any(Number),
+      decidedAtOffset: expect.any(Number),
+    });
   });
 
   it("uses an injected Mowe catalog as the model-visible tool source", async () => {
@@ -1480,6 +1493,54 @@ describe("MainLoop", () => {
       availableTokens: 4_000,
       settlements: [],
     });
+  });
+
+  it("releases Main's reservation when the budget charge cannot be persisted", async () => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const ledger = new MemoryLedger();
+    const runTokenBudget = new RunTokenBudget(4_000);
+    let rejectCharge = true;
+    const eventSink: MainEventSink = {
+      append: async <K extends EventType>(event: AppendEvent<K>) => {
+        if (event.type === "budget.charged" && rejectCharge) {
+          rejectCharge = false;
+          throw new Error("charge persistence unavailable");
+        }
+        return ledger.append(event);
+      },
+    };
+    const loop = new MainLoop({
+      model: new ScriptedModel([{
+        content: "done",
+        toolCalls: [],
+        stopReason: "stop",
+        usage: tokenUsage(10, 5),
+      }]),
+      runTokenBudget,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink,
+      tools: [],
+    });
+
+    await expect(loop.run({
+      runId: "main-budget-charge-persistence-failure",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(1),
+      initialMessage: "Go",
+    })).rejects.toThrow("charge persistence unavailable");
+
+    expect(runTokenBudget.snapshot()).toMatchObject({
+      usedTokens: 0,
+      reservedTokens: 0,
+      availableTokens: 4_000,
+      settlements: [],
+    });
+    expect((await ledger.read({ runId: "main-budget-charge-persistence-failure" }))
+      .some((event) => event.type === "budget.charged")).toBe(false);
   });
 
   it("charges provider-reported usage when a Main request fails", async () => {

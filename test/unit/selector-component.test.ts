@@ -107,4 +107,39 @@ describe("SelectorOverlay", () => {
       }
     }
   });
+
+  it("renders Codex-style facets and reprojects options without leaving the selector", () => {
+    const overlay = new SelectorOverlay({
+      title: "Resume a previous session",
+      searchLabel: "Type to search",
+      filters: [
+        {
+          key: "scope",
+          label: "Filter",
+          options: [{ value: "cwd", label: "Cwd" }, { value: "all", label: "All" }],
+          current: "cwd",
+        },
+        {
+          key: "status",
+          label: "Status",
+          options: [{ value: "active", label: "Active" }, { value: "archived", label: "Archived" }],
+          current: "active",
+        },
+      ],
+      options: [
+        { value: "active-run", label: "2s ago", description: "Active task" },
+        { value: "archived-run", label: "1d ago", description: "Archived task" },
+      ],
+      filterOptions: (options, values) => values.status === "archived" ? [options[1]!] : [options[0]!],
+      onSelect: () => {},
+      onCancel: () => {},
+    });
+
+    expect(overlay.render(120).join("\n")).toContain("Type to search    Filter: [Cwd] All    Status: [Active] Archived");
+    expect(overlay.getSelectedValue()).toBe("active-run");
+    overlay.handleInput("\t");
+    overlay.handleInput("\x1b[C");
+    expect(overlay.getSelectedValue()).toBe("archived-run");
+    expect(overlay.render(120).join("\n")).toContain("Status: Active [Archived]");
+  });
 });

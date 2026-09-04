@@ -1,7 +1,10 @@
 import { stat } from "node:fs/promises";
 
 import type { AgentTool, ToolResult } from "../domain/ports.js";
+import type { ShellOutputSink } from "./shell-output.js";
 import { executeShellCommand, type ShellExecutionResult } from "./shell-process.js";
+
+export type { ShellOutputSink } from "./shell-output.js";
 
 const MAX_TIMEOUT_SECONDS = 2_147_483_647 / 1_000;
 
@@ -10,6 +13,8 @@ export interface BashCommandExecutionInput {
   cwd: string;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Optional host-owned observers for complete, sanitized output streams. */
+  outputSink?: ShellOutputSink;
 }
 
 /** Narrow execution seam for an OS sandbox or another host-owned backend. */
@@ -20,6 +25,8 @@ export type BashCommandExecutor = (
 export interface BashToolOptions {
   /** Defaults to the existing unrestricted host-shell executor. */
   commandExecutor?: BashCommandExecutor;
+  /** Optional host-owned observers for complete, sanitized output streams. */
+  outputSink?: ShellOutputSink;
 }
 
 export function createBashTool(options: BashToolOptions = {}): AgentTool {
@@ -73,6 +80,7 @@ export function createBashTool(options: BashToolOptions = {}): AgentTool {
           cwd: context.workspace,
           ...(timeout === undefined ? {} : { timeoutMs: timeout * 1_000 }),
           ...(context.signal === undefined ? {} : { signal: context.signal }),
+          ...(options.outputSink === undefined ? {} : { outputSink: options.outputSink }),
         });
         return formatResult(execution, timeout);
       } catch (error: unknown) {
@@ -92,6 +100,11 @@ function formatResult(execution: ShellExecutionResult, timeout: number | undefin
     aborted: execution.aborted,
     timedOut: execution.timedOut,
     truncated: execution.stdout.truncated || execution.stderr.truncated,
+    ...(execution.stdout.outputSinkError === undefined && execution.stderr.outputSinkError === undefined
+      ? {}
+      : {
+          outputSinkError: execution.stdout.outputSinkError ?? execution.stderr.outputSinkError,
+        }),
     truncation: {
       stdout: truncationMetadata(execution.stdout),
       stderr: truncationMetadata(execution.stderr),

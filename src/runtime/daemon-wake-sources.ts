@@ -106,7 +106,14 @@ export class TimerWakeSourceImpl implements TimerWakeSource {
       this.#timer.unref?.();
     }
     if (this.#startImmediately) {
-      await this.tick();
+      try {
+        await this.tick();
+      } catch (error: unknown) {
+        // A failed bootstrap wake must not leave a live interval behind or
+        // make a later start() silently return the poisoned running state.
+        await this.stop();
+        throw error;
+      }
     }
   }
 

@@ -26,6 +26,7 @@ import type { AnyEvent } from "./domain/events.js";
 import { DEFAULT_MAIN_OUTPUT_TOKENS } from "./domain/types.js";
 import {
   DaemonControlServer,
+  createFileDaemonCommandRecoveryJournal,
   DaemonRunObserver,
   DaemonRemoteAttachment,
   DaemonRemoteSession,
@@ -240,23 +241,29 @@ const main = async (): Promise<number> => {
     const credentialStore = createNausicaaCredentialStore();
     const mainModel = createOpenRouterModelPort({ credentials: credentialStore });
     const modelCatalog = mainModel.catalog();
-    const credentialProvider = (() => {
+    // OpenRouter is the only provider exposed by this beta. Load its saved
+    // metadata eagerly so a first-run `/model` selection can immediately use
+    // the credential without requiring a process restart.
+    let storedCredential = await credentialStore.read("openrouter");
+    const selectedProvider = (model: string | undefined): string | undefined => {
+      if (model === undefined || model === UNCONFIGURED_MODEL) return undefined;
       try {
-        return parseModelSelector(resolvedSettings.model).provider;
+        return parseModelSelector(model).provider;
       } catch {
         return undefined;
       }
-    })();
-    const storedCredential = credentialProvider === undefined
-      ? undefined
-      : await credentialStore.read(credentialProvider);
+    };
+    const savedCredentialFor = (model: string | undefined, defaultProvider = false) => {
+      const provider = selectedProvider(model) ?? (defaultProvider ? "openrouter" : undefined);
+      return provider === "openrouter" && storedCredential !== undefined
+        ? { provider, type: storedCredential.type }
+        : undefined;
+    };
     const credentialStatus = inspectCredential(
       resolvedSettings.model,
       modelCatalog,
       process.env,
-      storedCredential === undefined || credentialProvider === undefined
-        ? undefined
-        : { provider: credentialProvider, type: storedCredential.type },
+      savedCredentialFor(resolvedSettings.model),
     );
     const selectedRunId = options.continue
       ? await findLatestRunId(resolvedSettings.dataDir, workspace)
@@ -442,22 +449,37 @@ const main = async (): Promise<number> => {
           edgeStatus: edgeRuntime.status,
           edgeSelection: edgeRuntime.selection,
           modelChoices,
+          auth: {
+            credentialStore,
+            modelPort: mainModel,
+            provider: "openrouter",
+            environment: process.env,
+            onChanged: async () => {
+              storedCredential = await credentialStore.read("openrouter");
+            },
+          },
           credentialStatus: () => inspectCredential(
             session.model === UNCONFIGURED_MODEL ? undefined : session.model,
             modelCatalog,
             process.env,
-            storedCredential === undefined || credentialProvider === undefined
-              ? undefined
-              : { provider: credentialProvider, type: storedCredential.type },
+            savedCredentialFor(session.model === UNCONFIGURED_MODEL ? undefined : session.model),
           ),
           startupModelMissing,
           showStartupSetup,
           startupNotice: () => startupGuidance({
             model: session.model === UNCONFIGURED_MODEL ? undefined : session.model,
             catalog: modelCatalog,
-            ...(storedCredential === undefined || credentialProvider === undefined
+            ...(savedCredentialFor(
+              session.model === UNCONFIGURED_MODEL ? undefined : session.model,
+              session.model === UNCONFIGURED_MODEL,
+            ) === undefined
               ? {}
-              : { savedCredential: { provider: credentialProvider, type: storedCredential.type } }),
+              : {
+                savedCredential: savedCredentialFor(
+                  session.model === UNCONFIGURED_MODEL ? undefined : session.model,
+                  session.model === UNCONFIGURED_MODEL,
+                )!,
+              }),
           }),
           awareness: () => readWorkspaceAgentAwareness(
             resolvedSettings.dataDir,
@@ -725,11 +747,15 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
   const shutdown = new Promise<void>((resolvePromise) => {
     resolveShutdown = resolvePromise;
   });
+  const commandJournal = createFileDaemonCommandRecoveryJournal(
+    resolve(options.settings.dataDir, "daemon", "command-recovery.jsonl"),
+  );
   const control = new DaemonControlServer({
     host: daemon.host,
     lifecycle: daemon,
     onStopResponse: resolveShutdown,
     socketPath,
+    commandJournal,
     observer,
   });
   const onSignal = (): void => resolveShutdown();
@@ -751,6 +777,7 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
     process.removeListener("SIGTERM", onSignal);
     await control.close().catch(() => undefined);
     await daemon.stop().catch(() => undefined);
+    await commandJournal.close().catch(() => undefined);
   }
 };
 

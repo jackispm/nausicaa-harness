@@ -59,6 +59,51 @@ describe("RetryingModelPort", () => {
     expect(delegate.calls).toBe(0);
   });
 
+  it("rejects a completion that resolves after the caller aborts", async () => {
+    let release!: (value: ModelResponse) => void;
+    const pending = new Promise<ModelResponse>((resolve) => { release = resolve; });
+    const delegate: ModelPort = {
+      complete: async () => pending,
+    };
+    const controller = new AbortController();
+    const completion = new RetryingModelPort(delegate, {
+      maxAttempts: 1,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    }).complete({ ...request(), signal: controller.signal });
+
+    controller.abort(new Error("cancelled while provider was pending"));
+    release(response);
+
+    await expect(completion).rejects.toThrow("cancelled while provider was pending");
+  });
+
+  it("unblocks completion when the provider never settles after cancellation", async () => {
+    const controller = new AbortController();
+    const delegate: ModelPort = {
+      complete: async () => new Promise<ModelResponse>(() => undefined),
+    };
+    const completion = new RetryingModelPort(delegate, {
+      maxAttempts: 1,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    }).complete({ ...request(), signal: controller.signal });
+    controller.abort(new Error("cancelled while provider hung"));
+
+    const result = await Promise.race([
+      completion.then(
+        () => ({ kind: "resolved" as const }),
+        (error: unknown) => ({ kind: "rejected" as const, error }),
+      ),
+      new Promise<{ kind: "timeout" }>((resolve) => {
+        setTimeout(() => resolve({ kind: "timeout" }), 250);
+      }),
+    ]);
+    expect(result.kind).toBe("rejected");
+    if (result.kind !== "rejected") return;
+    expect(result.error).toMatchObject({ message: "cancelled while provider hung" });
+  });
+
   it("refuses a server retry delay above the configured bound", async () => {
     const failure = new ProviderModelError({
       category: "rate-limit",
@@ -170,6 +215,67 @@ describe("RetryingModelPort", () => {
       expect(events.at(-1)).toEqual({ type: "error", error: transient });
     },
   );
+
+  it("discards a stream completion delivered after the caller aborts", async () => {
+    const controller = new AbortController();
+    const delegate: ModelPort = {
+      complete: async () => response,
+      stream: (_request) => (async function* () {
+        yield { type: "start" as const };
+        await Promise.resolve();
+        controller.abort(new Error("cancelled while stream was pending"));
+        yield { type: "done" as const, response };
+      })(),
+    };
+
+    const events = await collect(new RetryingModelPort(delegate, {
+      maxAttempts: 1,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    }).stream!({ ...request(), signal: controller.signal }));
+
+    expect(events.map((event) => event.type)).toEqual(["start", "error"]);
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      error: { message: "cancelled while stream was pending" },
+    });
+  });
+
+  it("unblocks a stream when the provider ignores cancellation while waiting", async () => {
+    const controller = new AbortController();
+    let returned = false;
+    const delegate: ModelPort = {
+      complete: async () => response,
+      stream: () => ({
+        [Symbol.asyncIterator]: () => ({
+          next: () => new Promise<IteratorResult<ModelStreamEvent>>(() => undefined),
+          return: async () => {
+            returned = true;
+            return { done: true, value: undefined };
+          },
+        }),
+      }),
+    };
+
+    const pending = collect(new RetryingModelPort(delegate, {
+      maxAttempts: 1,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    }).stream!({ ...request(), signal: controller.signal }));
+    controller.abort(new Error("cancelled while provider was waiting"));
+
+    const events = await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("stream cancellation timed out")), 250);
+      }),
+    ]);
+    expect(events).toEqual([{
+      type: "error",
+      error: expect.objectContaining({ message: "cancelled while provider was waiting" }),
+    }]);
+    expect(returned).toBe(true);
+  });
 
   it("preserves the delegate's optional stream and capability surface", () => {
     const capabilities = { imageInput: true, contextWindowTokens: 128_000 };

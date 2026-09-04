@@ -255,6 +255,8 @@ export type WorkspaceRunStatus =
 /** Read-only metadata used by resume selectors and startup discovery. */
 export interface WorkspaceRunSummary {
   runId: string;
+  /** First user task, used as the human-readable session title. */
+  title?: string;
   goal: string;
   status: WorkspaceRunStatus;
   createdAt: string;
@@ -2770,9 +2772,17 @@ export async function listWorkspaceRuns(
       const recordedWorkspace = await realpath(created.payload.workspace).catch(() => undefined);
       if (recordedWorkspace !== canonicalWorkspace) continue;
       const projection = projectRun(events, entry.name);
+      const goal = projection.goal?.statement ?? created.payload.goal.statement;
+      const title = await readWorkspaceRunTitle(
+        runsDir,
+        entry.name,
+        events,
+        goal,
+      );
       candidates.push({
         runId: entry.name,
-        goal: projection.goal?.statement ?? created.payload.goal.statement,
+        ...(title === undefined ? {} : { title }),
+        goal,
         status: workspaceRunStatus(projection),
         createdAt: created.occurredAt,
         updatedAt: events.at(-1)?.occurredAt ?? created.occurredAt,
@@ -2785,6 +2795,29 @@ export async function listWorkspaceRuns(
     right.updatedAt.localeCompare(left.updatedAt)
     || right.runId.localeCompare(left.runId));
   return candidates;
+}
+
+/** Recover a stable, human-readable title without changing the Ledger schema. */
+async function readWorkspaceRunTitle(
+  runsDir: string,
+  runId: string,
+  events: readonly AnyEvent[],
+  fallback: string,
+): Promise<string | undefined> {
+  const admitted = events.find((event): event is Extract<AnyEvent, {
+    type: "input.admitted";
+  }> => event.type === "input.admitted" && event.laneId === "main");
+  if (admitted === undefined) return fallback;
+  try {
+    const store = await FileContentAddressedStore.open(join(runsDir, runId, "store"));
+    const text = (await readUserText(store, admitted.payload.messageRef)).trim();
+    if (text.length === 0) return fallback;
+    const singleLine = text.replace(/[\u0000-\u001f\u007f]+/gu, " ").replace(/\s+/gu, " ").trim();
+    return singleLine.length === 0 ? fallback : singleLine.slice(0, 160);
+  } catch {
+    // Missing legacy artifacts should not hide an otherwise valid Run.
+    return fallback;
+  }
 }
 
 function workspaceRunStatus(

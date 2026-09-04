@@ -127,7 +127,7 @@ export function startupGuidance(input: StartupGuidanceInput): string {
     );
   }
   lines.push(
-    "Credentials are managed with `nausicaa auth login|status|logout`; this screen never saves or sends a key. Esc skips setup.",
+    "Credentials are managed with `/login`, `/logout`, or `nausicaa auth login|status|logout`; this screen never saves or sends a key. Esc skips setup.",
   );
   return lines.join("\n");
 }

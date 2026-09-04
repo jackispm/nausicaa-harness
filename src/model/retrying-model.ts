@@ -63,7 +63,17 @@ export class RetryingModelPort implements ModelPort {
     for (let attempt = 1; ; attempt += 1) {
       throwIfAborted(request.signal);
       try {
-        return await this.delegate.complete(request);
+        // Do not wait for a provider that ignores AbortSignal.  The caller's
+        // cancellation must release this retry boundary even if the provider
+        // promise never settles.
+        const response = await raceAbort(
+          this.delegate.complete(request),
+          request.signal,
+        );
+        // A provider may ignore AbortSignal and resolve after cancellation.
+        // Never let that late result cross the retry boundary.
+        throwIfAborted(request.signal);
+        return response;
       } catch (error: unknown) {
         if (!this.canRetry(error, attempt, request.signal)) throw error;
         await this.waitBeforeRetry(error, attempt, request.signal);
@@ -82,10 +92,23 @@ export class RetryingModelPort implements ModelPort {
       const buffered: ModelStreamEvent[] = [];
       let deltaPublished = false;
       let terminalError: Error | undefined;
+      let iterator: AsyncIterator<ModelStreamEvent> | undefined;
       try {
-        for await (const event of stream.call(this.delegate, request)) {
+        iterator = stream.call(this.delegate, request)[Symbol.asyncIterator]();
+        while (true) {
+          const next = await raceAbort(iterator.next(), request.signal);
+          if (next.done) break;
+          const event = next.value;
+          // Providers are not required to stop their iterator immediately
+          // after abort. Treat any late event as cancellation and discard it.
+          if (request.signal?.aborted) {
+            terminalError = abortError(request.signal);
+            void closeIterator(iterator);
+            break;
+          }
           if (event.type === "error") {
             terminalError = event.error;
+            void closeIterator(iterator);
             break;
           }
 
@@ -108,6 +131,7 @@ export class RetryingModelPort implements ModelPort {
         }
       } catch (error: unknown) {
         terminalError = asError(error);
+        void closeIterator(iterator);
       }
 
       terminalError ??= new Error("Model stream ended without a final response");
@@ -235,6 +259,17 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
       signal.removeEventListener("abort", onAbort);
     }).catch(() => undefined);
   });
+}
+
+async function closeIterator(
+  iterator: AsyncIterator<ModelStreamEvent> | undefined,
+): Promise<void> {
+  if (iterator === undefined) return;
+  try {
+    await iterator.return?.();
+  } catch {
+    // The terminal model error remains authoritative if iterator cleanup fails.
+  }
 }
 
 function asError(error: unknown): Error {

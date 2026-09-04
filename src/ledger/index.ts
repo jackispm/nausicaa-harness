@@ -3,3 +3,5 @@ export * from "./ledger.js";
 export * from "./memory.js";
 export * from "./projection.js";
 export * from "./task-graph.js";
+export * from "./todo-projection.js";
+export * from "./projection-query.js";

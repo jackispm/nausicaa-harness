@@ -268,6 +268,15 @@ describe("JsonlLedger recovery", () => {
     await ledger.close();
   });
 
+  it("rejects an oversized writer lock before reading its payload", async () => {
+    const { path } = await fixture();
+    await writeFile(`${path}.lock`, `${"x".repeat(4 * 1024 + 1)}\n`, { mode: 0o600 });
+
+    await expect(JsonlLedger.open(path)).rejects.toBeInstanceOf(
+      LedgerWriterLockedError,
+    );
+  });
+
   it("never follows a symbolic-link ledger file", async () => {
     const { directory, path } = await fixture();
     const outside = join(directory, "outside.jsonl");

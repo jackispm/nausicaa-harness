@@ -3,31 +3,34 @@ node_modules/
 dist/
 coverage/
 *.tgz
+*.tsbuildinfo
 
-# Local configuration and runtime state
+# Local configuration, credentials, and runtime state
 .env
 .env.*
 !.env.example
 .nausicaa/
 *.log
+logs/
+*.pem
+*.key
+*.p12
 
-# Local-only agent instructions, design, and working material
+# Local-only instructions and research
 AGENTS.md
-docs/
-*.md
-!README.md
-!CHANGELOG.md
-!CONTRIBUTING.md
-!SECURITY.md
-!CODE_OF_CONDUCT.md
-!LICENSE.md
 .private/
 .local/
 notes/
 research/
 .codex/
 .agents/
+HARNESS-CAPABILITY-COMPARISON.md
+TOOL-ARCHITECTURE-GLOSSARY.md
+TOOL-CALL-FLOW-SIMULATION.md
 
-# Operating-system files
+# Operating-system and editor files
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
+.claude/

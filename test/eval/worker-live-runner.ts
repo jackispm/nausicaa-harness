@@ -76,6 +76,7 @@ import { canonicalJson, hashJson } from "./fingerprint.js";
 import {
   assertEvaluationToolContract,
   createFrozenWorkspaceFixtureV2Tools,
+  normalizeFrozenToolDefinition,
 } from "./tool-contract.js";
 
 export const WORKER_LIVE_EVALUATION_ID = "worker-live-ab-v2";
@@ -698,12 +699,18 @@ class MeteredPhysicalAttemptModel implements ModelPort {
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     const attempt = this.meter.identify(request);
+    const providerRequest = request.tools.some((tool) => tool.name === "delegate_task")
+      ? {
+          ...request,
+          tools: request.tools.map(normalizeFrozenToolDefinition),
+        }
+      : request;
     const startedNs = process.hrtime.bigint();
     let usage: WorkerLiveProviderUsage | undefined;
     let providerCompleted = false;
     try {
-      this.meter.admit(request);
-      const response = await this.delegate.complete(request);
+      this.meter.admit(providerRequest);
+      const response = await this.delegate.complete(providerRequest);
       usage = providerUsage(response.usage);
       this.meter.charge(usage);
       providerCompleted = true;

@@ -6,6 +6,16 @@ export {
   type BashToolOptions,
 } from "./bash.js";
 export {
+  SHELL_MAX_OUTPUT_BYTES,
+  SHELL_MAX_OUTPUT_LINES,
+  ShellOutputCapture,
+  sanitizeShellOutput,
+  type ShellOutputCaptureOptions,
+  type ShellOutputChunkSink,
+  type ShellOutputSink,
+  type ShellOutputSnapshot,
+} from "./shell-output.js";
+export {
   artifactReadPointer,
   createArtifactReadTool,
   runArtifactHandle,

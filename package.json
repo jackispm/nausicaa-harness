@@ -2,7 +2,7 @@
   "name": "nausicaa",
   "version": "0.1.0",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT",
   "description": "A lightweight, ledger-driven multi-lane agent harness.",
   "type": "module",
   "engines": {
@@ -20,6 +20,7 @@
   "files": [
     "dist",
     "README.md",
+    "LICENSE",
     "THIRD_PARTY_NOTICES"
   ],
   "scripts": {
@@ -30,11 +31,11 @@
     "postbuild": "node --input-type=module --eval \"import { chmodSync } from 'node:fs'; chmodSync('dist/cli.js', 0o755);\"",
     "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "vitest run --exclude 'test/live/**' --exclude 'test/eval/**' --exclude 'test/smoke/**'",
+    "test": "vitest run --exclude 'test/live/**' --exclude 'test/eval/**' --exclude 'test/smoke/**' --exclude '.local/**' --exclude 'logs/**' --no-file-parallelism",
     "test:unit": "vitest run test/unit",
     "test:protocol": "vitest run test/protocol",
     "test:recovery": "vitest run test/recovery",
-    "test:smoke": "npm run build && vitest run test/smoke",
+    "test:smoke": "npm run build && vitest run test/smoke --no-file-parallelism",
     "test:live": "node ./node_modules/vitest/vitest.mjs run test/live --passWithNoTests --no-file-parallelism",
     "test:beta:live": "node ./node_modules/vitest/vitest.mjs run test/live/openrouter-beta-suite.test.ts --passWithNoTests --no-file-parallelism",
     "eval": "vitest run test/eval",

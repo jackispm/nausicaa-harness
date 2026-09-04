@@ -13,7 +13,11 @@ import type {
 } from "../domain/index.js";
 import { parseSingleJsonObject, systemClock } from "../domain/index.js";
 import { stableJson } from "../ledger/hash.js";
-import type { ContentAddressedStore } from "../store/index.js";
+import {
+  ArtifactIntegrityError,
+  ArtifactNotFoundError,
+  type ContentAddressedStore,
+} from "../store/index.js";
 import { TetoCadence, TokenRatioGate, type TetoCadenceState, type TokenRatioGateState } from "../teto/index.js";
 import type {
   MainAfterStepContext,
@@ -21,6 +25,7 @@ import type {
   MainBoundaryMessage,
 } from "./main-loop.js";
 import { persistedErrorText } from "./redaction.js";
+import { prepareModelPort } from "../model/prepared-model.js";
 import type { RunTokenBudget } from "./run-token-budget.js";
 
 const DEFAULT_REFLECTION_LANE = "reflection";
@@ -66,6 +71,11 @@ interface PendingReflection {
   reflectionRef: Extract<AnyEvent, { type: "reflection.observed" }>["payload"]["reflectionRef"];
 }
 
+/** A durable reflection artifact can never become readable by retrying. */
+class PermanentReflectionArtifactError extends Error {
+  override readonly name = "PermanentReflectionArtifactError";
+}
+
 export class ReflectionScheduler {
   private readonly eventSink: EventSink;
   private readonly modelPort: ModelPort;
@@ -87,11 +97,12 @@ export class ReflectionScheduler {
   private tail: Promise<void> = Promise.resolve();
   private unrecordedErrors: Error[] = [];
   private readonly pendingReflections: PendingReflection[];
+  private readonly discardedReflections = new Set<number>();
 
   constructor(options: ReflectionSchedulerOptions) {
     validateOptions(options);
     this.eventSink = options.eventSink;
-    this.modelPort = options.modelPort;
+    this.modelPort = prepareModelPort(options.modelPort, { captureCapabilities: false });
     this.store = options.store;
     this.runId = options.runId;
     this.model = options.model;
@@ -147,7 +158,19 @@ export class ReflectionScheduler {
         messageId,
       }];
     } catch (error: unknown) {
-      this.pendingReflections.shift();
+      if (error instanceof PermanentReflectionArtifactError) {
+        // Do not let one missing/corrupt artifact block every later note. The
+        // failed marker is idempotent and lets recovery skip this observation
+        // after a restart; if its append fails, recovery will retry safely.
+        this.pendingReflections.shift();
+        this.discardedReflections.add(pending.mainCallIndex);
+        await this.recordFailure(`${pending.mainCallIndex}:delivery:discarded`, error)
+          .catch(() => undefined);
+        return [];
+      }
+      // Keep the note queued when the delivery fact cannot be persisted. A
+      // transient Ledger failure must not make a durable revision disappear;
+      // the next Main boundary can retry the same idempotent delivery.
       await this.recordFailure(`delivery:${pending.mainCallIndex}`, error).catch(() => undefined);
       return [];
     }
@@ -267,16 +290,16 @@ export class ReflectionScheduler {
         ...(signal === undefined ? {} : { signal }),
       }), signal);
       providerUsage = response.usage;
-      if (runReservationId !== undefined) {
-        this.runTokenBudget?.settle(runReservationId, response.usage);
-        runReservationSettled = true;
-      }
       await this.recordBudgetCharge(
         decision.mainCallIndex,
         context.delta.boundaryId,
         response.usage,
       );
       budgetChargeRecorded = true;
+      if (runReservationId !== undefined) {
+        this.runTokenBudget?.settle(runReservationId, response.usage);
+        runReservationSettled = true;
+      }
       if (response.stopReason === "length") {
         throw new Error(
           `Reflection output was truncated at the ${this.policy.tetoMaxOutputTokens}-token limit`,
@@ -529,6 +552,13 @@ export function recoverReflectionSchedulerState(
       if (match !== null) passCalls.add(Number(match[1]));
     }
   }
+  // Preserve usage from a durable model.completed whose navigation boundary
+  // was not appended before a crash. It is billable, but not a committed
+  // Main call and therefore must not advance cadence.
+  const unpairedMainTokens = pendingMainUsage.reduce(
+    (total, usage) => total + totalTokens(usage),
+    0,
+  );
   let credit = 0;
   for (let index = 0; index < mainCalls.length; index += 1) {
     const call = mainCalls[index]!;
@@ -546,7 +576,7 @@ export function recoverReflectionSchedulerState(
     tokenGateState: {
       mainTokens: mainCalls.reduce(
         (sum, call) => sum + totalTokens(call.usage),
-        0,
+        unpairedMainTokens,
       ),
       tetoTokens: chargedReflectionTokens + [...observedUsageByCall]
         .filter(([call]) => !chargedCalls.has(call))
@@ -628,6 +658,20 @@ function recoverPendingReflections(
       ))
       .map((event) => event.payload.mainCallIndex),
   );
+  const discarded = new Set(
+    events
+      .filter((event) => (
+        event.runId === runId
+        && event.laneId === laneId
+        && event.type === "lane.status"
+        && event.payload.status === "failed"
+      ))
+      .flatMap((event) => {
+        const match = /^reflection:(\d+):delivery:discarded:status:failed$/u
+          .exec(event.idempotencyKey);
+        return match === null ? [] : [Number(match[1])];
+      }),
+  );
   return events
     .filter((event): event is Extract<AnyEvent, { type: "reflection.observed" }> => (
       event.runId === runId
@@ -635,6 +679,7 @@ function recoverPendingReflections(
       && event.type === "reflection.observed"
       && event.payload.action === "revise"
       && !delivered.has(event.payload.mainCallIndex)
+      && !discarded.has(event.payload.mainCallIndex)
     ))
     .sort((left, right) => left.globalOffset - right.globalOffset)
     .map((event) => ({
@@ -647,13 +692,33 @@ async function readReflectionNote(
   store: ContentAddressedStore,
   ref: PendingReflection["reflectionRef"],
 ): Promise<string> {
-  const value: unknown = JSON.parse(new TextDecoder().decode(await store.get(ref)));
+  let bytes: Uint8Array;
+  try {
+    bytes = await store.get(ref);
+  } catch (error: unknown) {
+    if (error instanceof ArtifactNotFoundError || error instanceof ArtifactIntegrityError) {
+      throw new PermanentReflectionArtifactError(
+        `Reflection artifact ${ref.contentHash} is unavailable or corrupt`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder().decode(bytes));
+  } catch (error: unknown) {
+    throw new PermanentReflectionArtifactError(
+      "Reflection artifact is not valid JSON",
+      { cause: error },
+    );
+  }
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("Reflection artifact is not an object");
+    throw new PermanentReflectionArtifactError("Reflection artifact is not an object");
   }
   const note = (value as { note?: unknown }).note;
   if (typeof note !== "string" || note.trim().length === 0 || note.length > 2_000) {
-    throw new Error("Reflection artifact has no bounded revise note");
+    throw new PermanentReflectionArtifactError("Reflection artifact has no bounded revise note");
   }
   return note.trim();
 }
