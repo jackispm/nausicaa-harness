@@ -201,6 +201,15 @@ describe("parseCliArgs", () => {
     });
   });
 
+  it("keeps the complete provider catalog opt-in", () => {
+    expect(parseCliArgs(["--all-providers", "--refresh-models", "--model", "anthropic:claude-sonnet-4", "task"], "/work"))
+      .toMatchObject({ allProviders: true, refreshModels: true, model: "anthropic:claude-sonnet-4", message: "task" });
+    expect(() => parseCliArgs(["--topology", "--all-providers"], "/work"))
+      .toThrow(/cannot be combined/u);
+    expect(() => parseCliArgs(["--attach", "run-1", "--all-providers"], "/work"))
+      .toThrow(/only accepts/u);
+  });
+
   it("leaves write access unset unless explicitly requested", () => {
     expect(parseCliArgs(["task"], "/work").allowWrite).toBeUndefined();
     expect(parseCliArgs(["--allow-write", "task"], "/work")).toMatchObject({
@@ -332,5 +341,6 @@ describe("parseCliArgs", () => {
     expect(usage).toContain("--daemon");
     expect(usage).toContain("--daemon-socket");
     expect(usage).toContain("--topology");
+    expect(usage).toContain("--all-providers");
   });
 });

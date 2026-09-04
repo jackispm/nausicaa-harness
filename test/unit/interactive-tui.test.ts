@@ -30,9 +30,11 @@ import type {
 import { JsonlLedger } from "../../src/ledger/index.js";
 import { ScriptedModel, type ModelCatalogEntry } from "../../src/model/index.js";
 import {
+  listWorkspaceRuns,
   SessionController,
   type SessionRuntimeEvent,
 } from "../../src/runtime/index.js";
+import { MESSAGE_MEDIA_TYPE } from "../../src/runtime/session-artifacts.js";
 import { FileContentAddressedStore } from "../../src/store/index.js";
 import { WorkspaceCommandSandbox } from "../../src/tools/index.js";
 
@@ -825,8 +827,14 @@ describe("interactive TUI", () => {
       expect(terminal.output).toContain("\x1b[?1049h");
       expect(terminal.output).toContain("\x1b[?1049l");
       expect(terminal.output).toContain("\x1b[48;2;232;232;232m");
-      expect(terminal.output).toContain("version");
-      expect(terminal.output).not.toContain("Ctrl+E");
+      const plainOutput = stripTerminalSequences(terminal.output);
+      expect(plainOutput).toContain("Nausicaa v0.1.0");
+      expect(plainOutput).toContain("escape interrupt");
+      expect(plainOutput).toContain("ctrl+o more");
+      expect(plainOutput).toContain("Press ctrl+o to show full startup help");
+      expect(plainOutput).toContain("Nausicaa can explain its own features");
+      expect(plainOutput).not.toContain("cwd");
+      expect(plainOutput).not.toContain("Ctrl+E");
       expect(terminal.cursorVisible).toBe(true);
       expect(exitFrame(terminal.output)).not.toContain('Try "inspect this project"');
       expect(exitFrame(terminal.output)).not.toContain("← main");
@@ -1333,7 +1341,7 @@ describe("interactive TUI", () => {
     }
   });
 
-  it("shows and explicitly revises the durable Run Goal", async () => {
+  it("shows and explicitly revises the persistent thread Goal", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-goal-"));
     const terminal = new MemoryTerminal(100, 28);
     const previousExitCode = process.exitCode;
@@ -1355,18 +1363,18 @@ describe("interactive TUI", () => {
       await delay(120);
       terminal.type("/goal Understand this repository");
       terminal.send("\r");
-      await waitForOutput(terminal, "Goal v1: Understand this repository");
-      terminal.type("/goal Explain installation precisely");
+      await waitForOutput(terminal, "Goal created.");
+      terminal.type("/goal edit Explain installation precisely");
       terminal.send("\r");
-      await waitForOutput(terminal, "Goal v2: Explain installation precisely");
+      await waitForOutput(terminal, "Goal updated.");
 
       expect(session.snapshot().goal).toMatchObject({
-        version: 2,
-        statement: "Explain installation precisely",
+        revision: 2,
+        objective: "Explain installation precisely",
       });
       expect(events
-        .filter((event) => event.kind === "event" && event.event.type === "goal.revised"))
-        .toHaveLength(1);
+        .filter((event) => event.kind === "event" && event.event.type === "thread.goal.changed"))
+        .toHaveLength(2);
 
       terminal.type("/exit");
       terminal.send("\r");
@@ -1561,7 +1569,7 @@ describe("interactive TUI", () => {
         terminal.type("and preserve the second line");
         terminal.send("\r");
         await waitForCondition(
-          () => session.snapshot().goal?.statement === "Keep the first line\nand preserve the second line",
+          () => session.snapshot().goal?.objective === "Keep the first line\nand preserve the second line",
           "multiline Goal revision",
         );
 
@@ -1926,6 +1934,195 @@ describe("interactive TUI", () => {
     }
   });
 
+  it("forks the attached Run through /fork and switches to the child transcript", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-fork-"));
+    const dataDir = join(root, "state");
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("FORK_SOURCE_ANSWER")]),
+        createRunId: () => "fork-source-run",
+      });
+      await session.submit({ inputId: "fork-source-input", text: "FORK_SOURCE_GOAL" });
+      await session.waitForIdle();
+
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+      await terminal.started;
+      terminal.type("/fork fork-child-run");
+      terminal.send("\r");
+      await waitForCondition(
+        () => session.snapshot().runId === "fork-child-run",
+        "child Run attachment through /fork",
+      );
+      await waitForOutput(terminal, "Forked Run fork-source-run to fork-child-run");
+      await waitForOutput(terminal, "FORK_SOURCE_ANSWER");
+      await expect(session.transcript()).resolves.toEqual([
+        expect.objectContaining({ role: "user", content: "FORK_SOURCE_GOAL" }),
+        expect.objectContaining({ role: "assistant", content: "FORK_SOURCE_ANSWER" }),
+      ]);
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("navigates the Run tree and forks from a selected historical checkpoint", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-tree-"));
+    const dataDir = join(root, "state");
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const source = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("TREE_SOURCE_ANSWER")]),
+        createRunId: () => "tree-ui-parent",
+      });
+      await source.submit({ inputId: "tree-ui-input", text: "TREE_SOURCE_GOAL" });
+      await source.waitForIdle();
+      await source.close();
+      const sourceSummary = (await listWorkspaceRuns(dataDir, root))
+        .find((run) => run.runId === "tree-ui-parent");
+      const checkpoint = sourceSummary?.checkpoints?.[0];
+      if (checkpoint === undefined) throw new Error("Missing source checkpoint");
+
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir,
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, { mainModel: new ScriptedModel([]) });
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("/tree");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Session tree");
+      terminal.type(`checkpoint ${checkpoint.watermark}`);
+      terminal.send("\r");
+      await waitForCondition(
+        () => session.snapshot().runId !== undefined
+          && session.snapshot().runId !== "tree-ui-parent",
+        "historical checkpoint fork through /tree",
+      );
+      await waitForOutput(terminal, `Forked Run tree-ui-parent at checkpoint ${checkpoint.watermark}`);
+      const tree = await session.workspaceRunTree();
+      expect(tree).toHaveLength(1);
+      expect(tree[0]?.children).toHaveLength(1);
+      expect(tree[0]?.children[0]?.run.parentCheckpoint).toEqual(checkpoint);
+      expect(tree[0]?.children[0]?.run.branchSummary).toContain(
+        `checkpoint ${checkpoint.watermark}`,
+      );
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports unavailable compaction through /compact without a Run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-compact-"));
+    const previousExitCode = process.exitCode;
+    try {
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      }, { mainModel: new ScriptedModel([]) });
+      const terminal = new MemoryTerminal(100, 28);
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("/compact");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Compaction is unavailable for this Run");
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("projects durable compaction lifecycle events without duplicate command notices", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-compact-events-"));
+    const previousExitCode = process.exitCode;
+    try {
+      let mainCalls = 0;
+      const model: ModelPort = {
+        capabilities: () => ({ imageInput: false, contextWindowTokens: 32_000 }),
+        async complete(request) {
+          if (request.sessionId.startsWith("fukai-compaction:")) {
+            return response(JSON.stringify({
+              decisions: ["Keep the completed answer as verified context"],
+              verifiedResults: ["The Main Turn completed"],
+              openQuestions: [],
+            }));
+          }
+          mainCalls += 1;
+          return response("x".repeat(5_000));
+        },
+      };
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        fukaiCompaction: {
+          enabled: true,
+          provider: "pi-ai",
+          maxInputTokens: 12_000,
+          maxOutputTokens: 500,
+          maxWallClockMs: 5_000,
+          retainRatio: 0.001,
+          minimumGainTokens: 1,
+        },
+        policy: { maxMainStepsPerActivation: 1, maxModelTokens: 100_000, tetoEnabled: false },
+      }, {
+        mainModel: model,
+        createRunId: () => "interactive-compact-events-run",
+      });
+      const terminal = new MemoryTerminal(100, 28);
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("Build a durable summary");
+      terminal.send("\r");
+      await waitForCondition(() => mainCalls >= 1, "Main compaction fixture response");
+      await session.waitForIdle();
+      terminal.type("/compact");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Compacting context...");
+      await waitForOutput(terminal, "Context compacted for the next Turn.");
+      expect(countOccurrences(terminal.output, "Context compacted for the next Turn.")).toBe(1);
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("opens the Run picker without requesting the model when /resume is entered", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-resume-latest-"));
     const dataDir = join(root, "state");
@@ -1996,7 +2193,6 @@ describe("interactive TUI", () => {
         mainModel: new ScriptedModel([response("OLDER_TRANSCRIPT_ANSWER")]),
         createRunId: () => "older-session-run",
       });
-      await older.reviseGoal("OLDER_SESSION_GOAL");
       await older.submit({ inputId: "older-input", text: "OLDER_SESSION_GOAL" });
       await older.waitForIdle();
       await older.close();
@@ -2010,7 +2206,6 @@ describe("interactive TUI", () => {
         mainModel: new ScriptedModel([response("CURRENT_TRANSCRIPT_ANSWER")]),
         createRunId: () => "current-session-run",
       });
-      await current.reviseGoal("CURRENT_SESSION_GOAL");
       await current.submit({ inputId: "current-input", text: "CURRENT_SESSION_GOAL" });
       await current.waitForIdle();
       const running = runInteractive({ session: current, terminal, forceAltScreen: true });
@@ -2089,7 +2284,6 @@ describe("interactive TUI", () => {
         mainModel: new ScriptedModel([response("DAMAGED_TRANSCRIPT_ANSWER")]),
         createRunId: () => "damaged-artifact-run",
       });
-      await damaged.reviseGoal("DAMAGED_ARTIFACT_GOAL");
       await damaged.submit({ inputId: "damaged-input", text: "DAMAGED_ARTIFACT_GOAL" });
       await damaged.waitForIdle();
       await damaged.close();
@@ -2107,7 +2301,6 @@ describe("interactive TUI", () => {
         mainModel: new ScriptedModel([response("CURRENT_ARTIFACT_ANSWER")]),
         createRunId: () => "current-artifact-run",
       });
-      await current.reviseGoal("CURRENT_ARTIFACT_GOAL");
       await current.submit({ inputId: "current-input", text: "CURRENT_ARTIFACT_GOAL" });
       await current.waitForIdle();
       const running = runInteractive({ session: current, terminal, forceAltScreen: true });
@@ -2392,6 +2585,90 @@ describe("interactive TUI", () => {
       expect(terminal.output).toContain("unknown");
       expect(terminal.output).toContain("src/config.ts");
       expect(terminal.output).toContain("replacement");
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reprojects a durable queued input after reopening the Run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-queue-reopen-"));
+    const runId = "interactive-durable-queue-reopen-run";
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const initial = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("INITIAL_QUEUE_REOPEN_ANSWER")]),
+        createRunId: () => runId,
+      });
+      await initial.submit({ inputId: "initial-input", text: "prepare" });
+      await initial.waitForIdle();
+      expect(initial.snapshot().runId).toBe(runId);
+      await initial.close();
+
+      const store = await FileContentAddressedStore.open(
+        join(root, "state", "runs", runId, "store"),
+      );
+      const messageRef = await store.put(JSON.stringify({
+        role: "user",
+        content: "DURABLE_QUEUE_SENTINEL",
+        createdAt: new Date().toISOString(),
+      }), MESSAGE_MEDIA_TYPE);
+      const ledger = await JsonlLedger.open(
+        join(root, "state", "runs", runId, "ledger.jsonl"),
+      );
+      const events = await ledger.read({ runId });
+      const nextSequence = events.reduce((highest, event) => (
+        event.type === "input.admitted"
+          ? Math.max(highest, event.payload.sequence)
+          : highest
+      ), 0) + 1;
+      await ledger.append({
+        runId,
+        laneId: "main",
+        type: "input.admitted",
+        payload: {
+          inputId: "reopened-follow-up",
+          messageRef,
+          delivery: "follow-up",
+          sequence: nextSequence,
+        },
+        correlationId: "input:reopened-follow-up",
+        idempotencyKey: `${runId}:input:reopened-follow-up:admitted`,
+        visibility: "user",
+      });
+      await ledger.close();
+
+      const resumed = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        runId,
+      }, {
+        mainModel: new ScriptedModel([]),
+      });
+      const running = runInteractive({ session: resumed, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      await waitForOutput(terminal, "DURABLE_QUEUE_SENTINEL");
+      const visible = normalizeTerminalOutput(terminal.output);
+      expect(visible).toContain("follow-up");
+      expect(await resumed.pendingInputs()).toEqual([
+        expect.objectContaining({
+          inputId: "reopened-follow-up",
+          delivery: "follow-up",
+          text: "DURABLE_QUEUE_SENTINEL",
+        }),
+      ]);
+
       terminal.type("/exit");
       terminal.send("\r");
       await expect(running).resolves.toBe(0);

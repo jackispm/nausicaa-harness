@@ -26,6 +26,7 @@ import type {
   Advice,
   ArtifactRef,
   Goal,
+  ThreadGoal,
   NavigationDelta,
   RunPolicy,
   TaskBudget,
@@ -175,6 +176,26 @@ function goal(value: unknown, path: string): asserts value is Goal {
   string(item.statement, `${path}.statement`, false);
   stringArray(item.successCriteria, `${path}.successCriteria`);
   stringArray(item.hardConstraints, `${path}.hardConstraints`);
+}
+
+function threadGoal(value: unknown, path: string): asserts value is ThreadGoal {
+  const item = record(value, path);
+  string(item.goalId, `${path}.goalId`, false);
+  integer(item.revision, `${path}.revision`, 1);
+  string(item.objective, `${path}.objective`, false);
+  oneOf(item.status, `${path}.status`, [
+    "active", "paused", "blocked", "usageLimited", "budgetLimited", "complete",
+  ] as const);
+  if (item.tokenBudget !== undefined) integer(item.tokenBudget, `${path}.tokenBudget`, 1);
+  integer(item.tokensUsed, `${path}.tokensUsed`);
+  integer(item.timeUsedSeconds, `${path}.timeUsedSeconds`);
+  integer(item.continuationsUsed, `${path}.continuationsUsed`);
+  dateTime(item.createdAt, `${path}.createdAt`);
+  dateTime(item.updatedAt, `${path}.updatedAt`);
+  if (item.blockedReason !== undefined) {
+    if (item.status !== "blocked") invalid(`${path}.blockedReason`, "omitted unless status is blocked");
+    string(item.blockedReason, `${path}.blockedReason`, false);
+  }
 }
 
 function taskId(value: unknown, path: string): void {
@@ -900,10 +921,40 @@ function exactKeys(value: Record<string, unknown>, allowed: readonly string[], p
 
 const payloadValidators = {
   "run.created": (value, path) => {
-    const item = payloadObject(value, path, ["goal", "workspace", "policy"]);
-    goal(item.goal, `${path}.goal`);
+    const item = payloadObject(value, path, ["workspace", "policy"]);
+    if (item.goal !== undefined) goal(item.goal, `${path}.goal`);
     string(item.workspace, `${path}.workspace`, false);
     runPolicy(item.policy, `${path}.policy`);
+    if (item.mainModel !== undefined) {
+      string(item.mainModel, `${path}.mainModel`, false);
+      if (
+        (item.mainModel as string).length > 256
+        || /[\s\u0000-\u001f\u007f]/u.test(item.mainModel as string)
+      ) {
+        invalid(`${path}.mainModel`, "at most 256 characters without spaces or control characters");
+      }
+      const separator = (item.mainModel as string).indexOf(":");
+      if (
+        separator === 0
+        || (separator >= 0 && separator === (item.mainModel as string).length - 1)
+      ) {
+        invalid(`${path}.mainModel`, "a valid provider:model or model selector");
+      }
+    }
+  },
+  "run.forked": (value, path) => {
+    const item = payloadObject(value, path, ["parentRunId", "parentCheckpoint"]);
+    string(item.parentRunId, `${path}.parentRunId`, false);
+    const checkpoint = payloadObject(
+      item.parentCheckpoint,
+      `${path}.parentCheckpoint`,
+      ["watermark", "checksum"],
+    );
+    integer(checkpoint.watermark, `${path}.parentCheckpoint.watermark`, 1);
+    string(checkpoint.checksum, `${path}.parentCheckpoint.checksum`, false);
+    if (!/^sha256:[0-9a-f]{64}$/.test(checkpoint.checksum as string)) {
+      invalid(`${path}.parentCheckpoint.checksum`, "a SHA-256 digest");
+    }
   },
   "run.resumed": (value, path) => {
     const item = payloadObject(value, path, ["fromOffset"]);
@@ -923,6 +974,44 @@ const payloadValidators = {
   "goal.revised": (value, path) => {
     const item = payloadObject(value, path, ["goal"]);
     goal(item.goal, `${path}.goal`);
+  },
+  "thread.goal.changed": (value, path) => {
+    const item = payloadObject(value, path, ["operation", "goal"]);
+    oneOf(item.operation, `${path}.operation`, [
+      "create", "edit", "progress", "pause", "resume", "complete", "blocked", "usageLimited", "budgetLimited",
+    ] as const);
+    const operation = item.operation as
+      | "create"
+      | "edit"
+      | "progress"
+      | "pause"
+      | "resume"
+      | "complete"
+      | "blocked"
+      | "usageLimited"
+      | "budgetLimited";
+    threadGoal(item.goal, `${path}.goal`);
+    if (item.expectedRevision !== undefined) integer(item.expectedRevision, `${path}.expectedRevision`, 1);
+    const status = (item.goal as unknown as ThreadGoal).status;
+    const expectedStatus = {
+      pause: "paused",
+      resume: "active",
+      complete: "complete",
+      blocked: "blocked",
+      usageLimited: "usageLimited",
+      budgetLimited: "budgetLimited",
+    } as const;
+    if (operation in expectedStatus && status !== expectedStatus[operation as keyof typeof expectedStatus]) {
+      invalid(`${path}.goal.status`, `the status implied by operation ${operation}`);
+    }
+    if (operation === "create" && status !== "active") {
+      invalid(`${path}.goal.status`, "active for a create operation");
+    }
+  },
+  "thread.goal.cleared": (value, path) => {
+    const item = payloadObject(value, path, ["goalId", "revision"]);
+    string(item.goalId, `${path}.goalId`, false);
+    integer(item.revision, `${path}.revision`, 1);
   },
   "todo.updated": (value, path) => {
     const item = payloadObject(value, path, ["revision", "items"]);
@@ -1137,7 +1226,7 @@ const payloadValidators = {
     }
     if (hasInputId) {
       string(item.inputId, `${path}.inputId`, false);
-      oneOf(item.kind, `${path}.kind`, ["initial", "steering"] as const);
+      oneOf(item.kind, `${path}.kind`, ["initial", "steering", "continuation"] as const);
     }
   },
   "assistant.message": (value, path) => {
@@ -1255,6 +1344,36 @@ const payloadValidators = {
     string(item.toolCallId, `${path}.toolCallId`, false);
     string(item.name, `${path}.name`, false);
     artifactRef(item.argumentsRef, `${path}.argumentsRef`);
+  },
+  "tool.admitted": (value, path) => {
+    const item = payloadObject(value, path, [
+      "operationId",
+      "toolCallId",
+      "name",
+      "argumentsHash",
+    ]);
+    string(item.operationId, `${path}.operationId`, false);
+    string(item.toolCallId, `${path}.toolCallId`, false);
+    string(item.name, `${path}.name`, false);
+    string(item.argumentsHash, `${path}.argumentsHash`, false);
+    if (!/^sha256:[0-9a-f]{64}$/.test(item.argumentsHash as string)) {
+      invalid(`${path}.argumentsHash`, "a SHA-256 digest");
+    }
+  },
+  "tool.started": (value, path) => {
+    const item = payloadObject(value, path, [
+      "operationId",
+      "toolCallId",
+      "name",
+      "argumentsHash",
+    ]);
+    string(item.operationId, `${path}.operationId`, false);
+    string(item.toolCallId, `${path}.toolCallId`, false);
+    string(item.name, `${path}.name`, false);
+    string(item.argumentsHash, `${path}.argumentsHash`, false);
+    if (!/^sha256:[0-9a-f]{64}$/.test(item.argumentsHash as string)) {
+      invalid(`${path}.argumentsHash`, "a SHA-256 digest");
+    }
   },
   "approval.requested": (value, path) => {
     const item = payloadObject(value, path, [

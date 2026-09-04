@@ -4,6 +4,7 @@ import type {
   AdviceDisposition,
   ArtifactRef,
   Goal,
+  ThreadGoal,
   InputId,
   LaneId,
   LaneKind,
@@ -39,6 +40,10 @@ export interface RunView {
   lastOffset: number;
   workspace?: string;
   policy?: RunPolicy;
+  /** Initial Main selector, present on Runs created by current runtimes. */
+  mainModel?: string;
+  parentRunId?: RunId;
+  parentCheckpoint?: { watermark: number; checksum: string };
   answerRef?: ArtifactRef;
   error?: string;
   checkpoint?: { watermark: number; checksum: string };
@@ -163,6 +168,7 @@ export interface BudgetView {
 export interface RunProjection {
   run: RunView;
   goal: Goal | undefined;
+  threadGoal?: ThreadGoal;
   lanes: Record<LaneId, LaneView>;
   inbox: InboxMessageView[];
   inputs: InputView[];
@@ -271,6 +277,8 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
       || event.type === "model.completed"
       || event.type === "model.failed"
       || event.type === "tool.requested"
+      || event.type === "tool.admitted"
+      || event.type === "tool.started"
       || event.type === "approval.requested"
       || event.type === "approval.decided"
       || event.type === "tool.succeeded"
@@ -297,9 +305,18 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
           lastOffset: event.globalOffset,
           workspace: event.payload.workspace,
           policy: cloneJson(event.payload.policy),
+          ...(event.payload.mainModel === undefined
+            ? {}
+            : { mainModel: event.payload.mainModel }),
         };
-        projection.goal = cloneJson(event.payload.goal);
+        if (event.payload.goal !== undefined) {
+          projection.goal = cloneJson(event.payload.goal);
+        }
         projection.budget.maxModelTokens = event.payload.policy.maxModelTokens;
+        break;
+      case "run.forked":
+        projection.run.parentRunId = event.payload.parentRunId;
+        projection.run.parentCheckpoint = cloneJson(event.payload.parentCheckpoint);
         break;
       case "run.resumed":
         projection.run.status = "running";
@@ -335,6 +352,12 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
         break;
       case "goal.revised":
         projection.goal = cloneJson(event.payload.goal);
+        break;
+      case "thread.goal.changed":
+        projection.threadGoal = cloneJson(event.payload.goal);
+        break;
+      case "thread.goal.cleared":
+        delete projection.threadGoal;
         break;
       case "lane.registered":
         lane.kind = event.payload.kind;

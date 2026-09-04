@@ -15,11 +15,15 @@ import {
 } from "@earendil-works/pi-tui";
 
 import {
+  flattenWorkspaceRunTree,
   listWorkspaceRuns,
+  listWorkspaceRunTree,
   SessionController,
   type SessionRuntimeEvent,
   type SessionPendingInput,
   type SessionSnapshot,
+  type WorkspaceRunTreeNode,
+  type WorkspaceRunTreeRow,
   type WorkspaceRunSummary,
 } from "../runtime/index.js";
 import {
@@ -154,8 +158,8 @@ export interface InteractiveOptions {
 export interface InteractiveAuthOptions {
   readonly credentialStore: CredentialStore;
   readonly modelPort: AuthModelPort;
-  /** Defaults to OpenRouter for the current beta provider. */
-  readonly provider?: string;
+  /** Defaults to the currently selected model provider, then OpenRouter. */
+  readonly provider?: string | (() => string);
   /** Environment projection used for conditional logout messaging. */
   readonly environment?: NodeJS.ProcessEnv;
   /** Refresh host-owned status projections after a credential mutation. */
@@ -241,10 +245,10 @@ const quietAuthOutput: Output = {
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_INTERRUPT_EXIT_WINDOW_MS = 1_000;
 
-/** Prime-inspired presentation layer. Runtime state stays in SessionController. */
+/** Pi-inspired presentation layer. Runtime state stays in SessionController. */
 export async function runInteractive(options: InteractiveOptions): Promise<number> {
   const terminal = options.terminal ?? new ProcessTerminal();
-  // Prime-style fullscreen mode keeps the transcript scrollable and the prompt docked.
+  // Pi-style fullscreen mode keeps the transcript scrollable and the prompt docked.
   // Main-screen mode remains available when stdout is not a real terminal.
   const tui: TUI = (options.forceAltScreen ?? process.stdout.isTTY === true)
     ? new TuiAltScreen(terminal, true, undefined, { mouse: true })
@@ -259,7 +263,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     primary: true,
     scrollbar: "auto",
   });
-  const editor = new Editor(tui, nausicaaEditorTheme, { paddingX: 2 });
+  // Pi's editor defaults to zero horizontal padding; PromptSurface owns the
+  // prompt treatment while the editor keeps the text flush with its border.
+  const editor = new Editor(tui, nausicaaEditorTheme, { paddingX: 0 });
   const promptSurface = new PromptSurface(editor);
   const promptSlot = new Container();
   promptSlot.addChild(promptSurface);
@@ -298,6 +304,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   const submissionQueue: QueuedSubmission[] = [];
   const queueSelection = new QueueSelection();
   let pendingQueue: SessionPendingInput[] = [];
+  // Compaction lifecycle events are durable UI evidence. Counters let the
+  // slash command avoid adding a second success/error notice when the event
+  // projection already rendered the outcome.
+  let compactionCommittedEvents = 0;
+  let compactionFailureEvents = 0;
   const pastedImages = new Map<number, UserImage>();
   const promptStashes = new Map<string, PromptStash>();
   let detachedPromptStashSequence = 1;
@@ -320,8 +331,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
 
   const header = new BrandSplashHeader({
     version: "0.1.0",
-    getModel: () => options.session.snapshot().model,
-    getWorkspace: () => options.session.snapshot().workspace,
   });
   transcript.addChild(header);
   screen.addChild(transcriptViewport, { grow: 1, minSize: 1 });
@@ -485,6 +494,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     tui.requestRender(true);
   });
   tui.setTerminalColorSchemeNotifications(true);
+  // Match pi-tui's Loader cadence so the active request feels alive without
+  // tying animation updates to model/network event frequency.
   const activityTimer = setInterval(() => {
     const status = options.session.snapshot().status;
     if (status === "running" || status === "cancelling") {
@@ -492,7 +503,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       for (const block of toolBlocks.values()) block.advance();
       tui.requestRender();
     }
-  }, 500);
+  }, 80);
   activityTimer.unref?.();
 
   const appendBlock = (
@@ -1039,7 +1050,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   const loadAttachedTranscript = async (reset: boolean): Promise<void> => {
     if (reset) {
       transcriptGeneration += 1;
-      header.setCompact(false);
       resetTranscript();
       toolBlocks.clear();
       renderedAssistants.clear();
@@ -1047,7 +1057,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       clearShortcutGuide();
     }
     const entries = await options.session.transcript();
-    if (entries.length > 0 && terminal.rows < 36) header.setCompact(true);
     entries.forEach((entry) => {
       if (entry.role === "user") {
         addPromptToHistory(entry.content);
@@ -1090,6 +1099,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         event.type === "message.sent"
         || event.type === "step.completed"
         || event.type === "goal.revised"
+        || event.type === "thread.goal.changed"
+        || event.type === "thread.goal.cleared"
         || event.type === "message.handled"
       ) {
         tui.requestRender();
@@ -1110,7 +1121,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             const message = await options.session.readConversationMessage(event.payload.messageRef);
             if (closed || generation !== transcriptGeneration) break;
             if (message.role === "user") {
-              if (terminal.rows < 36) header.setCompact(true);
               appendBlock(new UserMessageBlock(
                 message.content,
                 message.images?.map((image) => image.mimeType),
@@ -1230,6 +1240,18 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "run.failed":
           appendNotice("Run failed. Start a new Run or resume from the last checkpoint.", "error");
           break;
+        case "fukai.compaction.requested":
+          appendNotice("Compacting context...", "info");
+          break;
+        case "fukai.compaction.committed":
+          appendNotice("Context compacted for the next Turn.", "success");
+          break;
+        case "fukai.compaction.failed":
+          appendNotice("Compaction provider failed; the raw context is unchanged.", "warning");
+          break;
+        case "fukai.compaction.fallback":
+          appendNotice("Compaction fell back to the raw context; the transcript is unchanged.", "warning");
+          break;
       }
     } else if (runtimeEvent.kind === "stream") {
       const event = runtimeEvent.event;
@@ -1281,6 +1303,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   };
 
   const unsubscribe = options.session.subscribe((runtimeEvent) => {
+    if (runtimeEvent.kind === "event") {
+      if (runtimeEvent.event.type === "fukai.compaction.committed") {
+        compactionCommittedEvents += 1;
+      } else if (
+        runtimeEvent.event.type === "fukai.compaction.failed"
+        || runtimeEvent.event.type === "fukai.compaction.fallback"
+      ) {
+        compactionFailureEvents += 1;
+      }
+    }
     const generation = transcriptGeneration;
     presentationTail = presentationTail
       .then(async () => {
@@ -1437,11 +1469,19 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     if (argument.length > 0 && argument.split(/\s+/u).length !== 1) {
       throw new Error(`Usage: /${commandName} [provider]`);
     }
+    const configuredProvider = typeof options.auth?.provider === "function"
+      ? options.auth.provider()
+      : options.auth?.provider;
+    const selectedModel = options.session.snapshot().model;
+    const modelProvider = selectedModel.includes(":")
+      ? selectedModel.slice(0, selectedModel.indexOf(":"))
+      : "openrouter";
     const provider = argument.length > 0
       ? argument
-      : options.auth?.provider ?? "openrouter";
-    if (provider !== "openrouter") {
-      throw new Error("Only the openrouter provider is available in this build.");
+      : configuredProvider ?? modelProvider;
+    if (options.auth?.modelPort.hasProvider !== undefined
+      && !options.auth.modelPort.hasProvider(provider)) {
+      throw new Error(`Unknown provider ${provider}; choose a provider from the model catalog.`);
     }
     return provider;
   };
@@ -1524,10 +1564,18 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     } catch {
       // The deletion already succeeded; a status refresh is optional.
     }
-    const environmentAvailable = environmentCredentialPresent(
+    let environmentAvailable = environmentCredentialPresent(
       provider,
       options.auth.environment ?? process.env,
     );
+    if (!environmentAvailable) {
+      try {
+        environmentAvailable = await options.auth.modelPort.checkAuth(provider) !== undefined;
+      } catch {
+        // The credential mutation already succeeded; an ambient status probe
+        // is advisory and must not turn logout into a failure.
+      }
+    }
     appendNotice(
       hadSavedCredential
         ? environmentAvailable
@@ -1795,6 +1843,87 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     appendNotice(`Attached Run ${runId}.`, "success");
   };
 
+  const forkSession = async (argument: string): Promise<void> => {
+    const current = options.session.snapshot();
+    if (current.status === "running" || current.status === "cancelling") {
+      throw new Error("/fork is unavailable while Main is working");
+    }
+    const parts = argument.split(/\s+/u).filter(Boolean);
+    if (parts.length > 1) throw new Error("Usage: /fork [run-id]");
+    const result = await options.session.forkRun(
+      parts.length === 0 ? {} : { runId: parts[0]! },
+    );
+    resetQueueSelection();
+    if (promptStashScope.startsWith("<new-run:")) {
+      promptStashes.delete(promptStashScope);
+    }
+    promptStashScope = result.runId;
+    await loadAttachedTranscript(true);
+    await refreshQueue();
+    appendNotice(`Forked Run ${result.parentRunId} to ${result.runId}.`, "success");
+  };
+
+  const showSessionTreeSelector = async (): Promise<void> => {
+    const snapshot = options.session.snapshot();
+    if (snapshot.status === "running" || snapshot.status === "cancelling") {
+      throw new Error("/tree is unavailable while Main is working");
+    }
+    const tree = await listWorkspaceRunTree(options.session.dataDir, options.session.workspace);
+    if (tree.length === 0) {
+      appendNotice("No saved Runs exist for this workspace.", "info");
+      return;
+    }
+    const selectorOptions = workspaceTreeOptions(tree, snapshot.runId);
+    const selectionByValue = new Map(
+      selectorOptions.map((option) => [option.value, parseWorkspaceTreeSelection(option.value)]),
+    );
+    const selector = new SelectorOverlay({
+      title: "Session tree",
+      searchLabel: "Type to search",
+      subtitle: "Select a Run to attach, or a checkpoint to fork from that history point.",
+      options: selectorOptions,
+      ...(snapshot.runId === undefined ? {} : { current: snapshot.runId }),
+      onSelect: (value) => {
+        closeSelector(false);
+        const selection = selectionByValue.get(value);
+        if (selection === undefined) return;
+        void navigateWorkspaceTreeSelection(selection).catch((error: unknown) => {
+          appendNotice(error instanceof Error ? error.message : String(error), "error");
+        });
+      },
+      onCancel: () => closeSelector(true),
+    });
+    mountSelector(selector);
+  };
+
+  const navigateWorkspaceTreeSelection = async (
+    selection: WorkspaceTreeSelection,
+  ): Promise<void> => {
+    if (selection.kind === "run") {
+      await switchSession(selection.runId);
+      return;
+    }
+    const snapshot = options.session.snapshot();
+    if (snapshot.status === "running" || snapshot.status === "cancelling") {
+      throw new Error("/tree is unavailable while Main is working");
+    }
+    if (snapshot.runId !== selection.runId) {
+      await switchSession(selection.runId);
+    }
+    const result = await options.session.forkRun({ checkpoint: selection.checkpoint });
+    resetQueueSelection();
+    if (promptStashScope.startsWith("<new-run:")) {
+      promptStashes.delete(promptStashScope);
+    }
+    promptStashScope = result.runId;
+    await loadAttachedTranscript(true);
+    await refreshQueue();
+    appendNotice(
+      `Forked Run ${result.parentRunId} at checkpoint ${result.parentCheckpoint.watermark} to ${result.runId}.`,
+      "success",
+    );
+  };
+
   const showSessionSelector = async (): Promise<void> => {
     const snapshot = options.session.snapshot();
     if (snapshot.status === "running" || snapshot.status === "cancelling") {
@@ -2021,6 +2150,33 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           if (argument.length > 0) throw new Error("Usage: /usage");
           appendBlock(new ContextUsageBlock(options.session.contextOverview()));
           break;
+        case "/compact": {
+          if (argument.length > 0) throw new Error("Usage: /compact");
+          const committedEventsBefore = compactionCommittedEvents;
+          const failureEventsBefore = compactionFailureEvents;
+          const result = await options.session.compact();
+          if (result.status === "committed") {
+            if (compactionCommittedEvents === committedEventsBefore) {
+              appendNotice("Context compacted for the next Turn.", "success");
+            }
+          } else if (result.status === "unavailable") {
+            appendNotice("Compaction is unavailable for this Run.", "warning");
+          } else {
+            if (result.reason === "provider-error") {
+              if (compactionFailureEvents === failureEventsBefore) {
+                appendNotice("Compaction provider failed; the raw context is unchanged.", "warning");
+              }
+            } else {
+              appendNotice(
+                result.reason === "budget-exhausted"
+                  ? "Compaction skipped because the Run token budget is exhausted."
+                  : "No eligible context was compacted.",
+                result.reason === "budget-exhausted" ? "warning" : "info",
+              );
+            }
+          }
+          break;
+        }
         case "/model": {
           if (argument.length === 0) {
             showModelSelector();
@@ -2075,18 +2231,36 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           break;
         }
         case "/goal": {
-          const statement = argument;
-          if (statement.length === 0) {
-            const goal = options.session.snapshot().goal;
-            appendNotice(goal === undefined
-              ? "No Run Goal yet."
-              : `Goal v${goal.version}: ${goal.statement}`);
-          } else {
-            assertProviderReady();
-            const goal = await options.session.reviseGoal(statement);
-            adoptAttachedPromptStashScope();
-            appendNotice(`Goal v${goal.version}: ${goal.statement}`, "success");
+          const parsed = parseGoalCommand(argument);
+          const current = options.session.snapshot().goal;
+          if (parsed.kind === "status") {
+            appendNotice(current === undefined ? "No goal is currently set." : formatThreadGoal(current));
+            break;
           }
+          if (parsed.kind === "create") {
+            const goal = current === undefined
+              ? await options.session.createGoal(parsed.objective, parsed.tokenBudget)
+              : await options.session.replaceGoal(parsed.objective, parsed.tokenBudget);
+            adoptAttachedPromptStashScope();
+            appendNotice(`${current === undefined ? "Goal created." : "Goal replaced."}\n${formatThreadGoal(goal)}`, "success");
+            break;
+          }
+          if (parsed.kind === "edit") {
+            const goal = await options.session.editGoal(parsed.objective, parsed.tokenBudget);
+            appendNotice(`Goal updated.\n${formatThreadGoal(goal)}`, "success");
+            break;
+          }
+          if (parsed.kind === "pause" || parsed.kind === "resume") {
+            if (current === undefined) {
+              appendNotice("No goal is currently set.", "info");
+              break;
+            }
+            const goal = await options.session.updateGoalStatus(parsed.kind === "pause" ? "paused" : "active");
+            appendNotice(`Goal ${parsed.kind}d.\n${formatThreadGoal(goal)}`, "success");
+            break;
+          }
+          const cleared = await options.session.clearGoal();
+          appendNotice(cleared ? "Goal cleared." : "No goal to clear.", cleared ? "success" : "info");
           break;
         }
         case "/session":
@@ -2096,6 +2270,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             if (argument.split(/\s+/u).length !== 1) throw new Error("Usage: /session [run-id]");
             await switchSession(argument);
           }
+          break;
+        case "/tree":
+          if (argument.length > 0) throw new Error("Usage: /tree");
+          await showSessionTreeSelector();
+          break;
+        case "/fork":
+          await forkSession(argument);
           break;
         case "/new":
           await options.session.newRun();
@@ -2384,6 +2565,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     if (matchesKey(data, "ctrl+o")) {
       toolsExpanded = !toolsExpanded;
       for (const block of toolBlocks.values()) block.setExpanded(toolsExpanded);
+      header.setExpanded(toolsExpanded);
       tui.requestRender();
       return { consume: true };
     }
@@ -2525,9 +2707,88 @@ function workspaceResumeOptions(
     description: [
       terminalSafeText(run.title ?? run.goal),
       capitalize(run.status),
+      run.parentRunId === undefined ? undefined : `Fork of ${run.parentRunId}`,
       `Run ID ${run.runId}`,
-    ].join(" · "),
+    ].filter((value): value is string => value !== undefined).join(" · "),
   }));
+}
+
+const TREE_CHECKPOINT_PREFIX = "tree-checkpoint:";
+
+type WorkspaceTreeSelection =
+  | { kind: "run"; runId: string }
+  | { kind: "checkpoint"; runId: string; checkpoint: { watermark: number; checksum: string } };
+
+/** Build selector rows while retaining the Run tree's durable parent shape. */
+export function workspaceTreeOptions(
+  tree: readonly WorkspaceRunTreeNode[],
+  currentRunId?: string,
+): SelectorOption[] {
+  const rows = flattenWorkspaceRunTree(tree);
+  const options: SelectorOption[] = [];
+  const seenCheckpoints = new Set<string>();
+  for (const row of rows) {
+    const prefix = workspaceTreePrefix(row);
+    const run = row.run;
+    const title = terminalSafeText(run.title ?? run.goal);
+    options.push({
+      value: run.runId,
+      label: `${prefix}${title || run.runId}${run.runId === currentRunId ? " (current)" : ""}`,
+      description: [
+        capitalize(run.status),
+        run.runId,
+        run.branchSummary,
+      ].filter((value): value is string => value !== undefined && value.length > 0).join(" · "),
+    });
+    for (const checkpoint of run.checkpoints ?? []) {
+      const value = encodeWorkspaceTreeCheckpoint(run.runId, checkpoint);
+      if (seenCheckpoints.has(value)) continue;
+      seenCheckpoints.add(value);
+      options.push({
+        value,
+        label: `${prefix}  checkpoint ${checkpoint.watermark}`,
+        description: `Fork ${run.runId} from ${checkpoint.checksum}`,
+      });
+    }
+  }
+  return options;
+}
+
+function workspaceTreePrefix(row: WorkspaceRunTreeRow): string {
+  const ancestors = row.ancestorContinues
+    .map((continues) => continues ? "|  " : "   ")
+    .join("");
+  return `${ancestors}${row.isLast ? "\\- " : "|- "}`;
+}
+
+function encodeWorkspaceTreeCheckpoint(
+  runId: string,
+  checkpoint: { watermark: number; checksum: string },
+): string {
+  return `${TREE_CHECKPOINT_PREFIX}${encodeURIComponent(runId)}:${checkpoint.watermark}:${encodeURIComponent(checkpoint.checksum)}`;
+}
+
+function parseWorkspaceTreeSelection(value: string): WorkspaceTreeSelection | undefined {
+  if (!value.startsWith(TREE_CHECKPOINT_PREFIX)) {
+    return { kind: "run", runId: value };
+  }
+  const encoded = value.slice(TREE_CHECKPOINT_PREFIX.length);
+  const firstSeparator = encoded.indexOf(":");
+  const lastSeparator = encoded.lastIndexOf(":");
+  if (firstSeparator <= 0 || lastSeparator <= firstSeparator) return undefined;
+  const encodedRunId = encoded.slice(0, firstSeparator);
+  const watermarkText = encoded.slice(firstSeparator + 1, lastSeparator);
+  const encodedChecksum = encoded.slice(lastSeparator + 1);
+  const watermark = Number(watermarkText);
+  if (!Number.isSafeInteger(watermark) || watermark < 1) return undefined;
+  try {
+    const runId = decodeURIComponent(encodedRunId);
+    const checksum = decodeURIComponent(encodedChecksum);
+    if (runId.length === 0 || !/^sha256:[0-9a-f]{64}$/u.test(checksum)) return undefined;
+    return { kind: "checkpoint", runId, checkpoint: { watermark, checksum } };
+  } catch {
+    return undefined;
+  }
 }
 
 function formatRunRelativeTime(value: string, now = Date.now()): string {
@@ -2556,6 +2817,69 @@ function parseInteractiveCommand(commandLine: string): {
     command: match?.[1] ?? commandLine,
     argument: (match?.[2] ?? "").trim(),
   };
+}
+
+type ParsedGoalCommand =
+  | { kind: "status" }
+  | { kind: "create"; objective: string; tokenBudget?: number }
+  | { kind: "edit"; objective: string; tokenBudget?: number }
+  | { kind: "pause" | "resume" | "clear" };
+
+function parseGoalCommand(argument: string): ParsedGoalCommand {
+  const value = argument.trim();
+  const control = value.toLowerCase();
+  if (value.length === 0 || control === "status") return { kind: "status" };
+  if (control === "pause" || control === "resume" || control === "clear" || control === "stop") {
+    return { kind: control === "stop" ? "clear" : control };
+  }
+  const edit = /^edit\s+([\s\S]+)$/iu.exec(value);
+  if (edit !== null) {
+    const parsed = parseGoalObjectiveAndBudget(edit[1]!);
+    return { kind: "edit", ...parsed };
+  }
+  if (control === "edit") throw new Error("Usage: /goal edit <objective>");
+  const parsed = parseGoalObjectiveAndBudget(value);
+  return { kind: "create", ...parsed };
+}
+
+function parseGoalObjectiveAndBudget(value: string): { objective: string; tokenBudget?: number } {
+  const normalized = value.trim();
+  const firstWhitespace = normalized.search(/\s/u);
+  const firstToken = firstWhitespace < 0
+    ? normalized
+    : normalized.slice(0, firstWhitespace);
+  const flag = /^(--budget|--token-budget)(?:=(.*))?$/u.exec(firstToken);
+  if (flag === null) return { objective: normalized };
+
+  let budgetText = flag[2];
+  let objective = firstWhitespace < 0 ? "" : normalized.slice(firstWhitespace).trim();
+  if (budgetText === undefined) {
+    const budgetSeparator = objective.search(/\s/u);
+    if (budgetSeparator < 0) {
+      throw new Error("Usage: /goal [--budget <tokens>] <objective>");
+    }
+    budgetText = objective.slice(0, budgetSeparator);
+    objective = objective.slice(budgetSeparator).trim();
+  }
+  if (!/^[1-9]\d*$/u.test(budgetText)) {
+    throw new Error("Goal token budget must be a positive integer.");
+  }
+  const tokenBudget = Number(budgetText);
+  if (!Number.isSafeInteger(tokenBudget) || objective.length === 0) {
+    throw new Error("Usage: /goal [--budget <tokens>] <objective>");
+  }
+  return { objective, tokenBudget };
+}
+
+function formatThreadGoal(goal: NonNullable<SessionSnapshot["goal"]>): string {
+  const budget = goal.tokenBudget === undefined ? "unbounded" : `${goal.tokensUsed}/${goal.tokenBudget}`;
+  const reason = goal.blockedReason === undefined ? "" : `\nReason: ${goal.blockedReason}`;
+  return [
+    `Goal (${goal.status}) - revision ${goal.revision}`,
+    `Objective: ${goal.objective}`,
+    `Usage: ${budget} tokens - ${goal.timeUsedSeconds}s - ${goal.continuationsUsed} continuation(s)`,
+    reason,
+  ].filter((line) => line.length > 0).join("\n");
 }
 
 function capitalize(value: string): string {

@@ -115,7 +115,7 @@ export function projectTaskGraph(
     lastOffset = Math.max(lastOffset, event.globalOffset);
 
     if (event.type === "run.created") {
-      runGoalVersion = event.payload.goal.version;
+      runGoalVersion = event.payload.goal?.version;
       continue;
     }
     if (event.type === "goal.revised") {

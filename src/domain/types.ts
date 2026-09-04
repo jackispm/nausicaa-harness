@@ -28,6 +28,48 @@ export interface Goal {
   hardConstraints: string[];
 }
 
+/**
+ * Persistent, user-owned objective for an interactive Session. This is
+ * deliberately separate from Goal, which remains the bounded task contract
+ * used by Worker, Team, Teto, Reflection, and one-shot execution.
+ */
+export type ThreadGoalStatus =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "usageLimited"
+  | "budgetLimited"
+  | "complete";
+
+export type ThreadGoalOperation =
+  | "create"
+  | "edit"
+  | "progress"
+  | "pause"
+  | "resume"
+  | "complete"
+  | "blocked"
+  | "usageLimited"
+  | "budgetLimited";
+
+/** Runtime boundary at which the persistent thread Goal may be shown to Main. */
+export type GoalContextKind = "continuation" | "objective-updated" | "budget-limit";
+
+/** Host-owned persistent Goal state. Absence means the Session is idle. */
+export interface ThreadGoal {
+  goalId: string;
+  revision: number;
+  objective: string;
+  status: ThreadGoalStatus;
+  tokenBudget?: number;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  continuationsUsed: number;
+  createdAt: string;
+  updatedAt: string;
+  blockedReason?: string;
+}
+
 export type TodoStatus = "pending" | "in_progress" | "completed" | "cancelled";
 
 /** Structured, host-visible work item kept independent from model prose. */

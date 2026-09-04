@@ -262,9 +262,18 @@ export class LedgerState {
   readonly #idempotency = new Map<string, AnyEvent>();
   readonly #eventIds = new Set<string>();
   readonly #runCreations = new Set<RunId>();
+  readonly #runForks = new Set<RunId>();
   readonly #goalVersions = new Map<RunId, number>();
+  readonly #threadGoals = new Map<RunId, { goalId: string; revision: number }>();
   readonly #sentMessages = new Map<string, EventEnvelope<"message.sent">>();
   readonly #toolRequests = new Map<string, EventEnvelope<"tool.requested">>();
+  readonly #toolAdmissions = new Map<string, EventEnvelope<"tool.admitted">>();
+  readonly #toolStarts = new Map<string, EventEnvelope<"tool.started">>();
+  readonly #toolUnknowns = new Map<string, EventEnvelope<"tool.unknown">>();
+  readonly #toolTerminals = new Map<
+    string,
+    EventEnvelope<"tool.succeeded"> | EventEnvelope<"tool.failed">
+  >();
   readonly #approvalRequests = new Map<string, EventEnvelope<"approval.requested">>();
   readonly #approvalDecisions = new Set<string>();
   readonly #laneSequences = new Map<string, number>();
@@ -387,13 +396,32 @@ export class LedgerState {
     this.#eventIds.add(stored.eventId);
     if (stored.type === "run.created") {
       this.#runCreations.add(stored.runId);
-      this.#goalVersions.set(stored.runId, stored.payload.goal.version);
+      if (stored.payload.goal !== undefined) {
+        this.#goalVersions.set(stored.runId, stored.payload.goal.version);
+      }
+    } else if (stored.type === "run.forked") {
+      this.#runForks.add(stored.runId);
+    } else if (stored.type === "thread.goal.changed") {
+      this.#threadGoals.set(stored.runId, {
+        goalId: stored.payload.goal.goalId,
+        revision: stored.payload.goal.revision,
+      });
+    } else if (stored.type === "thread.goal.cleared") {
+      this.#threadGoals.delete(stored.runId);
     } else if (stored.type === "goal.revised") {
       this.#goalVersions.set(stored.runId, stored.payload.goal.version);
     } else if (stored.type === "message.sent") {
       this.#sentMessages.set(messageScope(stored.runId, stored.payload.message.messageId), stored);
     } else if (stored.type === "tool.requested") {
       this.#toolRequests.set(operationScope(stored.runId, stored.payload.operationId), stored);
+    } else if (stored.type === "tool.admitted") {
+      this.#toolAdmissions.set(operationScope(stored.runId, stored.payload.operationId), stored);
+    } else if (stored.type === "tool.started") {
+      this.#toolStarts.set(operationScope(stored.runId, stored.payload.operationId), stored);
+    } else if (stored.type === "tool.unknown") {
+      this.#toolUnknowns.set(operationScope(stored.runId, stored.payload.operationId), stored);
+    } else if (stored.type === "tool.succeeded" || stored.type === "tool.failed") {
+      this.#toolTerminals.set(operationScope(stored.runId, stored.payload.operationId), stored);
     } else if (stored.type === "approval.requested") {
       this.#approvalRequests.set(operationScope(stored.runId, stored.payload.operationId), stored);
     } else if (stored.type === "approval.decided") {
@@ -454,6 +482,23 @@ export class LedgerState {
       throw new LedgerCorruptionError(`Run ${event.runId} has more than one run.created event`);
     }
 
+    if (event.type === "run.forked") {
+      if (!this.#runCreations.has(event.runId)) {
+        throw new LedgerCorruptionError(
+          `Run ${event.runId} has no run.created event before run.forked`,
+        );
+      }
+      if (this.#runForks.has(event.runId)) {
+        throw new LedgerCorruptionError(`Run ${event.runId} has more than one run.forked event`);
+      }
+      if (event.payload.parentRunId === event.runId) {
+        throw new LedgerCorruptionError("A Run cannot fork itself");
+      }
+      if (event.turnId !== undefined || event.laneId !== "main") {
+        throw new LedgerCorruptionError("run.forked must be a run-scoped Main fact");
+      }
+    }
+
     if (event.type === "goal.revised") {
       const currentVersion = this.#goalVersions.get(event.runId);
       if (currentVersion === undefined) {
@@ -466,6 +511,39 @@ export class LedgerState {
         throw new LedgerCorruptionError(
           `Goal version must increment from ${currentVersion} to ${currentVersion + 1}, received ${nextVersion}`,
         );
+      }
+    }
+
+    if (event.type === "thread.goal.changed") {
+      const current = this.#threadGoals.get(event.runId);
+      const next = event.payload.goal;
+      if (event.payload.operation === "create") {
+        if (current !== undefined) {
+          throw new LedgerCorruptionError(`Run ${event.runId} already has a thread Goal`);
+        }
+        if (next.revision !== 1 || event.payload.expectedRevision !== undefined) {
+          throw new LedgerCorruptionError("Thread Goal creation must start at revision 1 without an expected revision");
+        }
+      } else {
+        if (current === undefined) {
+          throw new LedgerCorruptionError(`Run ${event.runId} has no thread Goal to change`);
+        }
+        if (next.goalId !== current.goalId || next.revision !== current.revision + 1) {
+          throw new LedgerCorruptionError("Thread Goal revision must increment by one for the current Goal");
+        }
+        if (event.payload.expectedRevision !== current.revision) {
+          throw new LedgerCorruptionError("Thread Goal change has a stale expected revision");
+        }
+      }
+    }
+
+    if (event.type === "thread.goal.cleared") {
+      const current = this.#threadGoals.get(event.runId);
+      if (current === undefined) {
+        throw new LedgerCorruptionError(`Run ${event.runId} has no thread Goal to clear`);
+      }
+      if (current.goalId !== event.payload.goalId || current.revision !== event.payload.revision) {
+        throw new LedgerCorruptionError("Thread Goal clear does not match the current Goal revision");
       }
     }
 
@@ -518,6 +596,101 @@ export class LedgerState {
       if (this.#approvalRequests.has(scope)) {
         throw new LedgerCorruptionError(
           `Approval ${event.payload.operationId} was requested more than once`,
+        );
+      }
+    }
+
+    if (event.type === "tool.admitted" || event.type === "tool.started") {
+      const scope = operationScope(event.runId, event.payload.operationId);
+      if (this.#toolTerminals.has(scope) || this.#toolUnknowns.has(scope)) {
+        throw new LedgerCorruptionError(
+          `${event.type} ${event.payload.operationId} was recorded after an outcome`,
+        );
+      }
+      const toolRequest = this.#toolRequests.get(scope);
+      if (toolRequest === undefined) {
+        throw new LedgerCorruptionError(
+          `${event.type} ${event.payload.operationId} has no preceding tool.requested event`,
+        );
+      }
+      if (
+        toolRequest.laneId !== event.laneId
+        || toolRequest.turnId !== event.turnId
+        || toolRequest.payload.toolCallId !== event.payload.toolCallId
+        || toolRequest.payload.name !== event.payload.name
+        || toolRequest.payload.argumentsRef.contentHash !== event.payload.argumentsHash
+      ) {
+        throw new LedgerCorruptionError(
+          `${event.type} ${event.payload.operationId} does not match its tool request`,
+        );
+      }
+      if (event.type === "tool.admitted") {
+        if (this.#toolAdmissions.has(scope)) {
+          throw new LedgerCorruptionError(
+            `Tool admission ${event.payload.operationId} was recorded more than once`,
+          );
+        }
+      } else {
+        const admission = this.#toolAdmissions.get(scope);
+        if (admission === undefined) {
+          throw new LedgerCorruptionError(
+            `Tool start ${event.payload.operationId} has no preceding tool.admitted event`,
+          );
+        }
+        if (admission.payload.argumentsHash !== event.payload.argumentsHash) {
+          throw new LedgerCorruptionError(
+            `Tool start ${event.payload.operationId} does not match its admission`,
+          );
+        }
+        if (this.#toolStarts.has(scope)) {
+          throw new LedgerCorruptionError(
+            `Tool start ${event.payload.operationId} was recorded more than once`,
+          );
+        }
+      }
+    }
+
+    if (event.type === "tool.succeeded" || event.type === "tool.failed") {
+      const scope = operationScope(event.runId, event.payload.operationId);
+      if (this.#toolTerminals.has(scope)) {
+        throw new LedgerCorruptionError(
+          `Tool operation ${event.payload.operationId} has more than one terminal outcome`,
+        );
+      }
+      const toolRequest = this.#toolRequests.get(scope);
+      if (toolRequest !== undefined && (
+        toolRequest.laneId !== event.laneId
+        || toolRequest.turnId !== event.turnId
+        || toolRequest.payload.toolCallId !== event.payload.toolCallId
+        || toolRequest.payload.name !== event.payload.name
+      )) {
+        throw new LedgerCorruptionError(
+          `${event.type} ${event.payload.operationId} does not match its tool request`,
+        );
+      }
+    }
+
+    if (event.type === "tool.unknown") {
+      const scope = operationScope(event.runId, event.payload.operationId);
+      if (this.#toolTerminals.has(scope)) {
+        throw new LedgerCorruptionError(
+          `Tool operation ${event.payload.operationId} was marked unknown after a terminal outcome`,
+        );
+      }
+      if (this.#toolUnknowns.has(scope)) {
+        throw new LedgerCorruptionError(
+          `Tool operation ${event.payload.operationId} was marked unknown more than once`,
+        );
+      }
+      const toolRequest = this.#toolRequests.get(scope);
+      if (toolRequest !== undefined && (
+        toolRequest.laneId !== event.laneId
+        || toolRequest.turnId !== event.turnId
+        || toolRequest.payload.toolCallId !== event.payload.toolCallId
+        || toolRequest.payload.name !== event.payload.name
+      )) {
+        throw new LedgerCorruptionError(
+          `tool.unknown ${event.payload.operationId} does not match its tool request`,
         );
       }
     }

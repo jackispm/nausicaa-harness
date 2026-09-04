@@ -995,7 +995,7 @@ const createNewRun = async (
     runId,
     laneId: "main",
     type: "run.created",
-    payload: { goal, workspace, policy },
+    payload: { goal, workspace, policy, mainModel: request.model },
     correlationId: `run:${runId}`,
     idempotencyKey: "run:created",
     visibility: "run",

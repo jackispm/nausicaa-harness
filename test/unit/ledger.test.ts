@@ -13,6 +13,7 @@ import {
   type Ledger,
   MemoryLedger,
 } from "../../src/ledger/index.js";
+import { resolveRunPolicy } from "../../src/runtime/run-policy.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -481,6 +482,156 @@ describe("Ledger conformance", () => {
           decision: "denied",
         }, { turnId: "turn-1", idempotencyKey: "duplicate-decision" })))
           .rejects.toBeInstanceOf(LedgerCorruptionError);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
+  it("enforces the durable tool requested, admitted, and started chain", async () => {
+    const argumentsHash = `sha256:${"c".repeat(64)}`;
+    const argumentsRef = {
+      id: "arguments-1",
+      contentHash: argumentsHash,
+      mediaType: "application/json",
+      byteLength: 2,
+    };
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        const admitted = input("tool.admitted", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          argumentsHash,
+        }, { turnId: "turn-1", idempotencyKey: "admitted-orphan" });
+        await expect(ledger.append(admitted)).rejects.toBeInstanceOf(LedgerCorruptionError);
+
+        await ledger.append(input("tool.requested", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          argumentsRef,
+        }, { turnId: "turn-1", idempotencyKey: "tool-request-lifecycle" }));
+        await expect(ledger.append(input("tool.started", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          argumentsHash,
+        }, { turnId: "turn-1", idempotencyKey: "started-before-admitted" })))
+          .rejects.toBeInstanceOf(LedgerCorruptionError);
+
+        await ledger.append(input("tool.admitted", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          argumentsHash,
+        }, { turnId: "turn-1", idempotencyKey: "tool-admitted" }));
+        await expect(ledger.append(input("tool.admitted", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          argumentsHash,
+        }, { turnId: "turn-1", idempotencyKey: "tool-admitted-duplicate" })))
+          .rejects.toBeInstanceOf(LedgerCorruptionError);
+
+        await ledger.append(input("tool.started", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          argumentsHash,
+        }, { turnId: "turn-1", idempotencyKey: "tool-started" }));
+        await ledger.append(input("tool.failed", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          error: "adapter failed",
+          resultRef: {
+            id: "result-1",
+            contentHash: `sha256:${"d".repeat(64)}`,
+            mediaType: "text/plain",
+            byteLength: 13,
+          },
+        }, { turnId: "turn-1", idempotencyKey: "tool-failed" }));
+        await expect(ledger.append(input("tool.started", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          argumentsHash,
+        }, { turnId: "turn-1", idempotencyKey: "tool-started-duplicate" })))
+          .rejects.toBeInstanceOf(LedgerCorruptionError);
+        await expect(ledger.append(input("tool.succeeded", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          resultRef: {
+            id: "result-2",
+            contentHash: `sha256:${"e".repeat(64)}`,
+            mediaType: "text/plain",
+            byteLength: 14,
+          },
+        }, { turnId: "turn-1", idempotencyKey: "tool-succeeded-duplicate" })))
+          .rejects.toBeInstanceOf(LedgerCorruptionError);
+        await expect(ledger.append(input("tool.admitted", {
+          operationId: "operation-1",
+          toolCallId: "call-1",
+          name: "write",
+          argumentsHash,
+        }, { turnId: "turn-1", idempotencyKey: "tool-admitted-after-terminal" })))
+          .rejects.toBeInstanceOf(LedgerCorruptionError);
+      } finally {
+        await ledger.close();
+      }
+    }
+  });
+
+  it("enforces run fork lineage ordering, uniqueness, and Main scope", async () => {
+    const policy = resolveRunPolicy({ tetoEnabled: false });
+    const checkpoint = {
+      watermark: 1,
+      checksum: `sha256:${"a".repeat(64)}`,
+    };
+    for (const { ledger } of await ledgerImplementations()) {
+      try {
+        await expect(ledger.append(input("run.forked", {
+          parentRunId: "parent-run",
+          parentCheckpoint: checkpoint,
+        }, { runId: "orphan-child", idempotencyKey: "orphan-fork" })))
+          .rejects.toBeInstanceOf(LedgerCorruptionError);
+
+        await ledger.append(input("run.created", {
+          workspace: "/workspace",
+          policy,
+        }, { runId: "child-run", idempotencyKey: "child-created" }));
+        await expect(ledger.append(input("run.forked", {
+          parentRunId: "child-run",
+          parentCheckpoint: checkpoint,
+        }, { runId: "child-run", idempotencyKey: "self-fork" })))
+          .rejects.toThrow(/cannot fork itself/iu);
+
+        await ledger.append(input("run.forked", {
+          parentRunId: "parent-run",
+          parentCheckpoint: checkpoint,
+        }, { runId: "child-run", idempotencyKey: "child-fork" }));
+        await expect(ledger.append(input("run.forked", {
+          parentRunId: "parent-run",
+          parentCheckpoint: checkpoint,
+        }, { runId: "child-run", idempotencyKey: "child-fork-duplicate" })))
+          .rejects.toThrow(/more than one run\.forked/iu);
+
+        await ledger.append(input("run.created", {
+          workspace: "/workspace",
+          policy,
+        }, { runId: "lane-child", idempotencyKey: "lane-child-created" }));
+        await expect(ledger.append(input("run.forked", {
+          parentRunId: "parent-run",
+          parentCheckpoint: checkpoint,
+        }, { runId: "lane-child", laneId: "teto", idempotencyKey: "lane-fork" })))
+          .rejects.toThrow(/run-scoped Main fact/iu);
+        await expect(ledger.append(input("run.forked", {
+          parentRunId: "parent-run",
+          parentCheckpoint: checkpoint,
+        }, { runId: "lane-child", turnId: "turn-1", idempotencyKey: "turn-fork" })))
+          .rejects.toThrow(/run-scoped Main fact/iu);
       } finally {
         await ledger.close();
       }

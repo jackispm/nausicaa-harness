@@ -512,7 +512,12 @@ const naturalWorkerFactory: WorkerLiveModelFactory = ({ fixture, arm }) => {
           })]);
         }
         if (!terminalNotice) {
-          await abortableDelay(40, request.signal);
+          // Worker startup crosses a committed Main-step boundary and may
+          // spend time rebuilding Inbox/Ledger state before its provider
+          // request begins. Keep a generous observation window so this
+          // deterministic fixture proves overlap rather than scheduler
+          // startup latency.
+          await abortableDelay(250, request.signal);
           return response("", [toolCall(`read-${callId}`, "read_file", {
             path: firstEvidencePath(fixture.task.taskId),
           })]);

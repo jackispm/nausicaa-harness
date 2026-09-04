@@ -101,6 +101,7 @@ export async function projectSessionTranscript(
     if (event.type === "user.message" || event.type === "assistant.message") {
       const message = await readConversationArtifact(store, event.payload.messageRef);
       if (event.type === "user.message") {
+        if (event.payload.kind === "continuation") continue;
         if (message.role !== "user") {
           throw new SessionProtocolError("User transcript artifact is not a user message");
         }

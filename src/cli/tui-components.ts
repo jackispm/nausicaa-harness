@@ -36,6 +36,7 @@ type ColorScheme = "light" | "dark";
 interface ThemePalette {
   accent: (text: string) => string;
   accentBright: (text: string) => string;
+  borderMuted: (text: string) => string;
   info: (text: string) => string;
   success: (text: string) => string;
   warning: (text: string) => string;
@@ -46,9 +47,14 @@ interface ThemePalette {
   thinking: (text: string) => string;
   text: (text: string) => string;
   userBackground: (text: string) => string;
-  toolBackground: (text: string) => string;
+  toolPendingBackground: (text: string) => string;
+  toolSuccessBackground: (text: string) => string;
+  toolErrorBackground: (text: string) => string;
   adviceBackground: (text: string) => string;
   promptBackground: (text: string) => string;
+  markdownHeading: (text: string) => string;
+  markdownCodeBlock: (text: string) => string;
+  markdownListBullet: (text: string) => string;
 }
 
 function style(code: string, close: string, text: string): string {
@@ -65,7 +71,9 @@ function bg(code: string, text: string): string {
 
 const lightPalette: ThemePalette = {
   accent: (text) => fg("38;2;90;128;128", text),
-  accentBright: (text) => fg("38;2;63;110;110", text),
+  // Pi has one accent token; keep the brighter role as the same stable teal.
+  accentBright: (text) => fg("38;2;90;128;128", text),
+  borderMuted: (text) => fg("38;2;176;176;176", text),
   info: (text) => fg("38;2;84;125;167", text),
   success: (text) => fg("38;2;88;132;88", text),
   warning: (text) => fg("38;2;154;115;38", text),
@@ -73,30 +81,44 @@ const lightPalette: ThemePalette = {
   muted: (text) => fg("38;2;108;108;108", text),
   strong: (text) => style("1", "22", text),
   dim: (text) => fg("38;2;118;118;118", text),
-  thinking: (text) => fg("38;2;122;122;122", text),
-  text: (text) => text,
+  thinking: (text) => fg("38;2;108;108;108", text),
+  text: (text) => fg("38;2;31;35;40", text),
   userBackground: (text) => bg("48;2;232;232;232", text),
-  toolBackground: (text) => bg("48;2;237;237;242", text),
+  toolPendingBackground: (text) => bg("48;2;232;232;240", text),
+  toolSuccessBackground: (text) => bg("48;2;232;240;232", text),
+  toolErrorBackground: (text) => bg("48;2;240;232;232", text),
+  // Teto is Nausicaa-specific; retain its established Prime-style surface.
   adviceBackground: (text) => bg("48;2;235;240;238", text),
   promptBackground: (text) => bg("48;2;232;232;232", text),
+  markdownHeading: (text) => fg("38;2;154;115;38", text),
+  markdownCodeBlock: (text) => fg("38;2;88;132;88", text),
+  markdownListBullet: (text) => fg("38;2;88;132;88", text),
 };
 
 const darkPalette: ThemePalette = {
-  accent: (text) => fg("38;5;141", text),
-  accentBright: (text) => fg("38;5;183", text),
-  info: (text) => fg("38;5;81", text),
-  success: (text) => fg("38;5;114", text),
-  warning: (text) => fg("38;5;215", text),
-  error: (text) => fg("38;5;174", text),
-  muted: (text) => fg("38;5;145", text),
+  accent: (text) => fg("38;2;138;190;183", text),
+  // Pi's dark theme has a single accent token as well.
+  accentBright: (text) => fg("38;2;138;190;183", text),
+  borderMuted: (text) => fg("38;2;80;80;80", text),
+  info: (text) => fg("38;2;129;162;190", text),
+  success: (text) => fg("38;2;181;189;104", text),
+  warning: (text) => fg("38;2;255;255;0", text),
+  error: (text) => fg("38;2;204;102;102", text),
+  muted: (text) => fg("38;2;128;128;128", text),
   strong: (text) => style("1", "22", text),
-  dim: (text) => fg("38;5;103", text),
-  thinking: (text) => fg("38;5;145", text),
-  text: (text) => fg("97", text),
-  userBackground: (text) => bg("48;2;26;26;31", text),
-  toolBackground: (text) => bg("48;2;13;13;16", text),
+  dim: (text) => fg("38;2;102;102;102", text),
+  thinking: (text) => fg("38;2;128;128;128", text),
+  text: (text) => fg("38;2;212;212;212", text),
+  userBackground: (text) => bg("48;2;52;53;65", text),
+  toolPendingBackground: (text) => bg("48;2;40;40;50", text),
+  toolSuccessBackground: (text) => bg("48;2;40;50;40", text),
+  toolErrorBackground: (text) => bg("48;2;60;40;40", text),
+  // Teto is Nausicaa-specific; retain its established Prime-style surface.
   adviceBackground: (text) => bg("48;2;23;30;29", text),
-  promptBackground: (text) => bg("48;2;26;26;31", text),
+  promptBackground: (text) => bg("48;2;52;53;65", text),
+  markdownHeading: (text) => fg("38;2;240;198;116", text),
+  markdownCodeBlock: (text) => fg("38;2;181;189;104", text),
+  markdownListBullet: (text) => fg("38;2;138;190;183", text),
 };
 
 // Theme functions are intentionally stable references. A terminal scheme change
@@ -114,6 +136,7 @@ export function getNausicaaColorScheme(): ColorScheme {
 const palette: ThemePalette = {
   accent: (text) => activePalette.accent(text),
   accentBright: (text) => activePalette.accentBright(text),
+  borderMuted: (text) => activePalette.borderMuted(text),
   info: (text) => activePalette.info(text),
   success: (text) => activePalette.success(text),
   warning: (text) => activePalette.warning(text),
@@ -124,15 +147,19 @@ const palette: ThemePalette = {
   thinking: (text) => activePalette.thinking(text),
   text: (text) => activePalette.text(text),
   userBackground: (text) => activePalette.userBackground(text),
-  toolBackground: (text) => activePalette.toolBackground(text),
+  toolPendingBackground: (text) => activePalette.toolPendingBackground(text),
+  toolSuccessBackground: (text) => activePalette.toolSuccessBackground(text),
+  toolErrorBackground: (text) => activePalette.toolErrorBackground(text),
   adviceBackground: (text) => activePalette.adviceBackground(text),
   promptBackground: (text) => activePalette.promptBackground(text),
+  markdownHeading: (text) => activePalette.markdownHeading(text),
+  markdownCodeBlock: (text) => activePalette.markdownCodeBlock(text),
+  markdownListBullet: (text) => activePalette.markdownListBullet(text),
 };
 
 export const nausicaaEditorTheme: EditorTheme = {
-  // The published pi-tui Editor still renders border glyphs. Returning a
-  // space lets PromptSurface turn those rows into a flat background surface.
-  borderColor: () => " ",
+  // Pi uses a quiet horizontal rule around the composer when thinking is off.
+  borderColor: palette.borderMuted,
   selectList: {
     selectedPrefix: palette.accentBright,
     selectedText: palette.accentBright,
@@ -143,21 +170,21 @@ export const nausicaaEditorTheme: EditorTheme = {
 };
 
 export const nausicaaMarkdownTheme: MarkdownTheme = {
-  heading: palette.accentBright,
+  heading: palette.markdownHeading,
   link: palette.info,
   linkUrl: palette.muted,
-  code: palette.info,
-  codeBlock: palette.info,
+  code: palette.accent,
+  codeBlock: palette.markdownCodeBlock,
   codeBlockBorder: palette.muted,
   quote: palette.muted,
   quoteBorder: palette.muted,
   hr: palette.muted,
-  listBullet: palette.accent,
+  listBullet: palette.markdownListBullet,
   bold: palette.strong,
   italic: (text) => style("3", "23", text),
   strikethrough: (text) => style("9", "29", text),
   underline: (text) => style("4", "24", text),
-  highlightCode: (code) => code.split("\n").map((line) => palette.info(line)),
+  highlightCode: (code) => code.split("\n").map((line) => palette.markdownCodeBlock(line)),
 };
 
 const nausicaaThinkingMarkdownTheme: MarkdownTheme = {
@@ -176,6 +203,8 @@ const nausicaaThinkingMarkdownTheme: MarkdownTheme = {
   highlightCode: (code) => code.split("\n").map((line) => palette.thinking(line)),
 };
 
+const ASSISTANT_PADDING_X = 2;
+
 /** A compact wind-wing mark; deliberately distinct from Prime's butterfly. */
 export const NAUSICAA_LOGO = `                         ▄▄
                     ▄▄████
@@ -190,85 +219,110 @@ export const NAUSICAA_LOGO = `                         ▄▄
 
 export interface BrandSplashHeaderOptions {
   version?: string;
+  /** Retained for compatibility; Pi's startup header intentionally omits it. */
   getModel?: () => string;
+  /** Retained for compatibility; Pi's startup header intentionally omits it. */
   getWorkspace?: () => string;
   startHint?: string;
+  /** Retained for compatibility; the default startup surface is text-only. */
   logo?: string;
 }
 
-/** Prime-style startup surface. It becomes compact automatically on narrow terminals. */
-export class BrandSplashHeader implements Component {
-  private readonly logo: string[];
-  private readonly logoWidth: number;
-  private compact = false;
+const STARTUP_ONBOARDING = "Nausicaa can explain its own features and look up its docs. Ask it how to use or extend Nausicaa.";
+const STARTUP_COMPACT_ONBOARDING = "Press ctrl+o to show full startup help and loaded resources.";
 
-  constructor(private readonly options: BrandSplashHeaderOptions = {}) {
-    this.logo = (options.logo ?? NAUSICAA_LOGO).split("\n");
-    this.logoWidth = this.logo.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
+/** Pi-style startup surface with a compact and an expandable help view. */
+export class BrandSplashHeader implements Component {
+  private expanded = false;
+
+  constructor(private readonly options: BrandSplashHeaderOptions = {}) {}
+
+  /** Kept as a no-op for callers that used the former responsive Prime header. */
+  setCompact(_compact: boolean): void {}
+
+  setExpanded(expanded: boolean): void {
+    if (this.expanded === expanded) return;
+    this.expanded = expanded;
   }
 
-  setCompact(compact: boolean): void { this.compact = compact; }
+  isExpanded(): boolean {
+    return this.expanded;
+  }
 
   render(width: number): string[] {
     const safeWidth = Math.max(1, width);
     const padding = safeWidth > 2 ? 1 : 0;
     const contentWidth = Math.max(1, safeWidth - padding * 2);
-    if (this.compact) {
-      const summary = [
-        palette.strong(palette.text("Nausicaa")),
-        palette.dim(`v${this.options.version ?? "0.1.0"}`),
-        palette.muted(this.options.getModel?.() ?? "—"),
-        palette.dim(truncatePathMiddle(
-          this.options.getWorkspace?.() ?? "",
-          Math.max(8, Math.floor(contentWidth / 3)),
-        )),
-      ].join(` ${palette.dim("·")} `);
-      return ["", padLine(truncateToWidth(summary, contentWidth, ""), safeWidth, padding)];
-    }
-    const gutter = 4;
-    const labelWidth = 9;
-    const metadataWidth = contentWidth - this.logoWidth - gutter;
-    const valueWidth = Math.max(1, metadataWidth - labelWidth);
-    const labelled = (label: string, value: string): string => {
-      const display = label === "cwd"
-        ? truncatePathMiddle(value, valueWidth)
-        : truncateToWidth(value, valueWidth, "");
-      return `${palette.dim(label.padEnd(labelWidth))}${palette.muted(display)}`;
-    };
-    const metadata = [
-      labelled("version", `v${this.options.version ?? "0.1.0"}`),
-      labelled("model", this.options.getModel?.() ?? "—"),
-      labelled("cwd", this.options.getWorkspace?.() ?? ""),
-      "",
-      palette.dim(truncateToWidth(
-        this.options.startHint ?? 'Type a task, or "/help" for commands',
-        Math.max(1, metadataWidth),
-        "",
-      )),
+    const version = this.options.version === undefined ? "" : ` v${this.options.version}`;
+    // Pi emphasizes only the app name. Keeping the version dim makes the
+    // identity line readable without making the startup block feel heavy.
+    const title = `${palette.strong(palette.accentBright("Nausicaa"))}${palette.dim(version)}`;
+    const compactInstructions = this.options.startHint === undefined
+      ? startupCompactInstructions()
+      : palette.dim(this.options.startHint);
+    const expandedInstructions = startupExpandedInstructions();
+    const logicalLines = this.expanded
+      ? [title, expandedInstructions, "", STARTUP_ONBOARDING]
+      : [title, compactInstructions, STARTUP_COMPACT_ONBOARDING, "", STARTUP_ONBOARDING];
+    return [
+      " ".repeat(safeWidth),
+      ...logicalLines.flatMap((line) => wrapPaddedLines(line, contentWidth, safeWidth, padding)),
+      " ".repeat(safeWidth),
     ];
-    const showMetadata = metadataWidth >= labelWidth + 8;
-    const lines: string[] = [""];
-    if (showMetadata) {
-      const start = Math.max(0, Math.floor((this.logo.length - metadata.length) / 2));
-      this.logo.forEach((logoLine, index) => {
-        const meta = index >= start && index < start + metadata.length
-          ? metadata[index - start]
-          : "";
-        const gap = " ".repeat(Math.max(0, this.logoWidth - visibleWidth(logoLine) + gutter));
-        const line = truncateToWidth(`${palette.text(logoLine)}${gap}${meta}`, contentWidth, "");
-        lines.push(padLine(line, safeWidth, padding));
-      });
-    } else {
-      lines.push(padLine(palette.strong(palette.text("Nausicaa")), safeWidth, padding));
-      lines.push(padLine(palette.muted(`${this.options.getModel?.() ?? "—"} · ${truncatePathMiddle(this.options.getWorkspace?.() ?? "", Math.max(8, contentWidth - 4))}`), safeWidth, padding));
-    }
-    return lines;
   }
 
   invalidate(): void {}
 }
 
-/** Fixed dock tray: lane topology on the left, Main context capacity on the right. */
+function startupCompactInstructions(): string {
+  const key = (text: string): string => palette.dim(text);
+  const label = (text: string): string => palette.muted(text);
+  const separator = label(" · ");
+  return [
+    `${key("escape")}${label(" interrupt")}`,
+    `${key("ctrl+c/ctrl+d")}${label(" clear/exit")}`,
+    `${key("/")}${label(" commands")}`,
+    `${key("!")}${label(" bash")}`,
+    `${key("ctrl+o")}${label(" more")}`,
+  ].join(separator);
+}
+
+function startupExpandedInstructions(): string {
+  const key = (text: string): string => palette.dim(text);
+  const label = (text: string): string => palette.muted(text);
+  return [
+    `${key("escape")} ${label("interrupt")}`,
+    `${key("ctrl+c")} ${label("clear input or cancel the current request")}`,
+    `${key("ctrl+c twice")} ${label("exit")}`,
+    `${key("ctrl+d")} ${label("exit when the prompt is empty")}`,
+    `${key("ctrl+o")} ${label("expand or collapse tool output")}`,
+    `${key("ctrl+t")} ${label("expand or collapse thinking")}`,
+    `${key("?")} ${label("show the shortcut guide")}`,
+    `${key("Alt+Enter")} ${label("queue a follow-up")}`,
+    `${key("Alt+Up/Down")} ${label("browse queued input")}`,
+    `${key("Ctrl+S")} ${label("stash or restore the prompt")}`,
+    `${key("Ctrl+Up/Down")} ${label("jump between prompts")}`,
+    `${key("Ctrl+Shift+F")} ${label("search the transcript")}`,
+    `${key("/")} ${label("commands")}`,
+    `${key("!")} ${label("run bash")}`,
+    `${key("!!")} ${label("run bash without adding context")}`,
+  ].join("\n");
+}
+
+function wrapPaddedLines(
+  line: string,
+  contentWidth: number,
+  width: number,
+  padding: number,
+): string[] {
+  if (line.length === 0) return [" ".repeat(width)];
+  const wrapped = wrapTextWithAnsi(line, contentWidth);
+  return (wrapped.length === 0 ? [""] : wrapped).map((part) => (
+    padLine(truncateToWidth(part, contentWidth, ""), width, padding)
+  ));
+}
+
+/** Nausicaa-specific dock tray: lane topology on the left, context capacity on the right. */
 export class SessionTray implements Component {
   constructor(
     private readonly readSnapshot: () => SessionSnapshot,
@@ -308,7 +362,7 @@ export class SessionTray implements Component {
   invalidate(): void {}
 }
 
-/** Prime-aligned detail view: current Main capacity is not cumulative spend. */
+/** Nausicaa-specific detail view: current Main capacity is not cumulative spend. */
 export class ContextUsageBlock implements Component {
   constructor(private readonly overview: SessionContextOverview) {}
 
@@ -445,11 +499,12 @@ export class WorkerTaskSummaryLine implements Component {
   invalidate(): void {}
 }
 
-/** Prime-like loader outside the transcript. */
+/** Nausicaa-specific activity line outside the transcript. */
 export class ActivityLine implements Component {
   private frame = 0;
   private startedAt: number | undefined;
   private phase = "Thinking";
+  private static readonly spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
   constructor(private readonly readSnapshot: () => SessionSnapshot) {}
 
@@ -467,11 +522,17 @@ export class ActivityLine implements Component {
       return [];
     }
     this.startedAt ??= Date.now();
-    const spinner = ["·", "✦", "✧", "·"][this.frame % 4] ?? "·";
+    const spinner = ActivityLine.spinnerFrames[this.frame % ActivityLine.spinnerFrames.length] ?? "⠋";
     const elapsed = formatElapsed(Date.now() - this.startedAt);
     const usage = snapshot.usage.input + snapshot.usage.output;
     const label = snapshot.status === "cancelling" ? "Cancelling" : this.phase;
-    return [truncateToWidth(` ${palette.accent(spinner)} ${palette.strong(label)} ${palette.muted("·")} ${palette.muted(`${elapsed} · ${usage} tokens · step ${snapshot.lastCommittedStep}`)}`, Math.max(1, width), "")];
+    const line = truncateToWidth(
+      ` ${palette.accent(spinner)} ${palette.muted(`${label}...`)} ${palette.dim("·")} ${palette.muted(`${elapsed} · ${usage} tokens · step ${snapshot.lastCommittedStep}`)}`,
+      Math.max(1, width),
+      "",
+    );
+    // pi-tui's Loader reserves a quiet row before the animated status text.
+    return [" ".repeat(Math.max(1, width)), line];
   }
 
   invalidate(): void {}
@@ -492,7 +553,7 @@ export class UserMessageBlock extends Container {
     }
     const safeText = terminalSafeText(text).trim();
     if (safeText.length > 0) {
-      box.addChild(new Markdown(safeText, 0, 0, nausicaaMarkdownTheme));
+      box.addChild(new Markdown(safeText, 0, 0, nausicaaMarkdownTheme, { color: palette.text }));
     }
     this.addChild(box);
   }
@@ -512,7 +573,7 @@ export class ThinkingRow implements Component {
   private text = "";
   private readonly markdown = new Markdown(
     "",
-    1,
+    ASSISTANT_PADDING_X,
     0,
     nausicaaThinkingMarkdownTheme,
     { color: palette.thinking },
@@ -533,11 +594,11 @@ export class ThinkingRow implements Component {
     const hint = this.expanded ? "Ctrl+T to collapse" : "Ctrl+T to expand";
     if (!this.expanded) {
       const recap = thinkingRecap(this.text, "working");
-      return [truncateToWidth(` ${label} ${palette.dim("·")} ${palette.thinking(recap)} ${palette.dim(`(${hint})`)}`, safeWidth, "")];
+      return [truncateToWidth(`${" ".repeat(ASSISTANT_PADDING_X)}${label} ${palette.dim("·")} ${palette.thinking(recap)} ${palette.dim(`(${hint})`)}`, safeWidth, "")];
     }
     return [
-      truncateToWidth(` ${label} ${palette.dim(`(${hint})`)}`, safeWidth, ""),
-      ...this.markdown.render(safeWidth),
+      truncateToWidth(`${" ".repeat(ASSISTANT_PADDING_X)}${label} ${palette.dim(`(${hint})`)}`, safeWidth, ""),
+      ...fitLines(this.markdown.render(safeWidth), safeWidth),
     ];
   }
 
@@ -552,7 +613,13 @@ export class AssistantMessageBlock implements Component {
   private hasToolCalls: boolean;
 
   constructor(text = "", hasToolCalls = false) {
-    this.markdown = new Markdown("", 1, 0, nausicaaMarkdownTheme);
+    this.markdown = new Markdown(
+      "",
+      ASSISTANT_PADDING_X,
+      0,
+      nausicaaMarkdownTheme,
+      { color: palette.text },
+    );
     this.hasToolCalls = hasToolCalls;
     this.setText(text);
   }
@@ -671,6 +738,7 @@ export class ToolStatusBlock implements Component {
     const safeWidth = Math.max(1, width);
     if (this.cachedRender?.width === safeWidth) return this.cachedRender.lines;
     const status = this.statusPresentation();
+    const background = toolBackgroundForStatus(this.status);
     const presentation = renderToolPresentation({
       name: this.toolName,
       ...(this.argumentsText.length === 0 ? {} : { arguments: this.argumentsText }),
@@ -691,12 +759,12 @@ export class ToolStatusBlock implements Component {
     const expandHint = this.showExpandHint && canExpand
       ? ` ${palette.dim(`· (Ctrl+O to ${this.expanded ? "collapse" : "expand"})`)}`
       : "";
-    const header = `${marker}${palette.strong(this.toolName)} ${palette.dim("·")} ${status.color(status.label)}${expandHint}${detail ? ` ${palette.dim(`· ${oneLine(detail, 100)}`)}` : ""}`;
-    const lines = [toolPanelLine(header, safeWidth)];
+    const header = `${marker}${palette.strong(palette.text(this.toolName))} ${palette.dim("·")} ${status.color(status.label)}${expandHint}${detail ? ` ${palette.dim(`· ${oneLine(detail, 100)}`)}` : ""}`;
+    const lines = [toolPanelLine(header, safeWidth, background)];
     const body = this.expanded ? presentation.expanded : presentation.collapsed;
     if (body.length > 0) {
-      lines.push(toolPanelLine("", safeWidth));
-      lines.push(...body.map((line) => toolPanelLine(styleToolLine(line), safeWidth)));
+      lines.push(toolPanelLine("", safeWidth, background));
+      lines.push(...body.map((line) => toolPanelLine(styleToolLine(line), safeWidth, background)));
     }
     // An unresolved operation must remain inspectable even for a specialized
     // renderer that normally hides large call arguments.
@@ -706,8 +774,8 @@ export class ToolStatusBlock implements Component {
       && this.argumentsText.length > 0
       && presentation.expanded.length === 0
     ) {
-      lines.push(toolPanelLine("", safeWidth));
-      lines.push(...toolPanelBody("arguments", this.argumentsText, safeWidth));
+      lines.push(toolPanelLine("", safeWidth, background));
+      lines.push(...toolPanelBody("arguments", this.argumentsText, safeWidth, background));
     }
     this.cachedRender = { width: safeWidth, lines };
     return lines;
@@ -726,7 +794,7 @@ export class ToolStatusBlock implements Component {
   }
 }
 
-/** Match Prime's convention: only the newest tool advertises the global toggle. */
+/** Match Pi's convention: only the newest tool advertises the global toggle. */
 export function selectLatestToolExpandHint(
   existing: readonly ToolStatusBlock[],
   latest: ToolStatusBlock,
@@ -770,7 +838,13 @@ export class AdviceBlock extends Container {
     const score = confidence === undefined ? "" : ` ${Math.round(confidence * 100)}%`;
     box.addChild(new Text(`${palette.accentBright(palette.strong("Teto"))}${palette.dim(" · intent navigator")}${palette.muted(score)}`, 0, 0));
     box.addChild(new Spacer(1));
-    box.addChild(new Markdown(terminalSafeText(claim).trim(), 0, 0, nausicaaMarkdownTheme));
+    box.addChild(new Markdown(
+      terminalSafeText(claim).trim(),
+      0,
+      0,
+      nausicaaMarkdownTheme,
+      { color: palette.text },
+    ));
     if (suggestedAction?.trim()) {
       box.addChild(new Spacer(1));
       box.addChild(new Text(`${palette.warning("suggestion")} ${terminalSafeText(suggestedAction).trim()}`, 0, 0));
@@ -896,21 +970,21 @@ export class PromptSurface implements Component {
     const safeWidth = Math.max(1, width);
     const lines = this.editor.render(safeWidth);
     if (lines.length >= 3 && safeWidth >= 5) {
-      const prefix = palette.accent("> ");
-      const prefixWidth = visibleWidth(prefix);
       const editorRow = lines[1] ?? "";
       const content = sliceByColumn(
         editorRow,
-        prefixWidth,
-        Math.max(1, safeWidth - prefixWidth),
+        0,
+        safeWidth,
         true,
       );
       if (this.editor.getText?.().length === 0) {
         const cursor = sliceByColumn(content, 0, 1, true);
-        const available = Math.max(0, safeWidth - prefixWidth - 1);
-        lines[1] = `${prefix}${cursor}${palette.dim(truncateToWidth(this.placeholder, available, ""))}`;
+        const available = Math.max(0, safeWidth - 1);
+        // sliceByColumn can omit the editor's reset after the reverse-video cursor.
+        // Close inverse explicitly so the placeholder stays on the terminal surface.
+        lines[1] = `${cursor}${ESC}27m${palette.dim(truncateToWidth(this.placeholder, available, ""))}`;
       } else {
-        lines[1] = `${prefix}${content}`;
+        lines[1] = content;
       }
     }
     return lines.map((line) => backgroundLine(line, safeWidth, palette.promptBackground));
@@ -923,7 +997,7 @@ class ResponsiveBox implements Component {
   private readonly box: Box;
   private readonly fallback = new Container();
 
-  constructor(private readonly paddingX: number, paddingY: number, bgFn: (text: string) => string) {
+  constructor(private readonly paddingX: number, paddingY: number, bgFn?: (text: string) => string) {
     this.box = new Box(paddingX, paddingY, bgFn);
   }
 
@@ -940,12 +1014,26 @@ class ResponsiveBox implements Component {
   invalidate(): void { this.box.invalidate(); this.fallback.invalidate(); }
 }
 
-function toolPanelLine(line: string, width: number): string {
+function toolBackgroundForStatus(status: ToolStatus): (text: string) => string {
+  switch (status) {
+    case "succeeded": return palette.toolSuccessBackground;
+    case "failed":
+    case "unknown": return palette.toolErrorBackground;
+    case "running":
+    case "archived": return palette.toolPendingBackground;
+  }
+}
+
+function toolPanelLine(
+  line: string,
+  width: number,
+  background: (text: string) => string = palette.toolPendingBackground,
+): string {
   const safeWidth = Math.max(1, width);
   const padding = safeWidth >= 5 ? 2 : 0;
   const inner = toolPanelContentWidth(safeWidth);
   const content = `${" ".repeat(padding)}${truncateToWidth(line, inner, "")}`;
-  return backgroundLine(content, safeWidth, palette.toolBackground);
+  return backgroundLine(content, safeWidth, background);
 }
 
 function toolPanelContentWidth(width: number): number {
@@ -953,14 +1041,19 @@ function toolPanelContentWidth(width: number): number {
   return Math.max(1, safeWidth - (safeWidth >= 5 ? 4 : 0));
 }
 
-function toolPanelBody(label: string, text: string, width: number): string[] {
-  const lines = [toolPanelLine(palette.dim(label), width)];
+function toolPanelBody(
+  label: string,
+  text: string,
+  width: number,
+  background: (text: string) => string = palette.toolPendingBackground,
+): string[] {
+  const lines = [toolPanelLine(palette.dim(label), width, background)];
   const wrapped = boundedWrap(text, Math.max(1, width - 4), 200);
   for (const line of wrapped.lines) {
-    lines.push(toolPanelLine(palette.muted(line), width));
+    lines.push(toolPanelLine(palette.muted(line), width, background));
   }
   if (wrapped.truncated) {
-    lines.push(toolPanelLine(palette.dim("… more output"), width));
+    lines.push(toolPanelLine(palette.dim("… more output"), width, background));
   }
   return lines;
 }
@@ -991,14 +1084,6 @@ function formatElapsed(milliseconds: number): string {
   const seconds = Math.max(0, Math.floor(milliseconds / 1_000));
   if (seconds < 60) return `${seconds}s`;
   return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
-}
-
-function truncatePathMiddle(value: string, maxWidth: number): string {
-  const normalized = value.replaceAll("\\", "/");
-  if (visibleWidth(normalized) <= maxWidth) return normalized;
-  const parts = normalized.split("/").filter(Boolean);
-  if (parts.length <= 2) return truncateToWidth(normalized, maxWidth, "...");
-  return truncateToWidth(`.../${parts.slice(-2).join("/")}`, maxWidth, "...");
 }
 
 function padLine(line: string, width: number, padding: number): string {

@@ -32,6 +32,7 @@ import type {
   MoweExecutionRequest,
   MoweExecutionResponse,
   MoweApprovalContext,
+  MoweToolLifecycleContext,
   MoweToolEntry,
   ResultProjectionOptions,
 } from "./types.js";
@@ -434,6 +435,30 @@ export class MoweExecutor {
         return this.cancelled(call, operationId, request.signal?.reason);
       }
     }
+    const lifecycleContext: MoweToolLifecycleContext = {
+      runId: request.runId,
+      laneId: request.laneId,
+      operationId,
+      call: structuredClone(call),
+      tool: entry,
+      argumentsHash: sha256(stableJson(call.arguments)),
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
+    };
+    try {
+      await request.toolLifecycle?.admitted(lifecycleContext);
+    } catch (error: unknown) {
+      return this.failure(
+        call,
+        operationId,
+        `Tool admission recording failed: ${errorMessage(error)}`,
+      );
+    }
+    // Admission may be durable before cancellation arrives. Re-check before
+    // entering the effect boundary so an admitted-but-never-started call does
+    // not invoke user code.
+    if (isSignalAborted(request.signal)) {
+      return this.cancelled(call, operationId, request.signal?.reason);
+    }
     const deadline = createToolDeadline(request.signal, entry.metadata.timeoutMs);
     try {
       const context = {
@@ -446,12 +471,31 @@ export class MoweExecutor {
       const workspaceMutex = isWorkspaceWriteEntry(entry)
         ? workspaceMutexFor(workspaceMutexKey ?? resolvePath(request.workspace))
         : undefined;
+      const invokeTool = async (): Promise<ToolResult> => {
+        // This is the last durable boundary before user code or an external
+        // process can create a side effect.
+        if (isSignalAborted(request.signal)) {
+          throw abortReason(request.signal);
+        }
+        try {
+          await request.toolLifecycle?.started(lifecycleContext);
+        } catch (error: unknown) {
+          throw new Error(`Tool start recording failed: ${errorMessage(error)}`);
+        }
+        // The started hook is asynchronous because it normally commits a
+        // durable fact. Cancellation can win during that write; do not let a
+        // late callback completion turn it into an unrecorded side effect.
+        if (isSignalAborted(request.signal)) {
+          throw abortReason(request.signal);
+        }
+        return entry.tool.execute(call.arguments, context);
+      };
       let rawResult: ToolResult;
       try {
         rawResult = workspaceMutex === undefined
-          ? await entry.tool.execute(call.arguments, context)
+          ? await invokeTool()
           : await workspaceMutex.run(
-            () => entry.tool.execute(call.arguments, context),
+            invokeTool,
             deadline.signal,
           );
       } finally {

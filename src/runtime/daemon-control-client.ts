@@ -4,8 +4,9 @@ import { createConnection, type Socket } from "node:net";
 
 import {
   DAEMON_CONTROL_PROTOCOL_VERSION,
-  type DaemonControlEventFrame,
-  type DaemonControlRunEventFrame,
+  DaemonControlProtocolError,
+  parseDaemonControlFrame,
+  serializeDaemonControlRequest,
   type DaemonControlMethod,
   type DaemonControlRequest,
 } from "./daemon-control.js";
@@ -256,7 +257,7 @@ export class DaemonControlClient {
       });
     });
     try {
-      socket.write(`${JSON.stringify(request)}\n`);
+      socket.write(serializeDaemonControlRequest(request));
     } catch (error: unknown) {
       const pending = this.pending.get(id);
       if (pending !== undefined) {
@@ -336,11 +337,22 @@ export class DaemonControlClient {
         this.failProtocol(socket, generation, "frame_too_large", "daemon response frame exceeds the configured limit");
         return;
       }
-      let frame: unknown;
+      let decoded: unknown;
       try {
-        frame = JSON.parse(line);
+        decoded = JSON.parse(line);
       } catch {
         this.failProtocol(socket, generation, "invalid_json", "daemon response is not valid JSON");
+        return;
+      }
+      let frame: ReturnType<typeof parseDaemonControlFrame>;
+      try {
+        frame = parseDaemonControlFrame(decoded);
+      } catch (error: unknown) {
+        const code = error instanceof DaemonControlProtocolError
+          && /version is unsupported/u.test(error.message)
+          ? "unsupported_version"
+          : "invalid_frame";
+        this.failProtocol(socket, generation, code, "daemon response frame is invalid");
         return;
       }
       this.handleFrame(socket, generation, frame);
@@ -351,34 +363,16 @@ export class DaemonControlClient {
     }
   }
 
-  private handleFrame(socket: Socket, generation: number, value: unknown): void {
+  private handleFrame(
+    socket: Socket,
+    generation: number,
+    frame: ReturnType<typeof parseDaemonControlFrame>,
+  ): void {
     if (!this.isCurrent(socket, generation)) return;
-    if (value === null || typeof value !== "object" || Array.isArray(value)) {
-      this.failProtocol(socket, generation, "invalid_frame", "daemon response frame must be an object");
-      return;
-    }
-    const frame = value as {
-      readonly version?: unknown;
-      readonly kind?: unknown;
-      readonly id?: unknown;
-      readonly ok?: unknown;
-      readonly result?: unknown;
-      readonly error?: { readonly code?: unknown; readonly message?: unknown };
-      readonly event?: DaemonControlEventFrame["event"];
-      readonly observation?: DaemonControlRunEventFrame["observation"];
-    };
-    if (frame.version !== DAEMON_CONTROL_PROTOCOL_VERSION) {
-      this.failProtocol(socket, generation, "unsupported_version", "daemon response version is unsupported");
-      return;
-    }
     if (frame.kind === "event") {
-      if (frame.event === undefined || typeof frame.event !== "object") {
-        this.failProtocol(socket, generation, "invalid_frame", "daemon event frame is missing event");
-        return;
-      }
       for (const listener of this.listeners) {
         try {
-          listener(frame.event as DaemonHostEvent);
+          listener(frame.event);
         } catch {
           // Observers cannot own the transport.
         }
@@ -386,13 +380,9 @@ export class DaemonControlClient {
       return;
     }
     if (frame.kind === "run.event") {
-      if (frame.observation === undefined || typeof frame.observation !== "object") {
-        this.failProtocol(socket, generation, "invalid_frame", "daemon Run event frame is missing observation");
-        return;
-      }
       for (const listener of this.runListeners) {
         try {
-          listener(frame.observation as DaemonRunObservation);
+          listener(frame.observation);
         } catch {
           // Observers cannot own the transport.
         }

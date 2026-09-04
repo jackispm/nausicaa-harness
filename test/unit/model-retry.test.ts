@@ -7,8 +7,10 @@ import type {
   ModelStreamEvent,
 } from "../../src/domain/index.js";
 import {
+  DEFAULT_MODEL_RETRY_OPTIONS,
   ProviderModelError,
   RetryingModelPort,
+  withDefaultModelRetries,
 } from "../../src/model/index.js";
 
 const response: ModelResponse = {
@@ -19,6 +21,25 @@ const response: ModelResponse = {
 };
 
 describe("RetryingModelPort", () => {
+  it("provides a bounded Pi-compatible default policy and is idempotent", async () => {
+    expect(DEFAULT_MODEL_RETRY_OPTIONS).toEqual({
+      maxAttempts: 4,
+      baseDelayMs: 2_000,
+      maxDelayMs: 60_000,
+    });
+
+    const delegate = new CompletionSequence([response]);
+    const wrapped = withDefaultModelRetries(delegate, {
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    });
+
+    expect(wrapped).toBeInstanceOf(RetryingModelPort);
+    expect(withDefaultModelRetries(wrapped)).toBe(wrapped);
+    await expect(wrapped.complete(request())).resolves.toEqual(response);
+    expect(delegate.calls).toBe(1);
+  });
+
   it("retries transient completions with bounded deterministic backoff", async () => {
     const transient = new ProviderModelError({ category: "server", status: 503, retryable: true });
     const delegate = new CompletionSequence([transient, transient, response]);

@@ -26,6 +26,37 @@ export interface RetryingModelPortOptions {
   random?: () => number;
 }
 
+/**
+ * Default provider retry policy for the runtime's model boundary.
+ *
+ * Pi's coding-agent defaults to three retries with a two-second exponential
+ * backoff. `maxAttempts` includes the initial request, so four attempts match
+ * that contract while keeping the policy bounded by this adapter.
+ */
+export const DEFAULT_MODEL_RETRY_OPTIONS = {
+  maxAttempts: 4,
+  baseDelayMs: 2_000,
+  maxDelayMs: 60_000,
+} as const satisfies Pick<RetryingModelPortOptions, "maxAttempts" | "baseDelayMs" | "maxDelayMs">;
+
+/**
+ * Apply the runtime's default retry boundary exactly once.
+ *
+ * Provider-specific surfaces (catalog and authentication) remain on the
+ * underlying adapter; callers should retain that adapter for those concerns
+ * and pass this ModelPort only to execution boundaries.
+ */
+export function withDefaultModelRetries(
+  delegate: ModelPort,
+  overrides: Partial<RetryingModelPortOptions> = {},
+): RetryingModelPort {
+  if (delegate instanceof RetryingModelPort) return delegate;
+  return new RetryingModelPort(delegate, {
+    ...DEFAULT_MODEL_RETRY_OPTIONS,
+    ...overrides,
+  });
+}
+
 /** Explicit retry boundary. Keep budget metering inside this decorator. */
 export class RetryingModelPort implements ModelPort {
   private readonly maxAttempts: number;

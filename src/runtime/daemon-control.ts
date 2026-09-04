@@ -82,8 +82,82 @@ export interface DaemonControlRunEventFrame {
   readonly observation: DaemonRunObservation;
 }
 
+/** Every frame which may appear on the daemon's public JSONL control stream. */
+export type DaemonControlFrame =
+  | DaemonControlResponse
+  | DaemonControlEventFrame
+  | DaemonControlRunEventFrame;
+
 export class DaemonControlProtocolError extends Error {
   override readonly name = "DaemonControlProtocolError";
+}
+
+/**
+ * Parse one already-decoded JSON value from the public control protocol.
+ * Unknown fields are retained by the returned value so newer daemons can add
+ * metadata without breaking older embedders; version and discriminators are
+ * always strict.
+ */
+export function parseDaemonControlFrame(value: unknown): DaemonControlFrame {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new DaemonControlProtocolError("control frame must be an object");
+  }
+  const frame = value as Record<string, unknown>;
+  if (frame.version !== DAEMON_CONTROL_PROTOCOL_VERSION) {
+    throw new DaemonControlProtocolError("control frame version is unsupported");
+  }
+  if (frame.kind === "response") {
+    if ((typeof frame.id !== "string" && frame.id !== null) || typeof frame.ok !== "boolean") {
+      throw new DaemonControlProtocolError("control response frame is invalid");
+    }
+    if (frame.ok === false) {
+      if (!isRecord(frame.error)
+        || typeof frame.error.code !== "string"
+        || frame.error.code.length === 0
+        || typeof frame.error.message !== "string"
+        || frame.error.message.length === 0) {
+        throw new DaemonControlProtocolError("control response error is invalid");
+      }
+    }
+    return frame as unknown as DaemonControlResponse;
+  }
+  if (frame.kind === "event") {
+    if (!isRecord(frame.event)) {
+      throw new DaemonControlProtocolError("control event frame is invalid");
+    }
+    return frame as unknown as DaemonControlEventFrame;
+  }
+  if (frame.kind === "run.event") {
+    if (!isRecord(frame.observation)) {
+      throw new DaemonControlProtocolError("control Run event frame is invalid");
+    }
+    return frame as unknown as DaemonControlRunEventFrame;
+  }
+  throw new DaemonControlProtocolError("control frame kind is unsupported");
+}
+
+/** Parse one newline-delimited frame, accepting an optional CRLF terminator. */
+export function parseDaemonControlLine(line: string): DaemonControlFrame {
+  if (typeof line !== "string" || line.length === 0) {
+    throw new DaemonControlProtocolError("control frame line must be non-empty");
+  }
+  const body = line.endsWith("\r") ? line.slice(0, -1) : line;
+  if (body.length === 0) {
+    throw new DaemonControlProtocolError("control frame line must be non-empty");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(body);
+  } catch {
+    throw new DaemonControlProtocolError("control frame is not valid JSON");
+  }
+  return parseDaemonControlFrame(value);
+}
+
+/** Serialize a validated public frame with exactly one JSONL newline. */
+export function serializeDaemonControlFrame(frame: DaemonControlFrame): string {
+  const validated = parseDaemonControlFrame(frame);
+  return `${JSON.stringify(validated)}\n`;
 }
 
 export interface DaemonControlLifecycle {
@@ -412,7 +486,7 @@ export class DaemonControlServer {
 
     let request: DaemonControlRequest;
     try {
-      request = parseRequest(parsed);
+      request = parseDaemonControlRequest(parsed);
     } catch (error: unknown) {
       this.sendError(
         connection,
@@ -801,13 +875,13 @@ export class DaemonControlServer {
 
   private sendFrame(
     connection: Connection,
-    frame: DaemonControlResponse | DaemonControlEventFrame | DaemonControlRunEventFrame,
+    frame: DaemonControlFrame,
   ): void {
     const socket = connection.socket;
     if (socket.destroyed || !socket.writable) return;
     let encoded: string;
     try {
-      encoded = `${JSON.stringify(frame)}\n`;
+      encoded = serializeDaemonControlFrame(frame);
     } catch {
       socket.destroy();
       return;
@@ -999,7 +1073,7 @@ function nonNegativeInteger(value: unknown, field: string): number {
   return value as number;
 }
 
-function parseRequest(value: unknown): DaemonControlRequest {
+export function parseDaemonControlRequest(value: unknown): DaemonControlRequest {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new DaemonControlProtocolError("request must be an object");
   }
@@ -1027,6 +1101,12 @@ function parseRequest(value: unknown): DaemonControlRequest {
     method,
     ...(record.params === undefined ? {} : { params: record.params }),
   };
+}
+
+/** Serialize a request for callers implementing a small JSONL transport. */
+export function serializeDaemonControlRequest(request: DaemonControlRequest): string {
+  const parsed = parseDaemonControlRequest(request);
+  return `${JSON.stringify({ version: DAEMON_CONTROL_PROTOCOL_VERSION, ...parsed })}\n`;
 }
 
 function isRecoverableMethod(method: DaemonControlMethod): boolean {
@@ -1069,4 +1149,8 @@ function eventMatchesRun(event: DaemonHostEvent, runId: string | undefined): boo
   if (event.type === "state") return true;
   if (event.type === "wake") return event.request.runId === runId;
   return event.runId === runId;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

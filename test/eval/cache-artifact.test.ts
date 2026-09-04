@@ -45,7 +45,7 @@ describe("Phase 2.3 runtime cache artifact", () => {
       maxOutputTokens: 8,
       policy: {
         maxMainStepsPerActivation: 1,
-        maxModelTokens: 1_000,
+        maxModelTokens: 4_000,
         tetoEnabled: false,
       },
     }, {

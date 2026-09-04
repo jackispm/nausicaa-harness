@@ -48,30 +48,38 @@ describe("daemon remote attachment", () => {
       runId: fixture.runId,
       status: "idle",
       model: "scripted",
-      goal: { statement: "Assist the user with tasks in the current workspace" },
+      goal: {
+        revision: 1,
+        objective: "Assist the user with tasks in the current workspace",
+        status: "active",
+      },
     });
     expect(await remote.transcript()).toEqual(expect.arrayContaining([
       expect.objectContaining({ role: "user", content: "observe this Run" }),
       expect.objectContaining({ role: "assistant", content: "observed" }),
     ]));
 
-    const updated = stateWhere(remote, (state) => state.snapshot.goal?.version === 2);
+    const updated = stateWhere(remote, (state) => state.snapshot.goal?.revision === 2);
     const ledger = await JsonlLedger.open(join(
       fixture.dataDir,
       "runs",
       fixture.runId,
       "ledger.jsonl",
     ));
+    const currentGoal = projectRun(attachment.snapshot().events, fixture.runId).threadGoal;
+    if (currentGoal === undefined) throw new Error("missing fixture ThreadGoal");
     await ledger.append({
       runId: fixture.runId,
       laneId: "main",
-      type: "goal.revised",
+      type: "thread.goal.changed",
       payload: {
+        operation: "edit",
+        expectedRevision: 1,
         goal: {
-          version: 2,
-          statement: "Observe the daemon-owned Run",
-          successCriteria: [],
-          hardConstraints: [],
+          ...currentGoal,
+          revision: 2,
+          objective: "Observe the daemon-owned Run",
+          updatedAt: "2026-09-04T00:00:00.000Z",
         },
       },
       correlationId: `run:${fixture.runId}`,
@@ -81,7 +89,7 @@ describe("daemon remote attachment", () => {
     await ledger.close();
 
     await expect(updated).resolves.toMatchObject({
-      snapshot: { goal: { statement: "Observe the daemon-owned Run" } },
+      snapshot: { goal: { objective: "Observe the daemon-owned Run", revision: 2 } },
       attachmentStatus: "attached",
     });
     await remote.close();
@@ -93,21 +101,28 @@ describe("daemon remote attachment", () => {
     const fixture = await remoteFixture("remote-pages");
     const ledgerPath = join(fixture.dataDir, "runs", fixture.runId, "ledger.jsonl");
     const ledger = await JsonlLedger.open(ledgerPath);
-    for (let version = 2; version <= 140; version += 1) {
+    const currentGoal = projectRun(
+      await ledger.read({ runId: fixture.runId }),
+      fixture.runId,
+    ).threadGoal;
+    if (currentGoal === undefined) throw new Error("missing fixture ThreadGoal");
+    for (let revision = 2; revision <= 140; revision += 1) {
       await ledger.append({
         runId: fixture.runId,
         laneId: "main",
-        type: "goal.revised",
+        type: "thread.goal.changed",
         payload: {
+          operation: "edit",
+          expectedRevision: revision - 1,
           goal: {
-            version,
-            statement: `Goal ${version}`,
-            successCriteria: [],
-            hardConstraints: [],
+            ...currentGoal,
+            revision,
+            objective: `Goal ${revision}`,
+            updatedAt: `2026-09-04T00:00:${String(revision % 60).padStart(2, "0")}.000Z`,
           },
         },
         correlationId: `run:${fixture.runId}`,
-        idempotencyKey: `remote:test:goal:${version}`,
+        idempotencyKey: `remote:test:thread-goal:${revision}`,
         visibility: "run",
       });
     }
@@ -124,7 +139,7 @@ describe("daemon remote attachment", () => {
       cursor: `offset:${expected.at(-1)?.globalOffset}`,
     });
     expect(attachment.snapshot().events).toHaveLength(expected.length);
-    expect(projectRun(attachment.snapshot().events, fixture.runId).goal?.version).toBe(140);
+    expect(projectRun(attachment.snapshot().events, fixture.runId).threadGoal?.revision).toBe(140);
     await attachment.close();
     await fixture.close();
   });
@@ -154,6 +169,86 @@ describe("daemon remote attachment", () => {
     expect(fixture.host.snapshot().attachedClients).toBe(1);
 
     await attachment.close();
+    await fixture.close();
+  });
+
+  it("replays one durable Run continuously across detach and a fresh read-only attach", async () => {
+    const fixture = await remoteFixture("remote-attach-continuity");
+    const firstAttachment = await DaemonRemoteAttachment.open({
+      socketPath: fixture.control.socketPath,
+      runId: fixture.runId,
+      reconnectDelayMs: 5,
+    });
+    const remote = await DaemonRemoteSession.open({
+      attachment: firstAttachment,
+      workspace: fixture.workspace,
+      dataDir: fixture.dataDir,
+      model: "scripted",
+    });
+    const beforeDetach = firstAttachment.snapshot();
+
+    expect(remote.snapshot().permissionProfile).toBe("read-only");
+    expect("submit" in remote).toBe(false);
+    expect(fixture.host.snapshot().attachedClients).toBe(1);
+
+    await remote.close();
+    expect(fixture.host.snapshot().attachedClients).toBe(0);
+
+    // The daemon-owned Run progresses while no presentation attachment exists.
+    const ledger = await JsonlLedger.open(join(
+      fixture.dataDir,
+      "runs",
+      fixture.runId,
+      "ledger.jsonl",
+    ));
+    const currentGoal = projectRun(beforeDetach.events, fixture.runId).threadGoal;
+    if (currentGoal === undefined) throw new Error("missing fixture ThreadGoal");
+    const appended = await ledger.append({
+      runId: fixture.runId,
+      laneId: "main",
+      type: "thread.goal.changed",
+      payload: {
+        operation: "edit",
+        expectedRevision: currentGoal.revision,
+        goal: {
+          ...currentGoal,
+          revision: currentGoal.revision + 1,
+          objective: "Continue after the remote client detached",
+          updatedAt: "2026-09-04T00:00:01.000Z",
+        },
+      },
+      correlationId: `run:${fixture.runId}`,
+      idempotencyKey: "remote:attach-continuity:goal:2",
+      visibility: "run",
+    });
+    await ledger.close();
+
+    const secondAttachment = await DaemonRemoteAttachment.open({
+      socketPath: fixture.control.socketPath,
+      runId: fixture.runId,
+      reconnectDelayMs: 5,
+    });
+    const afterReattach = secondAttachment.snapshot();
+    const expectedEventIds = [...beforeDetach.events, appended].map((event) => event.eventId);
+
+    expect(afterReattach.status).toBe("attached");
+    expect(afterReattach.cursor).toBe(`offset:${appended.globalOffset}`);
+    expect(afterReattach.events.map((event) => event.eventId)).toEqual(expectedEventIds);
+    expect(new Set(afterReattach.events.map((event) => event.eventId)).size).toBe(
+      afterReattach.events.length,
+    );
+    for (let index = 1; index < afterReattach.events.length; index += 1) {
+      expect(afterReattach.events[index]?.globalOffset).toBe(
+        (afterReattach.events[index - 1]?.globalOffset ?? 0) + 1,
+      );
+    }
+    expect(projectRun(afterReattach.events, fixture.runId).threadGoal).toMatchObject({
+      revision: 2,
+      objective: "Continue after the remote client detached",
+    });
+
+    await secondAttachment.close();
+    expect(fixture.host.snapshot().attachedClients).toBe(0);
     await fixture.close();
   });
 
@@ -602,6 +697,7 @@ async function remoteFixture(name: string): Promise<{
     delivery: "new-turn",
   });
   await session.waitForIdle();
+  await session.createGoal("Assist the user with tasks in the current workspace");
   await session.close();
 
   const host = new DaemonHost({

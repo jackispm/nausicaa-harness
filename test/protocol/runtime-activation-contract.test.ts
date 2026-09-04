@@ -240,7 +240,6 @@ describe("runtime activation parity", () => {
       clock,
       createRunId: () => runId,
     });
-    await session.reviseGoal(sharedGoal.statement);
     await session.submit({ inputId: "activation-input", text: message, images });
     await session.waitForIdle();
     await session.close();
@@ -330,7 +329,6 @@ describe("runtime activation parity", () => {
       clock,
       createRunId: () => runId,
     });
-    await session.reviseGoal(sidecarGoal.statement);
     await session.submit({
       inputId: "teto-activation-input",
       text: task,
@@ -382,7 +380,20 @@ describe("runtime activation parity", () => {
 function projectMainRequest(request: ModelRequest | undefined): Omit<ModelRequest, "signal"> {
   if (request === undefined) throw new Error("Main request was not captured");
   const { signal: _signal, ...observable } = request;
-  return observable;
+  return {
+    ...observable,
+    // Session-owned Goal controls are a host capability, not part of the
+    // common single-lane Main contract being compared here.
+    tools: observable.tools.filter((tool) => (
+      tool.name !== "get_goal"
+      && tool.name !== "create_goal"
+      && tool.name !== "update_goal"
+    )),
+    messages: observable.messages.filter((message) => (
+      message.role !== "user"
+      || !message.content.startsWith("Persistent thread Goal (host-controlled state;")
+    )),
+  };
 }
 
 function projectSidecarContract(
@@ -394,7 +405,9 @@ function projectSidecarContract(
     mainCalls: main.callCount,
     mainModels: unique(main.requests.map((request) => request.model)),
     mainSessionIds: unique(main.requests.map((request) => request.sessionId)),
-    mainTools: main.requests[0]?.tools.map((tool) => tool.name) ?? [],
+    mainTools: main.requests[0]?.tools
+      .filter((tool) => !isSessionGoalTool(tool.name))
+      .map((tool) => tool.name) ?? [],
     tetoCalls: teto.callCount,
     tetoModels: unique(teto.requests.map((request) => request.model)),
     tetoSessionIds: unique(teto.requests.map((request) => request.sessionId)),
@@ -408,6 +421,10 @@ function projectSidecarContract(
     )).length,
     adviceMessages: events.filter((event) => event.type === "message.sent").length,
   };
+}
+
+function isSessionGoalTool(name: string): boolean {
+  return name === "get_goal" || name === "create_goal" || name === "update_goal";
 }
 
 function sidecarModels(prefix: string): {

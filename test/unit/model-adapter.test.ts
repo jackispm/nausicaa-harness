@@ -15,6 +15,7 @@ import {
   PiAiModelPort,
   ProviderModelError,
   ScriptedModel,
+  createBuiltinModelPort,
   parseModelSelector,
 } from "../../src/model/index.js";
 
@@ -207,6 +208,103 @@ describe("PiAiModelPort", () => {
       reasoning: true,
       authStatus: "unverified",
     })]);
+  });
+
+  it("supports provider-scoped refresh and exposes the refreshed catalog", async () => {
+    const oldProvider = fauxProvider({
+      provider: "dynamic-catalog",
+      models: [{ id: "old", name: "Old model" }],
+    });
+    const nextProvider = fauxProvider({
+      provider: "dynamic-catalog",
+      models: [{ id: "new", name: "New model" }],
+    });
+    let current = oldProvider.provider.getModels();
+    const provider = {
+      ...oldProvider.provider,
+      getModels: () => current,
+      refreshModels: async ({ allowNetwork, publish }: {
+        allowNetwork: boolean;
+        publish: (publication: { update?: () => void }) => Promise<boolean>;
+      }) => {
+        if (!allowNetwork) return;
+        const refreshed = nextProvider.provider.getModels();
+        await publish({ update: () => { current = refreshed; } });
+      },
+    };
+    const models = createModels();
+    models.setProvider(provider);
+    const adapter = new PiAiModelPort({ models });
+
+    expect(adapter.catalog().map((entry) => entry.id)).toEqual(["old"]);
+    const result = await adapter.refreshCatalog({ providers: ["dynamic-catalog"] });
+
+    expect(result.aborted).toBe(false);
+    expect(result.errors).toEqual(new Map());
+    expect(result.catalog.map((entry) => entry.id)).toEqual(["new"]);
+    await expect(adapter.availableCatalog("dynamic-catalog")).resolves.toEqual([
+      expect.objectContaining({ selector: "dynamic-catalog:new" }),
+    ]);
+  });
+
+  it("returns a cancelled refresh without publishing a stale provider result", async () => {
+    const faux = fauxProvider({
+      provider: "slow-catalog",
+      models: [{ id: "stable" }],
+    });
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const provider = {
+      ...faux.provider,
+      refreshModels: async ({ allowNetwork, signal }: {
+        allowNetwork: boolean;
+        signal: AbortSignal;
+      }) => {
+        if (!allowNetwork) return;
+        markStarted?.();
+        await new Promise<void>((resolve, reject) => {
+          const onAbort = () => {
+            signal.removeEventListener("abort", onAbort);
+            reject(signal.reason ?? new Error("cancelled"));
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          // Keep a pending callback alive until Models' shared signal aborts.
+          void resolve;
+        });
+      },
+    };
+    const models = createModels();
+    models.setProvider(provider);
+    const adapter = new PiAiModelPort({ models });
+    const controller = new AbortController();
+    const pending = adapter.refreshCatalog({
+      providers: ["slow-catalog"],
+      signal: controller.signal,
+    });
+    await started;
+    controller.abort(new Error("catalog refresh cancelled"));
+
+    await expect(pending).resolves.toMatchObject({ aborted: true });
+    expect(adapter.catalog().map((entry) => entry.id)).toEqual(["stable"]);
+  });
+
+  it("offers an explicit all-provider factory while retaining openrouter as the default", () => {
+    const builtin = createBuiltinModelPort();
+    const providers = new Set(builtin.catalog().map((entry) => entry.provider));
+    const openrouterModel = builtin.catalog().find((entry) => entry.provider === "openrouter");
+
+    expect(providers.has("openrouter")).toBe(true);
+    expect(providers.has("anthropic")).toBe(true);
+    expect(providers.has("openai")).toBe(true);
+    expect(openrouterModel).toBeDefined();
+    expect(builtin.capabilities(openrouterModel!.id).contextWindowTokens)
+      .toBe(openrouterModel!.contextWindowTokens);
+    expect(builtin.providerAuthTypes("openai")).toEqual(["api_key"]);
+    expect(builtin.providerAuthTypes("openai-codex")).toEqual(["oauth"]);
+    expect(builtin.hasProvider("openai")).toBe(true);
+    expect(builtin.hasProvider("does-not-exist")).toBe(false);
+    expect(builtin.providers().find((provider) => provider.id === "openai"))
+      .toMatchObject({ name: "OpenAI", modelCount: expect.any(Number), authTypes: ["api_key"] });
   });
 
   it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(

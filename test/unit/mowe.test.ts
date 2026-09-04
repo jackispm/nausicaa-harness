@@ -820,6 +820,133 @@ describe("Mowe", () => {
     expect(decisions).toEqual([{ decision: "denied", reason: "operator declined" }]);
   });
 
+  it("records admission and start immediately before the tool side effect", async () => {
+    const order: string[] = [];
+    let executions = 0;
+    const tool: AgentTool = {
+      ...echoTool(),
+      async execute(args) {
+        order.push("execute");
+        executions += 1;
+        return { content: String(args.text), isError: false };
+      },
+    };
+    const response = await new MoweExecutor({ catalog: [tool] }).execute({
+      runId: "run-tool-lifecycle",
+      laneId: "main",
+      workspace: "/tmp",
+      calls: [{ id: "call-1", name: "echo", arguments: { text: "value" } }],
+      toolLifecycle: {
+        admitted(context) {
+          order.push("admitted");
+          expect(context.argumentsHash).toBe(sha256(stableJson({ text: "value" })));
+          expect(executions).toBe(0);
+        },
+        started(context) {
+          order.push("started");
+          expect(context.call.id).toBe("call-1");
+          expect(executions).toBe(0);
+        },
+      },
+    });
+
+    expect(response.results[0]?.status).toBe("succeeded");
+    expect(order).toEqual(["admitted", "started", "execute"]);
+    expect(executions).toBe(1);
+  });
+
+  it("fails closed when lifecycle recording fails", async () => {
+    let executions = 0;
+    const tool: AgentTool = {
+      ...echoTool(),
+      async execute() {
+        executions += 1;
+        return { content: "unexpected", isError: false };
+      },
+    };
+    const response = await new MoweExecutor({ catalog: [tool] }).execute({
+      runId: "run-tool-lifecycle-failure",
+      laneId: "main",
+      workspace: "/tmp",
+      calls: [{ id: "call-1", name: "echo", arguments: { text: "value" } }],
+      toolLifecycle: {
+        admitted: () => {
+          throw new Error("admission journal unavailable");
+        },
+        started: () => undefined,
+      },
+    });
+
+    expect(response.results[0]?.status).toBe("failed");
+    expect(response.results[0]?.error).toContain("admission journal unavailable");
+    expect(executions).toBe(0);
+  });
+
+  it("fails closed with an explicit error when start recording fails", async () => {
+    let executions = 0;
+    const tool: AgentTool = {
+      ...echoTool(),
+      async execute() {
+        executions += 1;
+        return { content: "unexpected", isError: false };
+      },
+    };
+    const response = await new MoweExecutor({ catalog: [tool] }).execute({
+      runId: "run-tool-start-failure",
+      laneId: "main",
+      workspace: "/tmp",
+      calls: [{ id: "call-1", name: "echo", arguments: { text: "value" } }],
+      toolLifecycle: {
+        admitted: () => undefined,
+        started: () => {
+          throw new Error("start journal unavailable");
+        },
+      },
+    });
+
+    expect(response.results[0]?.status).toBe("failed");
+    expect(response.results[0]?.error).toBe(
+      "Tool start recording failed: start journal unavailable",
+    );
+    expect(executions).toBe(0);
+  });
+
+  it("does not invoke a tool when cancellation wins during start recording", async () => {
+    const controller = new AbortController();
+    const started = deferred<void>();
+    const release = deferred<void>();
+    let executions = 0;
+    const tool: AgentTool = {
+      ...echoTool(),
+      async execute() {
+        executions += 1;
+        return { content: "unexpected", isError: false };
+      },
+    };
+    const pending = new MoweExecutor({ catalog: [tool] }).execute({
+      runId: "run-tool-lifecycle-cancelled",
+      laneId: "main",
+      workspace: "/tmp",
+      signal: controller.signal,
+      calls: [{ id: "call-1", name: "echo", arguments: { text: "value" } }],
+      toolLifecycle: {
+        admitted: () => undefined,
+        started: async () => {
+          started.resolve();
+          await release.promise;
+        },
+      },
+    });
+    await started.promise;
+    controller.abort(new Error("cancelled during start"));
+    release.resolve();
+    const response = await pending;
+
+    expect(response.cancelled).toBe(true);
+    expect(response.results[0]?.status).toBe("cancelled");
+    expect(executions).toBe(0);
+  });
+
   it("records a denied terminal decision when no approval handler is configured", async () => {
     let executions = 0;
     const catalog = new MoweCatalog();

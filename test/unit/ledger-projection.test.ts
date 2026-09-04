@@ -194,6 +194,50 @@ describe("projectRun", () => {
     expect(Object.keys(projection.budget.byLane)).toEqual([]);
   });
 
+  it("attributes lifecycle facts without a turn id to the legacy Turn", async () => {
+    const ledger = new MemoryLedger();
+    await ledger.append(command("run.created", { goal, workspace: "/workspace", policy }));
+    await ledger.append(command("tool.requested", {
+      operationId: "legacy-operation",
+      toolCallId: "legacy-call",
+      name: "read",
+      argumentsRef: {
+        ...artifact("legacy-arguments"),
+        contentHash: `sha256:${"a".repeat(64)}`,
+      },
+    }));
+    await ledger.append(command("tool.admitted", {
+      operationId: "legacy-operation",
+      toolCallId: "legacy-call",
+      name: "read",
+      argumentsHash: `sha256:${"a".repeat(64)}`,
+    }));
+    await ledger.append(command("tool.started", {
+      operationId: "legacy-operation",
+      toolCallId: "legacy-call",
+      name: "read",
+      argumentsHash: `sha256:${"a".repeat(64)}`,
+    }));
+    await ledger.append(command("tool.succeeded", {
+      operationId: "legacy-operation",
+      toolCallId: "legacy-call",
+      name: "read",
+      resultRef: artifact("legacy-result"),
+    }));
+
+    const projection = projectRun(await ledger.read(), "run-1");
+    const legacyTurn = projection.turns[legacyTurnIdForRun("run-1")];
+    expect(legacyTurn).toMatchObject({ legacy: true });
+    expect(projection.conversation).toMatchObject([{
+      role: "tool",
+      artifact: artifact("legacy-result"),
+      turnId: legacyTurnIdForRun("run-1"),
+      toolCallId: "legacy-call",
+      toolName: "read",
+      isError: false,
+    }]);
+  });
+
   it("attributes an unfinished legacy one-shot execution to a stable active Turn", async () => {
     const ledger = new MemoryLedger();
     await ledger.append(command("run.created", { goal, workspace: "/workspace", policy }));

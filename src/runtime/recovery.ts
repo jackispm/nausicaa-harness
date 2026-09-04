@@ -14,6 +14,7 @@ import { sha256, stableJson } from "../ledger/hash.js";
 import type { Ledger } from "../ledger/index.js";
 import { projectRun } from "../ledger/index.js";
 import type { ContentAddressedStore } from "../store/store.js";
+import { pendingToolOperations } from "./tool-operation-recovery.js";
 
 const CONVERSATION_MESSAGE_MEDIA_TYPE = "application/vnd.nausicaa.conversation-message+json";
 const OPERATOR_RESOLUTION_ERROR = "Operator resolved unknown tool outcome as failed";
@@ -105,12 +106,20 @@ export const recoverRun = async (
 
   const projection = projectRun(events, runId);
   if (
-    projection.goal === undefined
-    || projection.run.policy === undefined
+    projection.run.policy === undefined
     || projection.run.workspace === undefined
   ) {
     throw new RunRecoveryError(`Run ${runId} is missing its creation facts`);
   }
+  // Interactive Sessions created after the optional thread Goal migration no
+  // longer persist the legacy Run Goal. Auxiliary/one-shot recovery still
+  // needs a bounded internal contract, so synthesize the neutral equivalent.
+  const recoveredGoal: Goal = projection.goal ?? {
+    version: 1,
+    statement: "Handle the current user request",
+    successCriteria: [],
+    hardConstraints: [],
+  };
 
   const completedAnswerRef = projection.run.status === "completed"
     ? projection.run.answerRef
@@ -118,7 +127,7 @@ export const recoverRun = async (
   const main = projectMainExecutionRecovery(events);
   return {
     runId,
-    goal: projection.goal,
+    goal: recoveredGoal,
     policy: projection.run.policy,
     workspace: projection.run.workspace,
     startStep: highestStep(events) + 1,
@@ -297,23 +306,18 @@ interface PendingToolOperation {
 const findPendingToolOperations = (
   events: readonly AnyEvent[],
 ): Map<string, PendingToolOperation> => {
-  const pending = new Map<string, PendingToolOperation>();
-  for (const event of events) {
-    if (event.type === "tool.requested") {
-      pending.set(event.payload.operationId, {
-        operationId: event.payload.operationId,
-        toolCallId: event.payload.toolCallId,
-        name: event.payload.name,
-        laneId: event.laneId,
-        ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
-        eventId: event.eventId,
-        correlationId: event.correlationId,
-      });
-    } else if (event.type === "tool.succeeded" || event.type === "tool.failed") {
-      pending.delete(event.payload.operationId);
-    }
-  }
-  return pending;
+  return new Map(pendingToolOperations(events).map((state) => {
+    const event = state.request;
+    return [event.payload.operationId, {
+      operationId: event.payload.operationId,
+      toolCallId: event.payload.toolCallId,
+      name: event.payload.name,
+      laneId: event.laneId,
+      ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
+      eventId: event.eventId,
+      correlationId: event.correlationId,
+    } satisfies PendingToolOperation];
+  }));
 };
 
 const findPendingToolOperation = (
@@ -355,6 +359,7 @@ const recoverConversationRefs = (events: readonly AnyEvent[]): FukaiConversation
     if (event.laneId !== "main") continue;
     switch (event.type) {
       case "user.message":
+        if (event.payload.kind === "continuation") break;
         add(event.payload.messageRef, event.globalOffset, `event:${event.eventId}`);
         break;
       case "assistant.message": {

@@ -25,6 +25,7 @@ describe("interactive command registry", () => {
       "edges",
       "skills",
       "context",
+      "compact",
       "model",
       "permissions",
       "mode",
@@ -32,6 +33,8 @@ describe("interactive command registry", () => {
       "theme",
       "goal",
       "session",
+      "tree",
+      "fork",
       "new",
       "resume",
       "resolve",
@@ -51,6 +54,8 @@ describe("interactive command registry", () => {
     expect(findInteractiveCommand("/cancel")?.name).toBe("stop");
     expect(findInteractiveCommand("/setup")?.name).toBe("setup");
     expect(findInteractiveCommand("/mode")?.name).toBe("mode");
+    expect(canonicalInteractiveCommandName("branch")).toBe("fork");
+    expect(findInteractiveCommand("/branch")?.name).toBe("fork");
   });
 
   it("keeps the pending extension list empty and includes compatibility help", () => {
@@ -62,6 +67,9 @@ describe("interactive command registry", () => {
     expect(help).toContain("/setup");
     expect(help).toContain("/edges [refresh]");
     expect(help).toContain("/mode [default|plan]");
+    expect(help).toContain("/fork [run-id]");
+    expect(help).toContain("/tree");
+    expect(help).toContain("/compact");
     expect(help).toContain("/resolve <operation-id>");
     expect(help).toContain("/stop");
     expect(help).toContain("/quit");

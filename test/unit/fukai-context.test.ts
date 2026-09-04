@@ -701,6 +701,56 @@ describe("FukaiContextProvider", () => {
     expect(second.manifest.dynamicHash).not.toBe(first.manifest.dynamicHash);
   });
 
+  it("keeps a persistent Goal out of ordinary Turns and renders it only at a typed boundary", async () => {
+    const store = new MemoryContentAddressedStore();
+    const provider = new FukaiContextProvider(new ContentStoreFukaiSource(store));
+    const threadGoal = {
+      goalId: "thread-goal-1",
+      revision: 1,
+      objective: "Ship the long-running change",
+      status: "active" as const,
+      tokenBudget: 500,
+      tokensUsed: 12,
+      timeUsedSeconds: 3,
+      continuationsUsed: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:01.000Z",
+    };
+    const request = {
+      runId: "run-thread-goal-context",
+      laneId: "main",
+      laneKind: "main" as const,
+      goal: { version: 1, statement: "Handle the current user request", successCriteria: [], hardConstraints: [] },
+      activeObjective: "Answer this single question",
+      threadGoal,
+      systemPrompt: "Main",
+      conversationRefs: [],
+      artifactSelections: [],
+      tools: [],
+      upperWatermark: 1,
+      policyVersion: "1",
+      budget: {
+        maxInputTokens: 2_000,
+        maxConversationMessages: 10,
+        maxArtifacts: 0,
+        maxArtifactBytes: 0,
+        maxQueries: 0,
+      },
+    };
+
+    const ordinary = await provider.build(request);
+    const continuation = await provider.build({
+      ...request,
+      goalContextKind: "continuation" as const,
+    });
+
+    expect(ordinary.messages.some((message) => message.content.includes(threadGoal.objective))).toBe(false);
+    expect(ordinary.systemPrompt).not.toContain(threadGoal.objective);
+    expect(continuation.messages.some((message) => message.content.includes(threadGoal.objective))).toBe(true);
+    expect(continuation.messages.some((message) => message.content.includes("<goal_context>"))).toBe(true);
+    expect(continuation.cacheKey).not.toBe(ordinary.cacheKey);
+  });
+
   it("fails when the stable prefix alone exceeds the budget", async () => {
     const store = new MemoryContentAddressedStore();
     const provider = new FukaiContextProvider(new ContentStoreFukaiSource(store));

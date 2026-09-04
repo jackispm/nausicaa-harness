@@ -1,5 +1,7 @@
 export * from "./advice-tool.js";
+export * from "./goal-tool.js";
 export * from "./main-loop.js";
+export * from "./l0-agent-loop.js";
 export * from "./main-public-projection.js";
 export * from "./fukai-compaction-runtime.js";
 export * from "./recovery.js";

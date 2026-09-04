@@ -1,10 +1,17 @@
-import type { AuthPrompt, Credential, CredentialStore } from "@earendil-works/pi-ai";
+import type {
+  AuthContext,
+  AuthEvent,
+  AuthPrompt,
+  AuthType,
+  Credential,
+  CredentialStore,
+} from "@earendil-works/pi-ai";
 
 import {
   createNausicaaCredentialStore,
 } from "../auth/index.js";
 import {
-  createOpenRouterModelPort,
+  createBuiltinModelPort,
   type PiAiModelPort,
 } from "../model/index.js";
 import {
@@ -36,6 +43,8 @@ export interface UtilityCommandDependencies {
   readonly input?: SecretInput;
   readonly output?: Output;
   readonly environment?: NodeJS.ProcessEnv;
+  /** Optional Pi auth context for deterministic host/tests. */
+  readonly authContext?: AuthContext;
 }
 
 export interface SecretInput {
@@ -52,7 +61,8 @@ export interface Output {
 }
 
 /** The small provider-auth surface needed by both top-level CLI and TUI. */
-export type AuthModelPort = Pick<PiAiModelPort, "checkAuth" | "login" | "logout">;
+export type AuthModelPort = Pick<PiAiModelPort, "checkAuth" | "login" | "logout">
+  & Partial<Pick<PiAiModelPort, "hasProvider" | "providerAuthTypes">>;
 
 /** Execute a non-Run command without opening a Ledger or touching the network. */
 export async function runUtilityCommand(
@@ -70,7 +80,13 @@ export async function runUtilityCommand(
   const store = dependencies.credentialStore
     ?? createNausicaaCredentialStore(credentialOptions);
   const model = dependencies.modelPort
-    ?? createOpenRouterModelPort({ credentials: store });
+    // Auth commands are provider-scoped and do not open a Run. Use Pi's
+    // complete built-in registry here even though the beta execution path
+    // remains OpenRouter-only unless `--all-providers` is selected.
+    ?? createBuiltinModelPort({
+      credentials: store,
+      ...(dependencies.authContext === undefined ? {} : { authContext: dependencies.authContext }),
+    });
   return runAuthCommand(command, {
     ...dependencies,
     credentialStore: store,
@@ -88,17 +104,31 @@ export async function runAuthCommand(
 ): Promise<number> {
   const output = dependencies.output ?? process.stdout;
   const provider = command.provider;
-  if (provider !== "openrouter") {
-    throw new Error(`Provider ${provider} is not configured in this build; available provider: openrouter`);
+  if (dependencies.modelPort.hasProvider !== undefined
+    && !dependencies.modelPort.hasProvider(provider)) {
+    throw new Error(`Unknown provider ${provider}; use a provider from the built-in Pi catalog`);
   }
 
   if (command.action === "login") {
+    const authTypes = dependencies.modelPort.providerAuthTypes?.(provider) ?? ["api_key"];
+    const loginType: AuthType | undefined = authTypes.includes("api_key")
+      ? "api_key"
+      : authTypes.includes("oauth")
+        ? "oauth"
+        : undefined;
+    if (loginType === undefined) {
+      throw new Error(
+        `Provider ${provider} does not expose a supported login type; supported login type: ${authTypes.join(
+          ", ",
+        ) || "none"}`,
+      );
+    }
     const input = dependencies.input ?? process.stdin;
     if (input.isTTY !== true || input.setRawMode === undefined) {
-      throw new Error("auth login requires a TTY; set OPENROUTER_API_KEY for non-interactive use");
+      throw new Error(`auth login requires a TTY for the ${provider} ${loginType} flow`);
     }
     const credential = await dependencies.modelPort.login(
-      "api_key",
+      loginType,
       createSecretInteraction(input, output),
       provider,
     );
@@ -108,7 +138,7 @@ export async function runAuthCommand(
       credential: credential.type,
       path: credentialStorePath(dependencies.credentialStore),
     };
-    writeResult(output, command.json, result, `Saved ${provider} API credential at ${result.path}.\n`);
+    writeResult(output, command.json, result, `Saved ${provider} ${credential.type} credential at ${result.path}.\n`);
     return 0;
   }
 
@@ -118,7 +148,11 @@ export async function runAuthCommand(
     const result = {
       provider,
       status: before === undefined ? "already-absent" as const : "removed" as const,
-      environmentCredential: environmentCredentialPresent(provider, dependencies.environment ?? process.env),
+      environmentCredential: await ambientCredentialConfigured(
+        dependencies.modelPort,
+        provider,
+        dependencies.environment ?? process.env,
+      ),
     };
     writeResult(
       output,
@@ -144,10 +178,12 @@ export async function runAuthCommand(
     configured: auth !== undefined,
     auth: "unverified" as const,
     source: stored === undefined
-      ? environmentPresent ? "environment" as const : "none" as const
+      ? environmentPresent || auth !== undefined ? "environment" as const : "none" as const
       : "saved" as const,
     ...(stored === undefined ? {} : { storedCredential: credentialSummary(stored) }),
-    environmentCredential: environmentPresent,
+    environmentCredential: environmentPresent || (
+      stored === undefined && auth !== undefined
+    ),
     path: credentialStorePath(dependencies.credentialStore),
   };
   writeResult(
@@ -191,13 +227,49 @@ async function runConfigCommand(
 function createSecretInteraction(input: SecretInput, output: Output) {
   return {
     prompt: async (prompt: AuthPrompt): Promise<string> => {
-      if (prompt.type !== "secret") {
-        throw new Error("This provider requested an unsupported login prompt");
+      if (prompt.type === "select") {
+        const options = prompt.options
+          .map((option, index) => `${index + 1}. ${option.label}${option.description === undefined ? "" : ` - ${option.description}`}`)
+          .join("\n");
+        const answer = await readPromptValue(
+          `${prompt.message}\n${options}\nChoose`,
+          input,
+          output,
+          prompt.signal,
+          "Selection cannot be empty",
+        );
+        const numeric = Number.parseInt(answer, 10);
+        if (Number.isSafeInteger(numeric) && numeric >= 1 && numeric <= prompt.options.length) {
+          return prompt.options[numeric - 1]!.id;
+        }
+        const matching = prompt.options.find((option) => option.id === answer);
+        if (matching !== undefined) return matching.id;
+        throw new Error("Invalid authentication selection");
       }
-      return readSecret(prompt.message, input, output, prompt.signal);
+      return readPromptValue(
+        prompt.message,
+        input,
+        output,
+        prompt.signal,
+        prompt.type === "secret" ? "API key cannot be empty" : "Input cannot be empty",
+      );
     },
-    notify: (event: { type: string; message?: string }): void => {
-      if (event.message !== undefined) output.write(`${event.message}\n`);
+    notify: (event: AuthEvent): void => {
+      switch (event.type) {
+        case "auth_url":
+          output.write(`${event.instructions ?? "Open this URL to authenticate"}: ${event.url}\n`);
+          break;
+        case "device_code":
+          output.write(
+            `Open ${event.verificationUri} and enter code ${event.userCode}`
+              + `${event.expiresInSeconds === undefined ? "" : ` (expires in ${event.expiresInSeconds}s)`}\n`,
+          );
+          break;
+        case "info":
+        case "progress":
+          output.write(`${event.message}\n`);
+          break;
+      }
     },
   };
 }
@@ -214,11 +286,12 @@ function userSettingsOptions(userHome: string | undefined): UserSettingsOptions 
   return userHome === undefined ? {} : { userHome };
 }
 
-async function readSecret(
+async function readPromptValue(
   message: string,
   input: SecretInput,
   output: Output,
-  signal?: AbortSignal,
+  signal: AbortSignal | undefined,
+  emptyMessage: string,
 ): Promise<string> {
   if (input.isTTY !== true || input.setRawMode === undefined) {
     throw new Error("Secret input requires a TTY");
@@ -247,7 +320,7 @@ async function readSecret(
         }
         if (character === "\r" || character === "\n") {
           if (value.trim().length === 0) {
-            finish(new Error("API key cannot be empty"));
+            finish(new Error(emptyMessage));
           } else {
             finish();
           }
@@ -293,6 +366,22 @@ export function environmentCredentialPresent(
   const name = provider === "openrouter" ? "OPENROUTER_API_KEY" : undefined;
   const value = name === undefined ? undefined : environment[name];
   return typeof value === "string" && value.trim().length > 0;
+}
+
+async function ambientCredentialConfigured(
+  modelPort: AuthModelPort,
+  provider: string,
+  environment: NodeJS.ProcessEnv,
+): Promise<boolean> {
+  if (environmentCredentialPresent(provider, environment)) return true;
+  // Pi's provider-owned check is side-effect-free and understands non-env
+  // sources such as ADC/AWS profiles. Treat a configured result as ambient
+  // only when no saved credential remains after logout.
+  try {
+    return (await modelPort.checkAuth(provider)) !== undefined;
+  } catch {
+    return false;
+  }
 }
 
 function credentialStorePath(store: CredentialStore): string {

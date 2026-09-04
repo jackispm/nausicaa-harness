@@ -37,7 +37,7 @@ const ALLOWED_PACK_PATHS = new Set<string>([
   "package.json",
 ]);
 
-const ALLOWED_PACK_PREFIXES = ["dist/"] as const;
+const ALLOWED_PACK_PREFIXES = ["dist/", "assets/"] as const;
 
 const FORBIDDEN_PACK_PREFIXES = [
   ".env",

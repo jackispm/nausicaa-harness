@@ -17,16 +17,19 @@ import type {
   ToolResult,
 } from "../domain/ports.js";
 import { prepareModelPort, PreparedModelPort } from "../model/prepared-model.js";
+import { withDefaultModelRetries } from "../model/retrying-model.js";
 import { systemClock } from "../domain/ports.js";
 import type {
   ArtifactRef,
   CacheOutcome,
   ConversationMessage,
   Goal,
+  GoalContextKind,
   LaneId,
   NavigationDelta,
   RunId,
   RunPolicy,
+  ThreadGoal,
   TokenUsage,
   ToolCall,
 } from "../domain/types.js";
@@ -57,6 +60,7 @@ import type {
 } from "../mowe/types.js";
 import { MAX_MOWE_MAX_OUTPUT_BYTES } from "../mowe/types.js";
 import { ProviderModelError } from "../model/provider-error.js";
+import { stableJson } from "../ledger/hash.js";
 import {
   boundedRedactedText,
   persistedErrorText,
@@ -80,10 +84,9 @@ import {
 } from "../tools/artifact-read.js";
 
 const DEFAULT_SYSTEM_PROMPT = `You are Main, the primary execution lane in Nausicaa.
-Advance the current Goal with the runtime-provided context and tools.
+Handle the current user request with the runtime-provided context and tools.
 The tools attached to this request are the complete tool-call interface; runtime results are authoritative.
-For repository evidence, identify the entry point, definition, call site, configuration, types, and tests. Use grep outputMode=files to establish the file set, follow pagination and truncation cursors, batch independent reads with read_many, and verify the evidence before concluding.
-Return the result when the Goal is complete.`;
+Return a grounded result when the current request is complete.`;
 
 /** Conservative per-request input ceiling for custom ports without model metadata. */
 export const UNKNOWN_MODEL_REQUEST_INPUT_FALLBACK_TOKENS = 32_768;
@@ -131,6 +134,10 @@ export interface MainBoundaryMessage {
   content: string;
   images?: UserImage[];
   messageId: string;
+  /** Optional host-owned Goal context boundary. It is dynamic and not a user Turn. */
+  goalContextKind?: GoalContextKind;
+  /** Fresh Goal snapshot for a host mutation delivered at this boundary. */
+  goalContextGoal?: ThreadGoal;
 }
 
 export interface MainBeforeStepContext {
@@ -138,6 +145,7 @@ export interface MainBeforeStepContext {
   laneId: LaneId;
   step: number;
   goal: Goal;
+  threadGoal?: ThreadGoal;
   previousDelta?: NavigationDelta;
   signal?: AbortSignal;
 }
@@ -147,6 +155,7 @@ export interface MainNavigationContext {
   laneId: LaneId;
   step: number;
   goal: Goal;
+  threadGoal?: ThreadGoal;
   responseText: string;
   toolCalls: readonly ToolCall[];
   toolResults: readonly ConversationMessage[];
@@ -206,6 +215,8 @@ export interface MainLoopDeps {
   ) => void | NavigationDelta;
   /** Synchronously enqueue auxiliary work; never execute a model in this hook. */
   afterStep?: (context: MainAfterStepContext) => void;
+  /** Optional awaited host bookkeeping at a committed step boundary. */
+  afterStepAsync?: (context: MainAfterStepContext) => Promise<void>;
   /** Optional, explicit selection of an already-admitted Fukai capsule. */
   selectCompaction?: (
     context: MainCompactionSelectionContext,
@@ -264,8 +275,12 @@ export interface MainLoopInput {
   runId: RunId;
   /** Present for interactive Runs; omitted only for schema-v1 one-shot compatibility. */
   turnId?: string;
-  /** Current Turn intent. The Run Goal remains the stable, versioned mission. */
+  /** Current Turn intent, independent from the optional thread Goal. */
   activeObjective?: string;
+  /** Optional user-owned persistent thread Goal, rendered only as dynamic context. */
+  threadGoal?: ThreadGoal;
+  /** Initial one-shot Goal context boundary; consumed after the first request. */
+  goalContextKind?: GoalContextKind;
   goal: Goal;
   model: string;
   workspace: string;
@@ -333,6 +348,7 @@ export class MainLoop {
   private readonly beforeStep: MainLoopDeps["beforeStep"];
   private readonly navigationHook: MainLoopDeps["navigationHook"];
   private readonly afterStep: MainLoopDeps["afterStep"];
+  private readonly afterStepAsync: MainLoopDeps["afterStepAsync"];
   private readonly selectCompaction: MainLoopDeps["selectCompaction"];
   private readonly compactForPressure: MainLoopDeps["compactForPressure"];
   private readonly approve: MainLoopDeps["approve"];
@@ -350,9 +366,12 @@ export class MainLoop {
     // boundary.  The wrapper is local to this loop so provider-owned catalogs
     // remain free to change between requests while an in-flight request stays
     // pinned to its captured data and method bindings.
+    // Keep retries at the provider boundary and request snapshots outside it.
+    // A caller-supplied prepared port already owns that boundary; wrapping it
+    // again would re-probe capabilities and snapshot the same request twice.
     this.model = deps.model instanceof PreparedModelPort
       ? deps.model
-      : prepareModelPort(deps.model);
+      : prepareModelPort(withDefaultModelRetries(deps.model));
     this.resolveModel = deps.resolveModel;
     this.runTokenBudget = deps.runTokenBudget;
     this.contextProvider = deps.contextProvider;
@@ -389,6 +408,7 @@ export class MainLoop {
     this.beforeStep = deps.beforeStep;
     this.navigationHook = deps.navigationHook;
     this.afterStep = deps.afterStep;
+    this.afterStepAsync = deps.afterStepAsync;
     this.selectCompaction = deps.selectCompaction;
     this.compactForPressure = deps.compactForPressure;
     this.approve = deps.approve;
@@ -451,6 +471,7 @@ export class MainLoop {
     let previousDelta: NavigationDelta | undefined;
     let steps = 0;
     const navigationDeltas: NavigationDelta[] = [];
+    let pendingGoalContextKind = input.goalContextKind;
 
     this.artifactAuthorization?.beginRun(input.runId, input.artifactReadRefs ?? []);
 
@@ -512,10 +533,25 @@ export class MainLoop {
           laneId,
           step,
           goal: input.goal,
+          ...(input.threadGoal === undefined
+            ? {}
+            : { threadGoal: input.threadGoal }),
           ...(previousDelta === undefined ? {} : { previousDelta }),
           ...(input.signal === undefined ? {} : { signal: input.signal }),
         });
+        // A host Goal mutation may arrive at the same safe boundary as other
+        // advisory messages. It takes precedence over the activation's initial
+        // continuation context and supplies the freshest Goal snapshot.
+        const goalBoundary = boundaryMessages.find((message) => (
+          message.goalContextKind !== undefined
+        ));
+        const goalContextKind = goalBoundary?.goalContextKind ?? pendingGoalContextKind;
+        const goalContextGoal = goalBoundary?.goalContextGoal ?? input.threadGoal;
         for (const boundary of boundaryMessages) {
+          // Goal context is rendered by Fukai as an ephemeral, typed dynamic
+          // block. Do not persist it as an ordinary user message or expose it
+          // to the next normal Turn.
+          if (boundary.goalContextKind !== undefined) continue;
           const message = boundaryConversationMessage(boundary, this.clock.now());
           const ref = await this.writeMessage(message);
           sequence += 1;
@@ -597,6 +633,12 @@ export class MainLoop {
           laneId,
           laneKind: input.laneKind ?? "main",
           goal: input.goal,
+          ...(goalContextKind === undefined || goalContextGoal === undefined
+            ? {}
+            : {
+                threadGoal: goalContextGoal,
+                goalContextKind,
+              }),
           workspace: input.workspace,
           ...(input.activeObjective === undefined
             ? {}
@@ -670,6 +712,9 @@ export class MainLoop {
           contextRequest = contextRequestFor(requestTools, false);
           view = await buildContext();
         }
+        // The initial context boundary is one-shot. A later step may still
+        // receive a fresh host boundary (for example budget-limit steering).
+        pendingGoalContextKind = undefined;
         const remainingTokens = Math.max(
           1,
           input.policy.maxModelTokens - chargedTokens(usage),
@@ -1023,6 +1068,9 @@ export class MainLoop {
           laneId,
           step,
           goal: input.goal,
+          ...(input.threadGoal === undefined
+            ? {}
+            : { threadGoal: input.threadGoal }),
           responseText: response.content,
           toolCalls: response.toolCalls,
           toolResults: toolMessages.map((result) => result.message),
@@ -1047,7 +1095,7 @@ export class MainLoop {
           idempotencyKey: `${eventPrefix}:step:${step}:completed`,
         });
 
-        this.dispatchAfterStep({
+        await this.dispatchAfterStep({
           runId: input.runId,
           laneId,
           step,
@@ -1180,7 +1228,7 @@ export class MainLoop {
         toolName: call.name,
       })}`;
       const argumentsRef = await this.conversationStore.put(
-        stableStringify(call.arguments),
+        stableJson(call.arguments),
         TOOL_ARGUMENTS_MEDIA_TYPE,
       );
       await this.emit(input, laneId, correlationId, eventState, {
@@ -1254,6 +1302,32 @@ export class MainLoop {
                 : { reason: boundedRedactedText(decision.reason, 1_024) }),
             },
             idempotencyKey: `${eventPrefix}:step:${step}:tool:${context.call.id}:approval:decided`,
+          });
+        },
+      },
+      toolLifecycle: {
+        admitted: async (context) => {
+          await this.emit(input, laneId, correlationId, eventState, {
+            type: "tool.admitted",
+            payload: {
+              operationId: context.operationId,
+              toolCallId: context.call.id,
+              name: context.call.name,
+              argumentsHash: context.argumentsHash,
+            },
+            idempotencyKey: `${eventPrefix}:step:${step}:tool:${context.call.id}:admitted`,
+          });
+        },
+        started: async (context) => {
+          await this.emit(input, laneId, correlationId, eventState, {
+            type: "tool.started",
+            payload: {
+              operationId: context.operationId,
+              toolCallId: context.call.id,
+              name: context.call.name,
+              argumentsHash: context.argumentsHash,
+            },
+            idempotencyKey: `${eventPrefix}:step:${step}:tool:${context.call.id}:started`,
           });
         },
       },
@@ -1547,12 +1621,18 @@ export class MainLoop {
     }
   }
 
-  private dispatchAfterStep(context: MainAfterStepContext): void {
+  private async dispatchAfterStep(context: MainAfterStepContext): Promise<void> {
     try {
       this.afterStep?.(context);
     } catch {
       // Auxiliary scheduling is best-effort and must not fail Main. The
       // scheduler owns observability for its local queue rejection.
+    }
+    try {
+      await this.afterStepAsync?.(context);
+    } catch {
+      // Host bookkeeping is advisory to the model loop; a persistence failure
+      // must not turn an otherwise committed Main step into a model failure.
     }
   }
 }
@@ -1737,6 +1817,12 @@ function validateInput(input: MainLoopInput): void {
   if (input.activeObjective !== undefined && input.activeObjective.trim().length === 0) {
     throw new Error("activeObjective must not be empty");
   }
+  if (
+    input.goalContextKind !== undefined
+    && !["continuation", "objective-updated", "budget-limit"].includes(input.goalContextKind)
+  ) {
+    throw new Error("goalContextKind is invalid");
+  }
   if (input.turnId !== undefined && input.activeObjective === undefined) {
     throw new Error("Interactive Turns require activeObjective");
   }
@@ -1744,6 +1830,7 @@ function validateInput(input: MainLoopInput): void {
     input.initialMessage === undefined
     && (input.initialImages?.length ?? 0) === 0
     && (input.conversationRefs?.length ?? 0) === 0
+    && input.turnId === undefined
   ) {
     throw new Error("A new run requires initialMessage or initialImages");
   }

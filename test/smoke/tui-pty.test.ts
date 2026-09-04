@@ -2,9 +2,10 @@ import { execFile } from "node:child_process";
 import { accessSync, constants, existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, delimiter, join } from "node:path";
+import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 
+import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 
 const execFileAsync = promisify(execFile);
@@ -134,17 +135,24 @@ describe("built CLI PTY", () => {
         expect(stdout).toContain("\x1b[?1049h");
         expect(stdout).toContain("\x1b[?1049l");
         expect(stdout).toMatch(/\x1b\[48;2;\d+;\d+;\d+m/);
-        expect(stdout).toContain("▄▄████");
-        expect(stdout).toContain("version");
-        expect(stdout).toContain("v0.1.0");
-        expect(stdout).toContain("deepseek/deepseek-v4-pro-0813");
-        expect(stdout).toContain("cwd");
-        expect(stdout).toContain(basename(root));
-        expect(stdout).toContain('Type a task, or "/help" for commands');
-        expect(stdout).toContain('Try "inspect this project"');
-        expect(stdout).toContain("Nausicaa awareness");
-        expect(stdout).not.toContain("Agent awareness is unavailable");
-        expect(stdout).toContain("main/new");
+        const plainStdout = stripTerminalSequences(stdout);
+        expect(plainStdout).toContain("Nausicaa v0.1.0");
+        expect(plainStdout).toContain("escape interrupt");
+        expect(stdout).not.toContain("▄▄████");
+        expect(plainStdout).not.toContain("version");
+        expect(plainStdout).toContain("v0.1.0");
+        // Setup diagnostics may still mention the configured model; the
+        // startup header itself intentionally omits session metadata.
+        const headerStart = plainStdout.indexOf("Nausicaa v0.1.0");
+        const nextHeaderRow = plainStdout.indexOf("Nausicaa can explain", headerStart);
+        const headerFrame = plainStdout.slice(headerStart, nextHeaderRow < 0 ? undefined : nextHeaderRow);
+        expect(headerFrame).not.toContain("deepseek");
+        expect(headerFrame).not.toContain("cwd");
+        expect(plainStdout).not.toContain('Type a task, or "/help" for commands');
+        expect(plainStdout).toContain('Try "inspect this project"');
+        expect(plainStdout).toContain("Nausicaa awareness");
+        expect(plainStdout).not.toContain("Agent awareness is unavailable");
+        expect(plainStdout).toContain("main/new");
       } finally {
         await rm(root, { recursive: true, force: true });
       }

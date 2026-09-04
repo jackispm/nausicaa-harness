@@ -416,4 +416,111 @@ describe("daemon Run discovery and recovery", () => {
     unsubscribe();
     await runtime.stop();
   });
+
+  it("recovers one durable input once across two daemon runtimes with a monotonic fence", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "nausicaa-daemon-restart-fence-"));
+    roots.push(dataDir);
+    const runId = "run-restart-fence";
+    const ledgerPath = await createRun(dataDir, runId, true);
+    const leasePath = join(dataDir, "daemon", "execution-lease.json");
+    const firstActivations: Array<{ runId: string; fencingToken: number; wakeCount: number }> = [];
+    let resolveFirstSessionStarted!: () => void;
+    const firstSessionStarted = new Promise<void>((resolve) => {
+      resolveFirstSessionStarted = resolve;
+    });
+    let releaseFirstSession!: () => void;
+    const firstSessionGate = new Promise<void>((resolve) => {
+      releaseFirstSession = resolve;
+    });
+    const first = await openDaemonRuntime({
+      host: { ownerId: "restart-fence-first", leasePath },
+      session: {
+        workspace: "/workspace",
+        dataDir,
+        model: "scripted",
+        policy,
+      },
+      createSession: async () => ({
+        resumeCurrent: async () => {
+          resolveFirstSessionStarted();
+          await firstSessionGate;
+        },
+        waitForIdle: async () => undefined,
+        cancel: async () => { releaseFirstSession(); },
+        close: async () => undefined,
+      }),
+    });
+    const stopFirstEvents = first.host.subscribe((event) => {
+      if (event.type === "activation.started") {
+        firstActivations.push({
+          runId: event.runId,
+          fencingToken: event.fencingToken,
+          wakeCount: event.wakeCount,
+        });
+      }
+    });
+
+    await first.start();
+    await expect(first.recoverPendingRuns()).resolves.toMatchObject({
+      queuedRunIds: [runId],
+    });
+    await firstSessionStarted;
+    await first.stop();
+    stopFirstEvents();
+
+    const secondActivations: Array<{ runId: string; fencingToken: number; wakeCount: number }> = [];
+    let resolveSecondSessionStarted!: () => void;
+    const secondSessionStarted = new Promise<void>((resolve) => {
+      resolveSecondSessionStarted = resolve;
+    });
+    let releaseSecondSession!: () => void;
+    const secondSessionGate = new Promise<void>((resolve) => {
+      releaseSecondSession = resolve;
+    });
+    const second = await openDaemonRuntime({
+      host: { ownerId: "restart-fence-second", leasePath },
+      session: {
+        workspace: "/workspace",
+        dataDir,
+        model: "scripted",
+        policy,
+      },
+      createSession: async () => ({
+        resumeCurrent: async () => {
+          resolveSecondSessionStarted();
+          await secondSessionGate;
+        },
+        waitForIdle: async () => undefined,
+        cancel: async () => { releaseSecondSession(); },
+        close: async () => undefined,
+      }),
+    });
+    const stopSecondEvents = second.host.subscribe((event) => {
+      if (event.type === "activation.started") {
+        secondActivations.push({
+          runId: event.runId,
+          fencingToken: event.fencingToken,
+          wakeCount: event.wakeCount,
+        });
+      }
+    });
+
+    await second.start();
+    await Promise.all([second.recoverPendingRuns(), second.recoverPendingRuns()]);
+    await secondSessionStarted;
+    await second.recoverPendingRuns();
+
+    expect(firstActivations).toEqual([{ runId, fencingToken: 1, wakeCount: 1 }]);
+    expect(secondActivations).toEqual([{ runId, fencingToken: 2, wakeCount: 1 }]);
+
+    releaseSecondSession();
+    await second.host.waitForIdle();
+    stopSecondEvents();
+    await second.stop();
+
+    const ledger = await JsonlLedger.open(ledgerPath);
+    const events = await ledger.read({ runId });
+    await ledger.close();
+    expect(events.filter((event) => event.type === "input.admitted")).toHaveLength(1);
+  });
 });

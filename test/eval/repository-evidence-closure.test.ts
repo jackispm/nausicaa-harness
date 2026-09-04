@@ -63,7 +63,7 @@ describe("repository evidence-closure contract", () => {
       steps: 4,
     });
     expect(model.requests).toHaveLength(4);
-    for (const request of model.requests) assertEvidencePrompt(request.systemPrompt);
+    for (const request of model.requests) assertEvidenceTools(request);
 
     expect(model.followedTruncation).toBe(true);
     expect(model.readBatchSize).toBe(EVIDENCE_PATHS.length);
@@ -155,23 +155,15 @@ function hasReadResults(request: ModelRequest): boolean {
   ));
 }
 
-function assertEvidencePrompt(prompt: string): void {
-  const normalized = prompt.toLowerCase();
-  for (const concept of [
-    "entry point",
-    "definition",
-    "call site",
-    "configuration",
-    "types",
-    "tests",
-    "pagination",
-    "truncation",
-    "outputmode=files",
-    "read_many",
-    "before concluding",
-  ]) {
-    expect(normalized, `missing repository evidence contract: ${concept}`).toContain(concept);
-  }
+function assertEvidenceTools(request: ModelRequest): void {
+  const grep = request.tools.find((tool) => tool.name === "grep");
+  expect(grep, "missing repository evidence contract: grep tool").toBeDefined();
+  const outputMode = grep?.parameters.properties?.outputMode;
+  expect(outputMode, "missing repository evidence contract: grep output mode").toMatchObject({
+    enum: expect.arrayContaining(["files"]),
+  });
+  const readMany = request.tools.find((tool) => tool.name === "read_many");
+  expect(readMany, "missing repository evidence contract: read_many tool").toBeDefined();
 }
 
 function call(id: string, name: string, arguments_: Record<string, unknown>): ToolCall {

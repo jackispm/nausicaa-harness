@@ -119,25 +119,6 @@ describe("SessionController", () => {
     }, { mainModel: new ScriptedModel([response("older answer")]), createRunId: () => "older-run", clock });
     await older.reviseGoal("Inspect the older Run");
     await older.close();
-    const olderLedger = await JsonlLedger.open(join(dataDir, "runs", "older-run", "ledger.jsonl"));
-    await olderLedger.append({
-      runId: "older-run",
-      laneId: "main",
-      type: "goal.revised",
-      payload: {
-        goal: {
-          version: 2,
-          statement: "Inspect the older Run",
-          successCriteria: [],
-          hardConstraints: [],
-        },
-      },
-      correlationId: "run:older-run",
-      idempotencyKey: "test:older:updated",
-      visibility: "run",
-      occurredAt: now.toISOString(),
-    });
-    await olderLedger.close();
 
     now = new Date("2026-08-30T10:05:00.000Z");
     const newer = await SessionController.open({
@@ -148,25 +129,6 @@ describe("SessionController", () => {
     }, { mainModel: new ScriptedModel([response("newer answer")]), createRunId: () => "newer-run", clock });
     await newer.reviseGoal("Inspect the newer Run");
     await newer.close();
-    const newerLedger = await JsonlLedger.open(join(dataDir, "runs", "newer-run", "ledger.jsonl"));
-    await newerLedger.append({
-      runId: "newer-run",
-      laneId: "main",
-      type: "goal.revised",
-      payload: {
-        goal: {
-          version: 2,
-          statement: "Inspect the newer Run",
-          successCriteria: [],
-          hardConstraints: [],
-        },
-      },
-      correlationId: "run:newer-run",
-      idempotencyKey: "test:newer:updated",
-      visibility: "run",
-      occurredAt: now.toISOString(),
-    });
-    await newerLedger.close();
 
     const damagedDir = join(dataDir, "runs", "damaged-run");
     await mkdir(damagedDir, { recursive: true });
@@ -179,7 +141,7 @@ describe("SessionController", () => {
       goal: "Inspect the newer Run",
       status: "ready",
       createdAt: "2026-08-30T10:05:00.000Z",
-      updatedAt: "2026-08-30T10:05:00.000Z",
+      updatedAt: expect.any(String),
     });
     expect(await listWorkspaceRuns(join(root, "missing-state"), root)).toEqual([]);
   });
@@ -373,6 +335,78 @@ describe("SessionController", () => {
     await session.close();
   });
 
+  it("supports an explicit idle compaction without rewriting the raw transcript", async () => {
+    const root = await temporaryRoot();
+    const mainAnswer = "x".repeat(5_000);
+    const requests: string[] = [];
+    const model: ModelPort = {
+      capabilities: () => ({ imageInput: false, contextWindowTokens: 32_000 }),
+      async complete(request) {
+        requests.push(request.sessionId);
+        if (request.sessionId.startsWith("fukai-compaction:")) {
+          return response(JSON.stringify({
+            decisions: ["Keep the completed answer as verified context"],
+            verifiedResults: ["The Main Turn completed"],
+            openQuestions: [],
+          }));
+        }
+        return response(mainAnswer);
+      },
+    };
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      fukaiCompaction: {
+        ...enabledFukaiPolicy(),
+        maxInputTokens: 12_000,
+        minimumGainTokens: 1,
+      },
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 100_000, tetoEnabled: false },
+    }, {
+      mainModel: model,
+      createRunId: () => "manual-fukai-run",
+    });
+
+    await session.submit({ inputId: "manual-fukai-input", text: "Build a durable summary" });
+    await session.waitForIdle();
+    const before = await session.transcript();
+
+    await expect(session.compact()).resolves.toMatchObject({ status: "committed" });
+    expect(requests.filter((id) => id.startsWith("fukai-compaction:")).length).toBe(1);
+    await expect(session.transcript()).resolves.toEqual(before);
+    await expect(session.compact()).resolves.toEqual({
+      status: "skipped",
+      reason: "no-eligible-context",
+    });
+    await session.close();
+  });
+
+  it("reports manual compaction as unavailable when the Run policy disables it", async () => {
+    const root = await temporaryRoot();
+    let factoryCalls = 0;
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 10_000, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([]),
+      createRunId: () => "manual-fukai-disabled-run",
+      createCompactionRuntime: () => {
+        factoryCalls += 1;
+        throw new Error("disabled factory must not run");
+      },
+    });
+
+    await expect(session.compact()).resolves.toEqual({
+      status: "unavailable",
+      reason: "disabled",
+    });
+    expect(factoryCalls).toBe(0);
+    await session.close();
+  });
+
   it("persists explicit Fukai settings in an interactive Run", async () => {
     const root = await temporaryRoot();
     const fukaiCompaction = {
@@ -485,10 +519,10 @@ describe("SessionController", () => {
         "Inspect the project",
         "Now summarize it",
       ]);
-    expect(durable.find((event) => event.type === "run.created")?.payload.goal.statement)
-      .toBe("Assist the user with tasks in the current workspace");
+    expect(durable.find((event) => event.type === "run.created")?.payload.goal)
+      .toBeUndefined();
     expect(model.requests[1]?.systemPrompt)
-      .toContain("Goal v1: Assist the user with tasks in the current workspace");
+      .not.toContain("Assist the user with tasks in the current workspace");
     expect(durable.filter((event) => event.type === "goal.revised")).toHaveLength(0);
     const prefixHashes = durable
       .filter((event) => event.type === "model.requested")
@@ -1361,7 +1395,7 @@ describe("SessionController", () => {
     await session.close();
   });
 
-  it("keeps a revised Run Goal stable while each Turn gets its own objective", async () => {
+  it("keeps a persistent thread Goal separate while each Turn gets its own objective", async () => {
     const root = await temporaryRoot();
     const first = await openSession(
       root,
@@ -1371,13 +1405,9 @@ describe("SessionController", () => {
     await first.submit({ inputId: "greeting", text: "你好" });
     await first.waitForIdle();
     const runId = first.snapshot().runId!;
-    expect(first.snapshot().goal).toMatchObject({
-      version: 1,
-      statement: "Assist the user with tasks in the current workspace",
-    });
+    expect(first.snapshot().goal).toBeUndefined();
     const revised = await first.reviseGoal("  Understand this repository  ");
-    expect(revised).toMatchObject({ version: 2, statement: "Understand this repository" });
-    await expect(first.reviseGoal("Understand this repository")).resolves.toEqual(revised);
+    expect(revised).toMatchObject({ revision: 1, objective: "Understand this repository" });
     await first.close();
 
     const model = new ScriptedModel([response("不客气")]);
@@ -1392,24 +1422,471 @@ describe("SessionController", () => {
     await resumed.submit({ inputId: "thanks", text: "谢谢" });
     await resumed.waitForIdle();
 
-    expect(model.requests[0]?.systemPrompt).toContain("Goal v2: Understand this repository");
+    expect(model.requests[0]?.messages.some((message) => (
+      message.content.includes("Understand this repository")
+    ))).toBe(false);
     expect(durableEvents(resumedEvents)
       .find((event) => event.type === "navigation.updated")
       ?.payload.delta.activeObjective).toBe("谢谢");
     expect(resumed.snapshot().goal).toMatchObject({
-      version: 2,
-      statement: "Understand this repository",
+      objective: "Understand this repository",
     });
     await resumed.close();
     const reopenedLedger = await JsonlLedger.open(
       join(root, "state", "runs", runId, "ledger.jsonl"),
     );
     const projectionEvents = await reopenedLedger.read({ runId });
-    expect(projectionEvents.filter((event) => event.type === "goal.revised")).toHaveLength(1);
+    expect(projectionEvents.filter((event) => event.type === "thread.goal.changed").length)
+      .toBeGreaterThanOrEqual(1);
     expect(projectionEvents
-      .find((event) => event.type === "goal.revised")
-      ?.payload.goal.statement).toBe("Understand this repository");
+      .find((event) => event.type === "thread.goal.changed")
+      ?.payload.goal.objective).toBe("Understand this repository");
     await reopenedLedger.close();
+  });
+
+  it("lets Main create and complete a persistent Goal through the host tools", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([
+      {
+        ...response("starting"),
+        stopReason: "toolUse",
+        toolCalls: [{
+          id: "create-goal",
+          name: "create_goal",
+          arguments: { objective: "Ship the verified change", token_budget: 500 },
+        }],
+      },
+      response("created"),
+      {
+        ...response("finishing"),
+        stopReason: "toolUse",
+        toolCalls: [{
+          id: "complete-goal",
+          name: "update_goal",
+          arguments: { status: "complete" },
+        }],
+      },
+      response("complete"),
+    ]);
+    const session = await openSession(root, model, "model-goal-run", [], 2);
+    const liveEvents: SessionRuntimeEvent[] = [];
+    session.subscribe((event) => liveEvents.push(event));
+
+    await session.submit({ inputId: "model-goal-input", text: "Please work on this" });
+    await session.waitForIdle();
+    for (let attempt = 0; attempt < 100 && session.snapshot().goal?.status !== "complete"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await session.waitForIdle();
+    }
+
+    expect(session.snapshot().goal).toMatchObject({
+      objective: "Ship the verified change",
+      status: "complete",
+      tokenBudget: 500,
+    });
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
+      "get_goal",
+      "create_goal",
+      "update_goal",
+    ]));
+    expect(model.requests[2]?.messages.some((message) => (
+      message.content.includes("<goal_context>")
+      && message.content.includes("Ship the verified change")
+    ))).toBe(true);
+    expect(liveEvents.filter((event) => (
+      event.kind === "event" && event.event.type === "thread.goal.changed"
+    ))).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event: expect.objectContaining({
+          payload: expect.objectContaining({ operation: "create" }),
+        }),
+      }),
+      expect.objectContaining({
+        event: expect.objectContaining({
+          payload: expect.objectContaining({ operation: "complete" }),
+        }),
+      }),
+    ]));
+    await expect(session.transcript()).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "user", content: "Please work on this" }),
+    ]));
+    expect((await session.transcript()).filter((entry) => (
+      entry.role === "user" && entry.content === "Continue working toward the active thread Goal."
+    ))).toHaveLength(0);
+    await session.close();
+  });
+
+  it("replaces a host Goal without relaxing model-side create semantics", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([
+      {
+        ...response("the existing Goal must remain intact"),
+        stopReason: "toolUse",
+        toolCalls: [{
+          id: "create-while-active",
+          name: "create_goal",
+          arguments: { objective: "An invalid second Goal" },
+        }],
+      },
+      {
+        ...response("complete the replacement"),
+        stopReason: "toolUse",
+        toolCalls: [{
+          id: "complete-replacement",
+          name: "update_goal",
+          arguments: { status: "complete" },
+        }],
+      },
+      response("replacement complete"),
+    ]);
+    const session = await openSession(root, model, "goal-replace-host");
+    const events: SessionRuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const original = await session.createGoal("Original objective");
+    const replacement = await session.replaceGoal("Replacement objective", 1_000);
+    await session.waitForIdle();
+
+    expect(replacement.goalId).not.toBe(original.goalId);
+    expect(replacement.revision).toBe(1);
+    expect(session.snapshot().goal).toMatchObject({
+      goalId: replacement.goalId,
+      objective: "Replacement objective",
+      status: "complete",
+      revision: expect.any(Number),
+    });
+    expect(model.requests[0]?.messages.some((message) => (
+      message.content.includes("objective was edited by the user")
+      && message.content.includes("Replacement objective")
+      && !message.content.includes("Original objective")
+    ))).toBe(true);
+    expect(model.requests[1]?.messages.some((message) => (
+      message.content.includes("An unfinished Goal already exists")
+    ))).toBe(true);
+
+    const durable = durableEvents(events);
+    expect(durable).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "thread.goal.cleared",
+        payload: { goalId: original.goalId, revision: original.revision },
+      }),
+      expect.objectContaining({
+        type: "thread.goal.changed",
+        payload: expect.objectContaining({
+          operation: "create",
+          goal: expect.objectContaining({
+            goalId: replacement.goalId,
+            revision: 1,
+            objective: "Replacement objective",
+          }),
+        }),
+      }),
+    ]));
+    await session.close();
+  });
+
+  it("delivers a host Goal replacement made during an active Turn", async () => {
+    const root = await temporaryRoot();
+    let releaseFirst: ((value: ModelResponse) => void) | undefined;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const model = new ScriptedModel([
+      () => new Promise<ModelResponse>((resolve) => {
+        releaseFirst = resolve;
+        markStarted?.();
+      }),
+      {
+        ...response("complete the replacement"),
+        stopReason: "toolUse",
+        toolCalls: [{
+          id: "complete-active-replacement",
+          name: "update_goal",
+          arguments: { status: "complete" },
+        }],
+      },
+      response("replacement complete"),
+    ]);
+    const session = await openSession(root, model, "goal-replace-active", [noopTool], 2);
+
+    const original = await session.createGoal("Original objective");
+    await started;
+    const replacement = await session.replaceGoal("Replacement objective", 1_000);
+    releaseFirst?.({
+      ...response("finish the old step"),
+      stopReason: "toolUse",
+      toolCalls: [{ id: "old-step-noop", name: "noop", arguments: {} }],
+    });
+    await session.waitForIdle();
+
+    expect(replacement.goalId).not.toBe(original.goalId);
+    expect(model.requests[1]?.messages.some((message) => (
+      message.content.includes("objective was edited by the user")
+      && message.content.includes("Replacement objective")
+    ))).toBe(true);
+    expect(session.snapshot().goal).toMatchObject({
+      goalId: replacement.goalId,
+      objective: "Replacement objective",
+      status: "complete",
+    });
+    await session.close();
+  });
+
+  it("upgrades a queued Goal continuation when the objective is edited before it starts", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([response("updated objective handled")]);
+    const session = await openSession(root, model, "goal-edit-before-continuation");
+
+    await session.createGoal("The old objective");
+    await session.editGoal("The new objective");
+    await session.waitForIdle();
+
+    expect(model.requests[0]?.messages.some((message) => (
+      message.content.includes("The new objective")
+      && message.content.includes("objective was edited by the user")
+    ))).toBe(true);
+    expect(model.requests[0]?.messages.some((message) => message.content.includes("The old objective")))
+      .toBe(false);
+    await session.close();
+  });
+
+  it("delivers a typed budget-limit context at the next safe Main step", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([
+      {
+        ...response("needs a wrap-up step"),
+        toolCalls: [{ id: "budget-noop", name: "noop", arguments: {} }],
+        stopReason: "toolUse",
+      },
+      response("wrapped up"),
+    ]);
+    const session = await openSession(root, model, "goal-budget-limit", [noopTool], 2);
+
+    await session.createGoal("Stay within the Goal budget", 1);
+    await session.waitForIdle();
+
+    expect(model.requests[1]?.messages.some((message) => (
+      message.content.includes("<goal_context>")
+      && message.content.includes("has reached its token budget")
+      && message.content.includes("Stay within the Goal budget")
+    ))).toBe(true);
+    expect(session.snapshot().goal).toMatchObject({
+      status: "budgetLimited",
+      tokensUsed: 12,
+      tokenBudget: 1,
+    });
+    await session.close();
+  });
+
+  it("attributes only provider usage after a Goal is created mid-Turn", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([
+      {
+        ...response("start the long-running objective"),
+        toolCalls: [{
+          id: "create-mid-turn",
+          name: "create_goal",
+          arguments: { objective: "Finish the follow-up work" },
+        }],
+        stopReason: "toolUse",
+      },
+      {
+        ...response("mark the newly created objective complete"),
+        toolCalls: [{
+          id: "complete-created-mid-turn",
+          name: "update_goal",
+          arguments: { status: "complete" },
+        }],
+        stopReason: "toolUse",
+      },
+    ]);
+    const session = await openSession(root, model, "goal-created-mid-turn", [], 2);
+
+    await session.submit({ inputId: "create-mid-turn-input", text: "Start this task" });
+    await session.waitForIdle();
+
+    expect(session.snapshot().goal).toMatchObject({
+      objective: "Finish the follow-up work",
+      status: "complete",
+      tokensUsed: 12,
+    });
+    await session.close();
+  });
+
+  it("does not charge a closing response after a Goal is completed mid-Turn", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([
+      {
+        ...response("the objective is satisfied"),
+        toolCalls: [{
+          id: "complete-mid-turn",
+          name: "update_goal",
+          arguments: { status: "complete" },
+        }],
+        stopReason: "toolUse",
+      },
+      response("closing response"),
+    ]);
+    const session = await openSession(root, model, "goal-completed-mid-turn", [], 2);
+    await session.createGoal("Ship the requested change", 1_000);
+    await session.waitForIdle();
+    // The first Goal continuation above consumed the scripted completion
+    // sequence and marked the Goal complete through the host tool.
+    expect(session.snapshot().goal).toMatchObject({
+      objective: "Ship the requested change",
+      status: "complete",
+      tokensUsed: 12,
+    });
+    await session.close();
+  });
+
+  it("reactivates completed or budget-limited Goals only when the edit leaves budget", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([
+      {
+        ...response("complete the initial objective"),
+        toolCalls: [{
+          id: "complete-before-edit",
+          name: "update_goal",
+          arguments: { status: "complete" },
+        }],
+        stopReason: "toolUse",
+      },
+      response("closing the initial objective"),
+      {
+        ...response("complete the replacement objective"),
+        toolCalls: [{
+          id: "complete-after-edit",
+          name: "update_goal",
+          arguments: { status: "complete" },
+        }],
+        stopReason: "toolUse",
+      },
+      response("closing the replacement objective"),
+    ]);
+    const session = await openSession(root, model, "goal-edit-terminal", [], 2);
+
+    await session.createGoal("Original objective", 1_000);
+    await session.waitForIdle();
+    expect(session.snapshot().goal?.status).toBe("complete");
+    const reactivated = await session.editGoal("Replacement objective", 1_000);
+    expect(reactivated).toMatchObject({ status: "active", objective: "Replacement objective" });
+    await session.waitForIdle();
+    expect(model.requests[2]?.messages.some((message) => (
+      message.content.includes("objective was edited by the user")
+      && message.content.includes("Replacement objective")
+    ))).toBe(true);
+
+    const budgetLimited = await session.editGoal("Budgeted replacement", 1);
+    expect(budgetLimited.status).toBe("budgetLimited");
+    await session.close();
+  });
+
+  it("carries an edit made on the final safe step into the next Goal continuation", async () => {
+    const root = await temporaryRoot();
+    let session!: SessionController;
+    const model = new ScriptedModel([
+      {
+        ...response("edit before this Turn closes"),
+        toolCalls: [{ id: "edit-at-final-step", name: "edit_goal", arguments: {} }],
+        stopReason: "toolUse",
+      },
+      (request) => {
+        expect(request.messages.some((message) => (
+          message.content.includes("objective was edited by the user")
+          && message.content.includes("Final-step objective")
+        ))).toBe(true);
+        return response("continued with the edited objective");
+      },
+    ]);
+    const editTool: AgentTool = {
+      definition: {
+        name: "edit_goal",
+        description: "Edit the current Goal for this race test",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      async execute() {
+        await session.editGoal("Final-step objective");
+        return { content: "edited", isError: false };
+      },
+    };
+    session = await openSession(root, model, "goal-edit-final-step", [editTool], 1);
+    await session.createGoal("Initial objective");
+    await session.waitForIdle();
+
+    expect(session.snapshot().goal?.objective).toBe("Final-step objective");
+    await session.close();
+  });
+
+  it("coalesces multiple active Goal edits to the latest safe-boundary context", async () => {
+    const root = await temporaryRoot();
+    let releaseFirst: ((value: ModelResponse) => void) | undefined;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const model = new ScriptedModel([
+      () => new Promise<ModelResponse>((resolve) => {
+        releaseFirst = resolve;
+        markStarted?.();
+      }),
+      (request) => {
+        const goalContext = request.messages.find((message) => (
+          message.content.includes("objective was edited by the user")
+        ));
+        expect(goalContext?.content).toContain("The latest objective");
+        expect(goalContext?.content).not.toContain("The first edit");
+        return response("finished after edit");
+      },
+    ]);
+    const session = await openSession(root, model, "goal-active-edits", [noopTool], 2);
+
+    await session.createGoal("The initial objective");
+    await started;
+    await session.editGoal("The first edit");
+    await session.editGoal("The latest objective");
+    releaseFirst?.({
+      ...response("continue"),
+      toolCalls: [{ id: "goal-edit-noop", name: "noop", arguments: {} }],
+      stopReason: "toolUse",
+    });
+    await session.waitForIdle();
+
+    expect(session.snapshot().goal?.objective).toBe("The latest objective");
+    await session.close();
+  });
+
+  it("blocks an active Goal after a non-retryable provider failure", async () => {
+    const root = await temporaryRoot();
+    const session = await openSession(
+      root,
+      new ScriptedModel([new Error("provider unavailable")]),
+      "goal-provider-error",
+    );
+
+    await session.createGoal("Recover from provider failure");
+    await session.waitForIdle();
+
+    expect(session.snapshot().goal).toMatchObject({
+      status: "blocked",
+      blockedReason: "provider unavailable",
+    });
+    await session.close();
+  });
+
+  it("does not invoke the provider when resuming an exhausted Goal budget", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([response("budget exhausted")]);
+    const session = await openSession(root, model, "goal-budget-resume");
+
+    await session.createGoal("Use a tiny Goal budget", 1);
+    await session.waitForIdle();
+    const callsBeforeResume = model.callCount;
+    expect(session.snapshot().goal?.status).toBe("budgetLimited");
+
+    await expect(session.updateGoalStatus("active")).resolves.toMatchObject({
+      status: "budgetLimited",
+    });
+    await session.waitForIdle();
+    expect(model.callCount).toBe(callsBeforeResume);
+    await session.close();
   });
 
   it("delivers busy steering at the next safe Main boundary", async () => {
@@ -2316,6 +2793,67 @@ describe("SessionController", () => {
       event.type === "turn.cancelled" && event.turnId === turnId
     ))).toBeDefined();
     expect(resumed.snapshot().blocker).toBeUndefined();
+    await resumed.close();
+  });
+
+  it("records a non-cooperative tool as unknown after the cancellation grace", async () => {
+    const root = await temporaryRoot();
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const hangingTool: AgentTool = {
+      definition: {
+        name: "hang_forever",
+        description: "A deterministic non-cooperative tool",
+        parameters: { type: "object", additionalProperties: false },
+      },
+      async execute() {
+        markStarted?.();
+        return new Promise(() => undefined);
+      },
+    };
+    const model = new ScriptedModel([{
+      ...response("starting tool"),
+      toolCalls: [{ id: "hang-call", name: "hang_forever", arguments: {} }],
+      stopReason: "toolUse",
+    }]);
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      cancelGraceMs: 10,
+    }, {
+      mainModel: model,
+      tools: [hangingTool],
+      createRunId: () => "cancel-grace-unknown",
+    });
+
+    const admitted = await session.submit({ inputId: "cancel-grace-input", text: "Start" });
+    await started;
+    expect(session.snapshot().runId).toBe("cancel-grace-unknown");
+    await session.cancel("cancel hanging tool");
+    expect(session.snapshot().status).toBe("detached");
+    await session.close();
+
+    const resumed = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      runId: "cancel-grace-unknown",
+    }, {
+      mainModel: new ScriptedModel([]),
+      tools: [hangingTool],
+    });
+    const unknown = (await resumed.transcript()).filter((entry) => (
+      entry.role === "tool" && entry.operationId !== undefined
+    ));
+    expect(unknown).toMatchObject([{
+      operationId: expect.stringContaining("op:"),
+      status: "unknown",
+      toolCallId: "hang-call",
+    }]);
+    expect(resumed.snapshot().blocker).toMatch(/^operation-unknown:/u);
+    await expect(resumed.resumeCurrent()).rejects.toThrow("Resolve");
     await resumed.close();
   });
 });

@@ -15,6 +15,7 @@ import {
   EdgeStatusBlock,
   EdgeSkillPickerSummary,
   NoticeBlock,
+  PromptSurface,
   QueuePreview,
   SessionTray,
   ToolStatusBlock,
@@ -155,6 +156,18 @@ describe("TUI components", () => {
     expect(activity).toContain("step 3");
   });
 
+  it("uses a Pi-style braille loader while a turn is active", () => {
+    const line = new ActivityLine(() => snapshot);
+    const first = stripTerminalSequences(line.render(80).join("\n"));
+    line.advance();
+    const second = stripTerminalSequences(line.render(80).join("\n"));
+
+    expect(line.render(80)).toHaveLength(2);
+    expect(first).toContain("⠋");
+    expect(second).toContain("⠙");
+    expect(first).toContain("Thinking...");
+  });
+
   it("marks user and final assistant messages as semantic terminal prompts", () => {
     const start = "\x1b]133;A\x07";
     const end = "\x1b]133;B\x07";
@@ -175,6 +188,49 @@ describe("TUI components", () => {
 
     const empty = new AssistantMessageBlock().render(80);
     expect(empty).toEqual([]);
+  });
+
+  it("keeps user and prompt surfaces grounded while assistant output stays transparent", () => {
+    const user = new UserMessageBlock("hello").render(80);
+    const assistant = new AssistantMessageBlock("hello").render(80);
+    const backgroundEscape = "\x1b[48;";
+
+    expect(user.join("\n")).toContain(backgroundEscape);
+    expect(assistant.join("\n")).not.toContain(backgroundEscape);
+    expect(stripTerminalSequences(user[1] ?? "")).toMatch(/^  hello/);
+    expect(stripTerminalSequences(assistant[0] ?? "")).toMatch(/^  hello/);
+
+    const editor = {
+      getText: () => "",
+      // sliceByColumn can leave the editor's reverse-video cursor unterminated.
+      render: (width: number) => [" ".repeat(width), `\x1b[7m `, " ".repeat(width)],
+      invalidate: () => {},
+    };
+    const prompt = new PromptSurface(editor).render(40);
+    expect(prompt.join("\n")).toContain(backgroundEscape);
+    expect(prompt[1]).toContain("\x1b[7m \x1b[27m");
+    const promptLine = stripTerminalSequences(prompt[1] ?? "");
+    expect(promptLine).toMatch(/^ /);
+    expect(promptLine).not.toMatch(/^> /);
+  });
+
+  it("uses Pi background tokens for user, prompt, and tool states", () => {
+    setNausicaaColorScheme("light");
+    expect(new UserMessageBlock("hello").render(20).join("\n"))
+      .toContain("\x1b[48;2;232;232;232m");
+    const pending = new ToolStatusBlock("bash", "running");
+    expect(pending.render(20).join("\n")).toContain("\x1b[48;2;232;232;240m");
+    const succeeded = new ToolStatusBlock("bash", "succeeded");
+    expect(succeeded.render(20).join("\n")).toContain("\x1b[48;2;232;240;232m");
+    const failed = new ToolStatusBlock("bash", "failed");
+    expect(failed.render(20).join("\n")).toContain("\x1b[48;2;240;232;232m");
+
+    setNausicaaColorScheme("dark");
+    expect(new UserMessageBlock("hello").render(20).join("\n"))
+      .toContain("\x1b[48;2;52;53;65m");
+    expect(new ToolStatusBlock("bash", "succeeded").render(20).join("\n"))
+      .toContain("\x1b[48;2;40;50;40m");
+    setNausicaaColorScheme("light");
   });
 
   it("lets pi-tui jump between Nausicaa semantic prompts", async () => {
@@ -338,25 +394,38 @@ describe("TUI components", () => {
     }
   });
 
-  it("keeps the Prime-style brand header useful at wide and narrow widths", () => {
+  it("keeps the Pi-style startup header expandable and free of session metadata", () => {
     const header = new BrandSplashHeader({
       version: "0.1.0",
       getModel: () => "openrouter:openai/gpt-5-mini",
       getWorkspace: () => "/work/project",
     });
     const wide = stripTerminalSequences(header.render(80).join("\n"));
+    const veryWide = stripTerminalSequences(header.render(100).join("\n"));
     const narrow = stripTerminalSequences(header.render(24).join("\n"));
-    expect(wide).toContain("version");
-    expect(wide).toContain("openrouter");
+    expect(wide).toContain("Nausicaa v0.1.0");
+    expect(wide).toContain("escape interrupt");
+    expect(wide).toContain("/ commands");
+    expect(veryWide).toContain("ctrl+o more");
+    expect(wide).toContain("Press ctrl+o to show full startup help and loaded resources.");
+    expect(wide).toContain("Nausicaa can explain its own features");
+    expect(wide).not.toContain("version");
+    expect(wide).not.toContain("openrouter");
+    expect(wide).not.toContain("cwd");
     expect(narrow).toContain("Nausicaa");
     for (const [width, lines] of [[80, header.render(80)] as const, [24, header.render(24)] as const]) {
       for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
     }
     header.setCompact(true);
-    const compact = stripTerminalSequences(header.render(80).join("\n"));
-    expect(header.render(80)).toHaveLength(2);
-    expect(compact).toContain("Nausicaa");
-    expect(compact).toContain("openrouter");
+    const compactLines = header.render(80);
+    const compact = stripTerminalSequences(compactLines.join("\n"));
+    expect(compact).toBe(wide);
+    header.setExpanded(true);
+    const expandedLines = header.render(80);
+    const expanded = stripTerminalSequences(expandedLines.join("\n"));
+    expect(expanded).toContain("ctrl+o expand or collapse tool output");
+    expect(expanded).not.toContain("Press ctrl+o to show full startup help");
+    expect(expandedLines.length).toBeGreaterThan(compactLines.length);
   });
 
   it("expands thinking by default and expands tool details without losing content", () => {

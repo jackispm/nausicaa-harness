@@ -141,6 +141,8 @@ export interface MoweExecutionRequest {
   approve?: (context: MoweApprovalContext) => MoweApprovalDecision | Promise<MoweApprovalDecision>;
   /** Durable lifecycle recorder for approval requests and decisions. */
   approvalLifecycle?: MoweApprovalLifecycle;
+  /** Durable admission/start recorder; failures fail closed before the effect. */
+  toolLifecycle?: MoweToolLifecycle;
 }
 
 export interface MoweApprovalContext {
@@ -170,6 +172,27 @@ export interface MoweApprovalLifecycle {
     context: MoweApprovalContext,
     decision: MoweApprovalDecisionRecord,
   ) => void | Promise<void>;
+}
+
+/**
+ * Durable lifecycle hooks around the external-effect boundary. `admitted` is
+ * called only after catalog, scope, schema, and approval checks pass. `started`
+ * is called immediately before the tool adapter is invoked. A hook failure is
+ * fail-closed and prevents the adapter from running.
+ */
+export interface MoweToolLifecycle {
+  admitted: (context: MoweToolLifecycleContext) => void | Promise<void>;
+  started: (context: MoweToolLifecycleContext) => void | Promise<void>;
+}
+
+export interface MoweToolLifecycleContext {
+  runId: RunId;
+  laneId: LaneId;
+  operationId: string;
+  call: MoweCall;
+  tool: MoweToolEntry;
+  argumentsHash: string;
+  signal?: AbortSignal;
 }
 
 export type MoweCallStatus = "succeeded" | "failed" | "cancelled";

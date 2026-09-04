@@ -413,16 +413,21 @@ describe("bash tool", () => {
     "terminates a descendant that escapes into a new session",
     async () => {
       const workspace = await temporaryDirectory();
+      const ready = path.join(workspace, "escaped-session-ready.txt");
       const marker = path.join(workspace, "escaped-session.txt");
       const python = [
         "import os,time",
         "os.setsid()",
+        `open(${JSON.stringify(ready)}, \"w\").write(\"ready\")`,
         "time.sleep(0.5)",
         `open(${JSON.stringify(marker)}, \"w\").write(\"bad\")`,
       ].join("\n");
       const encoded = Buffer.from(python, "utf8").toString("base64");
       const result = await createBashTool().execute({
-        command: `python3 -c 'import base64;exec(base64.b64decode("${encoded}"))' & sleep 0.2`,
+        command: [
+          `python3 -c 'import base64;exec(base64.b64decode("${encoded}"))' &`,
+          `while [ ! -e ${JSON.stringify(ready)} ]; do sleep 0.01; done`,
+        ].join(" "),
       }, toolContext(workspace));
 
       expect(result.isError).toBe(false);

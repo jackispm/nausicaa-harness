@@ -2,8 +2,10 @@ import type {
   ArtifactRef,
   ConversationMessage,
   Goal,
+  GoalContextKind,
   LaneId,
   RunId,
+  ThreadGoal,
   TokenUsage,
 } from "../domain/types.js";
 import type { EventEnvelope } from "../domain/events.js";
@@ -160,6 +162,10 @@ export interface FukaiContextRequest {
   goal: Goal;
   /** Current Turn intent, pinned as a dynamic user reminder outside the stable prefix. */
   activeObjective?: string;
+  /** Optional user-owned persistent thread Goal. This is dynamic context, never stable prompt text. */
+  threadGoal?: ThreadGoal;
+  /** Only these explicit boundaries may project the persistent Goal into context. */
+  goalContextKind?: GoalContextKind;
   /** Absolute runtime workspace used by workspace-relative tools. */
   workspace?: string;
   systemPrompt: string;

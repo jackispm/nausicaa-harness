@@ -25,6 +25,7 @@ import {
   fukaiCompactionInputTokenUpperBound,
   fukaiCompactionMaterialByteBudget,
   piAiFukaiCompactionGeneration,
+  type FukaiCompactionExecutionOutcome,
   type FukaiCompactionSelection,
   type FukaiConversationRef,
 } from "../fukai/index.js";
@@ -67,6 +68,26 @@ export interface RuntimeFukaiCompactionPressureRequest
   estimatedInputTokens: number;
 }
 
+/** Explicit operator-triggered compaction at an idle Main boundary. */
+export interface RuntimeFukaiCompactionManualRequest
+  extends RuntimeFukaiCompactionSelectRequest {
+  conversationRefs: readonly FukaiConversationRef[];
+  budget: ContextCompactionBudget;
+  /** Main selector captured for this compaction request. */
+  model?: string;
+}
+
+export type RuntimeFukaiCompactionManualSkipReason =
+  | "no-eligible-context"
+  | "budget-exhausted"
+  | "provider-error"
+  | "stale"
+  | "verification-failed";
+
+export type RuntimeFukaiCompactionManualResult =
+  | FukaiCompactionSelection
+  | { status: "skipped"; reason: RuntimeFukaiCompactionManualSkipReason };
+
 /** One activation prepares at most once; model boundaries only perform reads. */
 export interface RuntimeFukaiCompaction {
   prepare(request: RuntimeFukaiCompactionPrepareRequest): Promise<void>;
@@ -76,6 +97,9 @@ export interface RuntimeFukaiCompaction {
   compactIfNeeded?(
     request: RuntimeFukaiCompactionPressureRequest,
   ): Promise<FukaiCompactionSelection | undefined>;
+  compact?(
+    request: RuntimeFukaiCompactionManualRequest,
+  ): Promise<RuntimeFukaiCompactionManualResult | undefined>;
 }
 
 export interface RuntimeFukaiCompactionFactoryContext {
@@ -192,7 +216,7 @@ export const createRuntimeFukaiCompaction: RuntimeFukaiCompactionFactory = (cont
     previousView: Awaited<ReturnType<typeof readView>>,
     selectedWindow?: RuntimeFukaiCompactionSourceWindow,
     model = context.model,
-  ): Promise<void> => {
+  ): Promise<FukaiCompactionExecutionOutcome | undefined> => {
     const previous = previousView.status === "ready"
       ? previousView.selection
       : undefined;
@@ -210,8 +234,8 @@ export const createRuntimeFukaiCompaction: RuntimeFukaiCompactionFactory = (cont
       budget: request.budget,
       ...(previous === undefined ? {} : { previous }),
     });
-    if (window === undefined) return;
-    await coordinatorFor(model).execute({
+    if (window === undefined) return undefined;
+    return coordinatorFor(model).execute({
       runId: request.runId,
       laneId: request.laneId,
       goal: request.goal,
@@ -386,6 +410,49 @@ export const createRuntimeFukaiCompaction: RuntimeFukaiCompactionFactory = (cont
       }, previousView, window, request.model);
       const updated = await readView(request);
       return updated.status === "ready" ? updated.selection : previous;
+    },
+    async compact(request) {
+      if (!prepared) return undefined;
+      const previousView = await readView(request);
+      const previous = previousView.status === "ready"
+        ? previousView.selection
+        : undefined;
+      const window = selectRuntimeFukaiCompactionSources({
+        conversationRefs: request.conversationRefs,
+        goal: request.goal,
+        upperWatermark: request.upperWatermark,
+        budget: request.budget,
+        ...(previous === undefined ? {} : { previous }),
+      });
+      if (window === undefined) return undefined;
+      const sourceTokens = artifactTokenUpperBound(window.sourceBytes);
+      const maxOutputTokens = Math.min(
+        request.budget.maxOutputTokens,
+        sourceTokens - minimumGainTokens,
+      );
+      if (maxOutputTokens < 1) return undefined;
+      const outcome = await executeWindow({
+        ...request,
+        budget: {
+          ...request.budget,
+          maxOutputTokens,
+        },
+      }, previousView, window, request.model ?? context.model);
+      if (outcome?.status === "skipped") {
+        return {
+          status: "skipped",
+          reason: outcome.reason,
+        };
+      }
+      const updated = await readView(request);
+      if (
+        updated.status !== "ready"
+        || updated.selection === undefined
+        || updated.selection.capsule.compactionId === previous?.capsule.compactionId
+      ) {
+        return { status: "skipped", reason: "no-eligible-context" };
+      }
+      return updated.selection;
     },
   };
 };

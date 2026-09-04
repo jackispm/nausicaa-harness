@@ -53,6 +53,7 @@ import { createMcpEdgeAdapter } from "./mowe/edges/mcp.js";
 import { createSkillsEdgeAdapter } from "./mowe/edges/skills.js";
 import { runRemoteAttach } from "./cli/remote-attach.js";
 import {
+  applyProviderAuthStatus,
   nonInteractiveGuidance,
   inspectCredential,
   readAvailableBoundedStdinTask,
@@ -61,6 +62,7 @@ import {
   UNCONFIGURED_MODEL,
 } from "./cli/onboarding.js";
 import {
+  createBuiltinModelPort,
   createOpenRouterModelPort,
   parseModelSelector,
 } from "./model/index.js";
@@ -71,6 +73,7 @@ import {
 } from "./cli/edge-selection.js";
 
 const VERSION = "0.1.0";
+const MODEL_REFRESH_TIMEOUT_MS = 60_000;
 
 const main = async (): Promise<number> => {
   let options;
@@ -239,12 +242,44 @@ const main = async (): Promise<number> => {
       }
     }
     const credentialStore = createNausicaaCredentialStore();
-    const mainModel = createOpenRouterModelPort({ credentials: credentialStore });
+    const mainModel = options.allProviders
+      ? createBuiltinModelPort({ credentials: credentialStore })
+      : createOpenRouterModelPort({ credentials: credentialStore });
+    let modelRefreshAborted = false;
+    let modelRefreshErrors: ReadonlyMap<string, Error> = new Map();
+    if (options.refreshModels === true) {
+      const refreshController = new AbortController();
+      const refreshTimer = setTimeout(
+        () => refreshController.abort(new Error("model catalog refresh timed out")),
+        MODEL_REFRESH_TIMEOUT_MS,
+      );
+      refreshTimer.unref?.();
+      try {
+        const refreshed = await mainModel.refreshCatalog({
+          ...(options.allProviders ? {} : { providers: ["openrouter"] }),
+          signal: refreshController.signal,
+        });
+        modelRefreshAborted = refreshed.aborted;
+        modelRefreshErrors = refreshed.errors;
+      } finally {
+        clearTimeout(refreshTimer);
+      }
+      if (modelRefreshAborted || modelRefreshErrors.size > 0) {
+        const diagnostics = [
+          ...(modelRefreshAborted ? ["model catalog refresh aborted"] : []),
+          ...[...modelRefreshErrors.entries()].map(([provider, error]) => (
+            `${provider}: ${persistedErrorText(error, "model catalog refresh failed")}`
+          )),
+        ];
+        process.stderr.write(`Nausicaa model catalog refresh incomplete: ${diagnostics.join("; ")}\n`);
+      }
+    }
     const modelCatalog = mainModel.catalog();
-    // OpenRouter is the only provider exposed by this beta. Load its saved
-    // metadata eagerly so a first-run `/model` selection can immediately use
-    // the credential without requiring a process restart.
-    let storedCredential = await credentialStore.read("openrouter");
+    // Keep only non-secret credential metadata in the process. A model change
+    // can cross providers, so a single cached OpenRouter entry is insufficient.
+    let savedCredentials = new Map(
+      (await credentialStore.list()).map((entry) => [entry.providerId, entry.type]),
+    );
     const selectedProvider = (model: string | undefined): string | undefined => {
       if (model === undefined || model === UNCONFIGURED_MODEL) return undefined;
       try {
@@ -255,16 +290,32 @@ const main = async (): Promise<number> => {
     };
     const savedCredentialFor = (model: string | undefined, defaultProvider = false) => {
       const provider = selectedProvider(model) ?? (defaultProvider ? "openrouter" : undefined);
-      return provider === "openrouter" && storedCredential !== undefined
-        ? { provider, type: storedCredential.type }
+      const type = provider === undefined ? undefined : savedCredentials.get(provider);
+      return provider !== undefined && type !== undefined
+        ? { provider, type }
         : undefined;
     };
-    const credentialStatus = inspectCredential(
+    const selectedModelProvider = selectedProvider(resolvedSettings.model);
+    let selectedAuthCheck: Awaited<ReturnType<typeof mainModel.checkAuth>>;
+    let selectedAuthCheckFailed = false;
+    if (selectedModelProvider === undefined) {
+      selectedAuthCheck = undefined;
+    } else {
+      try {
+        selectedAuthCheck = await mainModel.checkAuth(selectedModelProvider);
+      } catch {
+        // A local credential store/provider check failure must not be mistaken
+        // for a missing key; the provider request remains authoritative.
+        selectedAuthCheckFailed = true;
+        selectedAuthCheck = undefined;
+      }
+    }
+    const credentialStatus = applyProviderAuthStatus(inspectCredential(
       resolvedSettings.model,
       modelCatalog,
       process.env,
       savedCredentialFor(resolvedSettings.model),
-    );
+    ), selectedAuthCheck);
     const selectedRunId = options.continue
       ? await findLatestRunId(resolvedSettings.dataDir, workspace)
       : options.resume;
@@ -280,6 +331,12 @@ const main = async (): Promise<number> => {
       || credentialStatus.catalogKnown === false
       || (
         credentialStatus.credentialEnv !== undefined
+        && !credentialStatus.credentialPresent
+      )
+      || (
+        !selectedAuthCheckFailed
+        && selectedModelProvider !== undefined
+        && credentialStatus.authConfigured === false
         && !credentialStatus.credentialPresent
       );
     if (
@@ -314,10 +371,23 @@ const main = async (): Promise<number> => {
     if (
       options.mode !== "interactive"
       && isNewRun
-      && credentialStatus.credentialEnv !== undefined
-      && !credentialStatus.credentialPresent
+      && (
+        (
+          credentialStatus.credentialEnv !== undefined
+          && !credentialStatus.credentialPresent
+        )
+        || (
+          !selectedAuthCheckFailed
+          && selectedModelProvider !== undefined
+          && credentialStatus.authConfigured === false
+          && !credentialStatus.credentialPresent
+        )
+      )
     ) {
-      const message = `Credential not detected: ${credentialStatus.credentialEnv}. `
+      const credentialSource = credentialStatus.credentialEnv
+        ?? credentialStatus.authSource
+        ?? `credentials for ${credentialStatus.provider ?? "the selected provider"}`;
+      const message = `Credential not detected: ${credentialSource}. `
         + "No provider request or edge refresh was started; auth remains unverified.";
       if (options.mode === "json") {
         writeJson({
@@ -326,7 +396,7 @@ const main = async (): Promise<number> => {
             type: "configuration.credential-missing",
             message,
             provider: credentialStatus.provider,
-            source: credentialStatus.credentialEnv,
+            source: credentialSource,
             authStatus: credentialStatus.authStatus,
             nextStep: nonInteractiveGuidance(resolvedSettings.model),
           },
@@ -379,6 +449,12 @@ const main = async (): Promise<number> => {
       || credentialStatus.catalogKnown === false
       || (
         credentialStatus.credentialEnv !== undefined
+        && !credentialStatus.credentialPresent
+      )
+      || (
+        !selectedAuthCheckFailed
+        && selectedModelProvider !== undefined
+        && credentialStatus.authConfigured === false
         && !credentialStatus.credentialPresent
       );
     const modelChoices = modelCatalog.map((entry) => ({
@@ -452,23 +528,43 @@ const main = async (): Promise<number> => {
           auth: {
             credentialStore,
             modelPort: mainModel,
-            provider: "openrouter",
+            provider: () => selectedProvider(session.model) ?? "openrouter",
             environment: process.env,
             onChanged: async () => {
-              storedCredential = await credentialStore.read("openrouter");
+              savedCredentials = new Map(
+                (await credentialStore.list()).map((entry) => [entry.providerId, entry.type]),
+              );
+              const provider = selectedProvider(session.model);
+              if (provider === undefined) {
+                selectedAuthCheck = undefined;
+                selectedAuthCheckFailed = false;
+              } else {
+                try {
+                  selectedAuthCheck = await mainModel.checkAuth(provider);
+                  selectedAuthCheckFailed = false;
+                } catch {
+                  selectedAuthCheck = undefined;
+                  selectedAuthCheckFailed = true;
+                }
+              }
             },
           },
-          credentialStatus: () => inspectCredential(
-            session.model === UNCONFIGURED_MODEL ? undefined : session.model,
-            modelCatalog,
-            process.env,
-            savedCredentialFor(session.model === UNCONFIGURED_MODEL ? undefined : session.model),
-          ),
+          credentialStatus: () => {
+            const model = session.model === UNCONFIGURED_MODEL ? undefined : session.model;
+            const provider = selectedProvider(model);
+            return applyProviderAuthStatus(
+              inspectCredential(model, modelCatalog, process.env, savedCredentialFor(model)),
+              provider !== undefined && provider === selectedModelProvider
+                ? selectedAuthCheck
+                : undefined,
+            );
+          },
           startupModelMissing,
           showStartupSetup,
           startupNotice: () => startupGuidance({
             model: session.model === UNCONFIGURED_MODEL ? undefined : session.model,
             catalog: modelCatalog,
+            ...(selectedAuthCheck === undefined ? {} : { auth: selectedAuthCheck }),
             ...(savedCredentialFor(
               session.model === UNCONFIGURED_MODEL ? undefined : session.model,
               session.model === UNCONFIGURED_MODEL,
@@ -577,6 +673,7 @@ const main = async (): Promise<number> => {
         allowWrite: resolvedAllowWrite,
         allowShell: resolvedAllowShell,
         allowNetwork: resolvedAllowNetwork,
+        allProviders: options.allProviders === true,
         operationId,
       });
       if (options.mode === "json") {
@@ -615,6 +712,7 @@ const main = async (): Promise<number> => {
         allowWrite: resolvedAllowWrite,
         allowShell: resolvedAllowShell,
         allowNetwork: resolvedAllowNetwork,
+        allProviders: options.allProviders === true,
       });
       if (options.mode === "json") {
         writeJson({
@@ -885,6 +983,7 @@ interface ResumeCommandOptions {
   allowWrite: boolean;
   allowShell: boolean;
   allowNetwork: boolean;
+  allProviders?: boolean;
   operationId?: string;
 }
 
@@ -900,6 +999,7 @@ const buildResumeCommand = (options: ResumeCommandOptions): string => [
   ...(options.allowWrite ? ["--allow-write"] : []),
   ...(options.allowShell ? ["--allow-shell"] : []),
   ...(options.allowNetwork ? ["--allow-network"] : []),
+  ...(options.allProviders ? ["--all-providers"] : []),
   "--resume",
   shellQuote(options.runId),
   ...(options.operationId === undefined

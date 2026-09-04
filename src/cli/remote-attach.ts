@@ -63,8 +63,6 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
   const activity = new ActivityLine(() => options.session.snapshot());
   const header = new BrandSplashHeader({
     version: "0.1.0",
-    getModel: () => options.session.snapshot().model,
-    getWorkspace: () => options.session.workspace,
   });
   let toolsExpanded = false;
   let closing = false;
@@ -96,7 +94,6 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
     const entries = await options.session.transcript();
     transcript.clear();
     transcript.addChild(header);
-    if (entries.length > 0 && terminal.rows < 36) header.setCompact(true);
     const state = options.session.state();
     if (state.error !== undefined) {
       append(new NoticeBlock(state.error, "warning"));
@@ -144,11 +141,12 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
 
   const unsubscribe = options.session.subscribe(() => scheduleRefresh());
   const activityTimer = setInterval(() => {
-    if (options.session.snapshot().status === "running") {
+    const status = options.session.snapshot().status;
+    if (status === "running" || status === "cancelling") {
       activity.advance();
       tui.requestRender();
     }
-  }, 500);
+  }, 80);
   activityTimer.unref?.();
 
   const finish = (code: number): Promise<void> => {

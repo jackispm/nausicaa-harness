@@ -98,6 +98,18 @@ async function settled(): Promise<void> {
   await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+async function waitForCondition(
+  condition: () => boolean | Promise<boolean>,
+  description: string,
+  timeoutMs = 2_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await condition())) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${description}`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 describe("daemon worker protocol", () => {
   const roots: string[] = [];
 
@@ -518,6 +530,86 @@ describe("daemon worker protocol", () => {
     });
     const descriptor = await readFile(leasePath, "utf8");
     expect(descriptor).toContain('"version":1');
+  });
+
+  it("does not replay an activation after a real child worker SIGKILL", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-worker-crash-recovery-"));
+    roots.push(root);
+    const leasePath = join(root, "leases.json");
+    const recoveryJournalPath = join(root, "worker-recovery.jsonl");
+    const firstMarkerPath = join(root, "first-runner-started");
+    const secondMarkerPath = join(root, "second-runner-invoked");
+    const leases = await FileExecutionLeaseStore.open(leasePath, { createLeaseId: () => "lease-parent" });
+    const claimed = await leases.claim({ runId: "run-1", ownerId: "host", acquisitionId: "claim-1", ttlMs: 10_000 });
+    if (claimed.status !== "acquired") throw new Error("expected lease");
+
+    const firstScript = [
+      "import { writeFile } from 'node:fs/promises';",
+      "import { runDaemonWorkerStdioServer } from './src/runtime/daemon-worker-server.ts';",
+      `runDaemonWorkerStdioServer({ runId: 'run-1', workerId: 'worker-1', recoveryJournalPath: ${JSON.stringify(recoveryJournalPath)}, runner: { activate: async () => { await writeFile(${JSON.stringify(firstMarkerPath)}, 'started', 'utf8'); await new Promise(() => undefined); return { status: 'completed' }; } } });`,
+    ].join(" ");
+    const secondScript = [
+      "import { writeFile } from 'node:fs/promises';",
+      "import { runDaemonWorkerStdioServer } from './src/runtime/daemon-worker-server.ts';",
+      `runDaemonWorkerStdioServer({ runId: 'run-1', workerId: 'worker-1', recoveryJournalPath: ${JSON.stringify(recoveryJournalPath)}, runner: { activate: async () => { await writeFile(${JSON.stringify(secondMarkerPath)}, 'replayed', 'utf8'); return { status: 'completed' }; } } });`,
+    ].join(" ");
+    let first: ReturnType<typeof spawnDaemonWorker> | undefined;
+    let second: ReturnType<typeof spawnDaemonWorker> | undefined;
+
+    try {
+      first = spawnDaemonWorker({
+        runId: "run-1",
+        workerId: "worker-1",
+        lease: { runId: "run-1", leasePath, fencingToken: claimed.lease.fencingToken },
+        args: ["--import", "tsx", "--input-type=module", "-e", firstScript],
+        cwd: process.cwd(),
+        env: process.env,
+        activationTimeoutMs: 2_000,
+      });
+      await first.initialize();
+      const firstActivation = first.client.activate({ activationId: "activation-1", wakes: [] });
+      await waitForCondition(async () => {
+        try {
+          return await readFile(firstMarkerPath, "utf8") === "started";
+        } catch (error: unknown) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw error;
+        }
+      }, "the first worker runner to start");
+
+      const firstPid = first.snapshot.pid;
+      if (firstPid === undefined) throw new Error("expected spawned worker PID");
+      process.kill(firstPid, "SIGKILL");
+      await waitForCondition(() => first!.snapshot.signal === "SIGKILL", "the first worker to exit");
+      await expect(firstActivation).resolves.toMatchObject({ status: "uncertain" });
+      await first.close();
+
+      second = spawnDaemonWorker({
+        runId: "run-1",
+        workerId: "worker-1",
+        lease: { runId: "run-1", leasePath, fencingToken: claimed.lease.fencingToken },
+        args: ["--import", "tsx", "--input-type=module", "-e", secondScript],
+        cwd: process.cwd(),
+        env: process.env,
+      });
+      await second.initialize();
+      await expect(second.client.activate({ activationId: "activation-1", wakes: [] })).resolves.toMatchObject({
+        status: "uncertain",
+      });
+      await expect(readFile(secondMarkerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await Promise.all([
+        first?.close().catch(() => undefined),
+        second?.close().catch(() => undefined),
+      ]);
+      await leases.release({
+        runId: claimed.lease.runId,
+        ownerId: claimed.lease.ownerId,
+        leaseId: claimed.lease.leaseId,
+        fencingToken: claimed.lease.fencingToken,
+        commandId: "release-1",
+      }).catch(() => undefined);
+    }
   });
 
   it("shares process close and observes a late descriptor cleanup failure", async () => {

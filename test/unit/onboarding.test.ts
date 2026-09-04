@@ -3,6 +3,7 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it } from "vitest";
 
 import {
+  applyProviderAuthStatus,
   inspectCredential,
   maskSecret,
   nonInteractiveGuidance,
@@ -134,11 +135,37 @@ describe("CLI onboarding", () => {
     )).toMatchObject({ credentialPresent: false });
   });
 
+  it("projects provider-owned auth checks without upgrading verification", () => {
+    const local = inspectCredential("anthropic:demo", catalog, {});
+    expect(applyProviderAuthStatus(local, { type: "api_key", source: "ANTHROPIC_API_KEY" }))
+      .toMatchObject({
+        credentialPresent: true,
+        credentialSource: "environment",
+        authConfigured: true,
+        authSource: "ANTHROPIC_API_KEY",
+        authStatus: "unverified",
+      });
+    expect(applyProviderAuthStatus(local, undefined)).toMatchObject({
+      credentialPresent: false,
+      authConfigured: false,
+      authStatus: "unverified",
+    });
+    expect(startupGuidance({
+      model: "anthropic:demo",
+      catalog,
+      environment: {},
+      auth: { type: "api_key", source: "ANTHROPIC_API_KEY" },
+    })).toContain("ANTHROPIC_API_KEY");
+  });
+
   it("gives a copyable non-interactive next step without accepting a key argument", () => {
     const guidance = nonInteractiveGuidance();
     expect(guidance).toContain("nausicaa --print --model 'openrouter:<model-id>' '<task>'");
     expect(guidance).toContain("OPENROUTER_API_KEY");
     expect(guidance).not.toContain("--api-key");
+    const anthropic = nonInteractiveGuidance("anthropic:claude-sonnet-4");
+    expect(anthropic).toContain("nausicaa --print --all-providers --model 'anthropic:claude-sonnet-4'");
+    expect(anthropic).toContain("nausicaa auth login anthropic");
   });
 
   it("reads one bounded stdin task and preserves empty EOF as missing input", async () => {

@@ -798,6 +798,19 @@ describe("MainLoop", () => {
     expect(events.some((event) => (
       event.type === "tool.succeeded" && event.payload.toolCallId === "guarded-call"
     ))).toBe(true);
+    const lifecycle = events.filter((event) => (
+      (event.type === "tool.requested"
+        || event.type === "tool.admitted"
+        || event.type === "tool.started"
+        || event.type === "tool.succeeded")
+      && event.payload.toolCallId === "guarded-call"
+    ));
+    expect(lifecycle.map((event) => event.type)).toEqual([
+      "tool.requested",
+      "tool.admitted",
+      "tool.started",
+      "tool.succeeded",
+    ]);
     expect(events.filter((event) => event.type === "approval.requested")).toHaveLength(1);
     expect(events.filter((event) => event.type === "approval.decided")).toHaveLength(1);
     const approval = projectRun(events, "main-tool-approval").approvals?.[0];
@@ -1948,8 +1961,11 @@ describe("MainLoop", () => {
     const store = new MemoryContentAddressedStore();
     const ledger = new MemoryLedger();
     let started = 0;
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const completionOrder: string[] = [];
+    let releaseBoth: (() => void) | undefined;
+    let releaseAlpha: (() => void) | undefined;
+    const bothStarted = new Promise<void>((resolve) => { releaseBoth = resolve; });
+    const betaFinished = new Promise<void>((resolve) => { releaseAlpha = resolve; });
     const tool = (name: string): AgentTool => ({
       definition: {
         name,
@@ -1959,9 +1975,16 @@ describe("MainLoop", () => {
       async execute() {
         started += 1;
         if (started === 2) {
-          release?.();
+          releaseBoth?.();
         }
-        await gate;
+        await bothStarted;
+        if (name === "alpha") {
+          await betaFinished;
+        } else {
+          completionOrder.push(name);
+          releaseAlpha?.();
+        }
+        if (name === "alpha") completionOrder.push(name);
         return { content: `${name}-done`, isError: false };
       },
     });
@@ -2015,6 +2038,7 @@ describe("MainLoop", () => {
     });
 
     expect(started).toBe(2);
+    expect(completionOrder).toEqual(["beta", "alpha"]);
     expect(result).toMatchObject({ finalText: "all done", steps: 2, completed: true });
     expect(result.usage).toEqual(tokenUsage(45, 10));
     expect(model.requests[0]?.messages.at(-1)?.content).toContain("Handle the current Turn");
@@ -2022,11 +2046,19 @@ describe("MainLoop", () => {
       message.content.includes("Runtime advice")
       && message.content.includes("Check the simpler route"),
     )).toBe(true);
-    expect(model.requests[1]?.messages.filter((message) => message.role === "tool")).toHaveLength(2);
+    expect(model.requests[1]?.messages
+      .filter((message) => message.role === "tool")
+      .map((message) => message.role === "tool" ? message.toolName : undefined))
+      .toEqual(["alpha", "beta"]);
 
     const events = await ledger.read({ runId: "run-main" });
     expect(events.filter((event) => event.type === "tool.requested")).toHaveLength(2);
-    expect(events.filter((event) => event.type === "tool.succeeded")).toHaveLength(2);
+    expect(events
+      .filter((event) => event.type === "tool.succeeded")
+      .map((event) => event.type === "tool.succeeded" ? event.payload.name : undefined))
+      .toEqual(["alpha", "beta"]);
+    expect(events.filter((event) => event.type === "tool.admitted")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "tool.started")).toHaveLength(2);
     expect(events.filter((event) => event.type === "navigation.updated")).toHaveLength(2);
     expect(result.navigationDeltas.map((delta) => delta.activeObjective)).toEqual([
       "Handle the current Turn",
@@ -2208,6 +2240,8 @@ describe("MainLoop", () => {
     expect(result).toMatchObject({ completed: true, finalText: "recovered" });
     const events = await ledger.read({ runId: "truncated-tool-run" });
     expect(events.filter((event) => event.type === "tool.failed")).toHaveLength(1);
+    expect(events.some((event) => event.type === "tool.admitted")).toBe(false);
+    expect(events.some((event) => event.type === "tool.started")).toBe(false);
     const retryContext = model.requests[1]?.messages.find((message) => message.role === "tool");
     expect(retryContext?.content).toContain("may be truncated");
   });

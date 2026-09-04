@@ -179,6 +179,42 @@ export class WorkerToolExecutor {
           });
         },
       },
+      toolLifecycle: {
+        admitted: async (context) => {
+          await this.append({
+            runId: this.runId,
+            laneId: this.laneId,
+            type: "tool.admitted",
+            payload: {
+              operationId: context.operationId,
+              toolCallId: context.call.id,
+              name: context.call.name,
+              argumentsHash: context.argumentsHash,
+            },
+            correlationId: request.correlationId,
+            idempotencyKey: `${toolPrefix}:admitted`,
+            visibility: request.visibility,
+            occurredAt: this.clock.now().toISOString(),
+          });
+        },
+        started: async (context) => {
+          await this.append({
+            runId: this.runId,
+            laneId: this.laneId,
+            type: "tool.started",
+            payload: {
+              operationId: context.operationId,
+              toolCallId: context.call.id,
+              name: context.call.name,
+              argumentsHash: context.argumentsHash,
+            },
+            correlationId: request.correlationId,
+            idempotencyKey: `${toolPrefix}:started`,
+            visibility: request.visibility,
+            occurredAt: this.clock.now().toISOString(),
+          });
+        },
+      },
       signal: request.signal,
     });
     let result = execution.results[0]?.result ?? {

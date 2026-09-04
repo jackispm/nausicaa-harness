@@ -166,7 +166,7 @@ export class DaemonRemoteSession {
       workspace: this.workspace,
       runId: this.runId,
       ...(projection.activeTurnId === undefined ? {} : { turnId: projection.activeTurnId }),
-      ...(projection.goal === undefined ? {} : { goal: structuredClone(projection.goal) }),
+      ...(projection.threadGoal === undefined ? {} : { goal: structuredClone(projection.threadGoal) }),
       status,
       model,
       tetoEnabled: policy?.tetoEnabled === true,
@@ -300,8 +300,7 @@ export class DaemonRemoteSession {
 function requireCreationFacts(events: readonly AnyEvent[], runId: string) {
   const projection = projectRun(events, runId);
   if (
-    projection.goal === undefined
-    || projection.run.policy === undefined
+    projection.run.policy === undefined
     || projection.run.workspace === undefined
   ) {
     throw new DaemonControlClientError(

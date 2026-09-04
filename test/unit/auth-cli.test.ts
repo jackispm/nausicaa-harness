@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { FileCredentialStore } from "../../src/auth/index.js";
-import { runAuthCommand, runUtilityCommand, type Output, type SecretInput } from "../../src/cli/auth.js";
+import { runAuthCommand, runUtilityCommand, type AuthModelPort, type Output, type SecretInput } from "../../src/cli/auth.js";
 import { createOpenRouterModelPort } from "../../src/model/index.js";
 
 class MemoryOutput implements Output {
@@ -96,6 +96,72 @@ describe("auth/config CLI", () => {
       )).resolves.toBe(0);
       expect(output.value).toContain("No environment credential is configured");
       expect(output.value).not.toContain("remain available");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("uses the built-in provider registry for non-OpenRouter status", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-provider-status-"));
+    try {
+      const output = new MemoryOutput();
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      const modelPort = createOpenRouterModelPort({
+        credentials: store,
+        authContext: { env: async () => undefined, fileExists: async () => false },
+      });
+      // An OpenRouter-only injected port still rejects provider-scoped auth;
+      // the utility default is covered by the separate no-dependency path.
+      await expect(runAuthCommand(
+        { action: "status", provider: "openrouter", json: true },
+        { credentialStore: store, modelPort, output, environment: {} },
+      )).resolves.toBe(0);
+      output.value = "";
+      await expect(runUtilityCommand(
+        { action: "status", provider: "anthropic", json: true },
+        {
+          userHome: root,
+          output,
+          environment: { ANTHROPIC_API_KEY: "ambient-anthropic" },
+          authContext: {
+            env: async (name) => name === "ANTHROPIC_API_KEY" ? "ambient-anthropic" : undefined,
+            fileExists: async () => false,
+          },
+        },
+      )).resolves.toBe(0);
+      expect(JSON.parse(output.value)).toMatchObject({
+        provider: "anthropic",
+        configured: true,
+        source: "environment",
+        environmentCredential: true,
+        auth: "unverified",
+      });
+      expect(output.value).not.toContain("ambient-anthropic");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("selects the OAuth flow for OAuth-only providers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-oauth-only-"));
+    try {
+      const output = new MemoryOutput();
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      const modelPort = createOpenRouterModelPort({ credentials: store });
+      let loginType: string | undefined;
+      const oauthOnly: AuthModelPort = {
+        checkAuth: modelPort.checkAuth.bind(modelPort),
+        login: async (type) => {
+          loginType = type;
+          return { type: "oauth", refresh: "refresh", access: "access", expires: Date.now() + 60_000 };
+        },
+        logout: modelPort.logout.bind(modelPort),
+        hasProvider: (provider: string) => provider === "openai-codex",
+        providerAuthTypes: () => ["oauth" as const],
+      };
+      const input = new FakeSecretInput();
+      await expect(runAuthCommand(
+        { action: "login", provider: "openai-codex", json: false },
+        { credentialStore: store, modelPort: oauthOnly, input, output },
+      )).resolves.toBe(0);
+      expect(loginType).toBe("oauth");
+      expect(output.value).toContain("Saved openai-codex oauth credential");
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

@@ -1,5 +1,6 @@
 import type { Readable } from "node:stream";
 
+import type { AuthCheck } from "@earendil-works/pi-ai";
 import type { ModelCatalogEntry } from "../model/index.js";
 export { UNCONFIGURED_MODEL_SELECTOR as UNCONFIGURED_MODEL } from "../model/index.js";
 
@@ -13,6 +14,9 @@ export interface CredentialStatus {
   credentialMask?: string;
   /** Credential source is intentionally non-secret metadata only. */
   credentialSource?: "saved" | "environment";
+  /** Provider-owned local auth check; still does not prove a request works. */
+  authConfigured?: boolean;
+  authSource?: string;
   authStatus: "unverified";
 }
 
@@ -26,6 +30,7 @@ export interface StartupGuidanceInput {
   catalog?: readonly ModelCatalogEntry[];
   environment?: NodeJS.ProcessEnv;
   savedCredential?: SavedCredentialStatus;
+  auth?: AuthCheck;
 }
 
 const providerCredentialEnvs: Readonly<Record<string, string>> = {
@@ -75,6 +80,27 @@ export function inspectCredential(
   };
 }
 
+/**
+ * Merge a provider-owned, side-effect-free auth check into local onboarding
+ * state. The check never upgrades `authStatus`: only a real request can verify
+ * credentials, and its source is metadata rather than a secret.
+ */
+export function applyProviderAuthStatus(
+  status: CredentialStatus,
+  auth: AuthCheck | undefined,
+): CredentialStatus {
+  if (auth === undefined) return { ...status, authConfigured: false };
+  return {
+    ...status,
+    credentialPresent: true,
+    ...(status.credentialSource === undefined
+      ? { credentialSource: "environment" as const }
+      : {}),
+    authConfigured: true,
+    ...(auth.source === undefined ? {} : { authSource: auth.source }),
+  };
+}
+
 /** Never expose more than the final four characters of an environment value. */
 export function maskSecret(value: string): string {
   const normalized = value.trim();
@@ -89,9 +115,17 @@ export function startupGuidance(input: StartupGuidanceInput): string {
     input.environment,
     input.savedCredential,
   );
+  const providerStatus = input.auth === undefined
+    ? status
+    : applyProviderAuthStatus(status, input.auth);
   const credentialStatus = input.model === undefined || input.model.trim().length === 0
-    ? inspectCredential("openrouter:__setup__", input.catalog, input.environment, input.savedCredential)
-    : status;
+    ? input.auth === undefined
+      ? inspectCredential("openrouter:__setup__", input.catalog, input.environment, input.savedCredential)
+      : applyProviderAuthStatus(
+        inspectCredential("openrouter:__setup__", input.catalog, input.environment, input.savedCredential),
+        input.auth,
+      )
+    : providerStatus;
   const lines: string[] = [];
   if (input.model === undefined || input.model.trim().length === 0) {
     lines.push(
@@ -103,11 +137,11 @@ export function startupGuidance(input: StartupGuidanceInput): string {
     );
   } else {
     lines.push(`Configuration: model ${input.model.trim()} is present.`);
-    if (!status.selectorRecognized) {
+    if (!providerStatus.selectorRecognized) {
       lines.push("Selector: not recognized locally; use /model to choose a provider:model selector.");
-    } else if (status.catalogKnown === true) {
+    } else if (providerStatus.catalogKnown === true) {
       lines.push("Selector: recognized locally and present in the local catalog.");
-    } else if (status.catalogKnown === false) {
+    } else if (providerStatus.catalogKnown === false) {
       lines.push("Selector: recognized locally but absent from the local catalog; availability is unverified.");
     } else {
       lines.push("Selector: recognized locally; no local catalog was supplied for verification.");
@@ -115,8 +149,12 @@ export function startupGuidance(input: StartupGuidanceInput): string {
   }
   if (credentialStatus.credentialSource === "saved") {
     lines.push("Credential source: saved credential; auth is unverified.");
+  } else if (credentialStatus.authConfigured === true) {
+    lines.push(
+      `Credential source: ${credentialStatus.authSource ?? "provider-owned ambient credential"}; auth is unverified.`,
+    );
   } else if (credentialStatus.credentialEnv === undefined) {
-    lines.push("Credential status: provider environment variable is unknown; auth is unverified.");
+    lines.push("Credential status: provider credential is not configured; auth is unverified.");
   } else if (!credentialStatus.credentialPresent) {
     lines.push(
       `Credential not detected: ${credentialStatus.credentialEnv}. Set it before the next request; auth remains unverified.`,
@@ -136,10 +174,15 @@ export function nonInteractiveGuidance(model?: string): string {
   const selector = model === undefined || model.trim().length === 0
     ? "openrouter:<model-id>"
     : model.trim();
+  const provider = selector.includes(":") ? selector.slice(0, selector.indexOf(":")) : "openrouter";
+  const catalogFlag = provider === "openrouter" ? "" : " --all-providers";
+  const credentialHint = provider === "openrouter"
+    ? "OPENROUTER_API_KEY or `nausicaa auth login`"
+    : `the ${provider} provider credential or \`nausicaa auth login ${provider}\``;
   return [
     "Next step (non-interactive):",
-    `  nausicaa --print --model ${shellQuote(selector)} ${shellQuote("<task>")}`,
-    "Credential source: OPENROUTER_API_KEY or `nausicaa auth login` (presence only; auth is unverified).",
+    `  nausicaa --print${catalogFlag} --model ${shellQuote(selector)} ${shellQuote("<task>")}`,
+    `Credential source: ${credentialHint} (presence only; auth is unverified).`,
   ].join("\n");
 }
 

@@ -1,5 +1,6 @@
 import {
   createModels,
+  type AuthOperationOptions,
   type AuthCheck,
   type AuthContext,
   type AuthInteraction,
@@ -14,9 +15,11 @@ import {
   type Message,
   type Model,
   type Models,
+  type ModelsRefreshOptions,
   type MutableModels,
   type Tool as PiTool,
 } from "@earendil-works/pi-ai";
+import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
 
 import type {
@@ -53,6 +56,18 @@ export interface OpenRouterModelPortOptions {
   fetch?: FetchFunction;
 }
 
+export interface BuiltinModelPortOptions {
+  /** Inject a prepared collection when the host owns provider registration. */
+  models?: MutableModels;
+  /** Persistent credentials are injected by the application boundary. */
+  credentials?: CredentialStore;
+  /** Optional auth context seam for embedders and offline tests. */
+  authContext?: AuthContext;
+  /** Provider used when a selector omits the `provider:` prefix. */
+  defaultProvider?: string;
+  fetch?: FetchFunction;
+}
+
 export interface ModelCatalogEntry {
   selector: string;
   provider: string;
@@ -64,6 +79,23 @@ export interface ModelCatalogEntry {
   toolUse: "unknown";
   reasoning: boolean;
   authStatus: "unverified";
+}
+
+export interface ModelCatalogRefreshResult {
+  /** True when the caller's signal cancelled the refresh before completion. */
+  aborted: boolean;
+  /** Provider-scoped refresh failures; successful providers remain published. */
+  errors: ReadonlyMap<string, Error>;
+  /** Last-known catalog after cache restore and any successful refreshes. */
+  catalog: readonly ModelCatalogEntry[];
+}
+
+/** Provider metadata needed by host setup surfaces without exposing internals. */
+export interface ModelProviderInfo {
+  id: string;
+  name: string;
+  modelCount: number;
+  authTypes: readonly AuthType[];
 }
 
 /**
@@ -97,18 +129,63 @@ export class PiAiModelPort implements ModelPort {
 
   /** Read the last-known in-memory catalog without refreshing or authenticating. */
   catalog(): readonly ModelCatalogEntry[] {
-    return this.models.getProviders().flatMap((provider) => provider.getModels().map((model) => ({
-      selector: `${provider.id}:${model.id}`,
-      provider: provider.id,
-      id: model.id,
-      name: model.name,
-      contextWindowTokens: model.contextWindow,
-      maxOutputTokens: model.maxTokens,
-      imageInput: model.input.includes("image"),
-      toolUse: "unknown" as const,
-      reasoning: model.reasoning,
-      authStatus: "unverified" as const,
-    })));
+    return this.models.getProviders().flatMap((provider) => provider.getModels().map((model) => (
+      catalogEntry(provider.id, model)
+    )));
+  }
+
+  /** Read provider registration/auth capabilities without performing I/O. */
+  providers(): readonly ModelProviderInfo[] {
+    return this.models.getProviders().map((provider) => ({
+      id: provider.id,
+      name: provider.name,
+      modelCount: provider.getModels().length,
+      authTypes: Object.freeze([
+        ...(provider.auth.apiKey === undefined ? [] : ["api_key" as const]),
+        ...(provider.auth.oauth === undefined ? [] : ["oauth" as const]),
+      ]),
+    }));
+  }
+
+  hasProvider(provider: string): boolean {
+    return this.models.getProvider(provider) !== undefined;
+  }
+
+  providerAuthTypes(provider: string): readonly AuthType[] {
+    const entry = this.models.getProvider(provider);
+    if (entry === undefined) return [];
+    return [
+      ...(entry.auth.apiKey === undefined ? [] : ["api_key" as const]),
+      ...(entry.auth.oauth === undefined ? [] : ["oauth" as const]),
+    ];
+  }
+
+  /**
+   * Refresh selected dynamic providers through pi-ai's generation-checked
+   * publication boundary. Static providers are no-ops and cached catalogs are
+   * retained when one provider fails.
+   */
+  async refreshCatalog(
+    options: ModelsRefreshOptions = {},
+  ): Promise<ModelCatalogRefreshResult> {
+    const result = await this.models.refresh(options);
+    return {
+      aborted: result.aborted,
+      errors: new Map(result.errors),
+      catalog: this.catalog(),
+    };
+  }
+
+  /**
+   * Return only models whose provider reports complete local authentication.
+   * This performs provider-owned auth checks but never changes the catalog.
+   */
+  async availableCatalog(
+    provider?: string,
+    options?: AuthOperationOptions,
+  ): Promise<readonly ModelCatalogEntry[]> {
+    const models = await this.models.getAvailable(provider, options);
+    return models.map((model) => catalogEntry(model.provider, model));
   }
 
   /** Check local credential configuration without making a provider request. */
@@ -274,6 +351,21 @@ function isPositiveInteger(value: number): boolean {
   return Number.isInteger(value) && value > 0;
 }
 
+function catalogEntry(provider: string, model: Model<Api>): ModelCatalogEntry {
+  return {
+    selector: `${provider}:${model.id}`,
+    provider,
+    id: model.id,
+    name: model.name,
+    contextWindowTokens: model.contextWindow,
+    maxOutputTokens: model.maxTokens,
+    imageInput: model.input.includes("image"),
+    toolUse: "unknown",
+    reasoning: model.reasoning,
+    authStatus: "unverified",
+  };
+}
+
 export function createOpenRouterModelPort(
   options: OpenRouterModelPortOptions = {},
 ): PiAiModelPort {
@@ -291,6 +383,28 @@ export function createOpenRouterModelPort(
   return new PiAiModelPort({
     models,
     defaultProvider: "openrouter",
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+  });
+}
+
+/**
+ * Explicit all-provider Pi catalog. The default CLI intentionally keeps the
+ * lighter OpenRouter-only factory until a host opts into this heavier catalog.
+ */
+export function createBuiltinModelPort(
+  options: BuiltinModelPortOptions = {},
+): PiAiModelPort {
+  const models = options.models ?? builtinModels(
+    options.credentials === undefined && options.authContext === undefined
+      ? undefined
+      : {
+          ...(options.credentials === undefined ? {} : { credentials: options.credentials }),
+          ...(options.authContext === undefined ? {} : { authContext: options.authContext }),
+        },
+  );
+  return new PiAiModelPort({
+    models,
+    defaultProvider: options.defaultProvider ?? "openrouter",
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
 }

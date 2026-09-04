@@ -5,6 +5,8 @@ import type {
   ArtifactRef,
   EventId,
   Goal,
+  ThreadGoal,
+  ThreadGoalOperation,
   TodoItem,
   LaneId,
   LaneKind,
@@ -28,7 +30,7 @@ import type {
 } from "./context.js";
 
 export type InputDelivery = "new-turn" | "steering" | "follow-up";
-export type UserMessageKind = "initial" | "steering";
+export type UserMessageKind = "initial" | "steering" | "continuation";
 
 export interface TurnExecutionBoundary {
   collaborationMode: "default" | "plan";
@@ -57,11 +59,34 @@ export interface ContextTruncation {
 }
 
 export interface EventPayloadMap {
-  "run.created": { goal: Goal; workspace: string; policy: RunPolicy };
+  /** `goal` is optional for normal interactive Runs; legacy/one-shot Runs retain it. */
+  "run.created": {
+    goal?: Goal;
+    workspace: string;
+    policy: RunPolicy;
+    /** Initial Main selector; optional for schema-v1 Runs. */
+    mainModel?: string;
+  };
+  /** A child Run was created from an immutable, verified parent checkpoint. */
+  "run.forked": {
+    parentRunId: RunId;
+    parentCheckpoint: { watermark: number; checksum: string };
+  };
   "run.resumed": { fromOffset: number; reason?: "new-turn" };
   "run.completed": { answerRef?: ArtifactRef };
   "run.failed": { error: string };
   "goal.revised": { goal: Goal };
+  /** Full-snapshot persistent interactive Goal mutation. */
+  "thread.goal.changed": {
+    operation: ThreadGoalOperation;
+    goal: ThreadGoal;
+    expectedRevision?: number;
+  };
+  /** Clear tombstone for the current persistent interactive Goal. */
+  "thread.goal.cleared": {
+    goalId: string;
+    revision: number;
+  };
   "todo.updated": {
     revision: number;
     items: TodoItem[];
@@ -198,6 +223,20 @@ export interface EventPayloadMap {
     toolCallId: string;
     name: string;
     argumentsRef: ArtifactRef;
+  };
+  /** All catalog, policy, schema, and approval checks passed. */
+  "tool.admitted": {
+    operationId: string;
+    toolCallId: string;
+    name: string;
+    argumentsHash: string;
+  };
+  /** The tool adapter is about to be invoked and may create an effect. */
+  "tool.started": {
+    operationId: string;
+    toolCallId: string;
+    name: string;
+    argumentsHash: string;
   };
   "approval.requested": {
     operationId: string;

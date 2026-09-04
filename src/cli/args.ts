@@ -38,6 +38,10 @@ export interface CliOptions {
   mode: OutputMode;
   modeExplicit: boolean;
   continue: boolean;
+  /** Opt into the complete pi-ai built-in provider/model catalog. */
+  allProviders?: boolean;
+  /** Explicitly refresh dynamic provider model metadata before the Run. */
+  refreshModels?: boolean;
   model?: string;
   tetoModel?: string;
   resume?: string;
@@ -185,6 +189,12 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
       case "--model":
         options.model = readValue(args, index, argument);
         index += 1;
+        break;
+      case "--all-providers":
+        options.allProviders = true;
+        break;
+      case "--refresh-models":
+        options.refreshModels = true;
         break;
       case "--teto-model":
         options.tetoModel = readValue(args, index, argument);
@@ -353,6 +363,8 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
     || options.allowNetwork !== undefined
     || options.edges !== undefined
     || options.fukaiCompaction !== undefined
+    || options.allProviders !== undefined
+    || options.refreshModels !== undefined
   )) {
     throw new CliUsageError(
       "--topology cannot be combined with execution, lane, permission, or edge options",
@@ -385,6 +397,8 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
     || options.allowNetwork !== undefined
     || options.edges !== undefined
     || options.fukaiCompaction !== undefined
+    || options.allProviders !== undefined
+    || options.refreshModels !== undefined
     || options.topology
     || options.fileArgs.length > 0
     || options.message !== undefined
@@ -488,6 +502,8 @@ Options:
                           Select the output mode
   --model <provider:id>   Main model, for example openrouter:openai/gpt-5-mini
                           Or set NAUSICAA_MODEL; provider auth is not pre-verified
+  --all-providers         Use the complete pi-ai built-in provider/model catalog
+  --refresh-models        Refresh dynamic provider catalogs before the Run (network)
   --teto-model <value>    Optional model override for the Teto lane
   --resume <run-id>       Resume an interrupted Run
   --continue              Resume the latest Run for this workspace

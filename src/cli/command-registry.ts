@@ -106,6 +106,13 @@ export const PUBLIC_INTERACTIVE_COMMANDS: readonly InteractiveCommandSpec[] = Ob
     aliases: ["usage"],
   }),
   command({
+    name: "compact",
+    description: "Compact committed conversation context",
+    references: ["pi", "codex"],
+    alignment: "semantic-review",
+    visibility: "public",
+  }),
+  command({
     name: "model",
     description: "Choose the model",
     argumentHint: "[model]",
@@ -147,8 +154,8 @@ export const PUBLIC_INTERACTIVE_COMMANDS: readonly InteractiveCommandSpec[] = Ob
   }),
   command({
     name: "goal",
-    description: "Set or view the long-running task goal",
-    argumentHint: "[statement]",
+    description: "View or manage the optional long-running thread goal",
+    argumentHint: "[status|<objective>|--budget <tokens> <objective>|edit <objective>|pause|resume|clear]",
     references: ["prime", "codex"],
     alignment: "shared",
     visibility: "public",
@@ -160,6 +167,22 @@ export const PUBLIC_INTERACTIVE_COMMANDS: readonly InteractiveCommandSpec[] = Ob
     references: ["prime", "pi"],
     alignment: "semantic-review",
     visibility: "public",
+  }),
+  command({
+    name: "tree",
+    description: "Navigate the workspace Run tree and historical checkpoints",
+    references: ["pi"],
+    alignment: "semantic-review",
+    visibility: "public",
+  }),
+  command({
+    name: "fork",
+    description: "Fork the current Run from its latest committed checkpoint",
+    argumentHint: "[run-id]",
+    references: ["pi", "codex"],
+    alignment: "semantic-review",
+    visibility: "public",
+    aliases: ["branch"],
   }),
   command({
     name: "new",

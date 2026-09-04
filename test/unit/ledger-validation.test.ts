@@ -183,6 +183,10 @@ const crossRunReceipt = {
 
 const validPayloads = {
   "run.created": { goal, workspace: "/workspace", policy },
+  "run.forked": {
+    parentRunId: "parent-run",
+    parentCheckpoint: { watermark: 4, checksum: `sha256:${"0".repeat(64)}` },
+  },
   "run.resumed": { fromOffset: 4, reason: "new-turn" },
   "run.completed": { answerRef: artifact },
   "run.failed": { error: "model failed" },
@@ -285,6 +289,33 @@ const validPayloads = {
     name: "read",
     argumentsRef: artifact,
   },
+  "tool.admitted": {
+    operationId: "operation-1",
+    toolCallId: "call-1",
+    name: "read",
+    argumentsHash: artifact.contentHash,
+  },
+  "tool.started": {
+    operationId: "operation-1",
+    toolCallId: "call-1",
+    name: "read",
+    argumentsHash: artifact.contentHash,
+  },
+  "thread.goal.changed": {
+    operation: "create",
+    goal: {
+      goalId: "thread-goal-1",
+      revision: 1,
+      objective: "Finish the objective",
+      status: "active",
+      tokensUsed: 0,
+      timeUsedSeconds: 0,
+      continuationsUsed: 0,
+      createdAt: "2026-09-04T00:00:00.000Z",
+      updatedAt: "2026-09-04T00:00:00.000Z",
+    },
+  },
+  "thread.goal.cleared": { goalId: "thread-goal-1", revision: 1 },
   "approval.requested": {
     operationId: "operation-1",
     toolCallId: "call-1",
@@ -442,6 +473,10 @@ const validPayloads = {
 
 const invalidPayloads = {
   "run.created": { goal, workspace: "/workspace" },
+  "run.forked": {
+    parentRunId: "",
+    parentCheckpoint: { watermark: 0, checksum: "invalid" },
+  },
   "run.resumed": { fromOffset: -1 },
   "run.completed": { answerRef: null },
   "run.failed": {},
@@ -506,6 +541,33 @@ const invalidPayloads = {
   "model.failed": { model: "", error: "failed" },
   "model.cancelled": { requestId: "", reason: "user" },
   "tool.requested": { operationId: "op", toolCallId: "call", name: "read" },
+  "thread.goal.changed": {
+    operation: "create",
+    goal: {
+      goalId: "",
+      revision: 0,
+      objective: "",
+      status: "unknown",
+      tokensUsed: -1,
+      timeUsedSeconds: -1,
+      continuationsUsed: -1,
+      createdAt: "invalid",
+      updatedAt: "invalid",
+    },
+  },
+  "thread.goal.cleared": { goalId: "", revision: 0 },
+  "tool.admitted": {
+    operationId: "op",
+    toolCallId: "call",
+    name: "read",
+    argumentsHash: "bad-hash",
+  },
+  "tool.started": {
+    operationId: "op",
+    toolCallId: "call",
+    name: "read",
+    argumentsHash: "bad-hash",
+  },
   "approval.requested": {
     operationId: "op",
     toolCallId: "call",

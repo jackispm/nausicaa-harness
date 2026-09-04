@@ -137,6 +137,13 @@ export async function executeShellCommand(input: {
     child.stdout?.on("data", (chunk: string) => stdout.append(chunk));
     child.stderr?.on("data", (chunk: string) => stderr.append(chunk));
 
+    // Arm the stdio grace timer before synchronous process discovery runs on
+    // the root shell's exit event.
+    const childCompletion = waitForChildProcess(child);
+    // Do not leave detached descendants alive for the stdio grace period
+    // after their root shell has exited.
+    child.once("exit", terminate);
+
     if (input.timeoutMs !== undefined) {
       timeoutId = setTimeout(() => {
         if (aborted) return;
@@ -150,7 +157,7 @@ export async function executeShellCommand(input: {
       input.signal?.addEventListener("abort", onAbort, { once: true });
     }
 
-    void waitForChildProcess(child).then(
+    void childCompletion.then(
       (exitCode) => {
         // Background jobs are unsupported. Process groups handle the normal
         // case; the marker scan is a bounded, best-effort fallback for jobs
