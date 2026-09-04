@@ -1,5 +1,6 @@
 import type {
   ConversationMessage,
+  EventId,
   LaneId,
   RunId,
   TokenUsage,
@@ -23,6 +24,8 @@ export interface ToolDefinition {
 export interface ModelRequest {
   runId: RunId;
   laneId: LaneId;
+  /** Durable logical request identity, supplied by the L1 runtime when available. */
+  requestId?: EventId;
   sessionId: string;
   model: string;
   systemPrompt: string;

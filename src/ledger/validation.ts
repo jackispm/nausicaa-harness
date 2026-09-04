@@ -1297,6 +1297,42 @@ const payloadValidators = {
       contextManifest(item.contextManifest, `${path}.contextManifest`);
     }
   },
+  "model.retrying": (value, path) => {
+    const item = payloadObject(value, path, [
+      "requestId",
+      "model",
+      "attempt",
+      "maxAttempts",
+      "delayMs",
+      "category",
+      "error",
+    ]);
+    string(item.requestId, `${path}.requestId`, false);
+    string(item.model, `${path}.model`, false);
+    integer(item.attempt, `${path}.attempt`, 1);
+    integer(item.maxAttempts, `${path}.maxAttempts`, 1);
+    if ((item.maxAttempts as number) > 10) {
+      invalid(`${path}.maxAttempts`, "at most 10");
+    }
+    if ((item.attempt as number) >= (item.maxAttempts as number)) {
+      invalid(`${path}.attempt`, "less than maxAttempts for a pending retry");
+    }
+    finiteNumber(item.delayMs, `${path}.delayMs`);
+    if ((item.delayMs as number) > 60_000) {
+      invalid(`${path}.delayMs`, "at most 60000");
+    }
+    oneOf(item.category, `${path}.category`, [
+      "network",
+      "rate-limit",
+      "server",
+      "timeout",
+      "transient",
+    ] as const);
+    string(item.error, `${path}.error`, false);
+    if ((item.error as string).length > 512) {
+      invalid(`${path}.error`, "at most 512 characters");
+    }
+  },
   "model.completed": (value, path) => {
     const item = payloadObject(value, path, [
       "model",

@@ -32,6 +32,14 @@ import type {
 export type InputDelivery = "new-turn" | "steering" | "follow-up";
 export type UserMessageKind = "initial" | "steering" | "continuation";
 
+/** Failure classes that may trigger a bounded provider retry. */
+export type ModelRetryCategory =
+  | "network"
+  | "rate-limit"
+  | "server"
+  | "timeout"
+  | "transient";
+
 export interface TurnExecutionBoundary {
   collaborationMode: "default" | "plan";
   capabilities: {
@@ -201,6 +209,19 @@ export interface EventPayloadMap {
     estimatedInputTokens?: number;
     /** Redacted six-slot context contract used to build this request. */
     contextManifest?: ContextManifest;
+  };
+  /** A physical provider attempt failed and the retry boundary will wait before the next attempt. */
+  "model.retrying": {
+    /** Event ID of the logical model.requested fact for this provider call. */
+    requestId: EventId;
+    model: string;
+    /** 1-based attempt that failed; maxAttempts includes the initial attempt. */
+    attempt: number;
+    maxAttempts: number;
+    delayMs: number;
+    category: ModelRetryCategory;
+    /** Bounded, provider-safe failure summary. */
+    error: string;
   };
   "model.completed": {
     model: string;

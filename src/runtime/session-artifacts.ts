@@ -48,6 +48,19 @@ export type SessionTranscriptEntry =
       arguments?: Record<string, unknown>;
     };
 
+/**
+ * Durable compaction lifecycle facts that are safe to project into a
+ * read-only Session presentation. The event identity is part of the public
+ * projection so reconnect/replay cannot manufacture a second notice.
+ */
+export type SessionCompactionNotice = {
+  eventId: string;
+  globalOffset: number;
+  turnId?: string;
+  compactionId: string;
+  status: "requested" | "committed" | "failed" | "fallback";
+};
+
 export interface SessionPendingInput {
   inputId: string;
   delivery: InputDelivery;
@@ -163,6 +176,50 @@ export async function projectSessionTranscript(
     });
   }
   return transcript;
+}
+
+/**
+ * Project user-visible compaction lifecycle from replayed Ledger facts.
+ *
+ * Provider completion is intentionally omitted: it is an internal attempt
+ * boundary, while requested/committed/failed/fallback are the same lifecycle
+ * facts rendered by the live interactive surface. Duplicate event IDs are
+ * ignored defensively because a reconnect source must be idempotent.
+ */
+export function projectSessionCompactionNotices(
+  events: readonly AnyEvent[],
+  runId: string,
+): SessionCompactionNotice[] {
+  const notices: SessionCompactionNotice[] = [];
+  const seenEventIds = new Set<string>();
+  const ordered = [...events].sort((left, right) => (
+    left.globalOffset - right.globalOffset
+    || left.eventId.localeCompare(right.eventId)
+  ));
+  for (const event of ordered) {
+    if (
+      event.runId !== runId
+      || event.laneId !== "main"
+      || (
+        event.type !== "fukai.compaction.requested"
+        && event.type !== "fukai.compaction.committed"
+        && event.type !== "fukai.compaction.failed"
+        && event.type !== "fukai.compaction.fallback"
+      )
+      || seenEventIds.has(event.eventId)
+    ) {
+      continue;
+    }
+    seenEventIds.add(event.eventId);
+    notices.push({
+      eventId: event.eventId,
+      globalOffset: event.globalOffset,
+      ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
+      compactionId: event.payload.compactionId,
+      status: compactionStatus(event.type),
+    });
+  }
+  return notices;
 }
 
 export async function projectPendingInputs(
@@ -340,6 +397,21 @@ export function projectPendingAdmissions(
 
 function legacyTurnIdForTranscript(runId: string): string {
   return `legacy:${runId}:0`;
+}
+
+function compactionStatus(
+  type:
+    | "fukai.compaction.requested"
+    | "fukai.compaction.committed"
+    | "fukai.compaction.failed"
+    | "fukai.compaction.fallback",
+): SessionCompactionNotice["status"] {
+  switch (type) {
+    case "fukai.compaction.requested": return "requested";
+    case "fukai.compaction.committed": return "committed";
+    case "fukai.compaction.failed": return "failed";
+    case "fukai.compaction.fallback": return "fallback";
+  }
 }
 
 function upsertTranscriptToolEntry(

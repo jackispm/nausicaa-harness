@@ -6,6 +6,7 @@ import type {
   EventPayloadMap,
   EventType,
 } from "../domain/events.js";
+import type { ModelRetryNotice } from "../model/retrying-model.js";
 import type {
   AgentTool,
   Clock,
@@ -271,6 +272,16 @@ interface MainModelStreamProgress {
   reasoning: string;
 }
 
+interface MainModelRetryContext {
+  input: MainLoopInput;
+  laneId: LaneId;
+  correlationId: string;
+  eventState: { watermark: number };
+  eventPrefix: string;
+  step: number;
+  requestId: string;
+}
+
 export interface MainLoopInput {
   runId: RunId;
   /** Present for interactive Runs; omitted only for schema-v1 one-shot compatibility. */
@@ -360,6 +371,7 @@ export class MainLoop {
   private readonly artifactAuthorization: RunArtifactAuthorization | undefined;
   private readonly streamSequences = new Map<string, number>();
   private readonly modelCallAttempts = new Map<string, number>();
+  private readonly modelRetryContexts = new Map<string, MainModelRetryContext>();
 
   constructor(deps: MainLoopDeps) {
     // Every Main/Teto/Team request passes through one immutable provider
@@ -371,7 +383,9 @@ export class MainLoop {
     // again would re-probe capabilities and snapshot the same request twice.
     this.model = deps.model instanceof PreparedModelPort
       ? deps.model
-      : prepareModelPort(withDefaultModelRetries(deps.model));
+      : prepareModelPort(withDefaultModelRetries(deps.model, {
+          onRetry: (notice) => this.persistModelRetry(notice),
+        }));
     this.resolveModel = deps.resolveModel;
     this.runTokenBudget = deps.runTokenBudget;
     this.contextProvider = deps.contextProvider;
@@ -839,6 +853,7 @@ export class MainLoop {
           const modelRequest: ModelRequest = {
             runId: input.runId,
             laneId,
+            requestId: requestEvent.eventId,
             sessionId,
             model: requestModel,
             systemPrompt: view.systemPrompt,
@@ -851,6 +866,15 @@ export class MainLoop {
           // deadline, so a provider cannot outlive either boundary merely
           // because this activation is a one-shot invocation.
           const providerSignal = deadline.signal;
+          this.modelRetryContexts.set(requestEvent.eventId, {
+            input,
+            laneId,
+            correlationId,
+            eventState,
+            eventPrefix,
+            step,
+            requestId: requestEvent.eventId,
+          });
           response = await this.requestModel(
             {
               ...modelRequest,
@@ -956,6 +980,9 @@ export class MainLoop {
           throw terminalError;
         } finally {
           deadline.dispose();
+          if (requestEvent !== undefined) {
+            this.modelRetryContexts.delete(requestEvent.eventId);
+          }
         }
         try {
           await this.emit(input, laneId, correlationId, eventState, {
@@ -1558,6 +1585,30 @@ export class MainLoop {
       }
       throw error;
     }
+  }
+
+  private async persistModelRetry(notice: ModelRetryNotice): Promise<void> {
+    if (notice.requestId === undefined) {
+      throw new Error("Model retry observability requires a durable requestId");
+    }
+    const context = this.modelRetryContexts.get(notice.requestId);
+    if (context === undefined) {
+      throw new Error(`Model retry has no active request context: ${notice.requestId}`);
+    }
+    await this.emit(context.input, context.laneId, context.correlationId, context.eventState, {
+      type: "model.retrying",
+      payload: {
+        requestId: context.requestId,
+        model: notice.model,
+        attempt: notice.attempt,
+        maxAttempts: notice.maxAttempts,
+        delayMs: notice.delayMs,
+        category: notice.category,
+        error: notice.error,
+      },
+      idempotencyKey: `${context.eventPrefix}:step:${context.step}:model:retrying:${notice.attempt}`,
+      causationId: context.requestId,
+    });
   }
 
   private nextModelReservationId(

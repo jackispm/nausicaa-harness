@@ -2,11 +2,13 @@ import {
   Box,
   Container,
   type EditorTheme,
+  Loader,
   Markdown,
   type MarkdownTheme,
   Spacer,
   Text,
   type Component,
+  type TUI,
   sliceByColumn,
   stripTerminalSequences,
   truncateToWidth,
@@ -499,43 +501,92 @@ export class WorkerTaskSummaryLine implements Component {
   invalidate(): void {}
 }
 
-/** Nausicaa-specific activity line outside the transcript. */
+/** Pi's live request indicator, kept outside the transcript. */
 export class ActivityLine implements Component {
-  private frame = 0;
+  private readonly loader: Loader;
+  private readonly hasUi: boolean;
+  private active = false;
   private startedAt: number | undefined;
   private phase = "Thinking";
-  private static readonly spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  private manualFrame = 0;
 
-  constructor(private readonly readSnapshot: () => SessionSnapshot) {}
+  constructor(
+    private readonly readSnapshot: () => SessionSnapshot,
+    tui?: TUI,
+  ) {
+    // Loader owns both the exact braille frames and the 80ms cadence used by
+    // Pi. Tests may construct this component without a TUI, in which case the
+    // component remains fully renderable and lifecycle methods are no-ops for
+    // redraw scheduling.
+    this.hasUi = tui !== undefined;
+    this.loader = new Loader(
+      tui as TUI,
+      palette.accent,
+      palette.muted,
+      "Thinking...",
+    );
+    this.loader.stop();
+  }
 
-  advance(): void { this.frame += 1; }
+  start(): void {
+    if (this.active) return;
+    this.active = true;
+    this.startedAt ??= Date.now();
+    if (this.hasUi) this.loader.start();
+    else (this.loader as unknown as { updateDisplay: () => void }).updateDisplay();
+  }
+
+  stop(): void {
+    if (!this.active) return;
+    this.active = false;
+    this.startedAt = undefined;
+    this.loader.stop();
+  }
+
+  /** Compatibility hook for callers that used the old timer-driven line. */
+  advance(): void {
+    this.manualFrame += 1;
+    const loader = this.loader as unknown as { currentFrame: number; updateDisplay: () => void };
+    loader.currentFrame = this.manualFrame % 10;
+    loader.updateDisplay();
+  }
 
   setPhase(phase: "Thinking" | "Writing" | "Executing"): void {
     this.phase = phase;
+    this.loader.setMessage(`${phase}...`);
   }
 
   render(width: number): string[] {
+    // State snapshots are a fallback for embedders that do not forward the
+    // lifecycle event. The interactive path starts/stops explicitly below.
     const snapshot = this.readSnapshot();
-    const active = snapshot.status === "running" || snapshot.status === "cancelling";
-    if (!active) {
-      this.startedAt = undefined;
-      return [];
-    }
-    this.startedAt ??= Date.now();
-    const spinner = ActivityLine.spinnerFrames[this.frame % ActivityLine.spinnerFrames.length] ?? "⠋";
-    const elapsed = formatElapsed(Date.now() - this.startedAt);
+    const snapshotActive = snapshot.status === "running"
+      || snapshot.status === "cancelling";
+    if (snapshotActive && !this.active) this.start();
+    if (!snapshotActive && this.active) this.stop();
+    if (!this.active) return [];
+    const safeWidth = Math.max(1, width);
+    const elapsed = formatElapsed(Date.now() - (this.startedAt ?? Date.now()));
     const usage = snapshot.usage.input + snapshot.usage.output;
     const label = snapshot.status === "cancelling" ? "Cancelling" : this.phase;
-    const line = truncateToWidth(
-      ` ${palette.accent(spinner)} ${palette.muted(`${label}...`)} ${palette.dim("·")} ${palette.muted(`${elapsed} · ${usage} tokens · step ${snapshot.lastCommittedStep}`)}`,
-      Math.max(1, width),
-      "",
-    );
-    // pi-tui's Loader reserves a quiet row before the animated status text.
-    return [" ".repeat(Math.max(1, width)), line];
+    if (label !== this.phase || snapshot.status === "cancelling") {
+      this.loader.setMessage(`${label}...`);
+    }
+    const loaderLines = this.loader.render(safeWidth);
+    // Text.render pads to the requested width; trim that layout padding before
+    // adding the durable elapsed/usage suffix so the suffix remains visible.
+    const line = (loaderLines[1] ?? "").trimEnd();
+    return [
+      loaderLines[0] ?? "",
+      truncateToWidth(
+        `${line} ${palette.dim("·")} ${palette.muted(`${elapsed} · ${usage} tokens · step ${snapshot.lastCommittedStep}`)}`,
+        safeWidth,
+        "",
+      ),
+    ];
   }
 
-  invalidate(): void {}
+  invalidate(): void { this.loader.invalidate(); }
 }
 
 /** A user turn is a full-width quiet surface with no noisy role heading. */
@@ -982,7 +1033,8 @@ export class PromptSurface implements Component {
         const available = Math.max(0, safeWidth - 1);
         // sliceByColumn can omit the editor's reset after the reverse-video cursor.
         // Close inverse explicitly so the placeholder stays on the terminal surface.
-        lines[1] = `${cursor}${ESC}27m${palette.dim(truncateToWidth(this.placeholder, available, ""))}`;
+        const placeholder = `${cursor}${ESC}27m${palette.dim(truncateToWidth(this.placeholder, available, ""))}`;
+        lines[1] = `${placeholder}${" ".repeat(Math.max(0, safeWidth - visibleWidth(placeholder)))}`;
       } else {
         lines[1] = content;
       }

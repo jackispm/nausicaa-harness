@@ -265,6 +265,7 @@ export class LedgerState {
   readonly #runForks = new Set<RunId>();
   readonly #goalVersions = new Map<RunId, number>();
   readonly #threadGoals = new Map<RunId, { goalId: string; revision: number }>();
+  readonly #modelRequests = new Map<EventId, EventEnvelope<"model.requested">>();
   readonly #sentMessages = new Map<string, EventEnvelope<"message.sent">>();
   readonly #toolRequests = new Map<string, EventEnvelope<"tool.requested">>();
   readonly #toolAdmissions = new Map<string, EventEnvelope<"tool.admitted">>();
@@ -410,6 +411,8 @@ export class LedgerState {
       this.#threadGoals.delete(stored.runId);
     } else if (stored.type === "goal.revised") {
       this.#goalVersions.set(stored.runId, stored.payload.goal.version);
+    } else if (stored.type === "model.requested") {
+      this.#modelRequests.set(stored.eventId, stored);
     } else if (stored.type === "message.sent") {
       this.#sentMessages.set(messageScope(stored.runId, stored.payload.message.messageId), stored);
     } else if (stored.type === "tool.requested") {
@@ -573,6 +576,52 @@ export class LedgerState {
       throw new LedgerCorruptionError(
         "budget.charged laneId must equal the event laneId",
       );
+    }
+
+    if (event.type === "model.retrying") {
+      const request = this.#modelRequests.get(event.payload.requestId);
+      if (request === undefined) {
+        throw new LedgerCorruptionError(
+          `Model retry ${event.payload.requestId} has no preceding model.requested event`,
+        );
+      }
+      if (
+        request.runId !== event.runId
+        || request.laneId !== event.laneId
+        || request.turnId !== event.turnId
+        || request.payload.model !== event.payload.model
+        || request.correlationId !== event.correlationId
+        || event.causationId !== request.eventId
+      ) {
+        throw new LedgerCorruptionError(
+          `Model retry ${event.payload.requestId} does not match its model.requested event`,
+        );
+      }
+      const priorRetries = this.#events.filter((candidate): candidate is EventEnvelope<"model.retrying"> => (
+        candidate.type === "model.retrying"
+        && candidate.payload.requestId === event.payload.requestId
+      ));
+      const previous = priorRetries.at(-1);
+      if ((previous === undefined && event.payload.attempt !== 1)
+        || (previous !== undefined && (
+          previous.payload.attempt + 1 !== event.payload.attempt
+          || previous.payload.maxAttempts !== event.payload.maxAttempts
+        ))) {
+        throw new LedgerCorruptionError(
+          `Model retry attempt ${event.payload.attempt} is not monotonic for ${event.payload.requestId}`,
+        );
+      }
+      if (this.#events.some((candidate) => (
+        (candidate.type === "model.completed" || candidate.type === "model.failed")
+        && candidate.causationId === event.payload.requestId
+      ) || (
+        candidate.type === "model.cancelled"
+        && candidate.payload.requestId === event.payload.requestId
+      ))) {
+        throw new LedgerCorruptionError(
+          `Model retry ${event.payload.requestId} was recorded after a terminal outcome`,
+        );
+      }
     }
 
     if (event.type === "approval.requested") {

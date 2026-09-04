@@ -57,6 +57,43 @@ describe("RetryingModelPort", () => {
     expect(delays).toEqual([10, 20]);
   });
 
+  it("reports each retryable physical attempt before waiting", async () => {
+    const transient = new ProviderModelError({ category: "server", status: 503, retryable: true });
+    const delegate = new CompletionSequence([transient, transient, response]);
+    const notices: Array<Record<string, unknown>> = [];
+    const model = retrying(delegate, {
+      baseDelayMs: 10,
+      random: () => 1,
+      onRetry: (notice) => { notices.push({ ...notice }); },
+    });
+
+    await expect(model.complete({ ...request(), requestId: "request-event-1" })).resolves.toEqual(response);
+    expect(notices).toEqual([
+      {
+        requestId: "request-event-1",
+        runId: "run-1",
+        laneId: "main",
+        model: "demo",
+        attempt: 1,
+        maxAttempts: 3,
+        delayMs: 10,
+        category: "server",
+        error: "Model provider failure (server, HTTP 503)",
+      },
+      {
+        requestId: "request-event-1",
+        runId: "run-1",
+        laneId: "main",
+        model: "demo",
+        attempt: 2,
+        maxAttempts: 3,
+        delayMs: 20,
+        category: "server",
+        error: "Model provider failure (server, HTTP 503)",
+      },
+    ]);
+  });
+
   it.each(["authentication", "permission", "quota", "invalid-request", "aborted"] as const)(
     "does not retry the %s category even when a caller marks it retryable",
     async (category) => {

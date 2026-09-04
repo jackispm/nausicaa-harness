@@ -1,4 +1,7 @@
 import type {
+  ModelRetryCategory,
+} from "../domain/events.js";
+import type {
   ModelCapabilities,
   ModelPort,
   ModelRequest,
@@ -24,6 +27,23 @@ export interface RetryingModelPortOptions {
   maxDelayMs: number;
   sleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   random?: () => number;
+  /** Called after a retryable failure is classified and before the backoff. */
+  onRetry?: (notice: ModelRetryNotice) => void | Promise<void>;
+}
+
+export interface ModelRetryNotice {
+  /** Logical request identity, when the caller supplied one. */
+  requestId?: string;
+  runId: string;
+  laneId: string;
+  model: string;
+  /** 1-based attempt that failed; the next attempt is `attempt + 1`. */
+  attempt: number;
+  /** Includes the initial provider call. */
+  maxAttempts: number;
+  delayMs: number;
+  category: ModelRetryCategory;
+  error: string;
 }
 
 /**
@@ -64,6 +84,7 @@ export class RetryingModelPort implements ModelPort {
   private readonly maxDelayMs: number;
   private readonly sleep: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   private readonly random: () => number;
+  private readonly onRetry: ((notice: ModelRetryNotice) => void | Promise<void>) | undefined;
   readonly capabilities?: (model: string) => ModelCapabilities;
   readonly stream?: (request: ModelRequest) => AsyncIterable<ModelStreamEvent>;
 
@@ -82,6 +103,7 @@ export class RetryingModelPort implements ModelPort {
     this.maxDelayMs = options.maxDelayMs;
     this.sleep = options.sleep ?? abortableSleep;
     this.random = options.random ?? Math.random;
+    this.onRetry = options.onRetry;
     if (delegate.capabilities !== undefined) {
       this.capabilities = (model) => delegate.capabilities!(model);
     }
@@ -107,7 +129,7 @@ export class RetryingModelPort implements ModelPort {
         return response;
       } catch (error: unknown) {
         if (!this.canRetry(error, attempt, request.signal)) throw error;
-        await this.waitBeforeRetry(error, attempt, request.signal);
+        await this.waitBeforeRetry(request, error, attempt, request.signal);
       }
     }
   }
@@ -168,7 +190,7 @@ export class RetryingModelPort implements ModelPort {
       terminalError ??= new Error("Model stream ended without a final response");
       if (!deltaPublished && this.canRetry(terminalError, attempt, request.signal)) {
         try {
-          await this.waitBeforeRetry(terminalError, attempt, request.signal);
+          await this.waitBeforeRetry(request, terminalError, attempt, request.signal);
         } catch (error: unknown) {
           yield { type: "error", error: asError(error) };
           return;
@@ -201,11 +223,28 @@ export class RetryingModelPort implements ModelPort {
   }
 
   private async waitBeforeRetry(
+    request: ModelRequest,
     error: ProviderModelError,
     attempt: number,
     signal: AbortSignal | undefined,
   ): Promise<void> {
     const delayMs = error.retryAfterMs ?? this.backoffDelay(attempt);
+    if (this.onRetry !== undefined) {
+      await this.onRetry({
+        ...(request.requestId === undefined ? {} : { requestId: request.requestId }),
+        runId: request.runId,
+        laneId: request.laneId,
+        model: request.model,
+        attempt,
+        maxAttempts: this.maxAttempts,
+        delayMs,
+        // canRetry() has already constrained the category to the transient
+        // set used by the durable event contract.
+        category: error.category as ModelRetryCategory,
+        error: retryErrorSummary(error),
+      });
+    }
+    throwIfAborted(signal);
     await raceAbort(this.sleep(delayMs, signal), signal);
   }
 
@@ -305,4 +344,9 @@ async function closeIterator(
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function retryErrorSummary(error: ProviderModelError): string {
+  const summary = error.message.replace(/\0/g, "").slice(0, 512);
+  return summary.length > 0 ? summary : `Model provider failure (${error.category})`;
 }

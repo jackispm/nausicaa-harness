@@ -13,6 +13,7 @@ import {
 
 import type {
   DaemonRemoteSessionState,
+  SessionCompactionNotice,
   SessionSnapshot,
   SessionTranscriptEntry,
   WorkerTaskSummary,
@@ -42,6 +43,8 @@ export interface RemoteAttachSession {
   snapshot(): SessionSnapshot;
   state(): DaemonRemoteSessionState;
   transcript(): Promise<SessionTranscriptEntry[]>;
+  /** Durable lifecycle projection; optional for older embedders. */
+  compactionHistory?: () => Promise<SessionCompactionNotice[]>;
   workerTaskSummary(): WorkerTaskSummary;
   subscribe(listener: (state: DaemonRemoteSessionState) => void): () => void;
   close(): Promise<void>;
@@ -60,7 +63,7 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
     primary: true,
     scrollbar: "auto",
   });
-  const activity = new ActivityLine(() => options.session.snapshot());
+  const activity = new ActivityLine(() => options.session.snapshot(), tui);
   const header = new BrandSplashHeader({
     version: "0.1.0",
   });
@@ -91,12 +94,19 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
   };
 
   const renderTranscript = async (): Promise<void> => {
-    const entries = await options.session.transcript();
+    const [entries, compactionHistory] = await Promise.all([
+      options.session.transcript(),
+      options.session.compactionHistory?.() ?? Promise.resolve([]),
+    ]);
     transcript.clear();
     transcript.addChild(header);
     const state = options.session.state();
     if (state.error !== undefined) {
       append(new NoticeBlock(state.error, "warning"));
+    }
+    for (const notice of compactionHistory) {
+      const presentation = compactionNoticePresentation(notice);
+      append(new NoticeBlock(presentation.message, presentation.kind));
     }
     for (const entry of entries) {
       if (entry.role === "user") {
@@ -140,22 +150,13 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
   };
 
   const unsubscribe = options.session.subscribe(() => scheduleRefresh());
-  const activityTimer = setInterval(() => {
-    const status = options.session.snapshot().status;
-    if (status === "running" || status === "cancelling") {
-      activity.advance();
-      tui.requestRender();
-    }
-  }, 80);
-  activityTimer.unref?.();
-
   const finish = (code: number): Promise<void> => {
     if (finishPromise !== undefined) return finishPromise;
     closing = true;
     exitCode = code;
     finishPromise = (async () => {
       unsubscribe();
-      clearInterval(activityTimer);
+      activity.stop();
       await refreshTail.catch(() => undefined);
       await terminal.drainInput(250, 25).catch(() => undefined);
       try {
@@ -242,6 +243,24 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
     process.removeListener("SIGTERM", onSignal);
     process.removeListener("SIGINT", onInterrupt);
     process.stdin.removeListener("end", onSignal);
+  }
+}
+
+function compactionNoticePresentation(
+  notice: SessionCompactionNotice,
+): { message: string; kind: "info" | "success" | "warning" } {
+  switch (notice.status) {
+    case "requested":
+      return { message: "Compacting context...", kind: "info" };
+    case "committed":
+      return { message: "Context compacted for the next Turn.", kind: "success" };
+    case "failed":
+      return { message: "Compaction provider failed; the raw context is unchanged.", kind: "warning" };
+    case "fallback":
+      return {
+        message: "Compaction fell back to the raw context; the transcript is unchanged.",
+        kind: "warning",
+      };
   }
 }
 

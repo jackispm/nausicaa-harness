@@ -10,8 +10,10 @@ import {
   readConversationArtifact,
   readToolArgumentsFromStore,
   projectPendingInputs,
+  projectSessionCompactionNotices,
   projectSessionTranscript,
   type SessionPendingInput,
+  type SessionCompactionNotice,
   type SessionTranscriptEntry,
 } from "./session-artifacts.js";
 import type {
@@ -245,6 +247,12 @@ export class DaemonRemoteSession {
   async transcript(): Promise<SessionTranscriptEntry[]> {
     this.assertOpen();
     return projectSessionTranscript(this.store, this.attachmentSnapshot.events, this.runId);
+  }
+
+  /** Project compaction lifecycle from the attachment's replayed Ledger facts. */
+  async compactionHistory(): Promise<SessionCompactionNotice[]> {
+    this.assertOpen();
+    return projectSessionCompactionNotices(this.attachmentSnapshot.events, this.runId);
   }
 
   async pendingInputs(): Promise<SessionPendingInput[]> {

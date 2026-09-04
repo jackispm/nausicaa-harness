@@ -141,6 +141,18 @@ export function snapshotModelRequest(request: ModelRequest): Readonly<ModelReque
     messages: structuredClone(request.messages),
     tools: structuredClone(request.tools),
   };
+  // requestId correlates durable retry facts but is not part of the Pi-visible
+  // provider request contract. Keep it available to the retry decorator while
+  // making it non-enumerable so provider adapters and request projections do
+  // not observe a new field.
+  if (request.requestId !== undefined) {
+    Object.defineProperty(snapshot, "requestId", {
+      value: request.requestId,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
   for (const [key, value] of Object.entries(snapshot)) {
     if (key !== "signal") deepFreeze(value);
   }

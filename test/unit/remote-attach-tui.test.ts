@@ -49,6 +49,82 @@ describe("remote attach TUI", () => {
     await expect(running).resolves.toBe(0);
     expect(close).toHaveBeenCalledOnce();
   });
+
+  it("re-reads durable compaction history after an attachment update", async () => {
+    const terminal = new MemoryTerminal(100, 28);
+    const close = vi.fn(async () => undefined);
+    let history: RemoteAttachSession["compactionHistory"] = async () => ([
+      {
+        eventId: "compaction-requested",
+        globalOffset: 3,
+        compactionId: "compact-1",
+        status: "requested",
+      },
+      {
+        eventId: "compaction-committed",
+        globalOffset: 5,
+        compactionId: "compact-1",
+        status: "committed",
+      },
+    ]);
+    let notify: (() => void) | undefined;
+    const session: RemoteAttachSession = {
+      workspace: "/workspace",
+      snapshot: () => snapshot(),
+      state: () => ({ snapshot: snapshot(), attachmentStatus: "attached" }),
+      transcript: async () => [],
+      compactionHistory: async () => history?.() ?? [],
+      workerTaskSummary: () => ({
+        total: 0,
+        queued: 0,
+        running: 0,
+        ready: 0,
+        done: 0,
+        failed: 0,
+        stale: 0,
+      }),
+      subscribe: (listener: (state: DaemonRemoteSessionState) => void) => {
+        notify = () => listener({ snapshot: snapshot(), attachmentStatus: "attached" });
+        return () => { notify = undefined; };
+      },
+      close,
+    };
+
+    const running = runRemoteAttach({ session, terminal, forceAltScreen: true });
+    await terminal.started;
+    await waitFor(() => stripTerminalSequences(terminal.output).includes(
+      "Context compacted for the next Turn.",
+    ));
+
+    history = async () => ([
+      {
+        eventId: "compaction-requested",
+        globalOffset: 3,
+        compactionId: "compact-1",
+        status: "requested",
+      },
+      {
+        eventId: "compaction-committed",
+        globalOffset: 5,
+        compactionId: "compact-1",
+        status: "committed",
+      },
+      {
+        eventId: "compaction-fallback",
+        globalOffset: 7,
+        compactionId: "compact-2",
+        status: "fallback",
+      },
+    ]);
+    notify?.();
+    await waitFor(() => stripTerminalSequences(terminal.output).includes(
+      "Compaction fell back to the raw context; the transcript is unchanged.",
+    ));
+
+    terminal.send("q");
+    await expect(running).resolves.toBe(0);
+    expect(close).toHaveBeenCalledOnce();
+  });
 });
 
 function snapshot(): SessionSnapshot {

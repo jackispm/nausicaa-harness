@@ -66,6 +66,24 @@ describe("MainLoop model retry boundary", () => {
     expect(events.filter((event) => event.type === "model.completed")).toHaveLength(1);
     expect(events.filter((event) => event.type === "budget.charged")).toHaveLength(1);
     expect(events.some((event) => event.type === "model.failed")).toBe(false);
+    const requested = events.find((event) => event.type === "model.requested");
+    const retries = events.filter((event) => event.type === "model.retrying");
+    expect(retries).toHaveLength(1);
+    expect(retries[0]).toMatchObject({
+      type: "model.retrying",
+      causationId: requested?.eventId,
+      correlationId: requested?.correlationId,
+      payload: {
+        requestId: requested?.eventId,
+        model: "demo",
+        attempt: 1,
+        maxAttempts: 4,
+        category: "server",
+      },
+    });
+    expect(retries[0]?.payload).toMatchObject({ delayMs: expect.any(Number) });
+    expect((retries[0]?.payload as { delayMs: number }).delayMs).toBeGreaterThanOrEqual(1_500);
+    expect((retries[0]?.payload as { delayMs: number }).delayMs).toBeLessThanOrEqual(2_000);
   });
 });
 

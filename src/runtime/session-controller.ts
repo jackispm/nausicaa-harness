@@ -152,6 +152,7 @@ export {
   SessionProtocolError,
 } from "./session-protocol-error.js";
 export type {
+  SessionCompactionNotice,
   SessionPendingInput,
   SessionTranscriptEntry,
 } from "./session-artifacts.js";

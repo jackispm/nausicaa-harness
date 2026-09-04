@@ -255,7 +255,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     : new TuiMainScreen(terminal, true);
   const screen = new VStack();
   const transcript = new Container();
-  const activity = new ActivityLine(() => options.session.snapshot());
+  const activity = new ActivityLine(() => options.session.snapshot(), tui);
   const shortcutGuide = new Container();
   const queuePreview = new QueuePreview();
   const transcriptViewport = new ScrollView(transcript, {
@@ -494,17 +494,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     tui.requestRender(true);
   });
   tui.setTerminalColorSchemeNotifications(true);
-  // Match pi-tui's Loader cadence so the active request feels alive without
-  // tying animation updates to model/network event frequency.
-  const activityTimer = setInterval(() => {
-    const status = options.session.snapshot().status;
-    if (status === "running" || status === "cancelling") {
-      activity.advance();
-      for (const block of toolBlocks.values()) block.advance();
-      tui.requestRender();
-    }
+  // Tool rows retain their own small status animation. The request indicator
+  // is a real pi-tui Loader and owns its interval independently.
+  const toolAnimationTimer = setInterval(() => {
+    for (const block of toolBlocks.values()) block.advance();
+    tui.requestRender();
   }, 80);
-  activityTimer.unref?.();
+  toolAnimationTimer.unref?.();
 
   const appendBlock = (
     component: Parameters<Container["addChild"]>[0],
@@ -1115,6 +1111,36 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         void refreshQueue();
       }
       switch (event.type) {
+        case "turn.started":
+        case "turn.resumed":
+          activity.start();
+          tui.requestRender();
+          break;
+        case "turn.completed":
+        case "turn.waiting":
+        case "turn.interrupted":
+        case "turn.failed":
+        case "turn.cancelled":
+          activity.stop();
+          tui.requestRender();
+          if (event.type === "turn.waiting") {
+            appendNotice(
+              event.payload.reason === "model-output-limit"
+                ? "The model reached its output limit. The partial answer is preserved; use /resume to continue."
+                : "Turn paused at a safe boundary. Use /resume or /stop.",
+              "warning",
+            );
+          } else if (event.type === "turn.failed") {
+            appendNotice("Turn failed. Use /resume or start a new Run.", "error");
+          } else if (event.type === "turn.cancelled") {
+            appendNotice("Turn cancelled.", "warning");
+          }
+          break;
+        case "run.failed":
+          activity.stop();
+          tui.requestRender();
+          appendNotice("Run failed. Start a new Run or resume from the last checkpoint.", "error");
+          break;
         case "user.message": {
           clearShortcutGuide();
           try {
@@ -1223,23 +1249,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             event.payload.disposition === "accept" ? "success" : "info",
           );
           break;
-        case "turn.waiting":
-          appendNotice(
-            event.payload.reason === "model-output-limit"
-              ? "The model reached its output limit. The partial answer is preserved; use /resume to continue."
-              : "Turn paused at a safe boundary. Use /resume or /stop.",
-            "warning",
-          );
-          break;
-        case "turn.failed":
-          appendNotice("Turn failed. Use /resume or start a new Run.", "error");
-          break;
-        case "turn.cancelled":
-          appendNotice("Turn cancelled.", "warning");
-          break;
-        case "run.failed":
-          appendNotice("Run failed. Start a new Run or resume from the last checkpoint.", "error");
-          break;
         case "fukai.compaction.requested":
           appendNotice("Compacting context...", "info");
           break;
@@ -1258,6 +1267,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       if (event.laneId !== "main") return;
       switch (event.type) {
         case "stream.start":
+          activity.start();
           beginResponse(event.turnId);
           break;
         case "stream.thinking-start":
@@ -1289,10 +1299,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           break;
         case "stream.failed":
           // A durable turn.failed event owns the one user-visible terminal notice.
+          activity.stop();
           discardResponse();
           break;
         case "stream.cancelled":
           // A durable turn.cancelled event owns the one user-visible terminal notice.
+          activity.stop();
           discardResponse();
           break;
       }
@@ -1345,7 +1357,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       await waitForSubmissionDrain();
       closed = true;
       unsubscribe();
-      clearInterval(activityTimer);
+      clearInterval(toolAnimationTimer);
       await terminal.drainInput(250, 25).catch(() => undefined);
       // Freeze the last live snapshot before closing detaches the Ledger-backed state.
       try {

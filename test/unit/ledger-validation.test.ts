@@ -273,6 +273,15 @@ const validPayloads = {
     }],
     contextBuildMs: 1.5,
   },
+  "model.retrying": {
+    requestId: "event-model-requested",
+    model: "model-1",
+    attempt: 1,
+    maxAttempts: 4,
+    delayMs: 2_000,
+    category: "server",
+    error: "Model provider failure (server, HTTP 503)",
+  },
   "model.completed": {
     model: "model-1",
     responseRef: artifact,
@@ -532,6 +541,15 @@ const invalidPayloads = {
   "navigation.updated": { delta: { ...delta, triggerKind: "wander" } },
   "model.selected": { model: "openrouter:model 1" },
   "model.requested": { model: "model-1", requestHash: "hash", contextWatermark: -1 },
+  "model.retrying": {
+    requestId: "",
+    model: "model-1",
+    attempt: 4,
+    maxAttempts: 4,
+    delayMs: -1,
+    category: "unknown",
+    error: "",
+  },
   "model.completed": {
     model: "model-1",
     responseRef: artifact,
@@ -1243,5 +1261,65 @@ describe("event payload validation", () => {
     });
     expect(interactive.type).toBe("model.cancelled");
     expect(interactive.turnId).toBe("turn-1");
+  });
+
+  it("binds model retry facts to one requested request and enforces attempt order", async () => {
+    const ledger = new MemoryLedger();
+    const requested = await ledger.append({
+      runId: "run-retry",
+      laneId: "main",
+      type: "model.requested",
+      payload: {
+        model: "model-1",
+        requestHash: "request-hash",
+        contextWatermark: 0,
+      },
+      correlationId: "correlation-retry",
+      idempotencyKey: "retry-requested",
+    });
+    const retry = (attempt: number, idempotencyKey: string) => ledger.append({
+      runId: "run-retry",
+      laneId: "main",
+      type: "model.retrying",
+      payload: {
+        requestId: requested.eventId,
+        model: "model-1",
+        attempt,
+        maxAttempts: 4,
+        delayMs: 10,
+        category: "server",
+        error: "provider unavailable",
+      },
+      causationId: requested.eventId,
+      correlationId: "correlation-retry",
+      idempotencyKey,
+    });
+
+    await expect(retry(1, "retry-1")).resolves.toMatchObject({
+      type: "model.retrying",
+      payload: { attempt: 1 },
+    });
+    await expect(retry(3, "retry-3")).rejects.toThrow(/not monotonic/);
+    await expect(retry(2, "retry-2")).resolves.toMatchObject({
+      type: "model.retrying",
+      payload: { attempt: 2 },
+    });
+    await expect(ledger.append({
+      runId: "run-retry",
+      laneId: "main",
+      type: "model.retrying",
+      payload: {
+        requestId: "missing-request",
+        model: "model-1",
+        attempt: 1,
+        maxAttempts: 4,
+        delayMs: 10,
+        category: "server",
+        error: "provider unavailable",
+      },
+      causationId: "missing-request",
+      correlationId: "correlation-retry",
+      idempotencyKey: "retry-missing",
+    })).rejects.toThrow(/no preceding model.requested/);
   });
 });
