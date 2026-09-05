@@ -1957,6 +1957,14 @@ export class SessionController {
         await this.stopWorkerLane(this.attached);
         await commitRunCheckpoint(this.attached.sink, this.attached.runId).catch(() => undefined);
       }
+      // Withdraw this Session from the addressable roster before releasing the
+      // Run Ledger. Otherwise a concurrent A2A admission can observe the old
+      // heartbeat, acquire the now-unlocked Ledger, and enqueue work after the
+      // process has stopped polling it.
+      // Presence is advisory and must never prevent the durable Session from
+      // closing. `sessionRegistry.close()` below still removes this process's
+      // record when the terminal marker cannot be written.
+      await this.markPresenceTerminal().catch(() => undefined);
       await this.detach();
       if (this.closeEdgeCompositionOnClose) {
         try {
@@ -3946,6 +3954,16 @@ export class SessionController {
         : `${state}: ${snapshot.blocker}`,
     }));
     this.presenceUpdateTail = update.catch(() => undefined);
+  }
+
+  private async markPresenceTerminal(): Promise<void> {
+    const operation = this.presenceUpdateTail.then(() => this.sessionRegistry.update({
+      runId: null,
+      state: "terminal",
+      activitySummary: "terminal",
+    }));
+    this.presenceUpdateTail = operation.catch(() => undefined);
+    await operation;
   }
 
   /** Start a read-only Ledger tail so another process can reach this Session. */

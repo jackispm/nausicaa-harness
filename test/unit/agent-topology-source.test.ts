@@ -5,10 +5,12 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { readWorkspaceAgentAwareness } from "../../src/cli/agent-topology-source.js";
-import { renderAgentTopologyFromSource } from "../../src/cli/agent-topology.js";
+import { renderAgentTopologyFromSource, renderAgentTopologyPanel } from "../../src/cli/agent-topology.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import { executeRun } from "../../src/runtime/index.js";
 import { LocalSessionRegistry } from "../../src/runtime/local-session-registry.js";
+import { projectAgentTopology } from "../../src/runtime/agent-awareness.js";
+import { SessionController } from "../../src/runtime/session-controller.js";
 
 describe("workspace Awareness source", () => {
   it("returns an empty, printable projection without creating runtime state", async () => {
@@ -99,6 +101,45 @@ describe("workspace Awareness source", () => {
       ]);
     } finally {
       await Promise.all(registries.map((registry) => registry.close()));
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("does not show a closed Session in the live panel", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "nausicaa-topology-closed-session-"));
+    const dataDir = join(workspace, ".nausicaa");
+    try {
+      const run = await executeRun({
+        workspace,
+        dataDir,
+        model: "scripted",
+        message: "Seed a Run for close visibility",
+        policy: { maxMainSteps: 1, tetoEnabled: true },
+      }, {
+        mainModel: new ScriptedModel([{
+          content: "done",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0 },
+        }]),
+        createRunId: () => "closed-awareness-run",
+      });
+      const session = await SessionController.open({
+        workspace,
+        dataDir,
+        model: "scripted",
+        runId: run.runId,
+        sessionId: "closed-awareness-session",
+      }, { mainModel: new ScriptedModel([]) });
+      await session.close();
+
+      const source = await readWorkspaceAgentAwareness(dataDir, workspace);
+      const panel = renderAgentTopologyPanel(projectAgentTopology(source), 160).join("\n");
+      expect(panel).not.toContain("closed-awareness-session");
+      expect(panel).not.toContain("closed-awareness-run");
+      expect(source.records?.find((record) => record.endpoint.runId === run.runId)?.state)
+        .toBe("offline");
+    } finally {
       await rm(workspace, { recursive: true, force: true });
     }
   });

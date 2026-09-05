@@ -19,7 +19,7 @@ afterEach(async () => {
 });
 
 describe("local CLI Cross-Run composition", () => {
-  it("resolves a same-workspace Run and appends a durable target Inbox message", async () => {
+  it("does not resolve a durable Run without a live Session", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-local-a2a-"));
     roots.push(root);
     const dataDir = join(root, ".nausicaa");
@@ -60,9 +60,9 @@ describe("local CLI Cross-Run composition", () => {
         const result = request.messages.findLast((message) => (
           message.role === "tool" && message.toolName === "agent_message"
         ));
-        expect(result?.content).toContain('"status":"queued"');
+        expect(result?.content).toContain('"code":"target-unavailable"');
         return {
-          content: "sent",
+          content: "not sent",
           toolCalls: [],
           stopReason: "stop",
           usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0 },
@@ -81,11 +81,10 @@ describe("local CLI Cross-Run composition", () => {
       crossRun: createLocalCrossRunComposition({ workspace: root, dataDir }),
     });
 
-    expect(source).toMatchObject({ completed: true, finalText: "sent" });
+    expect(source).toMatchObject({ completed: true, finalText: "not sent" });
     expect(sourceModel.requests[0]?.tools.map((tool) => tool.name)).toContain("agent_message");
     const targetLedger = await readFile(join(target.stateDir, "ledger.jsonl"), "utf8");
-    expect(targetLedger).toContain('"type":"message.sent"');
-    expect(targetLedger).toContain("hello from source");
+    expect(targetLedger).not.toContain("hello from source");
   });
 
   it("does not classify unrelated root Runs as siblings", async () => {
@@ -350,7 +349,7 @@ describe("local CLI Cross-Run composition", () => {
     }
   });
 
-  it("reconciles a message admitted while the target Session was offline", async () => {
+  it("withdraws a closed Session before A2A target resolution", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-local-a2a-offline-"));
     roots.push(root);
     const dataDir = join(root, ".nausicaa");
@@ -373,6 +372,16 @@ describe("local CLI Cross-Run composition", () => {
     });
     expect(target.completed).toBe(false);
 
+    const targetModel = new ScriptedModel([]);
+    const targetSession = await SessionController.open({
+      workspace: root,
+      dataDir,
+      model: "scripted",
+      runId: target.runId,
+      sessionId: "closed-target-session",
+    }, { mainModel: targetModel });
+    await targetSession.close();
+
     const sourceModel = new ScriptedModel([
       {
         content: "send",
@@ -387,49 +396,36 @@ describe("local CLI Cross-Run composition", () => {
         }],
         usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0 },
       },
-      {
-        content: "sent",
-        toolCalls: [],
-        stopReason: "stop",
-        usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0 },
+      (request) => {
+        const result = request.messages.findLast((message) => (
+          message.role === "tool" && message.toolName === "agent_message"
+        ));
+        expect(result?.content).toContain('"code":"target-unavailable"');
+        return {
+          content: "not sent",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0 },
+        };
       },
     ]);
     const source = await executeRun({
       workspace: root,
       dataDir,
       model: "scripted",
-      message: "Send while target is offline",
+      message: "Send after target closed",
       policy: { maxMainSteps: 2, tetoEnabled: false },
     }, {
       mainModel: sourceModel,
       createRunId: () => "offline-source-run",
       crossRun: createLocalCrossRunComposition({ workspace: root, dataDir }),
     });
-    expect(source).toMatchObject({ completed: true, finalText: "sent" });
-
-    const targetModel = new ScriptedModel([{
-      content: "replied after reopen",
-      toolCalls: [],
-      stopReason: "stop",
-      usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0 },
-    }]);
-    const targetSession = await SessionController.open({
-      workspace: root,
-      dataDir,
-      model: "scripted",
-      runId: target.runId,
-      sessionId: "offline-target-session",
-    }, { mainModel: targetModel });
-    try {
-      await waitFor(() => targetModel.callCount === 1);
-      await targetSession.waitForIdle();
-      expect(targetModel.requests[0]?.messages.at(-1)).toMatchObject({
-        role: "user",
-        content: expect.stringContaining("delivered after reopen"),
-      });
-    } finally {
-      await targetSession.close();
-    }
+    expect(source).toMatchObject({ completed: true, finalText: "not sent" });
+    const targetLedger = await readFile(
+      join(root, ".nausicaa", "runs", target.runId, "ledger.jsonl"),
+      "utf8",
+    );
+    expect(targetLedger).not.toContain("delivered after reopen");
   });
 });
 
