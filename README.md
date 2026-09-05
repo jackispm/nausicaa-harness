@@ -3,6 +3,9 @@
 > 面向通用任务的多 Lane、多拓扑 Agent 执行运行时。
 > An execution runtime for general-purpose agents that think and act as a topology.
 
+[![CI](https://github.com/jackispm/nausicaa-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/jackispm/nausicaa-harness/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/nausicaa-harness)](https://www.npmjs.com/package/nausicaa-harness)
+
 [中文说明](#中文说明) | [English](#english)
 
 ## 中文说明
@@ -33,6 +36,15 @@ edge 集成仍在完善。
 
 ### 快速开始
 
+已发布包（全局 CLI）：
+
+```bash
+npm install -g nausicaa-harness
+nausicaa --help
+```
+
+源码开发：
+
 ```bash
 git clone https://github.com/jackispm/nausicaa-harness.git
 cd nausicaa-harness
@@ -46,6 +58,10 @@ nausicaa "Summarize this workspace"
 ```
 
 凭据也可以通过 `nausicaa auth login` 或 TUI 的 `/login` 保存。
+
+常用入口：`--print`、`--json`、`--topology`、`--worker`、`--daemon`、
+`--daemon-worker-command <path>`、`--attach <run-id>`；TUI 提供
+`/list-agents`、`/permissions`、`/plan`、`/skills` 和 `/edges`。
 
 开发检查：`npm run typecheck`、`npm test`、`npm run test:smoke`、`npm run build`。
 
@@ -80,6 +96,15 @@ provider, daemon, RPC, and edge integrations are still evolving.
 
 ### Quick start
 
+Published package (global CLI):
+
+```bash
+npm install -g nausicaa-harness
+nausicaa --help
+```
+
+Source checkout:
+
 ```bash
 git clone https://github.com/jackispm/nausicaa-harness.git
 cd nausicaa-harness
@@ -93,6 +118,10 @@ nausicaa "Summarize this workspace"
 ```
 
 Credentials can also be saved with `nausicaa auth login` or the TUI `/login` command.
+
+Common entry points are `--print`, `--json`, `--topology`, `--worker`, `--daemon`,
+`--daemon-worker-command <path>`, and `--attach <run-id>`. The TUI includes
+`/list-agents`, `/permissions`, `/plan`, `/skills`, and `/edges`.
 
 Development checks: `npm run typecheck`, `npm test`, `npm run test:smoke`, and
 `npm run build`.

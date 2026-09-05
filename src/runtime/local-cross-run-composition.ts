@@ -109,7 +109,6 @@ export function createLocalCrossRunComposition(
       dataDir,
       workspace,
       workspaceId,
-      sessionId,
     ),
   };
   const roster: CrossRunRosterResolver = {
@@ -118,7 +117,6 @@ export function createLocalCrossRunComposition(
       dataDir,
       workspace,
       workspaceId,
-      sessionId,
     ),
   };
   const authorizer: CrossRunAuthorizer = {
@@ -127,7 +125,6 @@ export function createLocalCrossRunComposition(
       dataDir,
       workspace,
       workspaceId,
-      sessionId,
       proofToken,
     ),
   };
@@ -170,14 +167,12 @@ async function resolveLocalTarget(
   dataDir: string,
   workspace: string,
   workspaceId: string,
-  sessionId: string,
 ): Promise<CrossRunResolvedTarget> {
   const entries = await localRosterEntries(
     source,
     dataDir,
     workspace,
     workspaceId,
-    sessionId,
   );
   const candidates = entries.filter((entry) => entry.relationship === selector.relationship);
   const matching = candidates.filter((entry) => matchesSelector(entry, selector));
@@ -207,14 +202,12 @@ async function listLocalRoster(
   dataDir: string,
   workspace: string,
   workspaceId: string,
-  sessionId: string,
 ): Promise<CrossRunRoster> {
   const entries = await localRosterEntries(
     source,
     dataDir,
     workspace,
     workspaceId,
-    sessionId,
   );
   return {
     current: structuredClone(source),
@@ -227,7 +220,6 @@ async function localRosterEntries(
   dataDir: string,
   workspace: string,
   workspaceId: string,
-  _configuredSessionId: string,
 ): Promise<CrossRunRosterEntry[]> {
   if (source.workspaceId !== workspaceId || source.sessionId.length === 0) {
     throw new CrossRunProtocolError("source is outside the local A2A scope", "authorization-denied");
@@ -243,20 +235,20 @@ async function localRosterEntries(
   for (const run of runs) {
     const relationships = relationshipFor(sourceRun.parentRunId, run.runId, sourceRun.runId, run.parentRunId);
     const liveSessions = sessions.filter((candidate) => (
-      candidate.live && candidate.runId === run.runId
+      isAddressableSession(candidate)
+      && candidate.runId === run.runId
     ));
-    const targetSessions = liveSessions.length > 0
-      ? liveSessions
-      : [{ sessionId: _configuredSessionId, state: run.status, live: false }];
-    for (const targetSession of targetSessions) {
+    // A durable Run without a live Session is history, not an addressable
+    // Agent. Never synthesize a session identity from the local configuration:
+    // doing so makes a closed Run appear reachable and strands A2A messages.
+    for (const targetSession of liveSessions) {
       const endpoint = endpointFor(run.runId, workspaceId, targetSession.sessionId);
       if (sameEndpoint(endpoint, source)) continue;
       const status = targetSession.live
         ? endpointStatusForSession(targetSession.state, run.status)
         : endpointStatus(run.status);
-      const reachable = status !== "inactive";
       for (const relationship of relationships) {
-        entries.push({ endpoint, relationship, status, reachable });
+        entries.push({ endpoint, relationship, status, reachable: status !== "inactive" });
       }
     }
   }
@@ -308,7 +300,6 @@ async function authorizeLocalRoute(
   dataDir: string,
   workspace: string,
   workspaceId: string,
-  sessionId: string,
   proofToken: string,
 ): Promise<{ readonly allowed: boolean; readonly reason?: "authorization-denied" | "target-unavailable" }> {
   if (
@@ -320,9 +311,16 @@ async function authorizeLocalRoute(
   }
   const runs = await listWorkspaceRuns(dataDir, workspace);
   const target = runs.find((run) => run.runId === input.target.runId);
-  return target === undefined
-    ? { allowed: false, reason: "target-unavailable" }
-    : { allowed: true };
+  if (target === undefined) return { allowed: false, reason: "target-unavailable" };
+  const sessions = await readLocalSessionRegistry(dataDir, workspace);
+  return sessions.some((session) => (
+    isAddressableSession(session)
+    && session.runId === input.target.runId
+    && session.sessionId === input.target.sessionId
+    && session.laneId === input.target.laneId
+  ))
+    ? { allowed: true }
+    : { allowed: false, reason: "target-unavailable" };
 }
 
 async function admitLocalTarget(
@@ -347,6 +345,9 @@ async function admitLocalTarget(
       ledger = await JsonlLedger.open(ledgerPath);
     } catch (error: unknown) {
       if (!(error instanceof LedgerWriterLockedError)) throw error;
+      if (!(await hasAddressableTargetSession(dataDir, workspace, input.envelope.target))) {
+        throw new CrossRunProtocolError("target Session is no longer active", "target-unavailable");
+      }
       // The target Session owns the Ledger writer while it is live. Queue the
       // normalized message for that process to ingest under its own lock.
       const normalized = await normalizeTargetAdmission(
@@ -364,6 +365,9 @@ async function admitLocalTarget(
         queuedAt: clock.now().toISOString(),
       });
     }
+    if (!(await hasAddressableTargetSession(dataDir, workspace, input.envelope.target))) {
+      throw new CrossRunProtocolError("target Session is no longer active", "target-unavailable");
+    }
     const admission = new LedgerCrossRunTargetAdmission({
       ledger,
       target: input.envelope.target,
@@ -377,6 +381,26 @@ async function admitLocalTarget(
   } finally {
     await ledger?.close().catch(() => undefined);
   }
+}
+
+function isAddressableSession(
+  session: Awaited<ReturnType<typeof readLocalSessionRegistry>>[number],
+): boolean {
+  return session.live && session.state !== "offline" && session.state !== "terminal";
+}
+
+async function hasAddressableTargetSession(
+  dataDir: string,
+  workspace: string,
+  target: CrossRunEndpoint,
+): Promise<boolean> {
+  const sessions = await readLocalSessionRegistry(dataDir, workspace);
+  return sessions.some((session) => (
+    isAddressableSession(session)
+    && session.runId === target.runId
+    && session.sessionId === target.sessionId
+    && session.laneId === target.laneId
+  ));
 }
 
 async function targetLedgerPath(dataDir: string, runId: string): Promise<string> {

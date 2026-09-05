@@ -313,7 +313,12 @@ function addRunSource(
     const lane = projection.lanes[laneId];
     if (lane === undefined || laneId === "main") continue;
     const laneEndpoint = endpoint(scope, runId, laneId);
-    const state = stateForLane(lane.status);
+    // A Run-level offline/terminal observation dominates durable lane status.
+    // Otherwise a closed Run with a dormant Teto or Worker lane appears live
+    // even though no process can receive a message for it.
+    const state = mainState === "offline" || mainState === "terminal"
+      ? mainState
+      : stateForLane(lane.status);
     const role = laneId === "teto" || lane.kind === "intent-navigator" || laneId.endsWith(":teto")
       ? "teto"
       : laneId === "worker" || lane.kind === "worker"

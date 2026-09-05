@@ -104,20 +104,33 @@ export async function readWorkspaceAgentAwareness(
       // one interactive TUI and one daemon/read-only attachment). Preserve
       // every session identity instead of collapsing the Run to the newest
       // heartbeat; endpoint identity is what lets A2A address the right one.
-      const sources = runSessions.length === 0 ? [undefined] : runSessions;
-      for (const session of sources) {
+      // A durable Run without a current session is history, not a live agent.
+      // Keep one offline record for diagnostic text output, but never invent a
+      // fresh session identity from the configured local scope.
+      if (runSessions.length === 0) {
         runs.push({
           projection: projectRun(snapshot.events, summary.runId),
-          scope: session === undefined
-            ? { workspaceId: LOCAL_WORKSPACE_ID, sessionId: LOCAL_SESSION_ID }
-            : { workspaceId: LOCAL_WORKSPACE_ID, sessionId: session.sessionId },
-          ...(session === undefined ? {} : { state: session.state }),
+          scope: { workspaceId: LOCAL_WORKSPACE_ID, sessionId: LOCAL_SESSION_ID },
+          state: "offline" as const,
           ...(snapshot.generation === undefined ? {} : { generation: snapshot.generation }),
           generationTrusted: true,
           sourceValid: true,
-          activitySummary: observedActivitySummary(session, summary),
-          lastSeen: session?.lastSeen ?? summary.updatedAt,
+          activitySummary: observedActivitySummary(undefined, summary),
+          lastSeen: summary.updatedAt,
         });
+      } else {
+        for (const session of runSessions) {
+          runs.push({
+            projection: projectRun(snapshot.events, summary.runId),
+            scope: { workspaceId: LOCAL_WORKSPACE_ID, sessionId: session.sessionId },
+            ...(session.state === undefined ? {} : { state: session.state }),
+            ...(snapshot.generation === undefined ? {} : { generation: snapshot.generation }),
+            generationTrusted: true,
+            sourceValid: true,
+            activitySummary: observedActivitySummary(session, summary),
+            lastSeen: session.lastSeen ?? summary.updatedAt,
+          });
+        }
       }
     } catch {
       // A Run can be rotated between discovery and the observer read. Keep
