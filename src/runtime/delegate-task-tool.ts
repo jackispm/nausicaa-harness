@@ -3,6 +3,7 @@ import {
   DEFAULT_TASK_MAX_ATTEMPTS,
   MAX_TASK_ATTEMPTS,
 } from "../domain/types.js";
+import type { Goal, TaskBudget } from "../domain/types.js";
 import type { ContentAddressedStore } from "../store/index.js";
 import { TaskDispatcher } from "./task-dispatcher.js";
 import {
@@ -87,22 +88,25 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
         const inputRefs = input === undefined
           ? []
           : [await options.store.put(input, "text/plain")];
+        const taskId = arguments_.taskId === undefined
+          ? undefined
+          : requiredString(arguments_.taskId, "taskId");
+        const goal = {
+          version: 1,
+          statement,
+          successCriteria,
+          hardConstraints,
+        } satisfies Goal;
+        const budget = {
+          maxModelTokens,
+          maxWallClockMs,
+          ...(maxAttempts === undefined ? {} : { maxAttempts }),
+        } satisfies TaskBudget;
         const result = await options.dispatcher.dispatch({
-          ...(arguments_.taskId === undefined
-            ? {}
-            : { taskId: requiredString(arguments_.taskId, "taskId") }),
-          goal: {
-            version: 1,
-            statement,
-            successCriteria,
-            hardConstraints,
-          },
+          ...(taskId === undefined ? {} : { taskId }),
+          goal,
           inputRefs,
-          budget: {
-            maxModelTokens,
-            maxWallClockMs,
-            ...(maxAttempts === undefined ? {} : { maxAttempts }),
-          },
+          budget,
         });
         return {
           content: JSON.stringify({

@@ -3,6 +3,16 @@ import { describe, expect, it } from "vitest";
 import { RunTokenBudget } from "../../src/runtime/index.js";
 
 describe("RunTokenBudget", () => {
+  it("supports an unbounded aggregate budget", () => {
+    const budget = new RunTokenBudget(undefined);
+
+    expect(budget.maxTokens).toBeUndefined();
+    expect(budget.reserve("main:1", 200_000)).toMatchObject({ status: "reserved" });
+    budget.settle("main:1", 200_000);
+    expect(budget.availableTokens()).toBe(Number.MAX_SAFE_INTEGER);
+    expect(budget.snapshot()).not.toHaveProperty("maxTokens");
+  });
+
   it("atomically reserves one shared balance and makes retries idempotent", () => {
     const budget = new RunTokenBudget(100, 20);
 

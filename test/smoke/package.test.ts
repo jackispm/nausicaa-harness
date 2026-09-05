@@ -83,7 +83,7 @@ describe("npm package surface", () => {
       expect(help).toContain(command);
     }
     for (const command of [
-      "/agents",
+      "/list-agents",
       "/permissions",
       "/plan",
       "/skills",

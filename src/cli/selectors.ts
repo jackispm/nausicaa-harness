@@ -57,12 +57,12 @@ function workspacePermissionDescription(
   availability: WorkspaceSandboxAvailability | undefined,
 ): string {
   if (availability === undefined) {
-    return "Read and edit inside the workspace; sandboxed Bash is capability-dependent; no network";
+    return "Read and edit inside the workspace; Git metadata is read-only; sandboxed Bash is capability-dependent; no network";
   }
   if (availability.available) {
-    return `Read, edit, and run sandboxed Bash inside the workspace (${availability.backend}); no network`;
+    return `Read, edit, and run sandboxed Bash inside the workspace (${availability.backend}); Git metadata is read-only; use full-access for repository writes; no network`;
   }
-  return `Read and edit inside the workspace; sandboxed Bash unavailable: ${availability.reason}; no network`;
+  return `Read and edit inside the workspace; Git metadata is read-only; sandboxed Bash unavailable: ${availability.reason}; no network`;
 }
 
 export function parsePermissionProfile(

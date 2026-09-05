@@ -119,23 +119,22 @@ describe("settings", () => {
   });
 
   it("resolves defaults and explicit overrides", () => {
-    expect(
-      resolveSettings(
-        "/work",
-        { model: "openrouter:base", maxSteps: 3 },
-        { model: "openrouter:override", maxOutputTokens: 8_192 },
-        {},
-      ),
-    ).toMatchObject({
+    const resolved = resolveSettings(
+      "/work",
+      { model: "openrouter:base", maxSteps: 3 },
+      { model: "openrouter:override", maxOutputTokens: 8_192 },
+      {},
+    );
+    expect(resolved).toMatchObject({
       model: "openrouter:override",
       tetoModel: "openrouter:override",
       tetoEnabled: true,
       maxSteps: 3,
       maxOutputTokens: 8_192,
       dataDir: "/work/.nausicaa",
-      allowShell: false,
+      allowShell: true,
       allowWrite: true,
-      allowNetwork: false,
+      allowNetwork: true,
       fukaiCompaction: {
         enabled: false,
         provider: "none",
@@ -147,6 +146,7 @@ describe("settings", () => {
         minimumGainTokens: 1,
       },
     });
+    expect(resolved.maxModelTokens).toBeUndefined();
   });
 
   it("keeps explicit and settings model choices ahead of the environment fallback", () => {
@@ -258,6 +258,21 @@ describe("settings", () => {
     )).toThrow(/maxOutputTokens.*1.*1000000/i);
   });
 
+  it("keeps the aggregate Run token budget opt-in", () => {
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base" },
+      { maxModelTokens: 12_345 },
+      {},
+    ).maxModelTokens).toBe(12_345);
+    expect(() => resolveSettings(
+      "/work",
+      { model: "openrouter:base", maxModelTokens: 0 },
+      {},
+      {},
+    )).toThrow(/maxModelTokens/);
+  });
+
   it("enables workspace writes by default and supports explicit overrides", () => {
     expect(resolveSettings(
       "/work",
@@ -273,13 +288,13 @@ describe("settings", () => {
     ).allowWrite).toBe(false);
   });
 
-  it("keeps shell access disabled by default and independent from writes", () => {
+  it("starts with host shell access by default and keeps overrides independent", () => {
     expect(resolveSettings(
       "/work",
       { model: "openrouter:base", allowWrite: true },
       {},
       {},
-    )).toMatchObject({ allowShell: false, allowWrite: true });
+    )).toMatchObject({ allowShell: true, allowWrite: true });
     expect(resolveSettings(
       "/work",
       { model: "openrouter:base", allowWrite: true },
@@ -288,13 +303,13 @@ describe("settings", () => {
     )).toMatchObject({ allowShell: true, allowWrite: false });
   });
 
-  it("keeps network access disabled by default and supports explicit overrides", () => {
+  it("starts with network access by default and supports explicit overrides", () => {
     expect(resolveSettings(
       "/work",
       { model: "openrouter:base" },
       {},
       {},
-    ).allowNetwork).toBe(false);
+    ).allowNetwork).toBe(true);
     expect(resolveSettings(
       "/work",
       { model: "openrouter:base" },

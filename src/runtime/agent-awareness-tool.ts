@@ -10,6 +10,9 @@ export interface AgentAwarenessToolOptions {
   read: (context: ToolExecutionContext) => AgentTopologySnapshot | Promise<AgentTopologySnapshot>;
 }
 
+/** Reusable type for a host-provided, permission-filtered Awareness reader. */
+export type AgentAwarenessReader = AgentAwarenessToolOptions["read"];
+
 /**
  * Exposes the same bounded topology projection used by the UI to a lane.
  * Awareness is deliberately a normal read tool: Main decides when the
@@ -30,11 +33,15 @@ export function createAgentAwarenessTool(options: AgentAwarenessToolOptions): Ag
     },
     async execute(_arguments_, context): Promise<ToolResult> {
       try {
-        const snapshot = redactAgentTopologySnapshot(await options.read(context));
+        const snapshot = liveAgentTopologySnapshot(
+          redactAgentTopologySnapshot(await options.read(context)),
+        );
         return {
           content: JSON.stringify({
             snapshot,
             guidance: {
+              liveOnly: "The snapshot excludes offline and terminal lanes. Group nodes by endpoint.sessionId to distinguish sessions.",
+              taskSummary: "Use node.activitySummary as the bounded host-provided task/status summary; it is not a private transcript.",
               teto: "Teto is an optional feedback lane. Each parent lane may have at most one active Teto.",
               team: "Team branches are independent task lanes. A branch may open its own Teto when its task needs a second line of thought.",
             },
@@ -60,4 +67,15 @@ export function createAgentAwarenessTool(options: AgentAwarenessToolOptions): Ag
     inputKinds: ["json"],
     outputKinds: ["json", "text"],
   });
+}
+
+function liveAgentTopologySnapshot(snapshot: AgentTopologySnapshot): AgentTopologySnapshot {
+  const nodes = snapshot.nodes.filter((node) => node.state !== "offline" && node.state !== "terminal");
+  const keys = new Set(nodes.map((node) => node.key));
+  return {
+    ...snapshot,
+    nodes,
+    edges: snapshot.edges.filter((edge) => keys.has(edge.source) && keys.has(edge.target)),
+    roots: snapshot.roots.filter((root) => keys.has(root)),
+  };
 }

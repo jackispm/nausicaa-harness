@@ -334,7 +334,7 @@ describe("parseCliArgs", () => {
     expect(usage).toContain("--max-output-tokens");
     expect(usage).toContain("--fukai-compaction");
     expect(usage).toContain("--fukai-provider <none|pi-ai>");
-    expect(usage).toMatch(/--allow-shell.*high privilege.*read\/write outside the workspace/i);
+    expect(usage).toMatch(/--allow-shell.*host-level shell access.*default/i);
     expect(usage).toContain("--allow-network");
     expect(usage).toContain("--edges");
     expect(usage).toContain("--refresh-edges");

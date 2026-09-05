@@ -22,6 +22,8 @@ import {
 } from "../../src/cli/tui-components.js";
 import type {
   AgentTool,
+  A2AMessage,
+  AnyEvent,
   ModelPort,
   ModelRequest,
   ModelResponse,
@@ -37,6 +39,7 @@ import {
 import { MESSAGE_MEDIA_TYPE } from "../../src/runtime/session-artifacts.js";
 import { FileContentAddressedStore } from "../../src/store/index.js";
 import { WorkspaceCommandSandbox } from "../../src/tools/index.js";
+import type { ShellExecutionResult } from "../../src/tools/shell-process.js";
 
 const TINY_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
@@ -227,6 +230,132 @@ describe("interactive TUI", () => {
         expect.objectContaining({ role: "user", content: "hello" }),
         expect.objectContaining({ role: "assistant", content: "MAIN_ANSWER_SENTINEL" }),
       ]);
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("renders external A2A payloads as Prime-style agent messages", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-external-a2a-"));
+    const previousExitCode = process.exitCode;
+    const runId = "interactive-external-a2a-target";
+    try {
+      const seed = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("seeded")]),
+        createRunId: () => runId,
+      });
+      await seed.submit({ inputId: "seed-input", text: "seed" });
+      await seed.waitForIdle();
+      await seed.close();
+
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        runId,
+        sessionId: "target-session",
+      }, {
+        mainModel: new ScriptedModel([]),
+      });
+      const terminal = new MemoryTerminal(120, 36);
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      const createdAt = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1_000).toISOString();
+      const payloads: A2AMessage["payload"][] = [
+        {
+          type: "message.inform",
+          text: "inform line one\ninform line two",
+        },
+        {
+          type: "question.ask",
+          question: "Which evidence should be checked first?",
+        },
+        {
+          type: "question.answer",
+          answer: "Start with the WindowServer watchdog report.",
+        },
+        {
+          type: "task.request",
+          taskId: "external-task-1",
+          goal: {
+            version: 1,
+            statement: "Inspect the external task and report the result",
+            successCriteria: [],
+            hardConstraints: [],
+          },
+          inputRefs: [],
+          budget: { maxModelTokens: 100, maxWallClockMs: 1_000 },
+        },
+        {
+          type: "advice.propose",
+          advice: {
+            adviceId: "external-advice-1",
+            kind: "orientation",
+            claim: "The external evidence points to a stale dependency",
+            evidenceRefs: [],
+            confidence: 0.8,
+            risk: "low",
+            suggestedAction: "Reproduce with a clean dependency graph",
+            urgency: "next-step",
+            expiresAt,
+            dedupeKey: "external-advice-1",
+            sourceLane: "main",
+          },
+        },
+      ];
+      for (const [index, payload] of payloads.entries()) {
+        const message = externalA2AMessage({
+          runId,
+          sourceRunId: "source-session-with-a-very-long-name",
+          sourceSessionId: "source-session",
+          targetSessionId: "target-session",
+          payload,
+          createdAt,
+          expiresAt,
+          index,
+        });
+        const event: Extract<AnyEvent, { type: "message.sent" }> = {
+          eventId: `external-event-${index}`,
+          runId,
+          laneId: "main",
+          globalOffset: 10 + index,
+          laneSeq: 10 + index,
+          type: "message.sent",
+          schemaVersion: 1,
+          occurredAt: createdAt,
+          correlationId: message.correlationId,
+          idempotencyKey: `a2a:send:${message.routeId}:${message.idempotencyKey}`,
+          visibility: message.visibility,
+          contentHash: `test-hash-${index}`,
+          payload: { message },
+        };
+        (session as unknown as {
+          publish: (runtimeEvent: SessionRuntimeEvent) => void;
+        }).publish({ kind: "event", event });
+      }
+
+      await waitForOutput(terminal, "Agent message received");
+      await waitForOutput(terminal, "from source-session");
+      expect(terminal.output).not.toContain("source-session-with-a-very-long-name");
+      const visible = normalizeTerminalOutput(terminal.output);
+      expect(visible).not.toContain("Source endpoint:");
+      expect(visible).toContain("inform line one inform line two");
+      expect(visible).toContain("Which evidence should be checked first?");
+      expect(visible).toContain("Start with the WindowServer watchdog report.");
+      expect(visible).toContain("Inspect the external task and report the result");
+      expect(visible).toContain("The external evidence points to a stale dependency");
 
       terminal.type("/exit");
       terminal.send("\r");
@@ -826,7 +955,7 @@ describe("interactive TUI", () => {
       expect(result).toBe(0);
       expect(terminal.output).toContain("\x1b[?1049h");
       expect(terminal.output).toContain("\x1b[?1049l");
-      expect(terminal.output).toContain("\x1b[48;2;232;232;232m");
+      expect(terminal.output).not.toContain("\x1b[48;2;232;232;232m");
       const plainOutput = stripTerminalSequences(terminal.output);
       expect(plainOutput).toContain("Nausicaa v0.1.0");
       expect(plainOutput).toContain("escape interrupt");
@@ -1432,7 +1561,7 @@ describe("interactive TUI", () => {
     }
   });
 
-  it.each(["/agents"])(
+  it.each(["/agents", "/topology", "/list-agents"])(
     "renders %s as a read-only Awareness topology",
     async (command) => {
       const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-awareness-"));
@@ -1475,14 +1604,15 @@ describe("interactive TUI", () => {
         terminal.type(command);
         terminal.send("\r");
         await waitForOutput(terminal, "Nausicaa awareness");
-        expect(terminal.output).toContain("awareness-run/main");
+        expect(terminal.output).toContain("run:awareness-run");
+        expect(terminal.output).toContain("session:session-a");
         expect(terminal.output).toContain("reviewing topology");
         expect(model.callCount).toBe(0);
         expect(events.filter((event) => event.kind === "event")).toHaveLength(0);
 
         terminal.type(`${command} extra`);
         terminal.send("\r");
-        await waitForOutput(terminal, "Usage: /agents");
+        await waitForOutput(terminal, "Usage: /list-agents");
         expect(model.callCount).toBe(0);
         expect(events.filter((event) => event.kind === "event")).toHaveLength(0);
 
@@ -1495,6 +1625,35 @@ describe("interactive TUI", () => {
       }
     },
   );
+
+  it("shows only the canonical list-agents command in the slash menu", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-command-menu-"));
+    const terminal = new MemoryTerminal(60, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, { mainModel: new ScriptedModel([]) });
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+      await terminal.started;
+      terminal.type("/");
+      await waitForOutput(terminal, "list-agents");
+      expect(terminal.output).not.toContain("/agents");
+      expect(terminal.output).not.toContain("/topology");
+      terminal.send("\x1b");
+      terminal.send("\x03");
+      terminal.type("/exit");
+      terminal.send("\x1b");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 
   it("reports unavailable Awareness without mutating the Run", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-awareness-unavailable-"));
@@ -1631,6 +1790,128 @@ describe("interactive TUI", () => {
       terminal.type("/exit");
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("executes ! and !! through the permission boundary with distinct context semantics", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-bash-prefixes-"));
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    const model = new ScriptedModel([
+      (request) => {
+        const messages = request.messages
+          .map((message) => typeof message.content === "string" ? message.content : "")
+          .join("\n");
+        expect(messages).toContain("ran:printf hello");
+        return response("first");
+      },
+      (request) => {
+        const messages = request.messages
+          .map((message) => typeof message.content === "string" ? message.content : "")
+          .join("\n");
+        expect(messages).not.toContain("ran:printf hidden");
+        return response("second");
+      },
+    ]);
+    try {
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        allowWrite: true,
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: model,
+        workspaceCommandSandbox: new WorkspaceCommandSandbox({
+          platform: "darwin",
+          seatbeltExecutable: "/usr/bin/true",
+          probe: () => true,
+          execute: async ({ command }) => shellExecution(`ran:${command}`),
+        }),
+      });
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("!printf hello");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Bash output queued for the next prompt");
+
+      terminal.type("Explain the output");
+      terminal.send("\r");
+      await waitForModelCalls(model, 1);
+
+      terminal.type("!!printf hidden");
+      terminal.send("\r");
+      await waitForOutput(terminal, "context disabled");
+      terminal.type("Continue");
+      terminal.send("\r");
+      await waitForModelCalls(model, 2);
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("asks for a wider permission boundary after a Bash denial and retries once", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-permission-approval-"));
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    let attempts = 0;
+    try {
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        allowWrite: true,
+        allowShell: false,
+        allowNetwork: false,
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([]),
+        workspaceCommandSandbox: new WorkspaceCommandSandbox({
+          platform: "darwin",
+          seatbeltExecutable: "/usr/bin/true",
+          probe: () => true,
+          execute: async () => {
+            attempts += 1;
+            if (attempts === 1) {
+              const denied = shellExecution("");
+              return {
+                ...denied,
+                exitCode: null,
+                spawnError: Object.assign(new Error("operation not permitted"), { code: "EPERM" }),
+              };
+            }
+            return shellExecution("approved");
+          },
+        }),
+      });
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+      await terminal.started;
+      terminal.type("!printf approved");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Permission required");
+      expect(attempts).toBe(1);
+      terminal.send("\r");
+      await waitForOutput(terminal, "Bash output queued for the next prompt");
+      // The first attempt uses the injected workspace sandbox. Approval
+      // promotes the session, so the retry uses the host executor instead.
+      expect(attempts).toBe(1);
+      expect(session.snapshot().permissionProfile).toBe("full-access");
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+      await session.close();
+      await delay(25);
     } finally {
       process.exitCode = previousExitCode;
       await rm(root, { recursive: true, force: true });
@@ -1836,6 +2117,59 @@ describe("interactive TUI", () => {
       terminal.type("/setup");
       terminal.send("\r");
       await waitForOutput(terminal, "CONFIGURED_SETUP_STATUS");
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("clears collapsed selector rows on the regular main screen", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-selector-main-screen-"));
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    try {
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: UNCONFIGURED_MODEL,
+        policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([]),
+        modelCatalog: [{
+          selector: "openrouter:demo",
+          provider: "openrouter",
+          id: "demo",
+          name: "Demo",
+          contextWindowTokens: 32_000,
+          maxOutputTokens: 4_096,
+          imageInput: false,
+          toolUse: "unknown",
+          reasoning: false,
+          authStatus: "unverified",
+        }],
+      });
+      const running = runInteractive({
+        session,
+        terminal,
+        startupModelMissing: true,
+        startupNotice: "SETUP_MAIN_SCREEN",
+        modelChoices: ["openrouter:demo"],
+      });
+
+      await terminal.started;
+      await waitForOutput(terminal, "Models");
+      const beforeCancel = terminal.output.length;
+      terminal.send("\x03");
+      await waitForCondition(
+        () => terminal.output.length > beforeCancel && !terminal.output.slice(-200).includes("Models"),
+        "selector cancellation render",
+      );
+      const cancelFrame = terminal.output.slice(beforeCancel);
+      expect(cancelFrame).toContain("\x1b[2K");
 
       terminal.type("/exit");
       terminal.send("\r");
@@ -2737,6 +3071,7 @@ describe("interactive TUI", () => {
       await waitForOutput(terminal, "1 Worker task · 1 running");
 
       releaseWorker(response("package name: nausicaa"));
+      await delay(100);
       await waitForOutput(terminal, "1 Worker task · 1 ready");
 
       releaseMain(response("Commit the Worker result", [{
@@ -2963,6 +3298,25 @@ const inspectTool: AgentTool = {
   },
 };
 
+function shellExecution(stdout: string): ShellExecutionResult {
+  const snapshot = {
+    content: stdout,
+    truncated: false,
+    truncatedBy: null,
+    totalBytes: Buffer.byteLength(stdout),
+    totalLines: stdout.length === 0 ? 0 : stdout.split("\n").length,
+    outputBytes: Buffer.byteLength(stdout),
+    outputLines: stdout.length === 0 ? 0 : stdout.split("\n").length,
+  };
+  return {
+    stdout: snapshot,
+    stderr: { ...snapshot, content: "", totalBytes: 0, totalLines: 0, outputBytes: 0, outputLines: 0 },
+    exitCode: 0,
+    aborted: false,
+    timedOut: false,
+  };
+}
+
 function response(
   content: string,
   toolCalls: ModelResponse["toolCalls"] = [],
@@ -2973,6 +3327,50 @@ function response(
     toolCalls,
     stopReason,
     usage: { input: 20, output: 5, cacheRead: 0, cacheWrite: 0 },
+  };
+}
+
+function externalA2AMessage(options: {
+  runId: string;
+  sourceRunId: string;
+  sourceSessionId: string;
+  targetSessionId: string;
+  payload: A2AMessage["payload"];
+  createdAt: string;
+  expiresAt: string;
+  index: number;
+}): A2AMessage {
+  const routeId = `a2a-route:interactive-external-${options.index}`;
+  return {
+    messageId: `external-message-${options.index}`,
+    runId: options.runId,
+    conversationId: "external-conversation",
+    threadId: "external-thread",
+    from: "main",
+    to: "main",
+    createdAt: options.createdAt,
+    expiresAt: options.expiresAt,
+    correlationId: `external-correlation-${options.index}`,
+    idempotencyKey: `external-send-${options.index}`,
+    visibility: "user",
+    priority: 1,
+    delivery: "next-step",
+    payload: options.payload,
+    routeId,
+    routeRelationship: "direct",
+    routeArtifacts: [],
+    sourceEndpoint: {
+      workspaceId: "local-workspace",
+      sessionId: options.sourceSessionId,
+      runId: options.sourceRunId,
+      laneId: "main",
+    },
+    targetEndpoint: {
+      workspaceId: "local-workspace",
+      sessionId: options.targetSessionId,
+      runId: options.runId,
+      laneId: "main",
+    },
   };
 }
 

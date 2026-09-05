@@ -10,6 +10,7 @@ import {
 describe("tool presentation registry", () => {
   it("covers every first-party Mowe tool and falls back for unknown tools", () => {
     expect(Object.keys(TOOL_PRESENTATION_RENDERERS).sort()).toEqual([
+      "apply_patch",
       "bash",
       "delegate_task",
       "directory_create",
@@ -108,6 +109,11 @@ describe("tool presentation registry", () => {
         stderr: "fatal detail",
         error: "Command exited with code 2",
         exitCode: 2,
+        diagnostic: {
+          code: "permission-denied",
+          scope: "git-metadata",
+          hint: "Select /permissions full-access for repository writes.",
+        },
         truncated: true,
         truncation: {
           stdout: { totalLines: 500, outputLines: 300 },
@@ -122,6 +128,7 @@ describe("tool presentation registry", () => {
     expect(text(rendered.expanded)).not.toContain("line-1\n");
     expect(text(rendered.expanded)).toContain("line-300");
     expect(text(rendered.expanded)).toContain("fatal detail");
+    expect(text(rendered.expanded)).toContain("Hint: Select /permissions full-access for repository writes.");
     expect(text(rendered.expanded)).toContain("Command exited with code 2");
     expect(text(rendered.expanded)).toContain("showing 301 of 501 lines");
   });
@@ -655,10 +662,11 @@ describe("tool presentation registry", () => {
     });
 
     expect(rendered.summary).toBe("src/a.ts · 1 replacement · +1 -1");
-    expect(rendered.collapsed).toEqual([{
-      text: "2 changed lines · +1 -1",
-      tone: "muted",
-    }]);
+    expect(rendered.collapsed.map((line) => line.text)).toEqual([
+      "-2 const oldName = true;",
+      "+2 const newName = true;",
+    ]);
+    expect(rendered.collapsed.map((line) => line.tone)).toEqual(["removed", "added"]);
     expect(rendered.expanded.map((line) => line.tone)).toEqual([
       "context",
       "removed",
@@ -671,6 +679,40 @@ describe("tool presentation registry", () => {
     expect(wrapped.length).toBeGreaterThan(1);
     expect(wrapped.every((line) => visibleWidth(line.text) <= 12)).toBe(true);
     expect(wrapped.every((line) => line.tone === "added")).toBe(true);
+  });
+
+  it("renders Codex-style apply patches as visible changed rows", () => {
+    const rendered = renderToolPresentation({
+      name: "apply_patch",
+      arguments: {
+        patch: "*** Begin Patch\n*** Update File: src/a.ts\n@@\n-old\n+new\n*** End Patch",
+      },
+      result: {
+        ok: true,
+        status: "applied",
+        changes: [{ path: "src/a.ts", operation: "update", byteLength: 4 }],
+      },
+      status: "succeeded",
+      width: 60,
+    });
+
+    expect(rendered.summary).toBe("1 file · applied · +1 -1");
+    expect(rendered.collapsed.map((line) => line.text)).toEqual(["-old", "+new"]);
+    expect(rendered.collapsed.map((line) => line.tone)).toEqual(["removed", "added"]);
+  });
+
+  it("does not claim an apply patch is complete before its result arrives", () => {
+    const rendered = renderToolPresentation({
+      name: "apply_patch",
+      arguments: {
+        patch: "*** Begin Patch\n*** Update File: src/a.ts\n@@\n-old\n+new\n*** End Patch",
+      },
+      status: "running",
+      width: 60,
+    });
+
+    expect(rendered.summary).toBe("patch · running · +1 -1");
+    expect(rendered.summary).not.toContain("applied");
   });
 
   it("shows failures, strips terminal controls, and bounds every line", () => {

@@ -14,11 +14,9 @@ const MAX_FUKAI_COMPACTION_WALL_CLOCK_MS = 5 * 60 * 1_000;
 
 export const DEFAULT_RUN_POLICY: RunPolicy = {
   maxMainStepsPerActivation: 24,
-  maxModelTokens: 200_000,
   mainRequestTimeoutMs: DEFAULT_MAIN_REQUEST_TIMEOUT_MS,
   tetoEnabled: true,
   tetoMaxOutputTokens: 64,
-  tetoTokenRatio: 0.1,
   // New lanes expose Teto as a capability; the owning model opens it when
   // the task warrants a second line of thought.
   tetoActivation: "manual",
@@ -35,12 +33,16 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
       : DEFAULT_RUN_POLICY.tetoActivation);
   const policy = {
     maxMainStepsPerActivation: allowance,
-    maxModelTokens: input.maxModelTokens ?? DEFAULT_RUN_POLICY.maxModelTokens,
+    ...(input.maxModelTokens === undefined
+      ? {}
+      : { maxModelTokens: input.maxModelTokens }),
     mainRequestTimeoutMs: input.mainRequestTimeoutMs
       ?? DEFAULT_MAIN_REQUEST_TIMEOUT_MS,
     tetoEnabled: input.tetoEnabled ?? DEFAULT_RUN_POLICY.tetoEnabled,
     tetoMaxOutputTokens: input.tetoMaxOutputTokens ?? DEFAULT_RUN_POLICY.tetoMaxOutputTokens,
-    tetoTokenRatio: input.tetoTokenRatio ?? DEFAULT_RUN_POLICY.tetoTokenRatio,
+    ...(input.tetoTokenRatio === undefined
+      ? {}
+      : { tetoTokenRatio: input.tetoTokenRatio }),
     tetoActivation: defaultTetoActivation,
     workerEnabled: input.workerEnabled ?? DEFAULT_RUN_POLICY.workerEnabled ?? false,
     ...(input.auxiliaryMode === undefined ? {} : { auxiliaryMode: input.auxiliaryMode }),
@@ -54,7 +56,10 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
   if (!Number.isSafeInteger(allowance) || allowance < 1) {
     throw new RangeError("maxMainStepsPerActivation must be a positive integer");
   }
-  if (!Number.isSafeInteger(policy.maxModelTokens) || policy.maxModelTokens < 1) {
+  if (
+    policy.maxModelTokens !== undefined
+    && (!Number.isSafeInteger(policy.maxModelTokens) || policy.maxModelTokens < 1)
+  ) {
     throw new RangeError("maxModelTokens must be a positive integer");
   }
   if (
@@ -75,7 +80,10 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
   if (typeof policy.workerEnabled !== "boolean") {
     throw new TypeError("workerEnabled must be a boolean");
   }
-  if (policy.tetoTokenRatio <= 0 || policy.tetoTokenRatio >= 1) {
+  if (
+    policy.tetoTokenRatio !== undefined
+    && (policy.tetoTokenRatio <= 0 || policy.tetoTokenRatio >= 1)
+  ) {
     throw new RangeError("tetoTokenRatio must be between zero and one");
   }
   if (policy.tetoActivation !== undefined

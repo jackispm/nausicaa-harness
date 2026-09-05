@@ -77,6 +77,7 @@ export const TOOL_PRESENTATION_RENDERERS: Readonly<Record<string, ToolPresentati
     read_image: renderReadImage,
     write_file: renderWriteFile,
     edit: renderEdit,
+    apply_patch: renderApplyPatch,
     directory_create: renderDirectoryCreate,
     path_copy: renderPathCopy,
     path_move: renderPathMove,
@@ -177,12 +178,37 @@ function renderBash(context: ToolRenderContext): ToolPresentation {
   if (exitCode !== undefined && exitCode !== null && exitCode !== 0 && error === undefined) {
     warnings.push(line(`Command exited with code ${exitCode}`, "error"));
   }
+  const diagnosticHint = isRecord(context.result.diagnostic)
+    ? stringValue(context.result.diagnostic.hint)
+    : undefined;
+  const diagnosticRows = diagnosticHint === undefined
+    ? []
+    : wrapRows(`Hint: ${diagnosticHint}`, context.width, "warning");
   const collapsed = tailPreview(outputRows, BASH_PREVIEW_LINES);
+  const expandedWithoutDiagnostic = boundedTailRows([...outputRows, ...warnings]);
+  const expanded = diagnosticRows.length === 0
+    ? expandedWithoutDiagnostic
+    : appendPinnedTail(expandedWithoutDiagnostic, diagnosticRows);
   return {
     summary,
-    collapsed: [...collapsed, ...warnings],
-    expanded: boundedTailRows([...outputRows, ...warnings]),
+    collapsed: [...collapsed, ...warnings, ...diagnosticRows],
+    expanded,
   };
+}
+
+/** Keep the normal tail/footer diagnostics visible when a pinned hint is added. */
+function appendPinnedTail(
+  rows: readonly ToolPresentationLine[],
+  pinned: readonly ToolPresentationLine[],
+): ToolPresentationLine[] {
+  const bodyLimit = Math.max(0, MAX_EXPANDED_LINES - pinned.length);
+  if (rows.length <= bodyLimit) return [...rows, ...pinned];
+  if (bodyLimit === 0) return [...pinned].slice(-MAX_EXPANDED_LINES);
+  return [
+    rows[0]!,
+    ...rows.slice(-(bodyLimit - 1)),
+    ...pinned,
+  ];
 }
 
 function renderReadFile(context: ToolRenderContext): ToolPresentation {
@@ -568,9 +594,61 @@ function renderEdit(context: ToolRenderContext): ToolPresentation {
   const rows = diff.length === 0
     ? [line("(no diff available)", "muted")]
     : renderRichDiffRows(diff, context.width);
+  const changedRows = rows.filter((row) => row.tone === "added" || row.tone === "removed");
+  const collapsed = changedRows.length === 0
+    ? [line(`${changes.added + changes.removed} changed lines · ${counts}`, "muted")]
+    : [
+        ...changedRows.slice(0, 8),
+        ...(changedRows.length > 8
+          ? [line(`... ${changedRows.length - 8} more changed lines`, "muted")]
+          : []),
+      ];
   return {
     summary: `${path} · ${replacementText} · ${counts}`,
-    collapsed: [line(`${changes.added + changes.removed} changed lines · ${counts}`, "muted")],
+    // Pi/Prime keep the useful part of an edit visible in the normal tool
+    // row. Context remains available through Ctrl+O, while the first changed
+    // lines make a write auditable without opening every tool panel.
+    collapsed,
+    expanded: boundedRows(rows),
+  };
+}
+
+function renderApplyPatch(context: ToolRenderContext): ToolPresentation {
+  const failure = resultFailure(context, "patch");
+  if (failure !== undefined) return failure;
+  const patch = stringValue(context.arguments?.patch) ?? "";
+  const changes = Array.isArray(context.result?.changes)
+    ? context.result.changes.filter(isRecord)
+    : [];
+  const status = context.result === undefined
+    ? context.status === "failed" ? "failed" : "running"
+    : stringValue(context.result.status)
+      ?? (context.status === "failed" ? "failed" : "applied");
+  const summary = changes.length === 0
+    ? `patch · ${status}`
+    : `${changes.length} file${changes.length === 1 ? "" : "s"} · ${status}`;
+  const diffSource = patch
+    .split("\n")
+    .filter((line) => line.startsWith("+") || line.startsWith("-")
+      || line.startsWith(" ") || line.startsWith("@@") || line.startsWith("*** "))
+    .join("\n");
+  const rows = diffSource.length === 0
+    ? [line("(no diff available)", "muted")]
+    : renderRichDiffRows(diffSource, context.width);
+  const changedRows = rows.filter((row) => row.tone === "added" || row.tone === "removed");
+  const added = changedRows.filter((row) => row.tone === "added").length;
+  const removed = changedRows.filter((row) => row.tone === "removed").length;
+  const collapsed = changedRows.length === 0
+    ? [line(`${summary} · no changed lines`, "muted")]
+    : [
+        ...changedRows.slice(0, 8),
+        ...(changedRows.length > 8
+          ? [line(`... ${changedRows.length - 8} more changed lines`, "muted")]
+          : []),
+      ];
+  return {
+    summary: `${summary} · +${added} -${removed}`,
+    collapsed,
     expanded: boundedRows(rows),
   };
 }
@@ -884,6 +962,12 @@ function resultFailure(
   if (error === undefined && context.status !== "failed") return undefined;
   const message = (error ?? context.rawResult) || "Tool failed";
   const rows = wrapRows(message, context.width, "error");
+  const diagnostic = isRecord(context.result?.diagnostic)
+    ? stringValue(context.result.diagnostic.hint)
+    : undefined;
+  if (diagnostic !== undefined) {
+    rows.push(...wrapRows(`Hint: ${diagnostic}`, context.width, "warning"));
+  }
   return {
     summary: error === undefined ? fallbackSummary : oneLine(error),
     collapsed: rows,

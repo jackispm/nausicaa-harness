@@ -520,9 +520,9 @@ Options:
                           Fukai compaction output budget
   --fukai-max-wall-clock-ms <number>
                           Fukai compaction wall-clock budget
-  --allow-write           Override settings to allow workspace writes (default)
-  --allow-shell           Explicit high privilege: shell may read/write outside the workspace
-  --allow-network         Allow public web fetch/search tools for this run
+  --allow-write           Allow workspace writes (default; use settings/profile to restrict)
+  --allow-shell           Allow host-level shell access (default; use /permissions to restrict)
+  --allow-network         Allow public web fetch/search tools (default)
   --edges                 Enable configured Skills/MCP/plugin edge sources
   --no-edges              Disable all configured edge sources for this run
   --refresh-edges         Refresh edge sources before starting the host/Turn

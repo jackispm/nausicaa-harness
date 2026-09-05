@@ -318,6 +318,26 @@ describe("A2AInbox", () => {
       .toBe("pending");
   });
 
+  it("claims only the explicitly requested message ids", async () => {
+    const inbox = new A2AInbox();
+    await inbox.send(taskMessage(
+      { type: "task.accept", taskId: "exact-a" },
+      { messageId: "exact-a", idempotencyKey: "exact-a", from: "worker-a", to: "main" },
+    ));
+    await inbox.send(taskMessage(
+      { type: "task.accept", taskId: "exact-b" },
+      { messageId: "exact-b", idempotencyKey: "exact-b", from: "worker-b", to: "main" },
+    ));
+
+    const claimed = await inbox.claim("main", "main", {
+      claimId: "exact-only",
+      messageIds: ["exact-b"],
+    });
+    expect(claimed.map((record) => record.message.messageId)).toEqual(["exact-b"]);
+    expect(inbox.snapshot().records.find((record) => record.message.messageId === "exact-a")?.status)
+      .toBe("pending");
+  });
+
   it("filters claims and lease wakeups by Run when requested", async () => {
     const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
     const inbox = new A2AInbox({ clock, claimLeaseMs: 1_000 });

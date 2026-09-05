@@ -21,7 +21,7 @@ describe("interactive command registry", () => {
       "status",
       "login",
       "logout",
-      "agents",
+      "list-agents",
       "edges",
       "skills",
       "context",
@@ -46,13 +46,16 @@ describe("interactive command registry", () => {
 
   it("canonicalizes established compatibility aliases", () => {
     expect(canonicalInteractiveCommandName("exit")).toBe("quit");
-    expect(canonicalInteractiveCommandName("topology")).toBe("agents");
+    expect(canonicalInteractiveCommandName("agents")).toBe("list-agents");
+    expect(canonicalInteractiveCommandName("topology")).toBe("list-agents");
+    expect(canonicalInteractiveCommandName("list-agents")).toBe("list-agents");
     expect(canonicalInteractiveCommandName("usage")).toBe("context");
     expect(canonicalInteractiveCommandName("cancel")).toBe("stop");
     expect(findInteractiveCommand("/stop")?.name).toBe("stop");
     expect(findInteractiveCommand("/quit")?.name).toBe("quit");
     expect(findInteractiveCommand("/cancel")?.name).toBe("stop");
     expect(findInteractiveCommand("/setup")?.name).toBe("setup");
+    expect(findInteractiveCommand("/list-agents")?.name).toBe("list-agents");
     expect(findInteractiveCommand("/mode")?.name).toBe("mode");
     expect(canonicalInteractiveCommandName("branch")).toBe("fork");
     expect(findInteractiveCommand("/branch")?.name).toBe("fork");
@@ -65,6 +68,9 @@ describe("interactive command registry", () => {
       expect(help).not.toMatch(new RegExp(String.raw`/${name}(?:\\s|$)`, "u"));
     }
     expect(help).toContain("/setup");
+    expect(help).toContain("/list-agents");
+    expect(help).not.toContain("/agents");
+    expect(help).not.toContain("/topology");
     expect(help).toContain("/edges [refresh]");
     expect(help).toContain("/mode [default|plan]");
     expect(help).toContain("/fork [run-id]");

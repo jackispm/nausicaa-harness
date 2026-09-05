@@ -74,12 +74,12 @@ export const PUBLIC_INTERACTIVE_COMMANDS: readonly InteractiveCommandSpec[] = Ob
     visibility: "public",
   }),
   command({
-    name: "agents",
+    name: "list-agents",
     description: "View active agent sessions or the local topology",
     references: ["prime", "codex"],
     alignment: "semantic-review",
     visibility: "public",
-    aliases: ["topology"],
+    aliases: ["agents", "topology"],
   }),
   command({
     name: "edges",
@@ -268,10 +268,9 @@ export function publicInteractiveCommandSpecs(): readonly InteractiveCommandSpec
 export function formatInteractiveCommandHelp(): string {
   return PUBLIC_INTERACTIVE_COMMANDS
     .map((spec) => {
-      const aliasText = spec.aliases === undefined || spec.aliases.length === 0
-        ? ""
-        : ` (alias: ${spec.aliases.map((alias) => `/${alias}`).join(", ")})`;
-      return `\`/${spec.name}${spec.argumentHint === undefined ? "" : ` ${spec.argumentHint}`}\` ${spec.description}${aliasText}`;
+      // Compatibility aliases remain accepted by dispatch, but the public
+      // help stays canonical and does not present duplicate commands.
+      return `\`/${spec.name}${spec.argumentHint === undefined ? "" : ` ${spec.argumentHint}`}\` ${spec.description}`;
     })
     .join("\n\n");
 }

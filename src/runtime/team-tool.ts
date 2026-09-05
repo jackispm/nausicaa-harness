@@ -35,6 +35,48 @@ export interface TeamControl {
   status?(context: ToolExecutionContext): unknown | Promise<unknown>;
 }
 
+/** Main-facing read-only capability for the durable Team board projection. */
+export function createTeamStatusTool(control: TeamControl): AgentTool {
+  if (control === null || typeof control !== "object" || typeof control.status !== "function") {
+    throw new TypeError("Team status control must provide status");
+  }
+  const tool: AgentTool = {
+    definition: {
+      name: "team_status",
+      description: "Read the durable status of Teams and branches created in this Run. Terminality comes from persisted branch facts, not from a notification or in-memory scheduler.",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+    async execute(_arguments_, context): Promise<ToolResult> {
+      try {
+        return {
+          content: JSON.stringify(await control.status!(context)),
+          isError: false,
+        };
+      } catch (error: unknown) {
+        return {
+          content: JSON.stringify({
+            error: error instanceof Error ? error.message : "Team status failed",
+          }),
+          isError: true,
+        };
+      }
+    },
+  };
+  return annotateTool(tool, {
+    effect: "read",
+    deterministic: true,
+    supportsBatch: false,
+    concurrencySafe: true,
+    scope: "run",
+    inputKinds: ["json"],
+    outputKinds: ["json"],
+  });
+}
+
 const MAX_BRANCHES = 16;
 const MAX_STRING_LENGTH = 4_096;
 

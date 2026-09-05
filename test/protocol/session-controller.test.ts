@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { AgentTool, AnyEvent, ModelPort, ModelResponse, UserImage } from "../../src/domain/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
@@ -23,6 +23,7 @@ import type { RuntimeFukaiCompactionFactory } from "../../src/runtime/fukai-comp
 import { FileContentAddressedStore } from "../../src/store/index.js";
 import { WorkspaceCommandSandbox } from "../../src/tools/index.js";
 import { FileProcessJobRegistry } from "../../src/tools/process-jobs.js";
+import type { ShellExecutionResult } from "../../src/tools/shell-process.js";
 
 const roots: string[] = [];
 
@@ -773,6 +774,49 @@ describe("SessionController", () => {
     await session.close();
   });
 
+  it("keeps restricted tools visible but requires host approval before a write", async () => {
+    const root = await temporaryRoot();
+    const model = new ScriptedModel([
+      {
+        ...response("write it"),
+        toolCalls: [{
+          id: "approval-write",
+          name: "write_file",
+          arguments: { path: "approved.txt", content: "approved" },
+        }],
+        stopReason: "toolUse",
+      },
+      response("done"),
+    ]);
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      allowWrite: false,
+      allowShell: false,
+      allowNetwork: false,
+      policy: { maxMainStepsPerActivation: 2, maxModelTokens: 20_000, tetoEnabled: false },
+    }, {
+      mainModel: model,
+      createRunId: () => "permission-gated-write",
+    });
+    let approvals = 0;
+    session.setApprovalHandler(async (context) => {
+      approvals += 1;
+      expect(context.tool.tool.definition.name).toBe("write_file");
+      await session.selectPermissionProfile("full-access");
+      return { approved: true };
+    });
+
+    await session.submit({ inputId: "permission-gated-input", text: "Write the file" });
+    await session.waitForIdle();
+
+    expect(approvals).toBe(1);
+    expect(model.requests[0]?.tools.map((tool) => tool.name)).toContain("write_file");
+    await expect(readFile(join(root, "approved.txt"), "utf8")).resolves.toBe("approved");
+    await session.close();
+  });
+
   it("hides an injected Skill schema when the captured catalog is empty", async () => {
     const root = await temporaryRoot();
     const model = new ScriptedModel([(request) => {
@@ -832,6 +876,58 @@ describe("SessionController", () => {
         reason: "Workspace Bash has no OS sandbox backend for win32",
       },
     });
+    await session.close();
+  });
+
+  it("routes operator Bash through the selected permission boundary", async () => {
+    const root = await temporaryRoot();
+    const execution: ShellExecutionResult = {
+      stdout: shellOutput("workspace-output"),
+      stderr: shellOutput(""),
+      exitCode: 0,
+      aborted: false,
+      timedOut: false,
+    };
+    const sandboxExecute = vi.fn(async () => execution);
+    const workspaceCommandSandbox = new WorkspaceCommandSandbox({
+      platform: "darwin",
+      seatbeltExecutable: "/usr/bin/true",
+      probe: () => true,
+      execute: sandboxExecute,
+    });
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      allowWrite: true,
+      policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+    }, {
+      mainModel: new ScriptedModel([]),
+      workspaceCommandSandbox,
+    });
+
+    const workspace = await session.executeBash("printf workspace");
+    expect(workspace.profile).toBe("workspace");
+    expect(workspace.execution.stdout.content).toBe("workspace-output");
+    expect(sandboxExecute).toHaveBeenCalledWith(expect.objectContaining({
+      command: "printf workspace",
+    }));
+
+    await session.selectPermissionProfile("full-access");
+    const fullAccess = await session.executeBash("printf full-access");
+    expect(fullAccess.profile).toBe("full-access");
+    expect(fullAccess.execution.stdout.content).toBe("full-access");
+    expect(sandboxExecute).toHaveBeenCalledOnce();
+
+    await session.selectCollaborationMode("plan");
+    await expect(session.executeBash("printf plan-denied")).rejects.toThrow(
+      "Bash is disabled in Plan mode",
+    );
+    await session.selectCollaborationMode("default");
+    await session.selectPermissionProfile("read-only");
+    await expect(session.executeBash("printf denied")).rejects.toThrow(
+      "Bash is disabled by the current permission profile",
+    );
     await session.close();
   });
 
@@ -2911,6 +3007,18 @@ function response(content: string): ModelResponse {
     toolCalls: [],
     stopReason: "stop",
     usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 },
+  };
+}
+
+function shellOutput(content: string): ShellExecutionResult["stdout"] {
+  return {
+    content,
+    truncated: false,
+    truncatedBy: null,
+    totalBytes: Buffer.byteLength(content),
+    totalLines: content.length === 0 ? 0 : content.split("\n").length,
+    outputBytes: Buffer.byteLength(content),
+    outputLines: content.length === 0 ? 0 : content.split("\n").length,
   };
 }
 

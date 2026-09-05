@@ -10,6 +10,7 @@ import {
   revalidateExistingWorkspacePath,
   type WorkspacePathPolicy,
 } from "./workspace-path.js";
+import { diagnosePermissionFailure } from "./permission-diagnostics.js";
 
 // Safety behavior follows Prime Agent 7787f074 (MIT) and Codex 31d338a1
 // (Apache-2.0): fixed argv, bounded output, and no repository-configured helpers.
@@ -753,6 +754,10 @@ async function executeSafely(operation: () => Promise<ToolResult>): Promise<Tool
     return await operation();
   } catch (error: unknown) {
     if (error instanceof GitExecutionError) {
+      const diagnostic = diagnosePermissionFailure({
+        error: error.execution.spawnError,
+        stderr: error.execution.stderr.content(),
+      });
       return failure({
         error: error.message,
         stderr: error.execution.stderr.content(),
@@ -760,9 +765,14 @@ async function executeSafely(operation: () => Promise<ToolResult>): Promise<Tool
         aborted: error.execution.aborted,
         timedOut: error.execution.timedOut,
         truncated: error.execution.stderr.truncated,
+        ...(diagnostic === undefined ? {} : { diagnostic }),
       });
     }
-    return failure({ error: safeMessage(error) });
+    const diagnostic = diagnosePermissionFailure({ error });
+    return failure({
+      error: safeMessage(error),
+      ...(diagnostic === undefined ? {} : { diagnostic }),
+    });
   }
 }
 

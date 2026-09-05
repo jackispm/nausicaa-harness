@@ -32,6 +32,10 @@ import type { ContentAddressedStore } from "../store/index.js";
 import type { Ledger } from "../ledger/index.js";
 import { persistedErrorText } from "./redaction.js";
 import { recoverRunTokenUsageByLane } from "./run-token-budget-recovery.js";
+import {
+  assertSpawnContextMatchesTask,
+  renderSpawnContext,
+} from "./lane-context.js";
 
 const DEFAULT_MAX_MODEL_TOKENS = 12_000;
 const DEFAULT_MAX_WALL_CLOCK_MS = 5 * 60 * 1_000;
@@ -205,6 +209,29 @@ export class TeamBranchExecutor {
     const record = records[0]!;
     if (record.message.runId !== this.options.runId) throw new Error(`Team task belongs to Run ${record.message.runId}`);
     const request = record.message as TaskRequestMessage;
+    if (request.payload.spawnContext !== undefined) {
+      try {
+        assertSpawnContextMatchesTask(request.payload.spawnContext, {
+          runId: this.options.runId,
+          from: request.from,
+          to: this.options.branchLaneId,
+          goal: request.payload.goal,
+          inputRefs: request.payload.inputRefs,
+          budget: request.payload.budget,
+        });
+      } catch (error: unknown) {
+        const failedPayload: TaskFailed = {
+          type: "task.failed",
+          taskId: request.payload.taskId,
+          reason: persistedErrorText(error, "Team branch SpawnContext was rejected"),
+          retryable: false,
+          evidenceRefs: request.payload.inputRefs.map((ref) => ref.contentHash),
+        };
+        await this.sendReply(request, failedPayload, "failed").catch(() => undefined);
+        await this.options.inbox.handle(request.messageId, this.options.branchLaneId).catch(() => undefined);
+        return { status: "failed", taskId: request.payload.taskId, reason: failedPayload.reason };
+      }
+    }
     // A terminal reply may have been committed immediately before a process
     // crash or a lost `message.handled` acknowledgement. Reconcile that fact
     // before invoking the model again; otherwise a redelivery repeats the
@@ -281,6 +308,10 @@ export class TeamBranchExecutor {
       budget.maxModelTokens,
       DEFAULT_MAX_MODEL_TOKENS,
     );
+    // The dispatcher canonicalizes a task deadline before admission. Do not
+    // silently shorten that contract here: a Team branch must receive the
+    // exact wall-clock allowance the parent authorized. Legacy messages that
+    // omit a deadline still use the bounded default.
     const deadlineAt = budget.deadline === undefined
       ? Date.parse(request.createdAt) + Math.min(budget.maxWallClockMs, DEFAULT_MAX_WALL_CLOCK_MS)
       : Date.parse(budget.deadline);
@@ -299,7 +330,7 @@ export class TeamBranchExecutor {
     try {
       const goal = task.goal;
       this.teto.setGoal(goal);
-      const initialMessage = await this.readTaskInput(goal, task.inputRefs, signal);
+      const initialMessage = await this.readTaskInput(goal, task.inputRefs, signal, task.spawnContext);
       const branchTools = this.branchTools();
       const events = await this.options.readEvents();
       const conversationRefs = recoverConversationRefs(
@@ -398,8 +429,8 @@ export class TeamBranchExecutor {
     return tools;
   }
 
-  private async readTaskInput(goal: Goal, refs: readonly { id: string; mediaType: string; contentHash: string; byteLength: number }[], signal: AbortSignal): Promise<string> {
-    const lines = ["Team branch objective:", goal.statement, "Success criteria:", ...goal.successCriteria.map((item) => `- ${item}`), "Hard constraints:", ...(goal.hardConstraints.length === 0 ? ["- None specified"] : goal.hardConstraints.map((item) => `- ${item}`)), "Attached data:"];
+  private async readTaskInput(goal: Goal, refs: readonly { id: string; mediaType: string; contentHash: string; byteLength: number }[], signal: AbortSignal, spawnContext?: import("../domain/types.js").SpawnContext): Promise<string> {
+    const lines = ["Team branch objective:", goal.statement, "Success criteria:", ...goal.successCriteria.map((item) => `- ${item}`), "Hard constraints:", ...(goal.hardConstraints.length === 0 ? ["- None specified"] : goal.hardConstraints.map((item) => `- ${item}`)), ...(spawnContext === undefined ? [] : [renderSpawnContext(spawnContext)]), "Attached data:"];
     for (const ref of refs.slice(0, 8)) {
       if (signal.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
       if (!ref.mediaType.startsWith("text/") && !ref.mediaType.includes("json")) {
@@ -445,7 +476,9 @@ export class TeamBranchExecutor {
       type: "lane.status",
       payload: { status, reason },
       correlationId: `${this.options.runId}:${this.options.branchLaneId}`,
-      idempotencyKey: `${this.options.runId}:${this.options.branchLaneId}:status:${status}:${this.createId()}`,
+      // One branch owns one task. A stable key makes replay after a crash a
+      // duplicate status append rather than a second contradictory fact.
+      idempotencyKey: `${this.options.runId}:${this.options.branchLaneId}:status:${status}`,
       visibility: "run",
       occurredAt: this.clock.now().toISOString(),
     });
@@ -476,7 +509,6 @@ export function createTeamBranchPolicy(
     mainRequestTimeoutMs: DEFAULT_MAX_WALL_CLOCK_MS,
     tetoEnabled: true,
     tetoMaxOutputTokens: Math.min(512, Math.max(1, maxModelTokens)),
-    tetoTokenRatio: 0.1,
     tetoActivation: "manual" as const,
     workerEnabled: false,
   });

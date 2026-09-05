@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 
 import {
   CROSS_RUN_MAX_FUTURE_SKEW_MS,
@@ -17,6 +18,7 @@ import {
   parseAgentTopologyFormat,
   renderAgentTopologyFromSource,
   renderAgentTopologyJson,
+  renderAgentTopologyPanel,
   renderAgentTopologyText,
 } from "../../src/cli/agent-topology.js";
 
@@ -245,5 +247,47 @@ describe("agent awareness topology", () => {
     expect(createAgentTopologyPresenter(source).render("text")).toContain("source");
     const block = new AgentTopologyBlock(source);
     expect(block.render(120).join("\n")).toContain("source");
+  });
+
+  it("renders a Prime-style Agent Family around the current endpoint", () => {
+    const current = endpoint("family-current", "main");
+    const teto = endpoint("family-current", "teto");
+    const sibling = endpoint("family-sibling", "main");
+    const otherChild = endpoint("family-other", "worker");
+    const otherSessionMain = endpoint("other-session", "main", "repo", "session-b");
+    const finished = endpoint("finished-session", "main", "repo", "session-b");
+    const snapshot = projectAgentTopology({
+      now,
+      records: [
+        { endpoint: current, state: "running", lastSeen: now, activitySummary: "coordinating the current request", children: [teto] },
+        { endpoint: teto, state: "idle", lastSeen: now },
+        { endpoint: sibling, state: "offline", lastSeen: now },
+        { endpoint: endpoint("family-other", "main"), state: "idle", lastSeen: now, children: [otherChild] },
+        { endpoint: otherChild, state: "waiting", lastSeen: now, activitySummary: "reviewing the branch design" },
+        { endpoint: otherSessionMain, state: "active", lastSeen: now, activitySummary: "checking another session" },
+        { endpoint: finished, state: "terminal", lastSeen: now, activitySummary: "finished task" },
+      ],
+    });
+
+    const coloredLines = renderAgentTopologyPanel(snapshot, 160, { currentEndpoint: current });
+    const output = stripTerminalSequences(coloredLines.join("\n"));
+    expect(coloredLines.some((line) => line.includes("\u001b["))).toBe(true);
+    expect(coloredLines.every((line) => visibleWidth(stripTerminalSequences(line)) <= 160)).toBe(true);
+    expect(output).toContain("Agent Family");
+    expect(output).toContain("Current agent — main");
+    expect(output).toContain("Current session");
+    expect(output).toContain("Other sessions (1)");
+    expect(output).toContain("session:session-b");
+    expect(output).toContain("reviewing the branch design");
+    expect(output).toContain("┌");
+    expect(output).toContain("│ # │ Agent");
+    expect(output).not.toContain("offline");
+    expect(output).not.toContain("terminal");
+    expect(output).toContain("run:family-current");
+    expect(output).toContain("teto · run:family-current");
+    expect(output).toContain("5 live agents");
+    expect(renderAgentTopologyText(snapshot)).toContain("offline");
+    expect(renderAgentTopologyText(snapshot)).toContain("terminal");
+    expect(renderAgentTopologyJson(snapshot)).toContain("family-sibling");
   });
 });

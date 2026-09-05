@@ -10,6 +10,7 @@ import type {
   TodoItem,
   LaneId,
   LaneKind,
+  LaneCapabilityManifest,
   LaneStatus,
   NavigationDelta,
   InputId,
@@ -101,6 +102,8 @@ export interface EventPayloadMap {
     source?: "model" | "operator";
   };
   "lane.registered": { kind: LaneKind; teamFingerprint?: string };
+  /** Public, metadata-only capability manifest for a lane. */
+  "lane.capability.published": { manifest: LaneCapabilityManifest };
   /** Optional lifecycle marker carried by the existing lane status fact. */
   "lane.status": {
     status: LaneStatus;

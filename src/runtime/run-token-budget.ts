@@ -21,7 +21,8 @@ export interface RunTokenBudgetOptions {
 }
 
 export interface RunTokenBudgetSnapshot {
-  maxTokens: number;
+  /** Omitted for an unbounded Run budget. */
+  maxTokens?: number;
   usedTokens: number;
   reservedTokens: number;
   availableTokens: number;
@@ -30,11 +31,14 @@ export interface RunTokenBudgetSnapshot {
 }
 
 /**
- * Single-process admission gate for all model calls in one Run. Methods are
- * synchronous so checking capacity and recording a reservation is atomic.
+ * Single-process admission gate for all model calls in one Run. An omitted
+ * maxTokens keeps accounting and idempotent settlement without imposing a
+ * cumulative Run limit. Methods are synchronous so checking capacity and
+ * recording a reservation is atomic.
  */
 export class RunTokenBudget {
-  readonly maxTokens: number;
+  /** Undefined means no aggregate Run token limit. */
+  readonly maxTokens: number | undefined;
   private usedTokens: number;
   private reservedTokens = 0;
   private readonly reservations = new Map<string, number>();
@@ -42,8 +46,8 @@ export class RunTokenBudget {
   private readonly parent: RunTokenBudget | undefined;
   private readonly parentReservationPrefix: string | undefined;
 
-  constructor(maxTokens: number, usedTokens = 0, options: RunTokenBudgetOptions = {}) {
-    positiveInteger(maxTokens, "maxTokens");
+  constructor(maxTokens: number | undefined, usedTokens = 0, options: RunTokenBudgetOptions = {}) {
+    if (maxTokens !== undefined) positiveInteger(maxTokens, "maxTokens");
     nonNegativeInteger(usedTokens, "usedTokens");
     if (options.parent === this) throw new TypeError("A token budget cannot parent itself");
     if (options.parent !== undefined) {
@@ -59,6 +63,9 @@ export class RunTokenBudget {
   }
 
   availableTokens(): number {
+    // Keep the numeric API stable for callers that size a provider request,
+    // while an omitted max remains genuinely unbounded in reserve().
+    if (this.maxTokens === undefined) return Number.MAX_SAFE_INTEGER;
     return Math.max(0, this.maxTokens - this.usedTokens - this.reservedTokens);
   }
 
@@ -81,7 +88,7 @@ export class RunTokenBudget {
       }
       return { id, tokens, status: "reserved" };
     }
-    if (tokens > this.availableTokens()) return undefined;
+    if (this.maxTokens !== undefined && tokens > this.availableTokens()) return undefined;
     const parentId = this.parentReservationId(id);
     if (parentId !== undefined && this.parent?.reserve(parentId, tokens) === undefined) {
       return undefined;
@@ -171,7 +178,7 @@ export class RunTokenBudget {
 
   snapshot(): RunTokenBudgetSnapshot {
     return {
-      maxTokens: this.maxTokens,
+      ...(this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens }),
       usedTokens: this.usedTokens,
       reservedTokens: this.reservedTokens,
       availableTokens: this.availableTokens(),

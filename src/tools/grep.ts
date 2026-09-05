@@ -108,8 +108,8 @@ export function createGrepTool(
     ...(cursorPagination ? {
       outputMode: {
         type: "string",
-        enum: ["matches", "files"],
-        description: "Return structured line matches (default) or one stable, deduplicated path per matching file",
+        enum: ["matches", "files", "content", "files_with_matches"],
+        description: "Return structured line matches (matches/content, default) or one stable, deduplicated path per matching file (files/files_with_matches)",
       },
       cursor: {
         type: "string",
@@ -678,7 +678,11 @@ function splitNullTerminated(output: Buffer, truncated: boolean): string[] {
 function optionalOutputMode(value: unknown): GrepOutputMode {
   if (value === undefined) return "matches";
   if (value === "matches" || value === "files") return value;
-  throw new TypeError("outputMode must be matches or files");
+  // Accept the names used by common grep adapters while retaining one
+  // canonical projection in cursors and results.
+  if (value === "content") return "matches";
+  if (value === "files_with_matches") return "files";
+  throw new TypeError("outputMode must be matches, files, content, or files_with_matches");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

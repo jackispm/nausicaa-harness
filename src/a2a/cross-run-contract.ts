@@ -15,6 +15,7 @@ import type {
   CrossRunRoute,
   LaneId,
   RunId,
+  SpawnContext,
   Visibility,
 } from "../domain/types.js";
 import {
@@ -27,6 +28,7 @@ import {
   assertArtifactRef,
   verifyArtifact,
 } from "../store/store.js";
+import { validateSpawnContext } from "../runtime/lane-context.js";
 
 /** Version of the host-to-host A2A contract. */
 export const CROSS_RUN_PROTOCOL_VERSION = 1 as const;
@@ -990,6 +992,9 @@ function normalizePayload(value: unknown): CrossRunPayload {
         goal: normalizeGoal(item.goal, "payload.goal"),
         inputRefs: normalizeArtifactRefs(item.inputRefs, "payload.inputRefs"),
         budget: normalizeTaskBudget(item.budget, "payload.budget"),
+        ...(item.spawnContext === undefined
+          ? {}
+          : { spawnContext: normalizeSpawnContext(item.spawnContext) }),
       };
     case "task.accept":
       return { type, taskId: normalizeTaskId(item.taskId, "payload.taskId") };
@@ -1021,7 +1026,7 @@ function normalizePayload(value: unknown): CrossRunPayload {
 function payloadKeys(type: CrossRunPayload["type"]): readonly string[] {
   switch (type) {
     case "advice.propose": return ["advice"];
-    case "task.request": return ["taskId", "goal", "inputRefs", "budget"];
+    case "task.request": return ["taskId", "goal", "inputRefs", "budget", "spawnContext"];
     case "task.accept": return ["taskId"];
     case "task.result": return ["taskId", "status", "summary", "evidenceRefs", "artifactRefs", "openQuestions", "usage"];
     case "task.failed": return ["taskId", "reason", "retryable", "evidenceRefs"];
@@ -1103,6 +1108,18 @@ function normalizeTaskBudget(value: unknown, path: string): import("../domain/ty
     ...(deadline === undefined ? {} : { deadline }),
     ...(item.maxAttempts === undefined ? {} : { maxAttempts: item.maxAttempts as number }),
   };
+}
+
+function normalizeSpawnContext(value: unknown): SpawnContext {
+  try {
+    validateSpawnContext(value);
+    return structuredClone(value);
+  } catch (error: unknown) {
+    throw new CrossRunProtocolError(
+      error instanceof Error ? error.message : "spawnContext is invalid",
+      "invalid-request",
+    );
+  }
 }
 
 function normalizeUsage(value: unknown, path: string): import("../domain/types.js").TokenUsage {

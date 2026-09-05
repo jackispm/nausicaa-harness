@@ -3,7 +3,15 @@ import { randomUUID } from "node:crypto";
 import type { A2AInbox } from "../a2a/index.js";
 import type { AnyEvent } from "../domain/events.js";
 import type { AgentTool, Clock, ModelPort, ToolExecutionContext } from "../domain/ports.js";
-import type { ArtifactRef, Goal, LaneId, RunId, TaskRequest } from "../domain/types.js";
+import type {
+  ArtifactRef,
+  Goal,
+  LaneId,
+  RunId,
+  SpawnContext,
+  TaskBudget,
+  TaskRequest,
+} from "../domain/types.js";
 import type { ContentAddressedStore } from "../store/index.js";
 import type { Ledger } from "../ledger/index.js";
 import { sha256, stableJson } from "../ledger/hash.js";
@@ -20,6 +28,7 @@ import { createTeamBranchPolicy, TeamBranchExecutor } from "./team-branch-execut
 import type { AgentTopologySnapshot } from "./agent-awareness.js";
 import type { TeamControl, TeamCreateRequest, TeamCreateResult, TeamBranchRequest } from "./team-tool.js";
 import { teamGoal } from "./team-tool.js";
+import { projectTeamBoards, type TeamBoard } from "./team-board.js";
 import {
   DEFAULT_SUBAGENT_MAX_DEPTH,
   MAX_SUBAGENT_NAME_LENGTH,
@@ -83,6 +92,15 @@ export interface TeamRuntimeOptions {
   clock?: Clock;
   createId?: () => string;
   signal?: AbortSignal;
+  /** Host-owned context projection for each Team branch request. */
+  spawnContext?: (input: {
+    teamId: string;
+    branchId: string;
+    laneId: LaneId;
+    goal: Goal;
+    inputRefs: readonly ArtifactRef[];
+    budget: TaskBudget;
+  }) => SpawnContext;
 }
 
 /**
@@ -106,6 +124,8 @@ export class TeamRuntime implements TeamControl {
   private readonly teamFingerprints = new Map<string, string>();
   /** In-process source of truth used to finish a partially admitted Team. */
   private readonly teamDefinitions = new Map<string, readonly PreparedTeamBranch[]>();
+  /** Branches admitted by restart repair but not yet reported to the caller. */
+  private readonly recoveredAdmissions = new Set<string>();
   private lifecycleTail: Promise<void> = Promise.resolve();
   private stopped = false;
 
@@ -210,6 +230,36 @@ export class TeamRuntime implements TeamControl {
         }
         runtime.scheduler.enqueue();
       }
+
+      // A crash may happen after the durable task.request but before the
+      // lane.registered append. Re-run the host-owned, idempotent admission
+      // from the task definition so that branch is recoverable on restart.
+      for (const [teamId, definition] of durableDefinitions) {
+        const laneIds = this.teams.get(teamId) ?? [];
+        this.teams.set(teamId, laneIds);
+        this.teamDefinitions.set(teamId, definition);
+        this.teamFingerprints.set(
+          teamId,
+          this.teamFingerprints.get(teamId) ?? preparedTeamFingerprint(definition),
+        );
+        const missingLaneIds = definition
+          .map((item) => `team:${teamId}:${item.branchId}`)
+          .filter((laneId) => !this.branches.has(laneId));
+        if (missingLaneIds.length === 0 || this.teams.size > MAX_TEAMS) continue;
+        await this.ensureBranches(
+          teamId,
+          definition,
+          {
+            runId: this.runId,
+            laneId: this.parentLaneId,
+            workspace: this.options.workspace,
+            operationId: `${this.runId}:team:${teamId}:restore`,
+            ...(this.options.signal === undefined ? {} : { signal: this.options.signal }),
+          },
+          true,
+        );
+        for (const laneId of missingLaneIds) this.recoveredAdmissions.add(laneId);
+      }
     });
   }
 
@@ -306,13 +356,33 @@ export class TeamRuntime implements TeamControl {
         threadId: `${this.runId}:team:${teamId}`,
         correlationId: `${this.runId}:team:${teamId}`,
         clock: this.clock,
+        ...(this.options.spawnContext === undefined
+          ? {}
+          : {
+              // Dispatcher canonicalizes the deadline and attempt budget
+              // before invoking this factory. Constructing the context here
+              // keeps it aligned with the durable task.
+              spawnContextFactory: ({ goal: dispatchedGoal, inputRefs: dispatchedInputRefs, budget: dispatchedBudget }) => (
+                this.options.spawnContext!({
+                  teamId,
+                  branchId,
+                  laneId,
+                  goal: dispatchedGoal,
+                  inputRefs: dispatchedInputRefs,
+                  budget: dispatchedBudget,
+                })
+              ),
+            }),
       });
+      const goal = teamGoal(branch);
+      const inputRefs = inputRef === undefined ? [] : [inputRef];
+      const laneId = `team:${teamId}:${branchId}`;
       await dispatcher.dispatch({
         taskId: `${teamId}:${branchId}`,
         from: this.parentLaneId,
         to: `team:${teamId}:${branchId}`,
-        goal: teamGoal(branch),
-        inputRefs: inputRef === undefined ? [] : [inputRef],
+        goal,
+        inputRefs,
         budget: taskBudget,
       });
     }
@@ -377,22 +447,27 @@ export class TeamRuntime implements TeamControl {
       results.push({
         branchId,
         laneId,
-        status: duplicateExisting && alreadyAdmitted ? "duplicate" : "queued",
+        // A restart repair has already admitted the lane durably, but the
+        // first explicit idempotent create after restart still reports the
+        // branch as queued (the caller did not observe that admission). Later
+        // retries correctly report duplicate.
+        status: duplicateExisting && alreadyAdmitted && !this.recoveredAdmissions.delete(laneId)
+          ? "duplicate"
+          : "queued",
       });
     }
     this.teams.set(teamId, laneIds);
     return results;
   }
 
-  status(_context: ToolExecutionContext): unknown {
+  async status(context: ToolExecutionContext): Promise<{ teams: TeamBoard[] }> {
+    assertOwner(context, this.runId, this.parentLaneId);
+    const events = await this.options.readEvents();
     return {
-      teams: [...this.teams.entries()].map(([teamId, laneIds]) => ({
-        teamId,
-        branches: laneIds.map((laneId) => ({
-          laneId,
-          active: this.branches.get(laneId)?.scheduler.pendingActivations !== 0,
-        })),
-      })),
+      teams: projectTeamBoards(events, {
+        runId: this.runId,
+        inbox: this.inbox.snapshot(),
+      }),
     };
   }
 
@@ -417,6 +492,7 @@ export class TeamRuntime implements TeamControl {
       this.teams.clear();
       this.teamDefinitions.clear();
       this.teamFingerprints.clear();
+      this.recoveredAdmissions.clear();
     });
   }
 
@@ -430,7 +506,7 @@ export class TeamRuntime implements TeamControl {
     goal?: Goal,
   ): BranchRuntime {
     const branchPolicy = createTeamBranchPolicy(
-      taskBudget?.maxModelTokens ?? tokenBudget.maxTokens,
+      taskBudget?.maxModelTokens ?? tokenBudget.maxTokens ?? DEFAULT_BRANCH_MODEL_TOKENS,
       this.options.policy,
       taskBudget?.maxAttempts,
     );
@@ -506,6 +582,17 @@ function teamRequestFingerprint(request: TeamCreateRequest): string {
   // This is deliberately content-only. The Team id is already the map key,
   // while stableJson makes retries deterministic across object key order.
   return sha256(stableJson(request.branches));
+}
+
+function preparedTeamFingerprint(definition: readonly PreparedTeamBranch[]): string {
+  return sha256(stableJson(definition.map((item) => ({
+    branchId: item.branchId,
+    statement: item.branch.statement,
+    successCriteria: item.branch.successCriteria ?? [],
+    hardConstraints: item.branch.hardConstraints ?? [],
+    inputRef: item.inputRef,
+    budget: item.taskBudget,
+  }))));
 }
 
 function validateBranchRequest(branch: TeamBranchRequest): void {

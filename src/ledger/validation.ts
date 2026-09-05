@@ -33,6 +33,10 @@ import type {
   TokenUsage,
   Visibility,
 } from "../domain/types.js";
+import {
+  validateLaneCapabilityManifest,
+  validateSpawnContext,
+} from "../runtime/lane-context.js";
 
 type PayloadValidator = (value: unknown, path: string) => void;
 
@@ -252,7 +256,9 @@ function runPolicy(value: unknown, path: string): asserts value is RunPolicy {
   } else {
     integer(item.maxMainSteps, `${path}.maxMainSteps`, 1);
   }
-  integer(item.maxModelTokens, `${path}.maxModelTokens`, 1);
+  if (item.maxModelTokens !== undefined) {
+    integer(item.maxModelTokens, `${path}.maxModelTokens`, 1);
+  }
   if (item.mainRequestTimeoutMs !== undefined) {
     integer(item.mainRequestTimeoutMs, `${path}.mainRequestTimeoutMs`, 1);
     if ((item.mainRequestTimeoutMs as number) > 60 * 60 * 1_000) {
@@ -264,7 +270,9 @@ function runPolicy(value: unknown, path: string): asserts value is RunPolicy {
     boolean(item.workerEnabled, `${path}.workerEnabled`);
   }
   integer(item.tetoMaxOutputTokens, `${path}.tetoMaxOutputTokens`, 1);
-  ratio(item.tetoTokenRatio, `${path}.tetoTokenRatio`);
+  if (item.tetoTokenRatio !== undefined) {
+    ratio(item.tetoTokenRatio, `${path}.tetoTokenRatio`);
+  }
   if (item.tetoActivation !== undefined) {
     oneOf(item.tetoActivation, `${path}.tetoActivation`, ["automatic", "manual"] as const);
   }
@@ -769,6 +777,16 @@ function a2aMessage(value: unknown, path: string): asserts value is A2AMessage {
       goal(payload.goal, `${path}.payload.goal`);
       artifactRefArray(payload.inputRefs, `${path}.payload.inputRefs`);
       taskBudget(payload.budget, `${path}.payload.budget`);
+      if (payload.spawnContext !== undefined) {
+        try {
+          validateSpawnContext(payload.spawnContext);
+        } catch (error: unknown) {
+          invalid(
+            `${path}.payload.spawnContext`,
+            error instanceof Error ? error.message : "a valid SpawnContext",
+          );
+        }
+      }
       {
         const budget = payload.budget as TaskBudget;
         const deadline = budget.deadline;
@@ -1039,6 +1057,17 @@ const payloadValidators = {
     const item = payloadObject(value, path, ["kind"]);
     oneOf(item.kind, `${path}.kind`, ["main", "intent-navigator", "reflection", "worker", "team"] as const);
     optionalString(item.teamFingerprint, `${path}.teamFingerprint`);
+  },
+  "lane.capability.published": (value, path) => {
+    const item = payloadObject(value, path, ["manifest"]);
+    try {
+      validateLaneCapabilityManifest(item.manifest);
+    } catch (error: unknown) {
+      invalid(
+        `${path}.manifest`,
+        error instanceof Error ? error.message : "a valid lane capability manifest",
+      );
+    }
   },
   "lane.status": (value, path) => {
     const item = payloadObject(value, path, ["status"]);

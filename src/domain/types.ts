@@ -19,6 +19,52 @@ export type LaneStatus =
   | "failed"
   | "cancelled";
 
+/** Explicit topology relation carried by host-issued lane identities. */
+export type LaneRelation = "owns" | "observes" | "delegates" | "member-of" | "peer";
+
+/** Stable, host-owned identity for one addressable lane. */
+export interface LaneIdentity {
+  workspaceId: string;
+  sessionId: string;
+  runId: RunId;
+  laneId: LaneId;
+  laneKind: LaneKind;
+  parentLaneId?: LaneId;
+  ownerLaneId?: LaneId;
+  relation?: LaneRelation;
+}
+
+export type LaneCapabilityKind =
+  | "tool"
+  | "skill"
+  | "a2a"
+  | "lifecycle"
+  | "observation";
+
+/** Metadata-only capability entry; never contains a tool schema or credential. */
+export interface LaneCapability {
+  name: string;
+  kind: LaneCapabilityKind;
+  description?: string;
+}
+
+/** A target visible to a lane through a host-authorized A2A route. */
+export interface LaneTargetCapability {
+  laneId: LaneId;
+  relation: LaneRelation;
+  actions: string[];
+}
+
+/** Small manifest safe to expose to a parent/model; private lane details stay out. */
+export interface LaneCapabilityManifest {
+  schemaVersion: 1;
+  lane: LaneIdentity;
+  role: string;
+  state: LaneStatus;
+  capabilities: LaneCapability[];
+  targets?: LaneTargetCapability[];
+}
+
 export type Visibility = "lane" | "run" | "user" | "sensitive";
 
 export interface Goal {
@@ -329,6 +375,25 @@ export interface TaskBudget {
   maxAttempts?: number;
 }
 
+/**
+ * The bounded context passed when a host creates a live child Lane.  It is
+ * intentionally a projection: a child receives only explicit artifacts and
+ * metadata, never the parent's private transcript or tool schemas.
+ */
+export interface SpawnContext {
+  schemaVersion: 1;
+  parent: LaneIdentity;
+  child: LaneIdentity;
+  goal: Goal;
+  inputRefs: ArtifactRef[];
+  projectInstructionRefs: ArtifactRef[];
+  parentSummaryRefs: ArtifactRef[];
+  tools: LaneCapability[];
+  skills: LaneCapability[];
+  laneManifest: LaneCapabilityManifest;
+  budget: TaskBudget;
+}
+
 /** Hard protocol bounds keep delegated work finite even for untrusted senders. */
 export const MAX_TASK_MODEL_TOKENS = 1_000_000;
 export const MAX_TASK_WALL_CLOCK_MS = 30 * 60 * 1_000;
@@ -341,6 +406,8 @@ export interface TaskRequest {
   goal: Goal;
   inputRefs: ArtifactRef[];
   budget: TaskBudget;
+  /** Optional for schema-v1 compatibility; new host-created tasks include it. */
+  spawnContext?: SpawnContext;
 }
 
 export interface TaskAccept {
@@ -404,12 +471,14 @@ export interface A2AMessage {
 }
 
 interface RunPolicyBase {
-  maxModelTokens: number;
+  /** Optional aggregate model-token budget; omitted means the Run is unbounded. */
+  maxModelTokens?: number;
   /** Optional for legacy Runs; runtime applies the durable default when absent. */
   mainRequestTimeoutMs?: number;
   tetoEnabled: boolean;
   tetoMaxOutputTokens: number;
-  tetoTokenRatio: number;
+  /** Optional Teto/Main token ratio gate; omitted means no ratio limit. */
+  tetoTokenRatio?: number;
   /** Optional for legacy Runs; manual makes `teto_start` the only opener. */
   tetoActivation?: TetoActivationMode;
   /** Optional for schema-v1 compatibility; omitted means the Worker lane is off. */

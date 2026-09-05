@@ -273,6 +273,25 @@ describe("workspace search tools", () => {
     });
   });
 
+  it("accepts common grep output-mode aliases and normalizes their projections", async () => {
+    const workspace = await temporaryDirectory("nausicaa-grep-alias-");
+    await writeFile(path.join(workspace, "visible.txt"), "needle\n");
+
+    const matches = await createGrepTool().execute({
+      pattern: "needle",
+      outputMode: "content",
+    }, context(workspace));
+    const files = await createGrepTool().execute({
+      pattern: "needle",
+      outputMode: "files_with_matches",
+    }, context(workspace));
+
+    expect(matches.isError).toBe(false);
+    expect(JSON.parse(matches.content)).toMatchObject({ matchCount: 1 });
+    expect(files.isError).toBe(false);
+    expect(JSON.parse(files.content)).toMatchObject({ files: ["visible.txt"] });
+  });
+
   it("keeps files-mode cursors separate from the default line-match query", async () => {
     const workspace = await temporaryDirectory("nausicaa-grep-files-cursor-");
     await writeFile(path.join(workspace, "a.ts"), "hit");

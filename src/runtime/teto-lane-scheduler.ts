@@ -713,7 +713,10 @@ function validateOptions(options: TetoLaneSchedulerOptions): void {
       throw new TypeError(`${name} must be non-empty and free of NUL`);
     }
   }
-  if (!Number.isSafeInteger(options.policy.maxModelTokens) || options.policy.maxModelTokens <= 0) {
+  if (
+    options.policy.maxModelTokens !== undefined
+    && (!Number.isSafeInteger(options.policy.maxModelTokens) || options.policy.maxModelTokens <= 0)
+  ) {
     throw new RangeError("Teto policy maxModelTokens must be a positive integer");
   }
   if (!Number.isSafeInteger(options.policy.tetoMaxOutputTokens)

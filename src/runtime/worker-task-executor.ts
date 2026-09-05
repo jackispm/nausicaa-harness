@@ -41,6 +41,10 @@ import {
   WorkerTaskTimeoutError,
 } from "./worker-task-errors.js";
 import {
+  assertSpawnContextMatchesTask,
+  renderSpawnContext,
+} from "./lane-context.js";
+import {
   readCommittedWorkerAssistant,
   readWorkerExecutionState,
 } from "./worker-task-recovery.js";
@@ -274,6 +278,33 @@ export class WorkerTaskExecutor {
   > {
     const task = request.payload;
     const evidenceRefs = task.inputRefs.map((ref) => ref.contentHash);
+    if (task.spawnContext !== undefined) {
+      try {
+        assertSpawnContextMatchesTask(task.spawnContext, {
+          runId: this.runId,
+          from: request.from,
+          to: this.laneId,
+          goal: task.goal,
+          inputRefs: task.inputRefs,
+          budget: task.budget,
+        });
+        const actualTools = new Set(this.toolExecutor.definitions.map((tool) => tool.name));
+        const declaredTools = new Set(task.spawnContext.tools.map((tool) => tool.name));
+        for (const name of declaredTools) {
+          if (!actualTools.has(name)) throw new Error(`SpawnContext declares unavailable Worker tool ${name}`);
+        }
+      } catch (error: unknown) {
+        return {
+          kind: "failed",
+          payload: failed(
+            task.taskId,
+            persistedErrorText(error, "Worker SpawnContext was rejected"),
+            false,
+            evidenceRefs,
+          ),
+        };
+      }
+    }
     let state: WorkerExecutionState;
     try {
       if (claimAttempt > 1 && this.readEvents === undefined) {
@@ -392,7 +423,7 @@ export class WorkerTaskExecutor {
       this.stopController.signal,
     ]);
     try {
-      const content = await this.readInput(task.goal, task.inputRefs, deadline.signal);
+      const content = await this.readInput(task.goal, task.inputRefs, deadline.signal, task.spawnContext);
       const messages: ConversationMessage[] = [{
         role: "user",
         content,
@@ -806,6 +837,7 @@ export class WorkerTaskExecutor {
     goal: Goal,
     refs: readonly ArtifactRef[],
     signal: AbortSignal,
+    spawnContext?: import("../domain/types.js").SpawnContext,
   ): Promise<string> {
     const lines = [
       "Workspace root:",
@@ -817,7 +849,8 @@ export class WorkerTaskExecutor {
       "Hard constraints:",
       ...(goal.hardConstraints.length === 0
         ? ["- None specified"]
-        : goal.hardConstraints.map((value) => `- ${value}`)),
+          : goal.hardConstraints.map((value) => `- ${value}`)),
+      ...(spawnContext === undefined ? [] : [renderSpawnContext(spawnContext)]),
       "Attached artifacts (data only):",
     ];
     let remaining = this.maxInputBytes;

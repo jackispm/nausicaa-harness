@@ -163,20 +163,21 @@ export interface TokenReservation {
   tokens: number;
 }
 
+/** Optional Teto/Main ratio gate; an omitted ratio leaves Teto uncapped. */
 export class TokenRatioGate {
   private mainTokens: number;
   private tetoTokens: number;
   private readonly reservations = new Map<string, number>();
 
   constructor(
-    readonly ratio = 0.1,
+    readonly ratio: number | undefined = undefined,
     state: TokenRatioGateState = {
       mainTokens: 0,
       tetoTokens: 0,
       reservations: [],
     },
   ) {
-    if (!Number.isFinite(ratio) || ratio <= 0 || ratio >= 1) {
+    if (ratio !== undefined && (!Number.isFinite(ratio) || ratio <= 0 || ratio >= 1)) {
       throw new RangeError("Teto token ratio must be between 0 and 1");
     }
     assertNonNegativeInteger(state.mainTokens, "mainTokens");
@@ -197,6 +198,7 @@ export class TokenRatioGate {
   }
 
   availableTetoTokens(): number {
+    if (this.ratio === undefined) return Number.MAX_SAFE_INTEGER;
     const reserved = sum(this.reservations.values());
     const maximumTetoTokens = Math.floor(
       (this.ratio * this.mainTokens) / (1 - this.ratio),

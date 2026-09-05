@@ -27,6 +27,8 @@ import type { MoweAgentTool } from "../mowe/types.js";
 export interface CrossRunRuntimeSenderContext {
   readonly runId: string;
   readonly laneId: string;
+  /** Host-owned process/session identity for this activation, when available. */
+  readonly sessionId?: string;
   readonly workspace: string;
   /** The source Ledger is the default durable outbox boundary. */
   readonly ledger: Ledger;

@@ -636,7 +636,7 @@ function assertFactPredecessor(
   }
 }
 
-async function normalizeTargetAdmission(
+export async function normalizeTargetAdmission(
   value: CrossRunTargetAdmissionInput,
   target: CrossRunEndpoint,
   verifySender?: (sender: CrossRunSenderIdentity) => boolean | Promise<boolean>,

@@ -123,7 +123,8 @@ export interface ResolvedSettings {
   tetoModel: string;
   tetoEnabled: boolean;
   maxSteps: number;
-  maxModelTokens: number;
+  /** Optional aggregate Run token budget; omitted means unbounded. */
+  maxModelTokens?: number;
   maxOutputTokens: number;
   dataDir: string;
   allowShell: boolean;
@@ -212,12 +213,16 @@ export const resolveSettings = (
     tetoModel: merged.tetoModel ?? model,
     tetoEnabled: merged.tetoEnabled ?? true,
     maxSteps: boundedInteger(merged.maxSteps ?? 24, "maxSteps", 1, 1_000),
-    maxModelTokens: boundedInteger(
-      merged.maxModelTokens ?? 200_000,
-      "maxModelTokens",
-      1,
-      Number.MAX_SAFE_INTEGER,
-    ),
+    ...(merged.maxModelTokens === undefined
+      ? {}
+      : {
+          maxModelTokens: boundedInteger(
+            merged.maxModelTokens,
+            "maxModelTokens",
+            1,
+            Number.MAX_SAFE_INTEGER,
+          ),
+        }),
     maxOutputTokens: boundedInteger(
       merged.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS,
       "maxOutputTokens",
@@ -225,11 +230,13 @@ export const resolveSettings = (
       MAX_MAIN_OUTPUT_TOKENS,
     ),
     dataDir: isAbsolute(dataDir) ? resolve(dataDir) : resolve(workspace, dataDir),
-    allowShell: merged.allowShell ?? false,
-    // Match the mature coding-agent baseline: edits inside the workspace are
-    // available by default, while unsandboxed shell and network stay off.
+    // A normal interactive user session starts with the host's capabilities.
+    // Restricted lanes (Worker/Teto/Team) pass an explicit boundary and remain
+    // fail-closed; these defaults only apply when the user has not selected a
+    // narrower profile.
+    allowShell: merged.allowShell ?? true,
     allowWrite: merged.allowWrite ?? true,
-    allowNetwork: merged.allowNetwork ?? false,
+    allowNetwork: merged.allowNetwork ?? true,
     edges,
     fukaiCompaction,
   };

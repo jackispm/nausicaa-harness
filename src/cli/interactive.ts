@@ -19,6 +19,7 @@ import {
   listWorkspaceRuns,
   listWorkspaceRunTree,
   SessionController,
+  type SessionBashExecution,
   type SessionRuntimeEvent,
   type SessionPendingInput,
   type SessionSnapshot,
@@ -32,6 +33,7 @@ import {
   type UserImage,
   validateUserImages,
 } from "../domain/images.js";
+import type { A2AMessage } from "../domain/types.js";
 import {
   readClipboardImage,
   type ClipboardImageReader,
@@ -72,6 +74,9 @@ import {
 } from "./queue-selection.js";
 import {
   ActivityLine,
+  AgentMessageBlock,
+  agentMessagePresentationFromA2A,
+  type AgentMessagePresentation,
   AdviceBlock,
   AssistantMessageBlock,
   BrandSplashHeader,
@@ -81,9 +86,11 @@ import {
   nausicaaEditorTheme,
   nausicaaMarkdownTheme,
   NoticeBlock,
+  parseExternalA2APrompt,
   PromptSurface,
   QueuePreview,
   SessionTray,
+  StableStatusSlot,
   ToolStatusBlock,
   UserMessageBlock,
   WorkerTaskSummaryLine,
@@ -114,6 +121,8 @@ import {
   type SecretInput,
 } from "./auth.js";
 import type { CredentialStore } from "@earendil-works/pi-ai";
+import { diagnosePermissionFailure } from "../tools/permission-diagnostics.js";
+import type { PermissionDiagnostic } from "../tools/permission-diagnostics.js";
 
 export interface InteractiveOptions {
   session: SessionController;
@@ -244,35 +253,60 @@ const quietAuthOutput: Output = {
 
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_INTERRUPT_EXIT_WINDOW_MS = 1_000;
+const MAX_INTERACTIVE_BASH_CONTEXT_CHARS = 32 * 1024;
+const MAX_PENDING_BASH_CONTEXTS = 8;
 
 /** Pi-inspired presentation layer. Runtime state stays in SessionController. */
 export async function runInteractive(options: InteractiveOptions): Promise<number> {
   const terminal = options.terminal ?? new ProcessTerminal();
-  // Pi-style fullscreen mode keeps the transcript scrollable and the prompt docked.
-  // Main-screen mode remains available when stdout is not a real terminal.
-  const tui: TUI = (options.forceAltScreen ?? process.stdout.isTTY === true)
+  // Pi's default is the regular main-screen renderer: startup text and the
+  // transcript stay in terminal scrollback. Fullscreen remains an explicit
+  // opt-in for embedders that need a fixed viewport/dock.
+  const useAltScreen = options.forceAltScreen === true;
+  const tui: TUI = useAltScreen
     ? new TuiAltScreen(terminal, true, undefined, { mouse: true })
     : new TuiMainScreen(terminal, true);
+  // A forced render resets pi-tui's differential-render state. That is safe
+  // in the alternate screen, where the next frame starts at a known origin,
+  // but it leaves stale rows behind on the main screen because the terminal
+  // cursor is already below the previous frame. Keep the previous frame for
+  // main-screen updates so shrinking selectors and notices can be erased.
+  const requestTuiRender = (force = false): void => {
+    tui.invalidate();
+    if (force && tui instanceof TuiAltScreen) {
+      tui.requestRender(true);
+      return;
+    }
+    tui.requestRender();
+  };
+  // Warp and other terminal session browsers use the OSC title as their
+  // session label. Keep it stable and application-specific while the TUI is
+  // running; the sidebar icon remains terminal-owned metadata.
+  terminal.setTitle("Nausicaa");
   const screen = new VStack();
+  const documentContainer = new Container();
   const transcript = new Container();
   const activity = new ActivityLine(() => options.session.snapshot(), tui);
+  // Match Pi's status-container lifecycle: idle is zero rows by default, while
+  // the optional clear-on-shrink setting retains its two-row cleanup marker in
+  // regular mode only.
+  const statusSlot = new StableStatusSlot(
+    activity,
+    () => tui.mode === "regular" && tui.getClearOnShrink(),
+  );
   const shortcutGuide = new Container();
   const queuePreview = new QueuePreview();
-  const transcriptViewport = new ScrollView(transcript, {
-    follow: "end",
-    primary: true,
-    scrollbar: "auto",
-  });
-  // Pi's editor defaults to zero horizontal padding; PromptSurface owns the
-  // prompt treatment while the editor keeps the text flush with its border.
+  // Pi's editor defaults to zero horizontal padding and uses no input fill.
   const editor = new Editor(tui, nausicaaEditorTheme, { paddingX: 0 });
   const promptSurface = new PromptSurface(editor);
   const promptSlot = new Container();
   promptSlot.addChild(promptSurface);
   const toolBlocks = new Map<string, ToolStatusBlock>();
+  const agentMessageBlocks = new Map<string, AgentMessageBlock>();
   const assistantBlocks: AssistantMessageBlock[] = [];
   let thinkingExpanded = true;
   let toolsExpanded = false;
+  let agentMessagesExpanded = false;
   let responseBlock: AssistantMessageBlock | undefined;
   let responseGroup: Container | undefined;
   let responseSpacer: Spacer | undefined;
@@ -290,6 +324,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   let closed = false;
   let activeSecretInput: TuiSecretInput | undefined;
   let activeSubmission: QueuedSubmission | undefined;
+  let activeBashAbortController: AbortController | undefined;
+  let bashOperationSequence = 0;
+  let pendingBashContext: string[] = [];
   let submissionDrainPromise: Promise<void> | undefined;
   let finishPromise: Promise<void> | undefined;
   let queuedFinishCode: number | undefined;
@@ -301,6 +338,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     component: SelectorOverlay;
     restorePreview: () => void;
   } | undefined;
+  let pendingPermissionApproval: (() => void) | undefined;
+  let permissionApprovalTail: Promise<void> = Promise.resolve();
+  let permissionApprovalGranted = false;
   const submissionQueue: QueuedSubmission[] = [];
   const queueSelection = new QueueSelection();
   let pendingQueue: SessionPendingInput[] = [];
@@ -332,34 +372,52 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   const header = new BrandSplashHeader({
     version: "0.1.0",
   });
-  transcript.addChild(header);
-  screen.addChild(transcriptViewport, { grow: 1, minSize: 1 });
-  screen.addChild(activity, { basis: "auto", minSize: 0, shrink: 1 });
-  screen.addChild(shortcutGuide, { basis: "auto", minSize: 0, shrink: 1 });
-  screen.addChild(queuePreview, { basis: "auto", minSize: 0, shrink: 1 });
-  screen.addChild(promptSlot, { minSize: 1, shrink: 0 });
-  screen.addChild(new WorkerTaskSummaryLine(
-    () => options.session.workerTaskSummary(),
-  ), {
-    basis: "auto",
-    minSize: 0,
-    shrink: 1,
+  const headerContainer = new Container();
+  documentContainer.addChild(headerContainer);
+  documentContainer.addChild(transcript);
+  const transcriptViewport = new ScrollView(documentContainer, {
+    follow: "end",
+    primary: true,
+    scrollbar: "auto",
   });
-  screen.addChild(new SessionTray(
+  const workerTaskSummary = new WorkerTaskSummaryLine(
+    () => options.session.workerTaskSummary(),
+  );
+  const sessionTray = new SessionTray(
     () => options.session.snapshot(),
     () => interruptExitUntil > Date.now() ? "Press Ctrl+C again to exit" : undefined,
-  ), {
-    basis: 1,
-    minSize: 1,
-    shrink: 0,
-  });
+  );
+  // Keep the transcript and the input dock as two stable layout regions, like
+  // Pi's InteractiveMode. Dynamic status rows live inside the dock so their
+  // appearance/removal cannot change the editor's anchoring independently.
+  const dock = new VStack([
+    { component: queuePreview, shrink: 1, minSize: 0 },
+    { component: statusSlot, shrink: 1, minSize: 0 },
+    { component: shortcutGuide, shrink: 1, minSize: 0 },
+    { component: workerTaskSummary, shrink: 1, minSize: 0 },
+    { component: promptSlot, shrink: 1, minSize: 3 },
+    { component: sessionTray, basis: 2, shrink: 0, minSize: 2 },
+  ]);
+  screen.addChild(transcriptViewport, { basis: 0, grow: 1, shrink: 1, minSize: 1 });
   if (tui instanceof TuiAltScreen) {
+    screen.addChild(dock, { basis: "auto", grow: 0, shrink: 1, minSize: 1 });
     tui.setLayoutRoot(screen);
   } else {
-    tui.addChild(screen);
+    // This is Pi's regular-mode composition: each root remains in the main
+    // screen's scrollback instead of being forced into a full-height VStack.
+    tui.addChild(documentContainer);
+    tui.addChild(queuePreview);
+    tui.addChild(statusSlot);
+    tui.addChild(shortcutGuide);
+    tui.addChild(workerTaskSummary);
+    tui.addChild(promptSlot);
+    tui.addChild(sessionTray);
   }
   tui.setFocus(editor);
-  const autocompleteCommands = publicInteractiveCommandSpecs().map((spec) => {
+  const autocompleteSpecs = [...publicInteractiveCommandSpecs()].sort((left, right) => (
+    autocompletePriority(left.name) - autocompletePriority(right.name)
+  ));
+  const autocompleteCommands = autocompleteSpecs.map((spec) => {
     const completion: {
       name: string;
       description: string;
@@ -400,6 +458,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     autocompleteCommands,
     options.session.workspace,
   ));
+  // Keep the initial command menu useful while compatibility aliases remain
+  // accepted by dispatch but are intentionally hidden from the public list.
+  // Pi's default editor exposes five completion rows. Larger menus make the
+  // composer grow and are a frequent source of apparent dock drift.
+  editor.setAutocompleteMaxVisible?.(5);
   const setEditorTextFromQueueSelection = (text: string): void => {
     editor.setText(text);
   };
@@ -490,16 +553,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     detectedColorScheme = scheme;
     if (themePreference !== "auto") return;
     setNausicaaColorScheme(scheme);
-    tui.invalidate();
-    tui.requestRender(true);
+    requestTuiRender(true);
   });
   tui.setTerminalColorSchemeNotifications(true);
-  // Tool rows retain their own small status animation. The request indicator
-  // is a real pi-tui Loader and owns its interval independently.
+  // Tool rows retain Prime's shared four-frame pulse. The request indicator is
+  // a real pi-tui Loader and owns its braille interval independently.
   const toolAnimationTimer = setInterval(() => {
     for (const block of toolBlocks.values()) block.advance();
     tui.requestRender();
-  }, 80);
+  }, 250);
   toolAnimationTimer.unref?.();
 
   const appendBlock = (
@@ -523,8 +585,307 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     appendBlock(new NoticeBlock(message, kind));
   };
 
+  const clearPendingBashContext = (): void => {
+    pendingBashContext = [];
+  };
+
+  const renderBashExecution = (
+    result: SessionBashExecution,
+  ): Record<string, unknown> => {
+    const execution = result.execution;
+    const diagnostic = diagnosePermissionFailure({
+      command: result.command,
+      error: execution.spawnError,
+      stderr: execution.stderr.content,
+    });
+    return {
+      stdout: execution.stdout.content,
+      stderr: execution.stderr.content,
+      exitCode: execution.exitCode,
+      aborted: execution.aborted,
+      timedOut: execution.timedOut,
+      ...(execution.spawnError === undefined
+        ? {}
+        : { error: execution.spawnError.message }),
+      ...(diagnostic === undefined ? {} : { diagnostic }),
+      truncated: execution.stdout.truncated || execution.stderr.truncated,
+      truncation: {
+        stdout: execution.stdout,
+        stderr: execution.stderr,
+      },
+    };
+  };
+
+  const tailForBashContext = (value: string, limit: number): string => {
+    if (value.length <= limit) return value;
+    return `[earlier output omitted; showing the last ${limit} characters]\n${value.slice(-limit)}`;
+  };
+
+  const bashContextFromExecution = (result: SessionBashExecution): string => {
+    const execution = result.execution;
+    const streamLimit = Math.floor(MAX_INTERACTIVE_BASH_CONTEXT_CHARS / 2);
+    const rows = [`[Nausicaa Bash] $ ${result.command}`];
+    if (execution.stdout.content.length > 0) {
+      rows.push(`stdout:\n${tailForBashContext(execution.stdout.content, streamLimit)}`);
+    }
+    if (execution.stderr.content.length > 0) {
+      rows.push(`stderr:\n${tailForBashContext(execution.stderr.content, streamLimit)}`);
+    }
+    if (execution.spawnError !== undefined) {
+      rows.push(`error: ${execution.spawnError.message}`);
+    }
+    if (execution.aborted) rows.push("status: aborted");
+    if (execution.timedOut) rows.push("status: timed out");
+    if (execution.exitCode !== 0 && execution.exitCode !== null) {
+      rows.push(`exit code: ${execution.exitCode}`);
+    }
+    if (rows.length === 1) rows.push("(no output)");
+    return terminalSafeText(rows.join("\n"));
+  };
+
+  /** Ask before crossing a capability boundary; headless callers fail closed. */
+  const requestPermissionApproval = (
+    title: string,
+    subtitle: string,
+    approveLabel: string,
+    approveDescription: string,
+    reuseGranted = true,
+  ): Promise<boolean> => {
+    if (reuseGranted && permissionApprovalGranted) return Promise.resolve(true);
+    const request = permissionApprovalTail.then(() => {
+      if (reuseGranted && permissionApprovalGranted) return true;
+      if (closing || closed) return false;
+      return new Promise<boolean>((resolve) => {
+        let settled = false;
+        const settle = (approved: boolean): void => {
+          if (settled) return;
+          settled = true;
+          if (pendingPermissionApproval === cancelPending) pendingPermissionApproval = undefined;
+          resolve(approved);
+        };
+        const cancelPending = (): void => settle(false);
+        pendingPermissionApproval = cancelPending;
+        const selector = new SelectorOverlay({
+          title,
+          subtitle,
+          options: [
+            {
+              value: "approve",
+              label: approveLabel,
+              description: approveDescription,
+            },
+            {
+              value: "cancel",
+              label: "Cancel",
+              description: "Leave the command failed and keep the current boundary",
+            },
+          ],
+          onSelect: (value) => {
+            closeSelector(false);
+            settle(value === "approve");
+          },
+          onCancel: () => {
+            closeSelector(true);
+            settle(false);
+          },
+        });
+        mountSelector(selector);
+      });
+    });
+    permissionApprovalTail = request.then(() => undefined, () => undefined);
+    return request;
+  };
+
+  /**
+   * Ask before crossing a capability boundary. A single approval retries the
+   * exact Bash command at most once, so a denied command cannot loop forever.
+   */
+  const requestBashPermission = (
+    command: string,
+    diagnostic: PermissionDiagnostic,
+  ): Promise<boolean> => {
+    const current = options.session.snapshot().permissionProfile;
+    const needsProfileUpgrade = current !== "full-access";
+    return requestPermissionApproval(
+      needsProfileUpgrade ? "Permission required" : "Host permission required",
+      `${diagnostic.hint}\n\nCommand: ${command}`,
+      needsProfileUpgrade ? "Allow full access and retry" : "Retry command",
+      needsProfileUpgrade
+        ? "Use the host shell for this and future commands in this session"
+        : "Retry after granting the required permission in the host or OS",
+      needsProfileUpgrade,
+    );
+  };
+
+  // Model-visible gated tools use the same TUI approval boundary as operator
+  // Bash. Approval upgrades only this local session; durable lane boundaries
+  // and child-lane restrictions remain unchanged.
+  options.session.setApprovalHandler(async (context) => {
+    const effect = context.tool.metadata.effect;
+    const permissionWasRestricted = options.session.snapshot().permissionProfile !== "full-access";
+    const approved = await requestPermissionApproval(
+      "Permission required",
+      `Tool ${context.tool.tool.definition.name} needs ${effect} capability before it can run.`,
+      "Allow full access and run",
+      "Grant the wider host boundary for this session",
+      permissionWasRestricted,
+    );
+    if (!approved) return { approved: false, reason: "Permission denied in TUI" };
+    try {
+      if (options.session.snapshot().permissionProfile !== "full-access") {
+        await options.session.selectPermissionProfile("full-access");
+      }
+      if (permissionWasRestricted) permissionApprovalGranted = true;
+      return { approved: true };
+    } catch (error: unknown) {
+      return {
+        approved: false,
+        reason: `Permission upgrade failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  });
+
+  const runInteractiveBash = async (
+    input: string,
+    includeContext: boolean,
+  ): Promise<void> => {
+    const command = input.slice(includeContext ? 1 : 2).trim();
+    if (command.length === 0) {
+      appendNotice(
+        includeContext ? "Usage: ! <bash command>" : "Usage: !! <bash command>",
+        "warning",
+      );
+      return;
+    }
+
+    const operationId = `interactive-bash:${++bashOperationSequence}`;
+    const block = new ToolStatusBlock(
+      "bash",
+      "running",
+      includeContext ? "! · context queued" : "!! · context disabled",
+    );
+    block.setArguments(JSON.stringify({ command }));
+    selectLatestToolExpandHint([...toolBlocks.values()], block);
+    toolBlocks.set(operationId, block);
+    appendBlock(block);
+
+    const controller = new AbortController();
+    activeBashAbortController = controller;
+    const retryPermissionFailure = async (
+      diagnostic: PermissionDiagnostic,
+      permissionWasRestricted: boolean,
+    ): Promise<boolean> => {
+      if (
+        options.session.snapshot().collaborationMode === "plan"
+        || !(await requestBashPermission(command, diagnostic))
+      ) return false;
+      try {
+        if (options.session.snapshot().permissionProfile !== "full-access") {
+          await options.session.selectPermissionProfile("full-access");
+        }
+        if (permissionWasRestricted) permissionApprovalGranted = true;
+        block.setStatus("running", "retrying with full-access");
+        await executeAttempt(false);
+      } catch (retryError: unknown) {
+        const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+        block.setStatus("failed", "retry failed");
+        block.setResult(JSON.stringify({
+          error: retryMessage,
+          ...(diagnosePermissionFailure({ command, error: retryError }) === undefined
+            ? {}
+            : { diagnostic: diagnosePermissionFailure({ command, error: retryError }) }),
+        }));
+        appendNotice(`Bash retry failed: ${retryMessage}`, "error");
+      }
+      return true;
+    };
+    async function executeAttempt(allowRetry: boolean): Promise<void> {
+      try {
+        const result = await options.session.executeBash(command, controller.signal);
+        const execution = result.execution;
+        const diagnostic = diagnosePermissionFailure({
+          command,
+          error: execution.spawnError,
+          stderr: execution.stderr.content,
+        });
+        const permissionWasRestricted = options.session.snapshot().permissionProfile !== "full-access";
+        if (
+          allowRetry
+          && diagnostic !== undefined
+          && await retryPermissionFailure(diagnostic, permissionWasRestricted)
+        ) return;
+        const succeeded = execution.spawnError === undefined
+          && !execution.aborted
+          && !execution.timedOut
+          && execution.exitCode === 0;
+        block.setStatus(
+          succeeded ? "succeeded" : "failed",
+          succeeded
+            ? result.profile === "workspace" ? "sandboxed" : "host shell"
+            : execution.aborted
+              ? "aborted"
+              : execution.timedOut
+                ? "timed out"
+                : `exit ${execution.exitCode ?? "unknown"}`,
+        );
+        block.setResult(JSON.stringify(renderBashExecution(result)));
+        if (includeContext) {
+          pendingBashContext = [
+            ...pendingBashContext,
+            bashContextFromExecution(result),
+          ].slice(-MAX_PENDING_BASH_CONTEXTS);
+          appendNotice("Bash output queued for the next prompt.", "info");
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        const diagnostic = diagnosePermissionFailure({ command, error });
+        // Plan mode is an intentional policy decision, not an escalation
+        // request. Capability upgrades are remembered for this session; an OS
+        // or host denial still asks again because changing the profile cannot
+        // grant that external permission.
+        if (
+          allowRetry
+          && diagnostic !== undefined
+          && await retryPermissionFailure(
+            diagnostic,
+            options.session.snapshot().permissionProfile !== "full-access",
+          )
+        ) {
+          return;
+        }
+        block.setStatus("failed", "not executed");
+        block.setResult(JSON.stringify({
+          error: message,
+          ...(diagnostic === undefined ? {} : { diagnostic }),
+        }));
+        appendNotice(`Bash was not executed: ${message}`, "error");
+      }
+    }
+    try {
+      await executeAttempt(true);
+    } finally {
+      if (activeBashAbortController === controller) activeBashAbortController = undefined;
+      tui.requestRender();
+    }
+  };
+
+  const appendAgentMessage = (details: AgentMessagePresentation): AgentMessageBlock | undefined => {
+    const existing = agentMessageBlocks.get(details.messageId);
+    if (existing !== undefined) return existing;
+    const previous = transcript.children.at(-1);
+    const block = new AgentMessageBlock(details, {
+      suppressLeadingSpace: previous instanceof AgentMessageBlock,
+    });
+    block.setExpanded(agentMessagesExpanded);
+    agentMessageBlocks.set(details.messageId, block);
+    // AgentMessageBlock owns its Pi-style leading spacer so adjacent agent
+    // messages can be compacted without affecting ordinary transcript rows.
+    appendBlock(block, false);
+    return block;
+  };
+
   const showAgentTopology = async (argument: string): Promise<void> => {
-    if (argument.length > 0) throw new Error("Usage: /agents");
+    if (argument.length > 0) throw new Error("Usage: /list-agents");
     if (options.awareness === undefined) {
       appendNotice(
         "Agent awareness is unavailable: the host did not provide a read-only topology source.",
@@ -536,7 +897,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       const source = typeof options.awareness === "function"
         ? await options.awareness()
         : options.awareness;
-      appendBlock(new AgentTopologyBlock(source));
+      const sessionSnapshot = options.session.snapshot();
+      appendBlock(new AgentTopologyBlock(source, {
+        currentEndpoint: {
+          workspaceId: "local-workspace",
+          sessionId: options.session.sessionId,
+          runId: sessionSnapshot.runId ?? `session:${options.session.sessionId}`,
+          laneId: "main",
+        },
+      }));
     } catch {
       appendNotice("Nausicaa agents · unavailable", "warning");
     }
@@ -714,6 +1083,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       "**Controls**",
       `\`${pasteImageLabel}\` paste image  ·  \`Ctrl+S\` stash prompt`,
       "`Ctrl+O` tool output  ·  `Ctrl+T` thinking",
+      "`Ctrl+P` agent messages",
       "**Help**",
       "`/help` commands  ·  `Ctrl+C` cancel or clear; twice when idle to exit",
     ].join("\n\n"), 1, 0, nausicaaMarkdownTheme));
@@ -924,7 +1294,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
 
   const appendAssistant = (
     block: AssistantMessageBlock,
-    spaceBefore = true,
+    // AssistantMessageBlock owns Pi's leading Spacer once it has visible
+    // content. Adding a transcript spacer here would create a double gap.
+    spaceBefore = false,
   ): Spacer | undefined => {
     block.setThinkingExpanded(thinkingExpanded);
     assistantBlocks.push(block);
@@ -933,8 +1305,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
 
   const resetTranscript = (): void => {
     transcript.clear();
-    transcript.addChild(header);
     assistantBlocks.length = 0;
+    agentMessageBlocks.clear();
   };
 
   const removeEmptyResponse = (): void => {
@@ -964,7 +1336,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     assistantBlocks.push(responseBlock);
     responseGroup = new Container();
     responseGroup.addChild(responseBlock);
-    responseSpacer = appendBlock(responseGroup);
+    // The live assistant component inserts the same leading Spacer as Pi's
+    // AssistantMessageComponent. Keep the outer transcript gap absent.
+    responseSpacer = appendBlock(responseGroup, false);
   };
 
   const endResponse = async (
@@ -1031,7 +1405,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       if (
         message.role !== "assistant"
         || message.content.length === 0
-        || message.toolCalls.length > 0
       ) return;
       const key = assistantKey(ref.id, message.content);
       if (renderedAssistants.has(key)) return;
@@ -1055,12 +1428,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const entries = await options.session.transcript();
     entries.forEach((entry) => {
       if (entry.role === "user") {
+        const agentMessage = parseExternalA2APrompt(entry.content);
+        if (agentMessage !== undefined) {
+          appendAgentMessage(agentMessage);
+          return;
+        }
         addPromptToHistory(entry.content);
         appendBlock(new UserMessageBlock(entry.content, entry.imageTypes));
         return;
       }
       if (entry.role === "assistant") {
-        if (entry.hasToolCalls) return;
         renderedAssistants.add(assistantKey(entry.turnId, entry.content));
         appendAssistant(new AssistantMessageBlock(entry.content, entry.hasToolCalls));
         return;
@@ -1074,7 +1451,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       if (entry.status !== "unknown") block.setResult(entry.content);
       selectLatestToolExpandHint([...toolBlocks.values()], block);
       toolBlocks.set(entry.operationId, block);
-      appendBlock(block);
+      appendBlock(block, false);
     });
   };
 
@@ -1086,11 +1463,20 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       const event = runtimeEvent.event;
       const isTetoAdvice = event.type === "message.sent"
         && event.payload.message.from === "teto"
-        && event.payload.message.payload.type === "advice.propose";
+        && event.payload.message.payload.type === "advice.propose"
+        && event.payload.message.sourceEndpoint === undefined;
+      const isExternalA2AMessage = event.type === "message.sent"
+        && event.payload.message.sourceEndpoint !== undefined;
       // The transcript renderer owns Main's presentation surface. Teto and
       // Worker facts stay durable and available to their schedulers, while a
       // Teto advice message remains an explicit user-facing notice below.
-      if (event.laneId !== "main" && !isTetoAdvice) return;
+      if (event.laneId !== "main" && !isTetoAdvice && !isExternalA2AMessage) {
+        // Worker lifecycle events still change the durable summary mounted in
+        // the dock. They are not transcript entries, but skipping the redraw
+        // leaves the old "running/ready" label until an unrelated Main event.
+        tui.requestRender();
+        return;
+      }
       if (
         event.type === "message.sent"
         || event.type === "step.completed"
@@ -1114,6 +1500,25 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "turn.started":
         case "turn.resumed":
           activity.start();
+          tui.requestRender();
+          break;
+        case "model.requested":
+        case "model.completed":
+          // A retrying provider returns to the ordinary Pi loader when the
+          // next physical attempt is admitted or completes.
+          activity.resumeWorking();
+          tui.requestRender();
+          break;
+        case "model.retrying":
+          activity.startRetry(
+            event.payload.attempt,
+            event.payload.maxAttempts,
+            event.payload.delayMs,
+          );
+          tui.requestRender();
+          break;
+        case "model.cancelled":
+          activity.stop();
           tui.requestRender();
           break;
         case "turn.completed":
@@ -1147,6 +1552,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             const message = await options.session.readConversationMessage(event.payload.messageRef);
             if (closed || generation !== transcriptGeneration) break;
             if (message.role === "user") {
+              const agentMessage = parseExternalA2APrompt(message.content);
+              if (agentMessage !== undefined) {
+                appendAgentMessage(agentMessage);
+                break;
+              }
               appendBlock(new UserMessageBlock(
                 message.content,
                 message.images?.map((image) => image.mimeType),
@@ -1169,7 +1579,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           block.setExpanded(toolsExpanded);
           selectLatestToolExpandHint([...toolBlocks.values()], block);
           toolBlocks.set(event.payload.operationId, block);
-          appendBlock(block);
+          appendBlock(block, false);
           activity.setPhase("Executing");
           try {
             const args = await options.session.readToolArguments(event.payload.argumentsRef);
@@ -1233,14 +1643,26 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           tui.requestRender();
           break;
         case "message.sent": {
-          const payload = event.payload.message.payload;
-          if (event.payload.message.from === "teto" && payload.type === "advice.propose") {
+          const message = event.payload.message;
+          const payload = message.payload;
+          if (message.from === "teto" && payload.type === "advice.propose"
+            && message.sourceEndpoint === undefined) {
             appendBlock(new AdviceBlock(
               payload.advice.claim,
               payload.advice.suggestedAction,
               payload.advice.confidence,
             ));
+            break;
           }
+          if (message.sourceEndpoint !== undefined) {
+            const agentMessage = agentMessagePresentationFromA2A(message);
+            if (agentMessage !== undefined) {
+              appendAgentMessage(agentMessage);
+              break;
+            }
+          }
+          const notice = formatA2AMessageNotice(message);
+          if (notice !== undefined) appendNotice(notice);
           break;
         }
         case "advice.acknowledged":
@@ -1250,15 +1672,27 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           );
           break;
         case "fukai.compaction.requested":
+          activity.startCompaction();
           appendNotice("Compacting context...", "info");
           break;
+        case "fukai.compaction.completed":
+          // The summary is persisted in a later committed event; keep the
+          // compaction loader visible until that durable boundary settles.
+          tui.requestRender();
+          break;
         case "fukai.compaction.committed":
+          if (options.session.snapshot().status === "running") activity.resumeWorking();
+          else activity.stop();
           appendNotice("Context compacted for the next Turn.", "success");
           break;
         case "fukai.compaction.failed":
+          if (options.session.snapshot().status === "running") activity.resumeWorking();
+          else activity.stop();
           appendNotice("Compaction provider failed; the raw context is unchanged.", "warning");
           break;
         case "fukai.compaction.fallback":
+          if (options.session.snapshot().status === "running") activity.resumeWorking();
+          else activity.stop();
           appendNotice("Compaction fell back to the raw context; the transcript is unchanged.", "warning");
           break;
       }
@@ -1342,6 +1776,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     if (finishPromise !== undefined) return finishPromise;
     closing = true;
     clearInterruptExit();
+    activeBashAbortController?.abort(new Error("Nausicaa is closing"));
+    pendingPermissionApproval?.();
     // A selector may have temporarily previewed a theme. Restore its committed
     // palette before waiting for queued submissions or stopping the renderer.
     closeSelector(true);
@@ -1361,7 +1797,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       await terminal.drainInput(250, 25).catch(() => undefined);
       // Freeze the last live snapshot before closing detaches the Ledger-backed state.
       try {
-        if (tui instanceof TuiAltScreen) tui.setLayoutRoot(transcript);
+        if (tui instanceof TuiAltScreen) tui.setLayoutRoot(documentContainer);
         tui.stop();
       } catch (error: unknown) {
         process.exitCode = code === 0 ? 1 : code;
@@ -1384,6 +1820,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   const onSignal = (): void => { void finish(0); };
   const onSigint = (): void => {
     if (activeSelector !== undefined) {
+      pendingPermissionApproval?.();
       closeSelector(true);
       return;
     }
@@ -1645,7 +2082,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       promptSlot.clear();
       promptSlot.addChild(promptSurface);
       tui.setFocus(editor);
-      tui.requestRender(true);
+      requestTuiRender(true);
     }
   }
 
@@ -1658,7 +2095,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     promptSlot.clear();
     promptSlot.addChild(component);
     tui.setFocus(component);
-    tui.requestRender(true);
+    requestTuiRender(true);
   }
 
   const showModelSelector = (): void => {
@@ -1708,6 +2145,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     try {
       const profile = parsePermissionProfile(value);
       const result = await options.session.selectPermissionProfile(profile);
+      // An explicit operator choice is equivalent to approving the wider
+      // boundary. Downgrades revoke that session-scoped approval.
+      permissionApprovalGranted = profile === "full-access";
       if (!result.changed) {
         appendNotice(`Permissions already use ${result.profile}.`, "info");
         return;
@@ -1788,8 +2228,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     // `auto` follows the last detected terminal scheme; explicit choices take
     // effect immediately and remain stable across terminal notifications.
     setNausicaaColorScheme(choice === "auto" ? detectedColorScheme : choice);
-    tui.invalidate();
-    tui.requestRender(true);
+    requestTuiRender(true);
     appendNotice(
       choice === "auto"
         ? "Theme set to auto; it follows terminal color changes."
@@ -1815,8 +2254,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       onPreview: (value) => {
         if (value !== "auto" && value !== "light" && value !== "dark") return;
         setNausicaaColorScheme(value === "auto" ? detectedColorScheme : value);
-        tui.invalidate();
-        tui.requestRender(true);
+        requestTuiRender(true);
       },
       onSelect: (value) => {
         const choice = parseThemeChoice(value);
@@ -1846,6 +2284,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
     await options.session.attachRun(runId);
     resetQueueSelection();
+    clearPendingBashContext();
     if (promptStashScope.startsWith("<new-run:")) {
       promptStashes.delete(promptStashScope);
     }
@@ -1866,6 +2305,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       parts.length === 0 ? {} : { runId: parts[0]! },
     );
     resetQueueSelection();
+    clearPendingBashContext();
     if (promptStashScope.startsWith("<new-run:")) {
       promptStashes.delete(promptStashScope);
     }
@@ -1924,6 +2364,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
     const result = await options.session.forkRun({ checkpoint: selection.checkpoint });
     resetQueueSelection();
+    clearPendingBashContext();
     if (promptStashScope.startsWith("<new-run:")) {
       promptStashes.delete(promptStashScope);
     }
@@ -2016,7 +2457,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
     const before = controller.snapshot();
     const pending = controller.refresh();
-    tui.requestRender(true);
+    requestTuiRender(true);
     const refreshed = await pending;
     if (refreshed.stale) {
       appendNotice(
@@ -2026,7 +2467,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     } else {
       appendNotice(`Edges refreshed at generation ${refreshed.generation}.`, "success");
     }
-    tui.requestRender(true);
+    requestTuiRender(true);
   };
 
   const applySkillSelection = async (values: readonly string[]): Promise<void> => {
@@ -2043,7 +2484,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       }
       const count = controller.snapshot().selectedSkillIds.length;
       appendNotice(`${count} Skill(s) selected for the next Turn.`, "success");
-      tui.requestRender(true);
+      requestTuiRender(true);
     } catch (error: unknown) {
       appendNotice(
         `Skills were not changed: ${error instanceof Error ? error.message : String(error)}`,
@@ -2120,10 +2561,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "/logout":
           await logoutInTui(argument);
           break;
-        case "/agents":
-          await showAgentTopology(argument);
-          break;
-        case "/topology":
+        case "/list-agents":
           await showAgentTopology(argument);
           break;
         case "/edges":
@@ -2293,6 +2731,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "/new":
           await options.session.newRun();
           resetQueueSelection();
+          clearPendingBashContext();
           promptStashes.delete(promptStashKey());
           promptStashScope = `<new-run:${detachedPromptStashSequence}>`;
           detachedPromptStashSequence += 1;
@@ -2373,6 +2812,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       await handleCommand(value, submission.images);
       return;
     }
+    if (value.startsWith("!!")) {
+      addPromptToHistory(value);
+      await runInteractiveBash(value, false);
+      return;
+    }
+    if (value.startsWith("!")) {
+      addPromptToHistory(value);
+      await runInteractiveBash(value, true);
+      return;
+    }
     const readinessError = providerReadinessError();
     if (readinessError !== undefined) {
       editor.setText(value);
@@ -2380,15 +2829,22 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       return;
     }
     const inputId = createInputId();
+    const shellContext = pendingBashContext.length === 0
+      ? undefined
+      : pendingBashContext.join("\n\n");
+    const promptText = shellContext === undefined
+      ? value
+      : `${shellContext}\n\nUser request:\n${value}`;
     try {
       await options.session.submit({
         inputId,
-        text: value,
+        text: promptText,
         ...(submission.images === undefined
           ? {}
           : { images: structuredClone(submission.images) }),
         delivery: submission.delivery,
       });
+      clearPendingBashContext();
       adoptAttachedPromptStashScope();
       addPromptToHistory(value);
     } catch (error: unknown) {
@@ -2468,7 +2924,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       ...collectMarkedImages(pastedImages, value),
     ];
     if ((value.length === 0 && submittedImages.length === 0) || closing) return Promise.resolve();
-    if (!value.startsWith("/") && options.session.snapshot().model === UNCONFIGURED_MODEL) {
+    const isBashCommand = value.startsWith("!");
+    if (!value.startsWith("/") && !isBashCommand && options.session.snapshot().model === UNCONFIGURED_MODEL) {
       editor.setText(value);
       appendNotice("Choose a model with /model before sending a task. Local setup status is shown at startup.", "warning");
       return Promise.resolve();
@@ -2542,6 +2999,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       return { consume: true };
     }
     if (isInterrupt) {
+      if (activeBashAbortController !== undefined) {
+        activeBashAbortController.abort(new Error("Cancelled by user"));
+        return { consume: true };
+      }
       if (options.edgeSelection?.snapshot().refreshing === true) {
         options.edgeSelection.cancelRefresh();
         appendNotice("Cancelling edge refresh; the previous snapshot remains available.", "warning");
@@ -2581,6 +3042,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       tui.requestRender();
       return { consume: true };
     }
+    if (matchesKey(data, "ctrl+p")) {
+      agentMessagesExpanded = !agentMessagesExpanded;
+      for (const block of agentMessageBlocks.values()) {
+        block.setExpanded(agentMessagesExpanded);
+      }
+      tui.requestRender();
+      return { consume: true };
+    }
     return undefined;
   });
 
@@ -2598,6 +3067,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   } catch {
     // Some terminals do not answer OSC 10/11 queries; the light palette remains valid.
   }
+  // Pi mounts its expandable startup header after the renderer has produced
+  // the first empty composer frame. Keeping that ordering matters in regular
+  // mode: the introduction becomes scrollback content instead of a permanent
+  // banner that pushes the composer down from the moment the process starts.
+  headerContainer.addChild(new Spacer(1));
+  headerContainer.addChild(header);
+  headerContainer.addChild(new Spacer(1));
+  requestTuiRender();
   await refreshQueue();
   if (options.showStartupSetup === true || options.startupModelMissing === true) {
     // Setup status is a startup diagnostic, not a public slash command.
@@ -2644,7 +3121,7 @@ function updateToolBlock(
   name: string,
   status: "succeeded" | "failed" | "unknown",
   detail: string,
-  append: (component: ToolStatusBlock) => unknown,
+  append: (component: ToolStatusBlock, spaceBefore?: boolean) => unknown,
 ): void {
   const existing = blocks.get(operationId);
   if (existing !== undefined) {
@@ -2654,7 +3131,7 @@ function updateToolBlock(
   const block = new ToolStatusBlock(name, status, detail);
   selectLatestToolExpandHint([...blocks.values()], block);
   blocks.set(operationId, block);
-  append(block);
+  append(block, false);
 }
 
 function assistantKey(turnId: string | undefined, content: string): string {
@@ -2679,6 +3156,49 @@ function oneLine(value: string, maxWidth = 160): string {
   return value.replace(/\s+/g, " ").trim().slice(0, maxWidth);
 }
 
+const MAX_A2A_NOTICE_CHARS = 160;
+const MAX_A2A_SOURCE_CHARS = 24;
+
+/** Keep cross-Run messages visible without allowing remote text to grow the transcript. */
+function formatA2AMessageNotice(message: A2AMessage): string | undefined {
+  const source = a2aSourceLabel(message);
+  switch (message.payload.type) {
+    case "message.inform":
+      return oneLine(
+        terminalSafeText(`Agent message from ${source}: ${message.payload.text}`),
+        MAX_A2A_NOTICE_CHARS,
+      );
+    case "question.ask":
+      return oneLine(
+        terminalSafeText(`Question from ${source}: ${message.payload.question}`),
+        MAX_A2A_NOTICE_CHARS,
+      );
+    case "question.answer":
+      return oneLine(
+        terminalSafeText(`Answer from ${source}: ${message.payload.answer}`),
+        MAX_A2A_NOTICE_CHARS,
+      );
+    case "task.request":
+      return oneLine(
+        terminalSafeText(`Task request from ${source}: ${message.payload.goal.statement}`),
+        MAX_A2A_NOTICE_CHARS,
+      );
+    case "advice.propose":
+      return oneLine(
+        terminalSafeText(`Advice from ${source}: ${message.payload.advice.claim}`),
+        MAX_A2A_NOTICE_CHARS,
+      );
+    default:
+      return undefined;
+  }
+}
+
+function a2aSourceLabel(message: A2AMessage): string {
+  const source = message.sourceEndpoint?.runId ?? message.from;
+  const label = oneLine(terminalSafeText(source), MAX_A2A_SOURCE_CHARS);
+  return label.length > 0 ? label : "unknown";
+}
+
 function commandArgumentCompletions(
   options: readonly SelectorOption[],
   prefix: string,
@@ -2688,6 +3208,12 @@ function commandArgumentCompletions(
     label: option.label,
     ...(option.description === undefined ? {} : { description: option.description }),
   }));
+}
+
+function autocompletePriority(name: string): number {
+  if (name === "help") return 0;
+  if (name === "list-agents") return 1;
+  return 2;
 }
 
 function workspaceRunOptions(

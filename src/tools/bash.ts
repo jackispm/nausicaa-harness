@@ -3,6 +3,7 @@ import { stat } from "node:fs/promises";
 import type { AgentTool, ToolResult } from "../domain/ports.js";
 import type { ShellOutputSink } from "./shell-output.js";
 import { executeShellCommand, type ShellExecutionResult } from "./shell-process.js";
+import { diagnosePermissionFailure } from "./permission-diagnostics.js";
 
 export type { ShellOutputSink } from "./shell-output.js";
 
@@ -37,8 +38,9 @@ export function createBashTool(options: BashToolOptions = {}): AgentTool {
       description: [
         "Execute a Bash command with the working directory fixed to the current workspace.",
         "The command is interpreted by Bash, including variables, pipes, redirects, and command substitution.",
-        "This privileged tool must be enabled behind an explicit execution permission.",
+        "This privileged tool follows the active host permission profile; an interactive TUI can request a wider boundary when execution is denied.",
         "Stdout and stderr retain only their bounded tails.",
+        "Workspace sandbox mode protects Git metadata; use the read-only git_* tools for inspection and full-access for repository writes.",
         "Background jobs are unsupported; where OS-level process containment is unavailable, cleanup is best-effort.",
       ].join(" "),
       parameters: {
@@ -82,9 +84,13 @@ export function createBashTool(options: BashToolOptions = {}): AgentTool {
           ...(context.signal === undefined ? {} : { signal: context.signal }),
           ...(options.outputSink === undefined ? {} : { outputSink: options.outputSink }),
         });
-        return formatResult(execution, timeout);
+        return formatResult(execution, timeout, command);
       } catch (error: unknown) {
-        return failure({ error: safeMessage(error) });
+        const diagnostic = diagnosePermissionFailure({ error });
+        return failure({
+          error: safeMessage(error),
+          ...(diagnostic === undefined ? {} : { diagnostic }),
+        });
       }
     },
   };
@@ -92,13 +98,23 @@ export function createBashTool(options: BashToolOptions = {}): AgentTool {
 
 export const bashTool: AgentTool = createBashTool();
 
-function formatResult(execution: ShellExecutionResult, timeout: number | undefined): ToolResult {
+function formatResult(
+  execution: ShellExecutionResult,
+  timeout: number | undefined,
+  command: string,
+): ToolResult {
+  const diagnostic = diagnosePermissionFailure({
+    command,
+    error: execution.spawnError,
+    stderr: execution.stderr.content,
+  });
   const output = {
     stdout: execution.stdout.content,
     stderr: execution.stderr.content,
     exitCode: execution.exitCode,
     aborted: execution.aborted,
     timedOut: execution.timedOut,
+    ...(diagnostic === undefined ? {} : { diagnostic }),
     truncated: execution.stdout.truncated || execution.stderr.truncated,
     ...(execution.stdout.outputSinkError === undefined && execution.stderr.outputSinkError === undefined
       ? {}

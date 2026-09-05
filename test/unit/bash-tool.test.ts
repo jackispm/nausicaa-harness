@@ -199,6 +199,29 @@ describe("bash tool", () => {
     });
   });
 
+  it("explains Git permission failures instead of presenting them as generic shell errors", async () => {
+    const workspace = await temporaryDirectory();
+    const result = await createBashTool({
+      commandExecutor: async () => failedExecution(
+        "fatal: unable to access '.git/config': Operation not permitted",
+        128,
+      ),
+    }).execute(
+      { command: "git add README.md" },
+      toolContext(workspace),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(parse(result)).toMatchObject({
+      error: "Command exited with code 128",
+      diagnostic: {
+        code: "permission-denied",
+        scope: "git-metadata",
+        hint: expect.stringContaining("/permissions full-access"),
+      },
+    });
+  });
+
   it("keeps output tails within byte and line limits and reports truncation", async () => {
     const workspace = await temporaryDirectory();
     const result = await createBashTool().execute(
@@ -489,5 +512,24 @@ function successfulExecution(
     exitCode: 0,
     aborted: false,
     timedOut: false,
+  };
+}
+
+function failedExecution(
+  stderr: string,
+  exitCode: number,
+): Awaited<ReturnType<BashCommandExecutor>> {
+  return {
+    ...successfulExecution(""),
+    stderr: {
+      content: stderr,
+      truncated: false,
+      truncatedBy: null,
+      totalBytes: Buffer.byteLength(stderr, "utf8"),
+      totalLines: 1,
+      outputBytes: Buffer.byteLength(stderr, "utf8"),
+      outputLines: 1,
+    },
+    exitCode,
   };
 }

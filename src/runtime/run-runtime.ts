@@ -89,10 +89,13 @@ import { createAdviceResponseTool } from "./advice-tool.js";
 import { TetoScheduler, type TetoAdviceDelivery } from "./teto-scheduler.js";
 import { TetoLaneScheduler } from "./teto-lane-scheduler.js";
 import { TetoLaneController } from "./teto-lane-controller.js";
-import { createAgentAwarenessTool } from "./agent-awareness-tool.js";
+import {
+  createAgentAwarenessTool,
+  type AgentAwarenessReader,
+} from "./agent-awareness-tool.js";
 import { createTetoControlTools } from "./teto-control-tool.js";
 import { TeamRuntime } from "./team-runtime.js";
-import { createTeamTool } from "./team-tool.js";
+import { createTeamStatusTool, createTeamTool } from "./team-tool.js";
 import { projectRunAwareness } from "./run-awareness.js";
 import { ReflectionScheduler } from "./reflection-scheduler.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
@@ -117,6 +120,11 @@ import {
   type EdgeTurnSnapshotProvider,
 } from "./edge-runtime.js";
 import { createRuntimeSkillCapability } from "./skill-tool.js";
+import {
+  capabilityEntriesFromTools,
+  createScopedSpawnContext,
+  createTetoCapabilityManifest,
+} from "./lane-context.js";
 
 export interface RunExecutionRequest {
   workspace: string;
@@ -152,6 +160,8 @@ export interface RunExecutionRequest {
   /** Whether this one-shot activation owns and closes the provider. */
   closeEdgeCompositionOnClose?: boolean;
   signal?: AbortSignal;
+  /** Host-owned process/session identity used by Lane manifests and A2A. */
+  sessionId?: string;
 }
 
 export interface RunExecutionDeps {
@@ -171,6 +181,8 @@ export interface RunExecutionDeps {
    * without it, no cross-Run capability is advertised.
    */
   crossRun?: CrossRunRuntimeComposition;
+  /** Optional host-owned workspace-wide Awareness projection. */
+  awareness?: AgentAwarenessReader;
   /** Embedding seam for a captured edge snapshot when request data is shared. */
   edgeSnapshot?: WorkspaceEdgeToolSnapshot;
   edgeSnapshotProvider?: EdgeTurnSnapshotProvider;
@@ -221,6 +233,7 @@ export const executeRun = async (
   let edgeSnapshot: WorkspaceEdgeToolSnapshot | undefined;
   let workspace: string;
   let runId: string;
+  let sessionId: string;
   let stateDir: string;
   let ledger: JsonlLedger;
   try {
@@ -234,6 +247,12 @@ export const executeRun = async (
     workspace = await canonicalWorkspace(request.workspace);
     runId = request.resumeRunId ?? (deps.createRunId ?? randomUUID)();
     validateRunId(runId);
+    // Keep one-shot Main requests on the same lane-scoped identity as
+    // persistent Sessions and the MainLoop fallback.
+    sessionId = request.sessionId ?? `${runId}:main`;
+    if (sessionId.trim().length === 0 || sessionId.includes("\0")) {
+      throw new Error("sessionId must be a non-empty string without NUL");
+    }
     stateDir = resolve(request.dataDir, "runs", runId);
     ledger = await JsonlLedger.open(resolve(stateDir, "ledger.jsonl"));
   } catch (error: unknown) {
@@ -387,7 +406,10 @@ export const executeRun = async (
     const remainingModelTokens = runTokenBudget.availableTokens();
     const legacyStepLimitExhausted = "maxMainSteps" in policy
       && setup.startStep > mainStepAllowance(policy);
-    if (remainingModelTokens === 0 || legacyStepLimitExhausted) {
+    if (
+      (policy.maxModelTokens !== undefined && remainingModelTokens === 0)
+      || legacyStepLimitExhausted
+    ) {
       await appendLaneStatus(
         sink,
         runId,
@@ -486,11 +508,14 @@ export const executeRun = async (
       }
       tools.push(crossRunTool);
     }
-    const readAwareness = async () => projectRunAwareness(
+    const readLocalAwareness = async () => projectRunAwareness(
       await ledger.read({ runId }),
       runId,
       clock.now().toISOString(),
     );
+    const readAwareness: AgentAwarenessReader = deps.awareness === undefined
+      ? async () => readLocalAwareness()
+      : deps.awareness;
     // Explicit auxiliaryMode is the preregistered evaluation seam. Its model
     // tool matrix is frozen, so only the declared auxiliary capability may
     // affect the request surface.
@@ -614,7 +639,11 @@ export const executeRun = async (
       runTokenBudget,
       readEvents: () => ledger.read({ runId }),
       readWatermark: () => ledger.watermark(),
-      readAwareness,
+      readAwareness: () => readAwareness({
+        runId,
+        workspace,
+        operationId: `${runId}:team:awareness`,
+      }),
       clock,
       policy,
       policyVersion,
@@ -622,6 +651,36 @@ export const executeRun = async (
         ? { createCompactionRuntime: deps.createCompactionRuntime ?? createRuntimeFukaiCompaction }
         : {}),
       ...(request.signal === undefined ? {} : { signal: request.signal }),
+      spawnContext: ({ teamId, branchId, laneId, goal, inputRefs, budget }) => createScopedSpawnContext({
+        parent: {
+          workspaceId: "local-workspace",
+          sessionId,
+          runId,
+          laneId: "main",
+          laneKind: "main",
+          relation: "owns",
+        },
+        child: {
+          workspaceId: "local-workspace",
+          sessionId,
+          runId,
+          laneId,
+          laneKind: "team",
+          parentLaneId: "main",
+          ownerLaneId: "main",
+          relation: "member-of",
+        },
+        goal,
+        inputRefs,
+        budget,
+        tools: capabilityEntriesFromTools(teamBranchTools),
+        role: `Team branch ${teamId}/${branchId}`,
+        targets: [{
+          laneId: "main",
+          relation: "owns",
+          actions: ["message.inform", "message.request", "task.result"],
+        }],
+      }),
     });
     await teamRuntime.restore();
     if (!evaluationAuxiliaryMode) {
@@ -630,6 +689,7 @@ export const executeRun = async (
         for (const tool of createTetoControlTools(scheduler)) pushRuntimeTool(tools, tool);
       }
       pushRuntimeTool(tools, createTeamTool(teamRuntime));
+      pushRuntimeTool(tools, createTeamStatusTool(teamRuntime));
     } else if (useUnifiedTeto && auxiliaryMode === "teto" && adviceDelivery === "live") {
       // The unified lane still publishes Advice through the same Main-owned
       // acknowledgement tool in frozen live evaluation arms.
@@ -641,6 +701,36 @@ export const executeRun = async (
         inbox,
         runId,
         clock,
+        spawnContextFactory: ({ from, to, goal, inputRefs, budget }) => createScopedSpawnContext({
+          parent: {
+            workspaceId: "local-workspace",
+            sessionId,
+            runId,
+            laneId: from,
+            laneKind: "main",
+            relation: "owns",
+          },
+          child: {
+            workspaceId: "local-workspace",
+            sessionId,
+            runId,
+            laneId: to,
+            laneKind: "worker",
+            parentLaneId: from,
+            ownerLaneId: from,
+            relation: "delegates",
+          },
+          goal,
+          inputRefs,
+          budget,
+          tools: capabilityEntriesFromTools(workerTools),
+          role: "Bounded delegated Worker lane",
+          targets: [{
+            laneId: from,
+            relation: "owns",
+            actions: ["message.inform", "message.request", "task.result"],
+          }],
+        }),
       });
       const workerModel = deps.workerModel ?? mainModel;
       const workerAdvertisesImages = shouldAdvertiseImageTools(
@@ -785,13 +875,39 @@ export const executeRun = async (
           }),
     });
 
+    const tetoManifest = policy.tetoEnabled
+      ? createTetoCapabilityManifest({
+          workspaceId: "local-workspace",
+          sessionId,
+          runId,
+          state: scheduler instanceof TetoLaneController
+            ? (scheduler.active ? "running" : "dormant")
+            : scheduler === undefined ? "dormant" : "running",
+          recommended: policy.tetoActivation !== "manual",
+        })
+      : undefined;
+    if (tetoManifest !== undefined) {
+      await sink.append({
+        runId,
+        laneId: tetoManifest.lane.laneId,
+        type: "lane.capability.published",
+        payload: { manifest: tetoManifest },
+        correlationId: `${runId}:lane-capability`,
+        idempotencyKey: `${runId}:lane:${tetoManifest.lane.laneId}:capability:${tetoManifest.state}`,
+        visibility: "run",
+        occurredAt: clock.now().toISOString(),
+      });
+    }
+
     try {
       const result = await loop.run({
         runId,
         goal: setup.goal,
         model: request.model,
         workspace: setup.workspace,
-        policy: { ...policy, maxModelTokens: remainingModelTokens },
+        policy: policy.maxModelTokens === undefined
+          ? policy
+          : { ...policy, maxModelTokens: remainingModelTokens },
         policyVersion,
         ...(request.message === undefined && (request.images?.length ?? 0) === 0
           ? {}
@@ -805,6 +921,8 @@ export const executeRun = async (
         artifactReadRefs: setup.artifactReadRefs,
         pressureEligibleConversationCount: setup.pressureEligibleConversationCount,
         maxOutputTokens: request.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS,
+        sessionId,
+        ...(tetoManifest === undefined ? {} : { laneCapabilityManifests: [tetoManifest] }),
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
 

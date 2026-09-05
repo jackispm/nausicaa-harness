@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { CliUsageError, parseCliArgs, usage } from "./cli/args.js";
 import { runUtilityCommand } from "./cli/auth.js";
@@ -37,6 +38,9 @@ import {
   SessionController,
   type DaemonRunDiscoveryFailure,
 } from "./runtime/index.js";
+import type { AgentAwarenessReader } from "./runtime/agent-awareness-tool.js";
+import { projectAgentTopology } from "./runtime/agent-awareness.js";
+import { createLocalCrossRunComposition } from "./runtime/local-cross-run-composition.js";
 import {
   createRegistryEdgeTurnSnapshotProvider,
   edgeStatusFromProvider,
@@ -119,9 +123,11 @@ const main = async (): Promise<number> => {
   let resolvedDataDir = resolve(workspace, options.dataDir ?? ".nausicaa");
   let resolvedModel: string | undefined;
   let resolvedMaxOutputTokens = DEFAULT_MAIN_OUTPUT_TOKENS;
-  let resolvedAllowWrite = false;
-  let resolvedAllowShell = false;
-  let resolvedAllowNetwork = false;
+  // Keep the fallback used by recovery/error guidance aligned with the
+  // ordinary user-session default (full access).
+  let resolvedAllowWrite = true;
+  let resolvedAllowShell = true;
+  let resolvedAllowNetwork = true;
   let activeRunId = options.resume;
   let openedEdgeComposition: ConfiguredEdgeComposition | undefined;
   try {
@@ -425,12 +431,24 @@ const main = async (): Promise<number> => {
     resolvedAllowWrite = resolvedSettings.allowWrite;
     resolvedAllowShell = resolvedSettings.allowShell;
     resolvedAllowNetwork = resolvedSettings.allowNetwork;
+    const localSessionId = `session-${randomUUID()}`;
+    const crossRun = createLocalCrossRunComposition({
+      workspace,
+      dataDir: resolvedSettings.dataDir,
+      sessionId: localSessionId,
+    });
+    const readWorkspaceAwareness: AgentAwarenessReader = async () => projectAgentTopology(
+      await readWorkspaceAgentAwareness(resolvedSettings.dataDir, workspace),
+    );
     if (options.daemon) {
       return await runDaemonMode({
         workspace,
         settings: resolvedSettings,
         mainModel,
         edgeRuntime,
+        crossRun,
+        awareness: readWorkspaceAwareness,
+        sessionId: localSessionId,
         ...(fukaiCompaction === undefined ? {} : { fukaiCompaction }),
         ...(options.workerEnabled === undefined
           ? {}
@@ -444,19 +462,13 @@ const main = async (): Promise<number> => {
           }),
       });
     }
+    // A selected model with a missing credential should still open directly
+    // into the Pi-style composer. Authentication is surfaced on /setup,
+    // /login, or when the first request actually needs it; it is not a chat
+    // transcript entry at startup.
     const showStartupSetup = startupModelMissing
       || !credentialStatus.selectorRecognized
-      || credentialStatus.catalogKnown === false
-      || (
-        credentialStatus.credentialEnv !== undefined
-        && !credentialStatus.credentialPresent
-      )
-      || (
-        !selectedAuthCheckFailed
-        && selectedModelProvider !== undefined
-        && credentialStatus.authConfigured === false
-        && !credentialStatus.credentialPresent
-      );
+      || credentialStatus.catalogKnown === false;
     const modelChoices = modelCatalog.map((entry) => ({
       value: entry.selector,
       label: entry.selector,
@@ -506,17 +518,24 @@ const main = async (): Promise<number> => {
           maxOutputTokens: resolvedSettings.maxOutputTokens,
           policy: {
             maxMainStepsPerActivation: resolvedSettings.maxSteps,
-            maxModelTokens: resolvedSettings.maxModelTokens,
+            ...(resolvedSettings.maxModelTokens === undefined
+              ? {}
+              : { maxModelTokens: resolvedSettings.maxModelTokens }),
             tetoEnabled: resolvedSettings.tetoEnabled,
             tetoMaxOutputTokens: 64,
-            tetoTokenRatio: 0.1,
           },
           allowWrite: resolvedSettings.allowWrite,
           allowShell: resolvedSettings.allowShell,
           allowNetwork: resolvedSettings.allowNetwork,
+          sessionId: localSessionId,
           edgeSnapshotProvider: edgeRuntime.provider,
           ...(selectedRunId === undefined ? {} : { runId: selectedRunId }),
-        }, { mainModel, modelCatalog });
+        }, {
+          mainModel,
+          modelCatalog,
+          awareness: readWorkspaceAwareness,
+          crossRun,
+        });
         if (options.resolveOperation !== undefined) {
           await session.resolveOperation(options.resolveOperation);
         }
@@ -577,10 +596,25 @@ const main = async (): Promise<number> => {
                 )!,
               }),
           }),
-          awareness: () => readWorkspaceAgentAwareness(
-            resolvedSettings.dataDir,
-            workspace,
-          ),
+          awareness: () => {
+            const current = session.snapshot();
+            const observedAt = new Date().toISOString();
+            return readWorkspaceAgentAwareness(
+              resolvedSettings.dataDir,
+              workspace,
+              {
+                now: observedAt,
+                currentSession: {
+                  sessionId: session.sessionId,
+                  ...(current.runId === undefined ? {} : { runId: current.runId }),
+                  laneId: "main",
+                  state: awarenessStateForSession(current.status),
+                  activitySummary: current.blocker ?? current.status,
+                  lastSeen: observedAt,
+                },
+              },
+            );
+          },
           ...(initialMessage === undefined ? {} : { initialMessage }),
           ...(processedImages.images.length === 0
             ? {}
@@ -614,19 +648,22 @@ const main = async (): Promise<number> => {
           : { resolveOperationId: options.resolveOperation }),
         policy: {
           maxMainSteps: resolvedSettings.maxSteps,
-          maxModelTokens: resolvedSettings.maxModelTokens,
+          ...(resolvedSettings.maxModelTokens === undefined
+            ? {}
+            : { maxModelTokens: resolvedSettings.maxModelTokens }),
           tetoEnabled: resolvedSettings.tetoEnabled,
           tetoMaxOutputTokens: 64,
-          tetoTokenRatio: 0.1,
         },
         allowWrite: resolvedSettings.allowWrite,
         allowShell: resolvedSettings.allowShell,
         allowNetwork: resolvedSettings.allowNetwork,
         edgeSnapshotProvider: edgeRuntime.provider,
         signal: controller.signal,
-      }, {
-        mainModel,
-        onEvent: (event: AnyEvent) => {
+        }, {
+          mainModel,
+          awareness: readWorkspaceAwareness,
+          crossRun,
+          onEvent: (event: AnyEvent) => {
           activeRunId ??= event.runId;
           if (options.mode === "json") writeJson({ kind: "event", event });
         },
@@ -747,6 +784,10 @@ interface DaemonModeOptions {
   settings: ResolvedSettings;
   mainModel: import("./domain/ports.js").ModelPort;
   edgeRuntime: CliEdgeRuntime;
+  crossRun: import("./runtime/cross-run-runtime.js").CrossRunRuntimeComposition;
+  awareness: AgentAwarenessReader;
+  /** Identity shared with the local Cross-Run composition for this process. */
+  sessionId: string;
   /** Preserve explicit startup policy when the daemon creates/resumes Runs. */
   fukaiCompaction?: ResolvedSettings["fukaiCompaction"];
   workerEnabled?: boolean;
@@ -777,14 +818,16 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
     session: {
       workspace: options.workspace,
       dataDir: options.settings.dataDir,
+      sessionId: options.sessionId,
       model: options.settings.model,
       tetoModel: options.settings.tetoModel,
       policy: {
         maxMainStepsPerActivation: options.settings.maxSteps,
-        maxModelTokens: options.settings.maxModelTokens,
+        ...(options.settings.maxModelTokens === undefined
+          ? {}
+          : { maxModelTokens: options.settings.maxModelTokens }),
         tetoEnabled: options.settings.tetoEnabled,
         tetoMaxOutputTokens: 64,
-        tetoTokenRatio: 0.1,
       },
       ...(options.fukaiCompaction === undefined
         ? {}
@@ -804,6 +847,8 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
     },
     sessionDeps: {
       mainModel: options.mainModel,
+      awareness: options.awareness,
+      crossRun: options.crossRun,
     },
     reconciliation: {
       // A short, serialized poll closes the gap between startup recovery and
@@ -973,6 +1018,19 @@ const combineInitialMessage = (
   const parts = [fileText, message?.trim() ?? ""].filter((part) => part.length > 0);
   return parts.length === 0 ? undefined : parts.join("\n");
 };
+
+function awarenessStateForSession(
+  status: "detached" | "idle" | "running" | "cancelling" | "closed",
+): "active" | "waiting" | "idle" | "terminal" {
+  switch (status) {
+    case "running": return "active";
+    case "cancelling": return "waiting";
+    case "closed": return "terminal";
+    case "detached":
+    case "idle":
+      return "idle";
+  }
+}
 
 interface ResumeCommandOptions {
   runId: string;

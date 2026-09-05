@@ -74,6 +74,16 @@ describe("TetoCadence", () => {
 });
 
 describe("TokenRatioGate", () => {
+  it("leaves Teto uncapped when no ratio is configured", () => {
+    const gate = new TokenRatioGate();
+
+    expect(gate.availableTetoTokens()).toBe(Number.MAX_SAFE_INTEGER);
+    expect(gate.reserve("unbounded", 1_000_000)).toEqual({
+      id: "unbounded",
+      tokens: 1_000_000,
+    });
+  });
+
   it("rejects token aggregation overflow instead of corrupting allowance", () => {
     const gate = new TokenRatioGate(0.1, {
       mainTokens: Number.MAX_SAFE_INTEGER,
@@ -85,7 +95,7 @@ describe("TokenRatioGate", () => {
   });
 
   it("reserves before a Teto call and caps Teto at 10% of all model tokens", () => {
-    const gate = new TokenRatioGate();
+    const gate = new TokenRatioGate(0.1);
     gate.chargeMain(900);
 
     expect(gate.availableTetoTokens()).toBe(100);
@@ -113,7 +123,7 @@ describe("TokenRatioGate", () => {
   });
 
   it("counts cache read and write usage reported by pi-ai", () => {
-    const gate = new TokenRatioGate();
+    const gate = new TokenRatioGate(0.1);
     gate.chargeMain({
       input: 100,
       output: 100,

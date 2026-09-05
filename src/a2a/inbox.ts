@@ -23,6 +23,7 @@ import {
   systemClock,
 } from "../domain/index.js";
 import { sha256, stableJson } from "../ledger/hash.js";
+import { validateSpawnContext } from "../runtime/lane-context.js";
 
 export interface EventSink {
   append<K extends EventType>(event: AppendEvent<K>): Promise<EventEnvelope<K>>;
@@ -79,6 +80,8 @@ export interface ClaimOptions {
   from?: LaneId;
   types?: readonly A2APayload["type"][];
   deliveries?: readonly DeliveryMode[];
+  /** Restrict this claim to these exact message IDs. */
+  messageIds?: readonly string[];
 }
 
 export type ClaimAvailabilityOptions = Pick<
@@ -457,6 +460,7 @@ export class A2AInbox {
     nonEmpty(claimId, "claimId");
     if (options.runId !== undefined) nonEmpty(options.runId, "runId");
     if (options.from !== undefined) nonEmpty(options.from, "from");
+    const messageIds = normalizeClaimMessageIds(options.messageIds);
     if (!Number.isSafeInteger(limit) || limit <= 0) {
       throw new RangeError("claim limit must be a positive integer");
     }
@@ -470,6 +474,7 @@ export class A2AInbox {
         || (options.runId !== undefined && record.message.runId !== options.runId)
         || record.claim?.claimedBy !== claimedBy
         || (options.from !== undefined && record.message.from !== options.from)
+        || (messageIds !== undefined && !messageIds.has(record.message.messageId))
         || (options.types !== undefined
           && !options.types.includes(record.message.payload.type))
         || (options.deliveries !== undefined
@@ -484,6 +489,7 @@ export class A2AInbox {
       .filter((record) => this.isClaimable(record, now))
       .filter((record) => options.runId === undefined || record.message.runId === options.runId)
       .filter((record) => options.from === undefined || record.message.from === options.from)
+      .filter((record) => messageIds === undefined || messageIds.has(record.message.messageId))
       .filter((record) => (
         options.types === undefined
         || options.types.includes(record.message.payload.type)
@@ -779,6 +785,15 @@ function validateMessage(message: A2AMessage): void {
     validateGoal(message.payload.goal);
     validateArtifactRefs(message.payload.inputRefs, "inputRefs");
     validateTaskBudget(message.payload.budget);
+    if (message.payload.spawnContext !== undefined) {
+      try {
+        validateSpawnContext(message.payload.spawnContext);
+      } catch (error: unknown) {
+        throw new A2AProtocolError(
+          error instanceof Error ? error.message : "spawnContext is invalid",
+        );
+      }
+    }
     if (message.payload.budget.deadline !== undefined) {
       const expectedDeadline = Date.parse(message.createdAt)
         + message.payload.budget.maxWallClockMs;
@@ -972,6 +987,24 @@ function claimIdFromEvent(
   const messageMarker = `:${event.payload.messageId}:`;
   const markerIndex = suffix.lastIndexOf(messageMarker);
   return markerIndex < 0 ? event.eventId : suffix.slice(0, markerIndex);
+}
+
+function normalizeClaimMessageIds(
+  value: readonly string[] | undefined,
+): Set<string> | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 256) {
+    throw new A2AProtocolError("messageIds must be an array of at most 256 IDs");
+  }
+  const ids = new Set<string>();
+  for (const messageId of value) {
+    nonEmpty(messageId, "messageId");
+    if (messageId.includes("\0")) {
+      throw new A2AProtocolError("messageId must not contain NUL");
+    }
+    ids.add(messageId);
+  }
+  return ids;
 }
 
 function nonEmpty(value: unknown, field: string): asserts value is string {

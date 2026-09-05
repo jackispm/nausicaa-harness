@@ -7,6 +7,7 @@ import type {
   AgentAwarenessAvailability,
   AgentAwarenessRecord,
   AgentAwarenessRelation,
+  AgentAwarenessState,
   AgentTopologyProjectionInput,
 } from "./agent-awareness.js";
 import { sanitizeAgentActivitySummary } from "./agent-awareness.js";
@@ -41,7 +42,19 @@ export interface AgentAwarenessRunSource {
   readonly visible?: boolean;
   /** Host-provided, already-safe text; it is sanitized again at this boundary. */
   readonly activitySummary?: string;
+  /** Host-observed live state overrides the last durable Run projection. */
+  readonly state?: AgentAwarenessState | string;
   /** Freshness timestamp from the same observation used for this source. */
+  readonly lastSeen?: string;
+}
+
+/** A live CLI session which has not attached a Run yet. */
+export interface AgentAwarenessSessionSource {
+  readonly sessionId: string;
+  readonly runId?: string;
+  readonly laneId?: string;
+  readonly state?: AgentAwarenessState | string;
+  readonly activitySummary?: string;
   readonly lastSeen?: string;
 }
 
@@ -81,6 +94,7 @@ export interface AgentAwarenessCompositionOptions {
   /** Per-Run scopes are needed when one query spans multiple Sessions. */
   readonly runScopes?: Readonly<Record<string, AgentAwarenessIdentityScope>>;
   readonly runs?: readonly AgentAwarenessRunSource[];
+  readonly sessions?: readonly AgentAwarenessSessionSource[];
   readonly host?: DaemonHostSnapshot;
   readonly hostLastSeen?: string;
   /** Optional detached-worker view from the same daemon control observation. */
@@ -140,6 +154,27 @@ export function composeAgentAwarenessProjectionInput(
   const records = new Map<string, Candidate>();
   const edges = new Map<string, AgentAwarenessEdgeInput>();
   const runScopes = new Map<string, Scope>();
+
+  for (const session of options.sessions ?? []) {
+    if (session.runId !== undefined) continue;
+    const scope = resolveScope(
+      `session:${session.sessionId}`,
+      options.workspaceId === undefined
+        ? { sessionId: session.sessionId }
+        : { workspaceId: options.workspaceId, sessionId: session.sessionId },
+      options,
+      runScopes,
+    );
+    addRecord(records, {
+      endpoint: endpoint(scope, `session:${session.sessionId}`, session.laneId ?? "main"),
+      role: "main",
+      state: session.state ?? "idle",
+      ...(session.activitySummary === undefined ? {} : { activitySummary: session.activitySummary }),
+      lastSeen: session.lastSeen ?? generatedAt,
+      authorized: true,
+      visible: true,
+    }, RECORD_PRIORITY.host);
+  }
 
   for (const source of options.runs ?? []) {
     if (source.authorized === false || source.visible === false) continue;
@@ -259,7 +294,7 @@ function addRunSource(
   }
   const main = endpoint(scope, runId, "main");
   const mainLane = projection.lanes.main;
-  const mainState = stateForMain(projection, source.session?.status, mainLane?.status);
+  const mainState = source.state ?? stateForMain(projection, source.session?.status, mainLane?.status);
   addRecord(records, {
     endpoint: main,
     role: "main",

@@ -8,6 +8,7 @@ import type {
   Goal,
   LaneId,
   RunId,
+  SpawnContext,
   TaskBudget,
   Visibility,
 } from "../domain/index.js";
@@ -18,6 +19,7 @@ import {
   MAX_TASK_WALL_CLOCK_MS,
   systemClock,
 } from "../domain/index.js";
+import { bindSpawnContextToTask } from "./lane-context.js";
 
 const DEFAULT_FROM: LaneId = "main";
 const DEFAULT_TO: LaneId = "worker";
@@ -45,6 +47,17 @@ export interface TaskDispatcherOptions {
   maxOutstandingTasks?: number;
   clock?: Clock;
   createId?: () => string;
+  /** Host-composed child context used when every dispatch shares one lane. */
+  spawnContext?: SpawnContext;
+  /** Build a context after canonical task deadline/attempt defaults are known. */
+  spawnContextFactory?: (input: {
+    taskId: string;
+    from: LaneId;
+    to: LaneId;
+    goal: Goal;
+    inputRefs: readonly ArtifactRef[];
+    budget: TaskBudget;
+  }) => SpawnContext;
 }
 
 export interface TaskDispatchRequest {
@@ -60,6 +73,8 @@ export interface TaskDispatchRequest {
   priority?: number;
   delivery?: DeliveryMode;
   visibility?: Visibility;
+  /** Explicit scoped context; takes precedence over the dispatcher default. */
+  spawnContext?: SpawnContext;
 }
 
 export interface TaskDispatchResult extends SendResult {
@@ -76,11 +91,13 @@ export class TaskDispatcher {
   private readonly runId: RunId;
   private readonly defaults: Omit<
     Required<TaskDispatcherOptions>,
-    "inbox" | "clock" | "createId" | "maxOutstandingTasks"
+    "inbox" | "clock" | "createId" | "maxOutstandingTasks" | "spawnContext" | "spawnContextFactory"
   >;
   private readonly clock: Clock;
   private readonly createId: () => string;
   private readonly maxOutstandingTasks: number;
+  private readonly spawnContext: SpawnContext | undefined;
+  private readonly spawnContextFactory: TaskDispatcherOptions["spawnContextFactory"];
 
   constructor(options: TaskDispatcherOptions) {
     nonEmpty(options.runId, "runId");
@@ -126,6 +143,10 @@ export class TaskDispatcher {
     this.maxOutstandingTasks = maxOutstandingTasks;
     this.clock = options.clock ?? systemClock;
     this.createId = options.createId ?? randomUUID;
+    this.spawnContext = options.spawnContext === undefined
+      ? undefined
+      : structuredClone(options.spawnContext);
+    this.spawnContextFactory = options.spawnContextFactory;
   }
 
   async dispatch(request: TaskDispatchRequest): Promise<TaskDispatchResult> {
@@ -193,6 +214,30 @@ export class TaskDispatcher {
       createdAt,
       existing === undefined ? undefined : existingBudget,
     );
+    const requestedSpawnContext = request.spawnContext
+      ?? (existing?.message.payload.type === "task.request"
+        ? existing.message.payload.spawnContext
+        : undefined)
+      ?? (this.spawnContextFactory === undefined
+        ? this.spawnContext
+        : this.spawnContextFactory({
+            taskId,
+            from,
+            to,
+            goal: request.goal,
+            inputRefs: request.inputRefs ?? [],
+            budget,
+          }));
+    const spawnContext = requestedSpawnContext === undefined
+      ? undefined
+      : bindSpawnContextToTask(requestedSpawnContext, {
+          runId: this.runId,
+          from,
+          to,
+          goal: request.goal,
+          inputRefs: request.inputRefs ?? [],
+          budget,
+        });
     const result = await this.inbox.send({
       messageId,
       runId: this.runId,
@@ -212,6 +257,7 @@ export class TaskDispatcher {
         goal: structuredClone(request.goal),
         inputRefs: [...structuredClone(request.inputRefs ?? [])],
         budget,
+        ...(spawnContext === undefined ? {} : { spawnContext }),
       },
     });
     return { ...result, taskId };

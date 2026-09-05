@@ -15,6 +15,7 @@ import type {
   Advice,
   ArtifactRef,
   Goal,
+  LaneCapabilityManifest,
   NavigationDelta,
   RunPolicy,
   TokenUsage,
@@ -81,6 +82,31 @@ const policy: RunPolicy = {
   tetoEnabled: true,
   tetoMaxOutputTokens: 200,
   tetoTokenRatio: 0.1,
+};
+const laneManifest: LaneCapabilityManifest = {
+  schemaVersion: 1,
+  lane: {
+    workspaceId: "workspace-1",
+    sessionId: "session-1",
+    runId: "run-1",
+    laneId: "teto",
+    laneKind: "intent-navigator",
+    parentLaneId: "main",
+    ownerLaneId: "main",
+    relation: "observes",
+  },
+  role: "Main-owned observer lane",
+  state: "ready",
+  capabilities: [{
+    name: "observe-main-public-events",
+    kind: "observation",
+    description: "Bounded public event projection",
+  }],
+  targets: [{
+    laneId: "main",
+    relation: "owns",
+    actions: ["message.inform"],
+  }],
 };
 const delta: NavigationDelta = {
   boundaryId: "boundary-1",
@@ -197,6 +223,7 @@ const validPayloads = {
     source: "operator",
   },
   "lane.registered": { kind: "main" },
+  "lane.capability.published": { manifest: laneManifest },
   "lane.status": { status: "running", reason: "scheduled" },
   "step.started": { step: 1 },
   "step.completed": { step: 1, hasToolCalls: false },
@@ -495,6 +522,7 @@ const invalidPayloads = {
     items: [{ id: "todo-1", content: "", status: "unknown" }],
   },
   "lane.registered": { kind: "unknown" },
+  "lane.capability.published": { manifest: { ...laneManifest, schemaVersion: 2 } },
   "lane.status": { status: "unknown" },
   "step.started": { step: 0 },
   "step.completed": { step: 1, hasToolCalls: "no" },

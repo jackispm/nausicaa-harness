@@ -38,9 +38,8 @@ if pid == 0:
     ])
 
 output = bytearray()
-marker = b'Try "inspect this project"'
+marker = b'Nausicaa can explain its own features'
 awareness_marker = b'Nausicaa awareness'
-exit_screen = b'\x1b[?1049l'
 deadline = time.monotonic() + 5.0
 sent_agents = False
 sent_exit = False
@@ -58,7 +57,7 @@ while time.monotonic() < deadline:
         if chunk:
             output.extend(chunk)
             if not sent_agents and marker in output:
-                os.write(fd, b"/agents\r")
+                os.write(fd, b"/list-agents\r")
                 sent_agents = True
             if sent_agents and not sent_exit and awareness_marker in output:
                 os.write(fd, b"/exit\r")
@@ -102,7 +101,7 @@ if marker not in output:
     sys.exit(124)
 if awareness_marker not in output:
     sys.exit(125)
-if not sent_exit or exit_screen not in output:
+if not sent_exit:
     sys.exit(126)
 if os.waitstatus_to_exitcode(status) != 0:
     sys.exit(127)
@@ -123,6 +122,7 @@ describe("built CLI PTY", () => {
             maxBuffer: 2 * 1024 * 1024,
             env: {
               PATH: process.env.PATH,
+              TMPDIR: process.env.TMPDIR,
               TERM: "xterm-256color",
               COLUMNS: "100",
               LINES: "30",
@@ -132,9 +132,10 @@ describe("built CLI PTY", () => {
         );
 
         expect(stderr).toBe("");
-        expect(stdout).toContain("\x1b[?1049h");
-        expect(stdout).toContain("\x1b[?1049l");
-        expect(stdout).toMatch(/\x1b\[48;2;\d+;\d+;\d+m/);
+        // Pi's default is the regular main-screen renderer. Alternate-screen
+        // mode remains an explicit embedding/test option.
+        expect(stdout).not.toContain("\x1b[?1049h");
+        expect(stdout).not.toContain("\x1b[?1049l");
         const plainStdout = stripTerminalSequences(stdout);
         expect(plainStdout).toContain("Nausicaa v0.1.0");
         expect(plainStdout).toContain("escape interrupt");
@@ -149,7 +150,7 @@ describe("built CLI PTY", () => {
         expect(headerFrame).not.toContain("deepseek");
         expect(headerFrame).not.toContain("cwd");
         expect(plainStdout).not.toContain('Type a task, or "/help" for commands');
-        expect(plainStdout).toContain('Try "inspect this project"');
+        expect(plainStdout).not.toContain('Try "inspect this project"');
         expect(plainStdout).toContain("Nausicaa awareness");
         expect(plainStdout).not.toContain("Agent awareness is unavailable");
         expect(plainStdout).toContain("main/new");

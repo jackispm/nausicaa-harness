@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { lstat, readdir } from "node:fs/promises";
 import { relative, resolve } from "node:path";
 
@@ -43,6 +44,8 @@ import { projectPendingAdmissions } from "./session-artifacts.js";
 
 /** The minimum surface an activation adapter needs from a SessionController. */
 export interface DaemonSession {
+  /** Flush the local cross-session sidecar before this short activation closes. */
+  reconcileExternalMessages?(): Promise<void>;
   resumeCurrent(): Promise<void>;
   waitForIdle(): Promise<void>;
   cancel(reason?: string): Promise<void>;
@@ -191,8 +194,21 @@ export function createDaemonSessionActivator(
     const guardedDeps: SessionControllerDeps = commitExecutionLease === undefined
       ? activationDeps
       : { ...activationDeps, commitExecutionLease };
+    // A Host may activate multiple Runs concurrently. Each short-lived
+    // SessionController therefore needs its own presence/A2A identity; sharing
+    // one registry file would make heartbeats overwrite one another and route
+    // messages to whichever activation happened to write last.
+    const activationSessionId = daemonActivationSessionId(
+      options.session.sessionId,
+      request.activationId,
+    );
     const session = await createSession(
-      { ...options.session, runId: request.runId, closeEdgeCompositionOnClose: false },
+      {
+        ...options.session,
+        runId: request.runId,
+        sessionId: activationSessionId,
+        closeEdgeCompositionOnClose: false,
+      },
       guardedDeps,
     );
     let cancelling = false;
@@ -209,6 +225,10 @@ export function createDaemonSessionActivator(
         throw abortedActivation(request.signal);
       }
       await session.resumeCurrent();
+      // Reconciliation can admit an informational A2A message as a normal
+      // Main input. Resume the Host wake first so that admission queues behind
+      // the recovered Turn instead of making resumeCurrent race an active one.
+      await session.reconcileExternalMessages?.();
       await session.waitForIdle();
       if (request.signal.aborted) {
         throw abortedActivation(request.signal);
@@ -979,6 +999,22 @@ function validateActivationRequest(request: DaemonActivationRequest): void {
   if (!Array.isArray(request.wakes) || request.wakes.length === 0) {
     throw new DaemonRuntimeActivationError("activation requires at least one wake");
   }
+}
+
+function daemonActivationSessionId(base: string | undefined, activationId: string): string {
+  // Session registry identities are bounded to 128 characters. Activation
+  // identifiers come from a host boundary and are intentionally not assumed
+  // to have the same bound, so preserve a readable prefix and cap the label.
+  const activationLabel = sanitizeSessionLabel(activationId).slice(0, 72);
+  const suffix = `activation-${activationLabel}-${randomUUID().slice(0, 8)}`;
+  const prefix = sanitizeSessionLabel(base ?? "daemon");
+  const maxPrefixLength = Math.max(1, 128 - suffix.length - 1);
+  return `${prefix.slice(0, maxPrefixLength)}:${suffix}`;
+}
+
+function sanitizeSessionLabel(value: string): string {
+  const normalized = value.replace(/[^A-Za-z0-9._:-]/gu, "-");
+  return normalized.length > 0 ? normalized : "daemon";
 }
 
 function abortedActivation(signal: AbortSignal): DaemonRuntimeActivationError {

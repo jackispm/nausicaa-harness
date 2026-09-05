@@ -68,12 +68,14 @@ function payloadRef(content = "wake"): ArtifactRef {
 }
 
 function sessionDouble(): DaemonSession & {
+  reconcileExternalMessages: ReturnType<typeof vi.fn>;
   resumeCurrent: ReturnType<typeof vi.fn>;
   waitForIdle: ReturnType<typeof vi.fn>;
   cancel: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
 } {
   return {
+    reconcileExternalMessages: vi.fn(async () => undefined),
     resumeCurrent: vi.fn(async () => undefined),
     waitForIdle: vi.fn(async () => undefined),
     cancel: vi.fn(async () => undefined),
@@ -176,6 +178,7 @@ describe("daemon runtime composition", () => {
         workspace: "/workspace",
         dataDir: "/state",
         model: "scripted",
+        sessionId: "daemon-session",
       },
       createSession,
     });
@@ -189,12 +192,60 @@ describe("daemon runtime composition", () => {
         dataDir: "/state",
         model: "scripted",
         runId: "run-1",
+        sessionId: expect.stringMatching(/^daemon-session:activation-activation-1-/u),
       }),
       expect.objectContaining({ commitExecutionLease: expect.any(Function) }),
     );
     expect(session.resumeCurrent).toHaveBeenCalledOnce();
+    expect(session.reconcileExternalMessages).toHaveBeenCalledOnce();
+    expect(session.resumeCurrent.mock.invocationCallOrder[0])
+      .toBeLessThan(session.reconcileExternalMessages.mock.invocationCallOrder[0]!);
     expect(session.waitForIdle).toHaveBeenCalledOnce();
     expect(session.close).toHaveBeenCalledOnce();
+  });
+
+  it("gives concurrent activations distinct presence identities", async () => {
+    const sessions = [sessionDouble(), sessionDouble()];
+    const createSession = vi.fn<DaemonSessionFactory>(async () => sessions.shift()!);
+    const activate = createDaemonSessionActivator({
+      session: {
+        workspace: "/workspace",
+        dataDir: "/state",
+        model: "scripted",
+        sessionId: "daemon-session",
+      },
+      createSession,
+    });
+
+    await Promise.all([
+      activate(activation({ activationId: "activation-a" })),
+      activate(activation({ activationId: "activation-b" })),
+    ]);
+
+    const identities = createSession.mock.calls.map(([options]) => options.sessionId);
+    expect(identities).toHaveLength(2);
+    expect(new Set(identities).size).toBe(2);
+    expect(identities.every((value) => value?.startsWith("daemon-session:activation-"))).toBe(true);
+  });
+
+  it("bounds a host-supplied activation id in the presence identity", async () => {
+    const session = sessionDouble();
+    const createSession = vi.fn<DaemonSessionFactory>(async () => session);
+    const activate = createDaemonSessionActivator({
+      session: {
+        workspace: "/workspace",
+        dataDir: "/state",
+        model: "scripted",
+        sessionId: "daemon-session",
+      },
+      createSession,
+    });
+
+    await activate(activation({ activationId: "x".repeat(512) }));
+
+    const identity = createSession.mock.calls[0]?.[0].sessionId;
+    expect(identity?.length).toBeLessThanOrEqual(128);
+    expect(identity).toMatch(/^daemon-session:activation-x{72}-[a-f0-9]{8}$/u);
   });
 
   it("cancels and closes a SessionController when the Host aborts an activation", async () => {

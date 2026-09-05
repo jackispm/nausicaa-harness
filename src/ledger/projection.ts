@@ -312,7 +312,11 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
         if (event.payload.goal !== undefined) {
           projection.goal = cloneJson(event.payload.goal);
         }
-        projection.budget.maxModelTokens = event.payload.policy.maxModelTokens;
+        if (event.payload.policy.maxModelTokens === undefined) {
+          delete projection.budget.maxModelTokens;
+        } else {
+          projection.budget.maxModelTokens = event.payload.policy.maxModelTokens;
+        }
         break;
       case "run.forked":
         projection.run.parentRunId = event.payload.parentRunId;

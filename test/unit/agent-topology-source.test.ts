@@ -8,6 +8,7 @@ import { readWorkspaceAgentAwareness } from "../../src/cli/agent-topology-source
 import { renderAgentTopologyFromSource } from "../../src/cli/agent-topology.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import { executeRun } from "../../src/runtime/index.js";
+import { LocalSessionRegistry } from "../../src/runtime/local-session-registry.js";
 
 describe("workspace Awareness source", () => {
   it("returns an empty, printable projection without creating runtime state", async () => {
@@ -56,6 +57,52 @@ describe("workspace Awareness source", () => {
     }
   });
 
+  it("keeps every session identity when multiple sessions observe one Run", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "nausicaa-topology-multi-session-"));
+    const dataDir = join(workspace, ".nausicaa");
+    const registries: LocalSessionRegistry[] = [];
+    try {
+      const run = await executeRun({
+        workspace,
+        dataDir,
+        model: "scripted",
+        message: "Seed a shared Run",
+        policy: { maxMainSteps: 1, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([{
+          content: "done",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0 },
+        }]),
+        createRunId: () => "shared-awareness-run",
+      });
+
+      for (const [sessionId, state] of [["session-one", "active"], ["session-two", "idle"]] as const) {
+        const registry = new LocalSessionRegistry({
+          dataDir,
+          workspace,
+          sessionId,
+          heartbeatMs: 60_000,
+        });
+        registries.push(registry);
+        await registry.start({ runId: run.runId, state });
+      }
+
+      const source = await readWorkspaceAgentAwareness(dataDir, workspace);
+      const runRecords = (source.records ?? []).filter((record) => (
+        record.endpoint.runId === run.runId && record.endpoint.laneId === "main"
+      ));
+      expect(runRecords.map((record) => record.endpoint.sessionId)).toEqual([
+        "session-one",
+        "session-two",
+      ]);
+    } finally {
+      await Promise.all(registries.map((registry) => registry.close()));
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it("accepts one host observation without creating a second source", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "nausicaa-topology-host-"));
     try {
@@ -80,6 +127,37 @@ describe("workspace Awareness source", () => {
       ]);
       expect(JSON.stringify(source)).not.toContain("private-owner");
       expect(renderAgentTopologyFromSource(source)).toContain("source fresh");
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("authoritatively refreshes the current detached Session observation", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "nausicaa-topology-current-session-"));
+    try {
+      const source = await readWorkspaceAgentAwareness(
+        join(workspace, ".nausicaa"),
+        workspace,
+        {
+          now: "2026-09-01T12:00:00.000Z",
+          currentSession: {
+            sessionId: "current-session",
+            state: "active",
+            laneId: "main",
+            lastSeen: "2026-09-01T12:00:00.000Z",
+            activitySummary: "working",
+          },
+        },
+      );
+      const current = source.records?.find((record) => (
+        record.endpoint.sessionId === "current-session"
+      ));
+      expect(current).toMatchObject({
+        state: "active",
+        lastSeen: "2026-09-01T12:00:00.000Z",
+        activitySummary: "working",
+      });
+      expect(current?.endpoint.runId).toBe("session:current-session");
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }

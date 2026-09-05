@@ -20,11 +20,14 @@ import type {
 } from "../runtime/index.js";
 import {
   ActivityLine,
+  AgentMessageBlock,
   AssistantMessageBlock,
   BrandSplashHeader,
   getNausicaaColorScheme,
   NoticeBlock,
+  parseExternalA2APrompt,
   SessionTray,
+  StableStatusSlot,
   ToolStatusBlock,
   UserMessageBlock,
   WorkerTaskSummaryLine,
@@ -53,21 +56,43 @@ export interface RemoteAttachSession {
 /** Read-only product surface over one daemon-owned Run attachment. */
 export async function runRemoteAttach(options: RemoteAttachOptions): Promise<number> {
   const terminal = options.terminal ?? new ProcessTerminal();
-  const tui: TUI = (options.forceAltScreen ?? process.stdout.isTTY === true)
+  // Match Pi's regular main-screen default. Attachments can explicitly opt
+  // into the alternate-screen viewport when an embedding needs a fixed dock.
+  const useAltScreen = options.forceAltScreen === true;
+  const tui: TUI = useAltScreen
     ? new TuiAltScreen(terminal, true, undefined, { mouse: true })
     : new TuiMainScreen(terminal, true);
+  const requestTuiRender = (force = false): void => {
+    tui.invalidate();
+    if (force && tui instanceof TuiAltScreen) {
+      tui.requestRender(true);
+      return;
+    }
+    tui.requestRender();
+  };
+  terminal.setTitle("Nausicaa");
   const screen = new VStack();
+  const documentContainer = new Container();
   const transcript = new Container();
-  const viewport = new ScrollView(transcript, {
+  const activity = new ActivityLine(() => options.session.snapshot(), tui);
+  const statusSlot = new StableStatusSlot(
+    activity,
+    () => tui.mode === "regular" && tui.getClearOnShrink(),
+  );
+  const header = new BrandSplashHeader({
+    version: "0.1.0",
+  });
+  const headerContainer = new Container();
+  documentContainer.addChild(headerContainer);
+  documentContainer.addChild(transcript);
+  const viewport = new ScrollView(documentContainer, {
     follow: "end",
     primary: true,
     scrollbar: "auto",
   });
-  const activity = new ActivityLine(() => options.session.snapshot(), tui);
-  const header = new BrandSplashHeader({
-    version: "0.1.0",
-  });
   let toolsExpanded = false;
+  let agentMessagesExpanded = false;
+  const agentMessageBlocks = new Map<string, AgentMessageBlock>();
   let closing = false;
   let refreshRequested = false;
   let refreshTail = Promise.resolve();
@@ -76,20 +101,34 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
   let resolveClosed!: () => void;
   const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
 
-  screen.addChild(viewport, { grow: 1, minSize: 1 });
-  screen.addChild(activity, { basis: "auto", minSize: 0, shrink: 1 });
-  screen.addChild(new WorkerTaskSummaryLine(
+  const workerTaskSummary = new WorkerTaskSummaryLine(
     () => options.session.workerTaskSummary(),
-  ), { basis: "auto", minSize: 0, shrink: 1 });
-  screen.addChild(new SessionTray(
+  );
+  const sessionTray = new SessionTray(
     () => options.session.snapshot(),
     () => attachmentLabel(options.session.state().attachmentStatus),
-  ), { basis: 1, minSize: 1, shrink: 0 });
-  if (tui instanceof TuiAltScreen) tui.setLayoutRoot(screen);
-  else tui.addChild(screen);
+  );
+  const dock = new VStack([
+    { component: statusSlot, shrink: 1, minSize: 0 },
+    { component: workerTaskSummary, shrink: 1, minSize: 0 },
+    { component: sessionTray, basis: 2, shrink: 0, minSize: 2 },
+  ]);
+  screen.addChild(viewport, { basis: 0, grow: 1, shrink: 1, minSize: 1 });
+  if (tui instanceof TuiAltScreen) {
+    screen.addChild(dock, { basis: "auto", grow: 0, shrink: 1, minSize: 1 });
+    tui.setLayoutRoot(screen);
+  } else {
+    tui.addChild(documentContainer);
+    tui.addChild(statusSlot);
+    tui.addChild(workerTaskSummary);
+    tui.addChild(sessionTray);
+  }
 
-  const append = (component: Parameters<Container["addChild"]>[0]): void => {
-    if (transcript.children.length > 0) transcript.addChild(new Spacer(1));
+  const append = (
+    component: Parameters<Container["addChild"]>[0],
+    spaceBefore = true,
+  ): void => {
+    if (spaceBefore && transcript.children.length > 0) transcript.addChild(new Spacer(1));
     transcript.addChild(component);
   };
 
@@ -99,7 +138,7 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
       options.session.compactionHistory?.() ?? Promise.resolve([]),
     ]);
     transcript.clear();
-    transcript.addChild(header);
+    agentMessageBlocks.clear();
     const state = options.session.state();
     if (state.error !== undefined) {
       append(new NoticeBlock(state.error, "warning"));
@@ -110,11 +149,28 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
     }
     for (const entry of entries) {
       if (entry.role === "user") {
+        const agentMessage = parseExternalA2APrompt(entry.content);
+        if (agentMessage !== undefined) {
+          const previous = transcript.children.at(-1);
+          const block = new AgentMessageBlock(agentMessage, {
+            suppressLeadingSpace: previous instanceof AgentMessageBlock,
+          });
+          block.setExpanded(agentMessagesExpanded);
+          agentMessageBlocks.set(agentMessage.messageId, block);
+          // The component owns its leading spacer, matching Prime's compact
+          // adjacent agent-message layout.
+          append(block, false);
+          continue;
+        }
         append(new UserMessageBlock(entry.content, entry.imageTypes));
         continue;
       }
       if (entry.role === "assistant") {
-        if (!entry.hasToolCalls) append(new AssistantMessageBlock(entry.content, false));
+        if (!entry.hasToolCalls) {
+          // The assistant component owns Pi's leading spacer. Do not add a
+          // second transcript spacer around it.
+          append(new AssistantMessageBlock(entry.content, false), false);
+        }
         continue;
       }
       const detail = entry.status === "unknown"
@@ -138,7 +194,6 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
       if (closing) return;
       const next = refreshTail.then(renderTranscript).catch((error: unknown) => {
         transcript.clear();
-        transcript.addChild(header);
         append(new NoticeBlock(
           error instanceof Error ? error.message : String(error),
           "error",
@@ -198,6 +253,11 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
       scheduleRefresh();
       return { consume: true };
     }
+    if (matchesKey(data, "ctrl+p")) {
+      agentMessagesExpanded = !agentMessagesExpanded;
+      scheduleRefresh();
+      return { consume: true };
+    }
     return undefined;
   });
 
@@ -208,8 +268,7 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
   process.stdin.once("end", onSignal);
   tui.onTerminalColorSchemeChange((scheme) => {
     setNausicaaColorScheme(scheme);
-    tui.invalidate();
-    tui.requestRender(true);
+    requestTuiRender(true);
   });
   tui.setTerminalColorSchemeNotifications(true);
 
@@ -218,7 +277,6 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
       await renderTranscript();
     } catch (error: unknown) {
       transcript.clear();
-      transcript.addChild(header);
       append(new NoticeBlock(
         error instanceof Error ? error.message : String(error),
         "error",
@@ -229,12 +287,15 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
       const scheme = await tui.queryTerminalColorScheme({ timeoutMs: 100 });
       if (scheme !== undefined && scheme !== getNausicaaColorScheme()) {
         setNausicaaColorScheme(scheme);
-        tui.invalidate();
-        tui.requestRender(true);
+        requestTuiRender(true);
       }
     } catch {
       // Not every terminal answers OSC color queries.
     }
+    headerContainer.addChild(new Spacer(1));
+    headerContainer.addChild(header);
+    headerContainer.addChild(new Spacer(1));
+    requestTuiRender();
     await closed;
     return exitCode;
   } finally {

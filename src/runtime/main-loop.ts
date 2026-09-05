@@ -27,6 +27,7 @@ import type {
   Goal,
   GoalContextKind,
   LaneId,
+  LaneCapabilityManifest,
   NavigationDelta,
   RunId,
   RunPolicy,
@@ -67,6 +68,7 @@ import {
   persistedErrorText,
   redactSensitiveText,
 } from "./redaction.js";
+import { renderLaneCapabilityManifest } from "./lane-context.js";
 import { deriveRuntimePolicyVersion } from "./fukai-compaction-runtime.js";
 import { resolveModelCapabilities } from "./model-capabilities.js";
 import {
@@ -306,6 +308,8 @@ export interface MainLoopInput {
   systemPrompt?: string;
   /** Fukai lane role; defaults to Main for legacy callers. */
   laneKind?: FukaiLaneKind;
+  /** Host-provided public manifests for lanes Main may reach. */
+  laneCapabilityManifests?: readonly LaneCapabilityManifest[];
   /** Override the loop default for workspace instruction visibility. */
   includeProjectInstructions?: boolean;
   /** Collaboration behavior selected by the interactive surface for this activation. */
@@ -530,7 +534,10 @@ export class MainLoop {
 
     for (let step = startStep; step <= finalStep; step += 1) {
       throwIfAborted(input.signal);
-      if (chargedTokens(usage) >= input.policy.maxModelTokens) {
+      if (
+        input.policy.maxModelTokens !== undefined
+        && chargedTokens(usage) >= input.policy.maxModelTokens
+      ) {
         break;
       }
       steps += 1;
@@ -729,13 +736,15 @@ export class MainLoop {
         // The initial context boundary is one-shot. A later step may still
         // receive a fresh host boundary (for example budget-limit steering).
         pendingGoalContextKind = undefined;
-        const remainingTokens = Math.max(
-          1,
-          input.policy.maxModelTokens - chargedTokens(usage),
-        );
+        const remainingTokens = input.policy.maxModelTokens === undefined
+          ? undefined
+          : Math.max(
+              1,
+              input.policy.maxModelTokens - chargedTokens(usage),
+            );
         let maxOutputTokens = Math.min(
           input.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS,
-          remainingTokens,
+          remainingTokens ?? Number.MAX_SAFE_INTEGER,
         );
         const reservationId = this.nextModelReservationId(input, laneId, step);
         let reservedMainTokens: number | undefined;
@@ -1815,9 +1824,14 @@ function effectiveSystemPrompt(
   input: MainLoopInput,
 ): string {
   const base = input.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
-  return input.collaborationMode === "plan"
-    ? `${base}\n\n${PLAN_MODE_PROMPT}`
-    : base;
+  const manifests = input.laneCapabilityManifests === undefined
+    ? ""
+    : renderLaneCapabilityManifest(input.laneCapabilityManifests);
+  return [
+    base,
+    input.collaborationMode === "plan" ? PLAN_MODE_PROMPT : undefined,
+    manifests.length === 0 ? undefined : manifests,
+  ].filter((part): part is string => part !== undefined).join("\n\n");
 }
 
 function resolveContextBudget(
@@ -1887,7 +1901,9 @@ function validateInput(input: MainLoopInput): void {
   }
   for (const [name, value] of [
     ["mainStepAllowance", mainStepAllowance(input.policy)],
-    ["maxModelTokens", input.policy.maxModelTokens],
+    ...(input.policy.maxModelTokens === undefined
+      ? []
+      : [["maxModelTokens", input.policy.maxModelTokens] as const]),
     ["startStep", input.startStep ?? 1],
     ["maxOutputTokens", input.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS],
   ] as const) {

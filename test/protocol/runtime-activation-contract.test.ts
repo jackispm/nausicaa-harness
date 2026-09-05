@@ -190,6 +190,7 @@ describe("runtime activation parity", () => {
       "noop",
       "agent_awareness",
       "team_create",
+      "team_status",
     ]);
   });
 
@@ -279,6 +280,7 @@ describe("runtime activation parity", () => {
       "process_list",
       "agent_awareness",
       "team_create",
+      "team_status",
     ]);
   });
 
@@ -359,6 +361,7 @@ describe("runtime activation parity", () => {
         "teto_stop",
         "teto_status",
         "team_create",
+        "team_status",
       ],
       tetoModels: ["scripted-teto"],
       tetoSessionIds: [`${runId}:teto:scripted-teto`],
