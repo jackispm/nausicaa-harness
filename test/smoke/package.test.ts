@@ -102,16 +102,27 @@ describe("npm package surface", () => {
       scripts?: Record<string, string>;
       private?: boolean;
       license?: string;
+      author?: string;
+      repository?: { url?: string };
+      homepage?: string;
+      bugs?: { url?: string };
+      keywords?: string[];
       bin?: Record<string, string>;
       exports?: Record<string, unknown>;
       files?: string[];
       engines?: { node?: string };
     };
 
-    expect(packageJson.private).toBe(true);
+    expect(packageJson.private).toBeUndefined();
+    expect(packageJson.name).toBe("nausicaa-harness");
     expect(packageJson.name).toMatch(/^@[a-z0-9._-]+\/[a-z0-9._-]+$|^[a-z0-9._-]+$/u);
     expect(packageJson.version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
     expect(packageJson.license).toBe("MIT");
+    expect(packageJson.author).toBe("Dongjie Gong <jack@gieey.com>");
+    expect(packageJson.repository?.url).toBe("git+https://github.com/jackispm/nausicaa-harness.git");
+    expect(packageJson.homepage).toBe("https://github.com/jackispm/nausicaa-harness#readme");
+    expect(packageJson.bugs?.url).toBe("https://github.com/jackispm/nausicaa-harness/issues");
+    expect(packageJson.keywords).toEqual(expect.arrayContaining(["multi-lane", "multi-topology", "teto"]));
     expect(packageJson.engines?.node).toBe(">=22.19.0");
     expect(packageJson.bin?.nausicaa).toBe("dist/cli.js");
     expect(packageJson.exports?.["."]).toBeDefined();

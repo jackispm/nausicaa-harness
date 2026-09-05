@@ -1,9 +1,31 @@
 {
-  "name": "nausicaa",
+  "name": "nausicaa-harness",
   "version": "0.1.0",
-  "private": true,
   "license": "MIT",
+  "author": "Dongjie Gong <jack@gieey.com>",
   "description": "A lightweight, ledger-driven multi-lane agent harness.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jackispm/nausicaa-harness.git"
+  },
+  "homepage": "https://github.com/jackispm/nausicaa-harness#readme",
+  "bugs": {
+    "url": "https://github.com/jackispm/nausicaa-harness/issues"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "agent-harness",
+    "llm",
+    "multi-agent",
+    "multi-lane",
+    "multi-topology",
+    "teto",
+    "a2a",
+    "tui",
+    "typescript",
+    "cli"
+  ],
   "type": "module",
   "engines": {
     "node": ">=22.19.0"
@@ -24,6 +46,9 @@
     "LICENSE",
     "THIRD_PARTY_NOTICES"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
