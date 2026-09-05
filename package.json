@@ -1,0 +1,69 @@
+{
+  "name": "nausicaa",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "A lightweight, ledger-driven multi-lane agent harness.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "nausicaa": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "assets",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES"
+  ],
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/cli.js",
+    "clean": "node --input-type=module --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "postbuild": "node --input-type=module --eval \"import { chmodSync } from 'node:fs'; chmodSync('dist/cli.js', 0o755);\"",
+    "prepack": "npm run build",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run --exclude 'test/live/**' --exclude 'test/eval/**' --exclude 'test/smoke/**' --exclude '.local/**' --exclude 'logs/**' --no-file-parallelism",
+    "test:unit": "vitest run test/unit",
+    "test:protocol": "vitest run test/protocol",
+    "test:recovery": "vitest run test/recovery",
+    "test:smoke": "npm run build && vitest run test/smoke --no-file-parallelism",
+    "test:live": "node ./node_modules/vitest/vitest.mjs run test/live --passWithNoTests --no-file-parallelism",
+    "test:beta:live": "node ./node_modules/vitest/vitest.mjs run test/live/openrouter-beta-suite.test.ts --passWithNoTests --no-file-parallelism",
+    "eval": "vitest run test/eval",
+    "eval:worker": "vitest run test/eval/worker-contract.test.ts test/eval/worker-runner.test.ts",
+    "eval:worker:live": "node --import tsx test/eval/worker-live-cli.ts",
+    "eval:worker:verify": "node --import tsx test/eval/verify-worker-live.ts",
+    "eval:live": "node --import tsx test/eval/live-runner.ts",
+    "eval:verify": "node --import tsx test/eval/verify-artifacts.ts",
+    "eval:cache:verify": "node --import tsx test/eval/verify-cache-artifact.ts",
+    "check": "npm run typecheck && npm test && npm run eval && npm run test:smoke"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-tui": "^0.84.3",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@vscode/ripgrep": "1.18.0",
+    "diff": "8.0.4",
+    "file-type": "21.3.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "fast-check": "^4.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "optionalDependencies": {
+    "@mariozechner/clipboard": "^0.3.9"
+  }
+}

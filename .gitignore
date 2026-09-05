@@ -1,0 +1,36 @@
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+*.tgz
+*.tsbuildinfo
+
+# Local configuration, credentials, and runtime state
+.env
+.env.*
+!.env.example
+.nausicaa/
+*.log
+logs/
+*.pem
+*.key
+*.p12
+
+# Local-only instructions and research
+AGENTS.md
+.private/
+.local/
+notes/
+research/
+.codex/
+.agents/
+HARNESS-CAPABILITY-COMPARISON.md
+TOOL-ARCHITECTURE-GLOSSARY.md
+TOOL-CALL-FLOW-SIMULATION.md
+
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
