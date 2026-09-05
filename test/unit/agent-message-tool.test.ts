@@ -64,6 +64,51 @@ function receiptFor(
 }
 
 describe("agent_message tool", () => {
+  it("accepts a plain text shorthand and normalizes it to message.inform", async () => {
+    const calls: CrossRunSendRequest[] = [];
+    const tool = createAgentMessageTool({
+      router: {
+        send: async (request) => {
+          calls.push(request);
+          return receiptFor(request);
+        },
+      },
+      sender,
+      executionWorkspace: context.workspace,
+    });
+
+    const result = await tool.execute({
+      target: { relationship: "direct", id: target.runId },
+      text: "Please inspect this repository",
+    }, context);
+
+    expect(result.isError).toBe(false);
+    expect(calls[0]?.payload).toEqual({
+      type: "message.inform",
+      text: "Please inspect this repository",
+    });
+    expect(tool.definition.parameters.required).toEqual(["target"]);
+  });
+
+  it("rejects mixing the plain text shorthand with a typed payload", async () => {
+    const tool = createAgentMessageTool({
+      router: { send: async (request) => receiptFor(request) },
+      sender,
+      executionWorkspace: context.workspace,
+    });
+
+    const result = await tool.execute({
+      target: { relationship: "direct", id: target.runId },
+      text: "plain",
+      payload: { type: "message.inform", text: "typed" },
+    }, context);
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({
+      error: { code: "invalid-request" },
+    });
+  });
+
   it("binds sender identity and defaults to the host-owned message scope", async () => {
     const calls: Array<{
       request: CrossRunSendRequest;
