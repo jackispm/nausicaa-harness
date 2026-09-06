@@ -20,6 +20,13 @@ interface PackResult {
   files: PackFile[];
 }
 
+interface LockPackage {
+  version?: string;
+  integrity?: string;
+  cpu?: string[];
+  os?: string[];
+}
+
 const REQUIRED_PACK_FILES = [
   "README.md",
   "LICENSE",
@@ -63,6 +70,25 @@ const FORBIDDEN_PACK_PREFIXES = [
 ] as const;
 
 describe("npm package surface", () => {
+  it("locks the Linux native build dependencies used by CI", async () => {
+    const lock = JSON.parse(
+      await readFile(new URL("../../package-lock.json", import.meta.url), "utf8"),
+    ) as { packages?: Record<string, LockPackage> };
+    const packages = lock.packages ?? {};
+
+    for (const [parentPath, nativePath] of [
+      ["node_modules/rollup", "node_modules/@rollup/rollup-linux-x64-gnu"],
+      ["node_modules/esbuild", "node_modules/@esbuild/linux-x64"],
+    ] as const) {
+      const parent = packages[parentPath];
+      const native = packages[nativePath];
+      expect(native?.version).toBe(parent?.version);
+      expect(native?.integrity).toMatch(/^sha512-/u);
+      expect(native?.os).toContain("linux");
+      expect(native?.cpu).toContain("x64");
+    }
+  });
+
   it("keeps documented beta commands aligned with built CLI help", async () => {
     const readme = await readFile(new URL("../../README.md", import.meta.url), "utf8");
     const { stdout: help } = await execFileAsync(
