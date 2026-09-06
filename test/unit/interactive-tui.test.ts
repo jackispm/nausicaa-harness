@@ -1510,7 +1510,12 @@ describe("interactive TUI", () => {
       await expect(running).resolves.toBe(0);
     } finally {
       process.exitCode = previousExitCode;
-      await rm(root, { recursive: true, force: true });
+      await rm(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 5,
+        retryDelay: 25,
+      });
     }
   });
 
