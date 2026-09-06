@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to package (for example, v0.1.1)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: "22.19.0"
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify and test release
+        run: |
+          npm run typecheck
+          npm test
+          npm run eval
+          npm run test:smoke
+
+      - name: Build release assets
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -eu
+          case "$RELEASE_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "Invalid release tag: $RELEASE_TAG" >&2; exit 1 ;;
+          esac
+
+          version="${RELEASE_TAG#v}"
+          node -e 'const expected = process.argv[1]; const actual = require("./package.json").version; if (actual !== expected) { throw new Error(`tag ${expected} does not match package.json ${actual}`); }' "$version"
+
+          mkdir -p release
+          npm pack --json --ignore-scripts --pack-destination release > release/pack.json
+          package_file=$(node -e 'const result = JSON.parse(require("fs").readFileSync("release/pack.json", "utf8")); process.stdout.write(result[0].filename)')
+          test -n "$package_file"
+          rm release/pack.json
+
+          source_revision=$(git rev-parse HEAD)
+          git archive --format=tar.gz --prefix="nausicaa-harness-${version}/" "$source_revision" > "release/nausicaa-harness-${version}-source.tar.gz"
+
+          sed "s/__NAUSICAA_DEFAULT_VERSION__/${version}/g" install.sh > release/install.sh
+          sed "s/__NAUSICAA_DEFAULT_VERSION__/${version}/g" install.ps1 > release/install.ps1
+          chmod 0755 release/install.sh
+
+          (
+            cd release
+            sha256sum "$package_file" "nausicaa-harness-${version}-source.tar.gz" install.sh install.ps1 > SHA256SUMS
+          )
+
+          printf 'Release assets:\n'
+          ls -lh release
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -eu
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release/* \
+              --title "Nausicaa ${RELEASE_TAG#v}" \
+              --generate-notes
+          fi

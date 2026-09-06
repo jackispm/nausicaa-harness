@@ -43,6 +43,22 @@ npm install -g nausicaa-harness
 nausicaa --help
 ```
 
+版本发布页还提供 npm tarball、干净源码归档、`SHA256SUMS` 以及
+macOS/Linux `install.sh` 和 Windows `install.ps1`。安装脚本安装同一个 npm
+包，不需要额外的原生运行时；需要 Node.js `>=22.19.0`。
+
+macOS/Linux 一键安装：
+
+```bash
+curl -fsSL https://github.com/jackispm/nausicaa-harness/releases/latest/download/install.sh | sh
+```
+
+Windows PowerShell：
+
+```powershell
+irm https://github.com/jackispm/nausicaa-harness/releases/latest/download/install.ps1 | iex
+```
+
 源码开发：
 
 ```bash
@@ -101,6 +117,22 @@ Published package (global CLI):
 ```bash
 npm install -g nausicaa-harness
 nausicaa --help
+```
+
+Each tagged release also includes the npm tarball, a clean source archive,
+`SHA256SUMS`, and `install.sh` / `install.ps1` for macOS/Linux and Windows.
+The scripts install the same npm package and require Node.js `>=22.19.0`.
+
+One-line install on macOS/Linux:
+
+```bash
+curl -fsSL https://github.com/jackispm/nausicaa-harness/releases/latest/download/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://github.com/jackispm/nausicaa-harness/releases/latest/download/install.ps1 | iex
 ```
 
 Source checkout:
