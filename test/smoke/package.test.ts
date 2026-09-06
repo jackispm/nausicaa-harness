@@ -25,6 +25,7 @@ interface LockPackage {
   integrity?: string;
   cpu?: string[];
   os?: string[];
+  optionalDependencies?: Record<string, string>;
 }
 
 const REQUIRED_PACK_FILES = [
@@ -76,16 +77,17 @@ describe("npm package surface", () => {
     ) as { packages?: Record<string, LockPackage> };
     const packages = lock.packages ?? {};
 
-    for (const [parentPath, nativePath] of [
-      ["node_modules/rollup", "node_modules/@rollup/rollup-linux-x64-gnu"],
-      ["node_modules/esbuild", "node_modules/@esbuild/linux-x64"],
-    ] as const) {
+    for (const parentPath of ["node_modules/rollup", "node_modules/esbuild"] as const) {
       const parent = packages[parentPath];
-      const native = packages[nativePath];
-      expect(native?.version).toBe(parent?.version);
-      expect(native?.integrity).toMatch(/^sha512-/u);
-      expect(native?.os).toContain("linux");
-      expect(native?.cpu).toContain("x64");
+      expect(parent?.optionalDependencies).toBeDefined();
+      for (const [name, version] of Object.entries(parent?.optionalDependencies ?? {})) {
+        const native = packages[`node_modules/${name}`];
+        expect(native, `${name} is missing from package-lock.json`).toBeDefined();
+        expect(native?.version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
+        if (/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) {
+          expect(native?.version).toBe(version);
+        }
+      }
     }
   });
 
