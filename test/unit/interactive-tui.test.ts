@@ -1498,12 +1498,25 @@ describe("interactive TUI", () => {
       await waitForOutput(terminal, "Goal updated.");
 
       expect(session.snapshot().goal).toMatchObject({
-        revision: 2,
         objective: "Explain installation precisely",
       });
-      expect(events
-        .filter((event) => event.kind === "event" && event.event.type === "thread.goal.changed"))
-        .toHaveLength(2);
+      const goalChanges: Extract<AnyEvent, { type: "thread.goal.changed" }>[] = [];
+      for (const runtimeEvent of events) {
+        if (runtimeEvent.kind === "event" && runtimeEvent.event.type === "thread.goal.changed") {
+          goalChanges.push(runtimeEvent.event);
+        }
+      }
+      const created = goalChanges.find((event) => event.payload.operation === "create");
+      const edited = goalChanges.find((event) => event.payload.operation === "edit");
+      expect(created?.payload.goal).toMatchObject({
+        revision: 1,
+        objective: "Understand this repository",
+      });
+      expect(edited?.payload.goal).toMatchObject({
+        objective: "Explain installation precisely",
+        revision: expect.any(Number),
+      });
+      expect(edited?.payload.goal.revision).toBeGreaterThan(created?.payload.goal.revision ?? 0);
 
       terminal.type("/exit");
       terminal.send("\r");
