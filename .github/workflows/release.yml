@@ -68,8 +68,8 @@ jobs:
           source_revision=$(git rev-parse HEAD)
           git archive --format=tar.gz --prefix="nausicaa-harness-${version}/" "$source_revision" > "release/nausicaa-harness-${version}-source.tar.gz"
 
-          sed "s/__NAUSICAA_DEFAULT_VERSION__/${version}/g" install.sh > release/install.sh
-          sed "s/__NAUSICAA_DEFAULT_VERSION__/${version}/g" install.ps1 > release/install.ps1
+          sed "/^default_version=/s/__NAUSICAA_DEFAULT_VERSION__/${version}/g" install.sh > release/install.sh
+          sed "/^[$]defaultVersion = /s/__NAUSICAA_DEFAULT_VERSION__/${version}/g" install.ps1 > release/install.ps1
           chmod 0755 release/install.sh
 
           (

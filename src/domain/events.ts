@@ -29,6 +29,7 @@ import type {
   ContextManifest,
   ContextSourceRef,
 } from "./context.js";
+import type { ThinkingLevel } from "./ports.js";
 import type {
   TeamDefinition,
   TeamJoined,
@@ -207,9 +208,12 @@ export interface EventPayloadMap {
   "assistant.message": { messageRef: ArtifactRef };
   "navigation.updated": { delta: NavigationDelta };
   /** Run-scoped Main-lane selection. Teto and Worker keep independent selectors. */
-  "model.selected": { model: string };
+  "model.selected": { model: string; thinkingLevel?: ThinkingLevel };
+  /** Main's explicit session preference; null restores the provider default. */
+  "thinking.selected": { level: ThinkingLevel | null };
   "model.requested": {
     model: string;
+    thinkingLevel?: ThinkingLevel;
     requestHash: string;
     contextWatermark: number;
     /** Runtime-owned bounded Main request deadline. Optional for legacy events. */

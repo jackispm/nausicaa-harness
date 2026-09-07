@@ -15,6 +15,7 @@ import type {
   ModelRequest,
   ModelResponse,
   ModelStreamEvent,
+  ThinkingLevel,
   ToolResult,
 } from "../domain/ports.js";
 import { prepareModelPort, PreparedModelPort } from "../model/prepared-model.js";
@@ -194,6 +195,8 @@ export interface MainLoopDeps {
   model: ModelPort;
   /** Read once at each provider boundary; an in-flight request keeps its selector. */
   resolveModel?: () => string;
+  /** Captured with the model selector, never reread during an in-flight request. */
+  resolveThinkingLevel?: () => ThinkingLevel | undefined;
   /** Shared admission gate for every provider call in this Run. */
   runTokenBudget?: RunTokenBudget;
   contextProvider: MainContextProvider;
@@ -355,6 +358,7 @@ export class MainRunTokenBudgetExhaustedError extends Error {
 export class MainLoop {
   private readonly model: PreparedModelPort;
   private readonly resolveModel: MainLoopDeps["resolveModel"];
+  private readonly resolveThinkingLevel: MainLoopDeps["resolveThinkingLevel"];
   private readonly runTokenBudget: RunTokenBudget | undefined;
   private readonly contextProvider: MainContextProvider;
   private readonly conversationStore: MainConversationStore;
@@ -394,6 +398,7 @@ export class MainLoop {
           onRetry: (notice) => this.persistModelRetry(notice),
         }));
     this.resolveModel = deps.resolveModel;
+    this.resolveThinkingLevel = deps.resolveThinkingLevel;
     this.runTokenBudget = deps.runTokenBudget;
     this.contextProvider = deps.contextProvider;
     this.conversationStore = deps.conversationStore;
@@ -594,6 +599,7 @@ export class MainLoop {
         // A concurrent selector change applies either to this complete request
         // boundary or the next one, never halfway through context assembly.
         const requestModel = this.resolveModel?.() ?? input.model;
+        const thinkingLevel = this.resolveThinkingLevel?.();
         const modelCapabilities = resolveModelCapabilities(this.model, requestModel);
         const imageInputCapability = modelCapabilities?.imageInput;
         const imageInputSupported = imageInputCapability !== false;
@@ -829,6 +835,7 @@ export class MainLoop {
           context: view.cacheKey,
           model: requestModel,
           maxOutputTokens,
+          ...(thinkingLevel === undefined ? {} : { thinkingLevel }),
           sessionId,
         });
         let requestEvent: { eventId: string; globalOffset: number } | undefined;
@@ -852,6 +859,7 @@ export class MainLoop {
             payload: {
               model: requestModel,
               requestHash,
+              ...(thinkingLevel === undefined ? {} : { thinkingLevel }),
               contextWatermark: view.upperWatermark,
               deadlineMs: mainRequestTimeoutMs,
               deadlineAt,
@@ -872,6 +880,7 @@ export class MainLoop {
             sessionId,
             model: requestModel,
             systemPrompt: view.systemPrompt,
+            ...(thinkingLevel === undefined ? {} : { thinkingLevel }),
             messages: view.messages,
             tools: requestTools,
             maxOutputTokens,

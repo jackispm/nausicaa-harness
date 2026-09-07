@@ -97,8 +97,8 @@ export const PUBLIC_INTERACTIVE_COMMANDS: readonly InteractiveCommandSpec[] = Ob
   }),
   command({
     name: "mcp",
-    description: "Show configured MCP servers and connection status",
-    argumentHint: "[refresh]",
+    description: "Manage MCP connections and saved configuration",
+    argumentHint: "[status|refresh]",
     references: ["prime", "codex"],
     alignment: "shared",
     visibility: "public",
@@ -134,6 +134,15 @@ export const PUBLIC_INTERACTIVE_COMMANDS: readonly InteractiveCommandSpec[] = Ob
     references: ["prime", "codex", "pi"],
     alignment: "shared",
     visibility: "public",
+  }),
+  command({
+    name: "thinking",
+    description: "Choose the model's reasoning effort",
+    argumentHint: "[level|default]",
+    references: ["pi", "prime"],
+    alignment: "shared",
+    visibility: "public",
+    aliases: ["effort"],
   }),
   command({
     name: "permissions",

@@ -45,6 +45,15 @@ export async function saveUserModel(
   options: UserSettingsOptions = {},
 ): Promise<{ path: string; model: string }> {
   const normalized = normalizeModelSelector(model);
+  const path = await updateUserSettings((existing) => ({ ...existing, model: normalized }), options);
+  return { path, model: normalized };
+}
+
+/** Serialize validated host-side settings changes through the existing private file lock. */
+export async function updateUserSettings(
+  update: (existing: Settings) => Settings,
+  options: UserSettingsOptions = {},
+): Promise<string> {
   const path = userSettingsPath(options);
   const previous = settingsWriteChains.get(path) ?? Promise.resolve();
   const operation = previous.then(async () => withSettingsFileLock(path, async () => {
@@ -55,7 +64,7 @@ export async function saveUserModel(
           userHome: options.userHome ?? dirname(dirname(path)),
         })
       : await readSettingsFile(path);
-    const next: Settings = { ...existing, model: normalized };
+    const next = update(existing);
     await writeSettingsFile(path, next);
   }));
   const tail = operation.then(() => undefined, () => undefined);
@@ -64,7 +73,7 @@ export async function saveUserModel(
     if (settingsWriteChains.get(path) === tail) settingsWriteChains.delete(path);
   });
   await operation;
-  return { path, model: normalized };
+  return path;
 }
 
 /** Read the validated user settings without trusting workspace configuration. */

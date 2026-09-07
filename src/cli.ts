@@ -3,8 +3,10 @@
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { VERSION } from "./version.js";
 import { CliUsageError, parseCliArgs, usage } from "./cli/args.js";
 import { runUtilityCommand } from "./cli/auth.js";
+import { createMcpManagement } from "./cli/mcp-management.js";
 import { selectNewRecoveryFailures } from "./cli/daemon-recovery-reporting.js";
 import { processImageInputs } from "./cli/image-input.js";
 import { runInteractive } from "./cli/interactive.js";
@@ -57,6 +59,7 @@ import {
 } from "./runtime/redaction.js";
 import { UnknownToolOperationError } from "./runtime/recovery.js";
 import { createMcpEdgeAdapter } from "./mowe/edges/mcp.js";
+import { createBundledSkillsEdgeAdapter } from "./mowe/edges/bundled-skills.js";
 import { createSkillsEdgeAdapter } from "./mowe/edges/skills.js";
 import { runRemoteAttach } from "./cli/remote-attach.js";
 import {
@@ -80,7 +83,6 @@ import {
   type EdgeSelectionController,
 } from "./cli/edge-selection.js";
 
-const VERSION = "0.1.0";
 const MODEL_REFRESH_TIMEOUT_MS = 60_000;
 
 const main = async (): Promise<number> => {
@@ -245,7 +247,13 @@ const main = async (): Promise<number> => {
           dataDir: resolvedSettings.dataDir,
           model: resolvedSettings.model,
         });
-        return await runRemoteAttach({ session });
+        return await runRemoteAttach({
+          session,
+          // The shipped CLI uses the fixed fullscreen dock. Keep the parsed
+          // legacy flag for compatibility, but never route production users
+          // back to the broken regular viewport path.
+          forceAltScreen: true,
+        });
       } finally {
         if (session === undefined) await attachment.close().catch(() => undefined);
         else await session.close().catch(() => undefined);
@@ -569,8 +577,19 @@ const main = async (): Promise<number> => {
         }
         return await runInteractive({
           session,
+          // Fullscreen is the only production renderer. The regular mode
+          // remains available solely to old embedding tests.
+          forceAltScreen: true,
           edgeStatus: edgeRuntime.status,
           edgeSelection: edgeRuntime.selection,
+          mcp: createMcpManagement({
+            configuredSources: resolvedSettings.edges.sources,
+            status: edgeRuntime.status,
+            refresh: async () => {
+              const result = await edgeRuntime.selection.refresh();
+              if (result.stale) throw new Error("MCP refresh did not complete; showing the last available status");
+            },
+          }),
           modelChoices,
           auth: {
             credentialStore,
@@ -1004,26 +1023,39 @@ const openCliEdgeRuntime = async (
   );
   const externalStartupRefresh = startupRefreshAllowed
     && (refreshRequested || settings.edges.refreshOnStart);
+  let currentComposition: ConfiguredEdgeComposition | undefined;
   const composition = await createConfiguredEdgeComposition({
     workspace,
     settings: skillPlan.edges,
     constructors: cliEdgeConstructors(
       skillPlan.localSkillSourceId,
       skillPlan.localSkillRoots,
+      skillPlan.bundledSkillSourceId,
+      () => new Set((currentComposition?.registry.snapshot().contextContributions ?? [])
+        .filter((summary) => summary.sourceId !== skillPlan.bundledSkillSourceId && summary.sourceType === "skill")
+        .map((summary) => summary.name)),
     ),
-    startupRefresh: externalStartupRefresh,
+    startupRefresh: false,
   });
+  currentComposition = composition;
+  const refreshSources = async (sourceIds: readonly string[], signal?: AbortSignal) => {
+    const overrides = sourceIds.filter((id) => id !== skillPlan.bundledSkillSourceId);
+    if (overrides.length > 0) await composition.registry.refresh({ workspace, timeoutMs: skillPlan.edges.refreshTimeoutMs, sourceIds: overrides, ...(signal === undefined ? {} : { signal }) });
+    // Project/explicit names must be current before selecting packaged fallbacks.
+    if (skillPlan.bundledSkillSourceId !== undefined && sourceIds.includes(skillPlan.bundledSkillSourceId)) {
+      return composition.registry.refresh({ workspace, timeoutMs: skillPlan.edges.refreshTimeoutMs, sourceIds: [skillPlan.bundledSkillSourceId], ...(signal === undefined ? {} : { signal }) });
+    }
+    return composition.registry.snapshot();
+  };
   // Local Skill discovery is metadata-only and does not start a provider or
   // external process. Refresh it independently so default Skills do not force
   // configured MCP sources to refresh when their external gate is off.
   let localRefreshFailed = false;
-  if (skillPlan.localSkillSourceId !== undefined && !externalStartupRefresh) {
+  if (externalStartupRefresh || skillPlan.localSkillSourceId !== undefined || skillPlan.bundledSkillSourceId !== undefined) {
     try {
-      await composition.registry.refresh({
-        workspace,
-        timeoutMs: skillPlan.edges.refreshTimeoutMs,
-        sourceIds: [skillPlan.localSkillSourceId],
-      });
+      await refreshSources(skillPlan.edges.sources
+        .filter((source) => externalStartupRefresh || source.type === "skill")
+        .map((source) => source.sourceId));
     } catch {
       localRefreshFailed = true;
     }
@@ -1032,10 +1064,13 @@ const openCliEdgeRuntime = async (
   // selector. The predicate closes over the controller so each Turn captures
   // the latest selection without mutating the registry snapshot.
   let selection: EdgeSelectionController | undefined;
-  const provider = createRegistryEdgeTurnSnapshotProvider(
-    composition.registry,
-    (summary) => selection?.selectionPredicate(summary) ?? false,
-  );
+  const provider: EdgeTurnSnapshotProvider = {
+    ...createRegistryEdgeTurnSnapshotProvider(
+      composition.registry,
+      (summary) => selection?.selectionPredicate(summary) ?? false,
+    ),
+    refresh: (signal) => refreshSources(skillPlan.edges.sources.map((source) => source.sourceId), signal),
+  };
   selection = createEdgeSelectionController(provider);
   const configured = projectConfiguredEdgeStatus(skillPlan.edges);
   return {
@@ -1085,6 +1120,8 @@ const openCliEdgeRuntime = async (
 const cliEdgeConstructors = (
   localSkillSourceId?: string,
   localSkillRoots: readonly string[] = DEFAULT_LOCAL_SKILL_ROOTS,
+  bundledSkillSourceId?: string,
+  getOverrideNames?: () => ReadonlySet<string>,
 ): EdgeAdapterConstructors => ({
   mcp: (source, context) => createMcpEdgeAdapter({
     sourceId: source.sourceId,
@@ -1095,7 +1132,9 @@ const cliEdgeConstructors = (
     ...(source.sessionId === undefined ? {} : { sessionId: source.sessionId }),
     cwd: context.workspace,
   }),
-  skill: (source) => source.sourceId === localSkillSourceId
+  skill: (source) => source.sourceId === bundledSkillSourceId
+    ? createBundledSkillsEdgeAdapter({ sourceId: source.sourceId, ...(getOverrideNames === undefined ? {} : { getOverrideNames }) })
+    : source.sourceId === localSkillSourceId
     ? createSkillsEdgeAdapter({
         sourceId: source.sourceId,
         roots: localSkillRoots,

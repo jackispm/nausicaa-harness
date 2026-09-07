@@ -152,6 +152,17 @@ describe("parseCliArgs", () => {
     });
   });
 
+  it("selects the interactive TUI renderer explicitly", () => {
+    expect(parseCliArgs(["--tui-mode", "regular"], "/work")).toMatchObject({
+      tuiMode: "regular",
+    });
+    expect(parseCliArgs(["--tui-mode", "fullscreen"], "/work")).toMatchObject({
+      tuiMode: "fullscreen",
+    });
+    expect(() => parseCliArgs(["--tui-mode", "other"], "/work")).toThrow(/unsupported TUI mode/u);
+    expect(usage).toContain("--tui-mode <regular|fullscreen>");
+  });
+
   it("parses read-only topology output and permits JSON", () => {
     expect(parseCliArgs(["--topology"], "/work")).toMatchObject({
       topology: true,

@@ -9,6 +9,7 @@ import {
   type SelectListLayoutOptions,
   type SelectListTheme,
   Spacer,
+  stripTerminalSequences,
   Text,
   truncateToWidth,
   visibleWidth,
@@ -17,7 +18,9 @@ import {
 import {
   nausicaaEditorTheme,
   nausicaaMarkdownTheme,
+  nausicaaPalette,
 } from "./tui-components.js";
+import { renderAuthPanel } from "./auth-menu.js";
 import {
   filterSelectorOptions,
   type SelectorOption,
@@ -25,6 +28,9 @@ import {
 
 export interface SelectorOverlayOptions {
   title: string;
+  /** The centered model picker shares the provider/login menu surface. */
+  presentation?: "inline" | "panel";
+  getRows?: () => number;
   subtitle?: string | ((visibleOptions: readonly SelectorOption[]) => string);
   /** Search caption; session history uses Codex-style wording. */
   searchLabel?: string;
@@ -215,6 +221,8 @@ export class SelectorOverlay extends Container implements Focusable {
   private readonly allOptions: readonly SelectorOption[];
   private filteredOptions: readonly SelectorOption[];
   private readonly title: string;
+  private readonly presentation: "inline" | "panel";
+  private readonly getRows: (() => number) | undefined;
   private readonly subtitle: SelectorOverlayOptions["subtitle"];
   private readonly searchLabel: string;
   private readonly filters: readonly SelectorFilter[];
@@ -232,10 +240,13 @@ export class SelectorOverlay extends Container implements Focusable {
   private readonly selectedValues = new Set<string>();
   private query = "";
   private _focused = false;
+  private pageSize = PAGE_SIZE;
 
   constructor(options: SelectorOverlayOptions) {
     super();
     this.title = options.title;
+    this.presentation = options.presentation ?? "inline";
+    this.getRows = options.getRows;
     this.subtitle = options.subtitle;
     this.searchLabel = options.searchLabel ?? "Search";
     this.filters = options.filters === undefined ? [] : [...options.filters];
@@ -325,7 +336,7 @@ export class SelectorOverlay extends Container implements Focusable {
       : Math.max(0, this.filteredOptions.findIndex((option) => option.value === selected));
     const nextIndex = Math.max(
       0,
-      Math.min(this.filteredOptions.length - 1, currentIndex + direction * PAGE_SIZE),
+      Math.min(this.filteredOptions.length - 1, currentIndex + direction * this.pageSize),
     );
     this.list.setSelectedIndex(nextIndex);
     this.onPreview?.(this.getSelectedValue() ?? "");
@@ -418,6 +429,7 @@ export class SelectorOverlay extends Container implements Focusable {
   }
 
   override render(width: number): string[] {
+    if (this.presentation === "panel") return this.renderPanel(width);
     const safeWidth = Math.max(1, width);
     const lines: string[] = [
       truncateToWidth(nausicaaMarkdownTheme.heading(this.title), safeWidth, ""),
@@ -448,6 +460,86 @@ export class SelectorOverlay extends Container implements Focusable {
       ),
     );
     return lines.map((line) => truncateToWidth(line, safeWidth, ""));
+  }
+
+  /**
+   * Prime Agent model-selector.ts + MenuPanel/MenuRow, minimally adapted from
+   * commit 7787f07415d843b9a800f6a4720e0c739bd608e5 (MIT; Mario Zechner and
+   * Prime Intellect). Pi's existing SelectList continues to own selection.
+   */
+  private renderPanel(width: number): string[] {
+    const columns = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+    const horizontalPadding = Math.min(2, Math.floor((columns - 1) / 2));
+    const innerWidth = columns - horizontalPadding * 2;
+    const terminalRows = this.getRows?.();
+    const budget = terminalRows !== undefined && Number.isFinite(terminalRows) && terminalRows > 0
+      ? Math.max(1, Math.floor(terminalRows) - 2)
+      : Number.POSITIVE_INFINITY;
+    const plain = (value: string): string => stripTerminalSequences(value)
+      .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+    const lines: string[] = [nausicaaPalette.strong(nausicaaPalette.text(plain(this.title)))];
+    const subtitle = typeof this.subtitle === "function" ? this.subtitle(this.filteredOptions) : this.subtitle;
+    const hasSubtitle = subtitle !== undefined && subtitle.trim().length > 0;
+    if (hasSubtitle) lines.push(nausicaaPalette.muted(plain(subtitle)));
+    const filterRows = [plain(this.searchLabel)];
+    for (const filter of this.renderFilters(innerWidth)) {
+      const index = filterRows.length - 1;
+      const joined = `${filterRows[index]}    ${plain(filter)}`;
+      if (visibleWidth(joined) <= innerWidth) filterRows[index] = joined;
+      else filterRows.push(plain(filter));
+    }
+    lines.push(...filterRows.map((line) => nausicaaPalette.muted(line)));
+    const inputLine = this.search.render(innerWidth + 2)[0] ?? "";
+    lines.push(inputLine.startsWith("> ") ? inputLine.slice(2) : inputLine);
+    // Keep the active model and both facet controls visible in short terminals.
+    if (hasSubtitle && lines.length + 5 > budget) lines.splice(1, 1);
+
+    const available = Math.max(2, budget - lines.length - 2);
+    const countFor = (itemRows: number, paddingRows: number): number => {
+      const capacity = Math.max(1, Math.min(PAGE_SIZE, Math.floor((available - paddingRows) / itemRows)));
+      const scrollRows = this.filteredOptions.length > capacity ? 1 : 0;
+      return Math.max(1, Math.min(PAGE_SIZE, Math.floor((available - paddingRows - scrollRows) / itemRows)));
+    };
+    const comfortableCount = countFor(3, 1);
+    const compactCount = countFor(2, 0);
+    const comfortableFits = comfortableCount * 3 + 1
+      + (this.filteredOptions.length > comfortableCount ? 1 : 0) <= available;
+    const compact = compactCount > comfortableCount || !comfortableFits;
+    this.pageSize = compact ? compactCount : comfortableCount;
+    const currentIndex = Math.max(0, this.filteredOptions.findIndex((option) => option.value === this.getSelectedValue()));
+    const start = Math.max(0, Math.min(currentIndex - Math.floor(this.pageSize / 2), this.filteredOptions.length - this.pageSize));
+    const visible = this.filteredOptions.slice(start, start + this.pageSize);
+    const selectedRows = new Set<number>();
+    if (visible.length === 0) {
+      lines.push(nausicaaPalette.muted(this.title === "Models" ? "No matching models" : "No matches"));
+    } else {
+      for (const [offset, option] of visible.entries()) {
+        const selected = start + offset === currentIndex;
+        if (!compact) {
+          if (selected || start + offset - 1 === currentIndex) selectedRows.add(lines.length);
+          lines.push("");
+        }
+        if (selected) {
+          selectedRows.add(lines.length);
+          selectedRows.add(lines.length + 1);
+        }
+        const label = this.multiSelect
+          ? `[${this.selectedValues.has(option.value) ? "x" : " "}] ${plain(option.label).replace(/^\[[ x]\]\s*/u, "")}`
+          : plain(option.label);
+        const primary = option.disabled === true
+          ? nausicaaPalette.muted(label)
+          : selected ? nausicaaPalette.strong(nausicaaPalette.text(label)) : nausicaaPalette.text(label);
+        lines.push(primary, nausicaaPalette.muted(plain(option.description ?? "")));
+      }
+      if (!compact) {
+        if (start + visible.length - 1 === currentIndex) selectedRows.add(lines.length);
+        lines.push("");
+      }
+      if (visible.length < this.filteredOptions.length) {
+        lines.push(nausicaaPalette.muted(`(${currentIndex + 1}/${this.filteredOptions.length})`));
+      }
+    }
+    return renderAuthPanel(lines, columns, selectedRows).slice(0, budget);
   }
 
   private renderFilters(width: number): readonly string[] {

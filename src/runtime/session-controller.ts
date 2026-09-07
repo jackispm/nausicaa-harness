@@ -12,7 +12,7 @@ import type {
   InputDelivery,
   TurnExecutionBoundary,
 } from "../domain/events.js";
-import type { AgentTool, Clock, ModelPort } from "../domain/ports.js";
+import type { AgentTool, Clock, ModelPort, ThinkingLevel } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
 import {
   type UserImage,
@@ -216,6 +216,13 @@ export interface SessionModelSelectionResult {
   activeRequestUnaffected: boolean;
 }
 
+export interface SessionThinkingSelectionResult {
+  level: ThinkingLevel | undefined;
+  previousLevel: ThinkingLevel | undefined;
+  changed: boolean;
+  activeRequestUnaffected: boolean;
+}
+
 export type SessionPermissionProfile =
   | "read-only"
   | "workspace"
@@ -260,6 +267,7 @@ export interface SessionSnapshot {
   goal?: ThreadGoal;
   status: SessionControllerStatus;
   model: string;
+  thinkingLevel?: ThinkingLevel;
   tetoEnabled: boolean;
   workerEnabled: boolean;
   permissionProfile: SessionPermissionProfile;
@@ -491,6 +499,7 @@ interface AttachedRun {
   policy: RunPolicy;
   tokenBudget: RunTokenBudget;
   mainModel: string;
+  mainThinkingLevel?: ThinkingLevel;
   inbox?: A2AInbox;
   processJobs?: ProcessJobManager;
   worker?: WorkerLaneRuntime;
@@ -536,6 +545,7 @@ export class SessionController {
   private externalPollTail: Promise<void> = Promise.resolve();
   private observedEventIds = new Set<string>();
   private selectedMainModel: string;
+  private selectedThinkingLevel: ThinkingLevel | undefined;
   private selectedTetoModel: string;
   private selectedWorkerModel: string;
   private writeAllowed: boolean;
@@ -671,6 +681,62 @@ export class SessionController {
 
   get model(): string {
     return this.selectedMainModel;
+  }
+
+  get thinkingLevel(): ThinkingLevel | undefined {
+    return this.selectedThinkingLevel;
+  }
+
+  getAvailableThinkingLevels(): readonly ThinkingLevel[] {
+    this.assertOpen();
+    return this.thinkingLevelsForModel(this.model);
+  }
+
+  /** Persist before publishing; a request already captured keeps its old level. */
+  async setThinkingLevel(level: ThinkingLevel | undefined): Promise<SessionThinkingSelectionResult> {
+    return this.runAdmission(async () => {
+      this.assertOpen();
+      if (level !== undefined && !this.getAvailableThinkingLevels().includes(level)) {
+        throw new SessionProtocolError(`Thinking level ${String(level)} is not supported by ${this.model}`);
+      }
+      const previousLevel = this.selectedThinkingLevel;
+      const result = {
+        level,
+        previousLevel,
+        changed: level !== previousLevel,
+        activeRequestUnaffected: this.active !== undefined,
+      };
+      if (!result.changed) return result;
+      const attached = this.attached;
+      if (attached !== undefined) {
+        const revision = attached.sink.cachedEvents.filter((event) => (
+          event.type === "thinking.selected" && event.laneId === "main"
+        )).length + 1;
+        await attached.sink.append({
+          runId: attached.runId,
+          laneId: "main",
+          type: "thinking.selected",
+          payload: { level: level ?? null },
+          correlationId: `run:${attached.runId}`,
+          idempotencyKey: `${attached.runId}:main:thinking:selected:${revision}`,
+          visibility: "run",
+          occurredAt: this.clock.now().toISOString(),
+        });
+        if (level === undefined) delete attached.mainThinkingLevel;
+        else attached.mainThinkingLevel = level;
+      }
+      this.selectedThinkingLevel = level;
+      this.publishState();
+      return result;
+    });
+  }
+
+  private thinkingLevelsForModel(model: string): readonly ThinkingLevel[] {
+    try {
+      return [...((this.deps.mainModel ?? createBuiltinModelPort()).capabilities?.(model)?.thinkingLevels ?? [])];
+    } catch {
+      return [];
+    }
   }
 
   get tetoModel(): string {
@@ -846,6 +912,9 @@ export class SessionController {
       }
 
       const attached = this.attached;
+      const thinkingLevel = this.selectedThinkingLevel !== undefined
+        && this.thinkingLevelsForModel(model).includes(this.selectedThinkingLevel)
+        ? this.selectedThinkingLevel : undefined;
       if (attached !== undefined) {
         const revision = attached.sink.cachedEvents.filter((event) => (
           event.type === "model.selected" && event.laneId === "main"
@@ -854,13 +923,15 @@ export class SessionController {
           runId: attached.runId,
           laneId: "main",
           type: "model.selected",
-          payload: { model },
+          payload: { model, ...(thinkingLevel === undefined ? {} : { thinkingLevel }) },
           correlationId: `run:${attached.runId}`,
           idempotencyKey: `${attached.runId}:main:model:selected:${revision}`,
           visibility: "run",
           occurredAt: this.clock.now().toISOString(),
         });
         attached.mainModel = model;
+        if (thinkingLevel === undefined) delete attached.mainThinkingLevel;
+        else attached.mainThinkingLevel = thinkingLevel;
       }
       if (this.selectedTetoModel === UNCONFIGURED_MODEL_SELECTOR) {
         this.selectedTetoModel = model;
@@ -869,6 +940,7 @@ export class SessionController {
         this.selectedWorkerModel = model;
       }
       this.selectedMainModel = model;
+      this.selectedThinkingLevel = thinkingLevel;
       this.publishState();
       return {
         model,
@@ -957,6 +1029,7 @@ export class SessionController {
         : { goal: structuredClone(this.attached.threadGoal) }),
       status: this.status,
       model: this.model,
+      ...(this.thinkingLevel === undefined ? {} : { thinkingLevel: this.thinkingLevel }),
       tetoEnabled: this.attached?.policy.tetoEnabled ?? this.policy.tetoEnabled,
       workerEnabled: this.attached?.policy.workerEnabled === true
         || (this.attached === undefined && this.policy.workerEnabled === true),
@@ -1951,7 +2024,7 @@ export class SessionController {
         throw new SessionProtocolError("Imported history contains unfinished work");
       }
       const events = source.events
-        .filter((event) => event.type !== "model.selected" && event.type !== "goal.revised"
+        .filter((event) => event.type !== "model.selected" && event.type !== "thinking.selected" && event.type !== "goal.revised"
           && !event.type.startsWith("thread.goal."))
         .map((event): AnyEvent => event.type === "run.created" ? {
           ...event,
@@ -2080,6 +2153,7 @@ export class SessionController {
     const previous = this.attached;
     this.attached = candidate;
     this.selectedMainModel = candidate.mainModel;
+    this.selectedThinkingLevel = candidate.mainThinkingLevel;
     candidate.worker?.scheduler.enqueue();
     this.startExternalObservation(candidate);
     if (previous !== undefined) {
@@ -2234,7 +2308,11 @@ export class SessionController {
           runId: childRunId,
           laneId: "main",
           type: "model.selected",
-          payload: { model: selectedModel },
+          payload: {
+            model: selectedModel,
+            ...(checkpointProjection.lanes.main?.thinkingLevel === undefined
+              ? {} : { thinkingLevel: checkpointProjection.lanes.main.thinkingLevel }),
+          },
           correlationId: `run:${childRunId}`,
           idempotencyKey: "main:model:selected:fork",
           visibility: "run",
@@ -2312,6 +2390,17 @@ export class SessionController {
         idempotencyKey: "lane:main:registered",
         visibility: "run",
       });
+      if (this.thinkingLevel !== undefined) {
+        await sink.append({
+          runId,
+          laneId: "main",
+          type: "thinking.selected",
+          payload: { level: this.thinkingLevel },
+          correlationId: `run:${runId}`,
+          idempotencyKey: "main:thinking:selected:initial",
+          visibility: "run",
+        });
+      }
       if (this.policy.tetoEnabled) {
         await sink.append({
           runId,
@@ -2357,6 +2446,7 @@ export class SessionController {
         policy: this.policy,
         tokenBudget: new RunTokenBudget(this.policy.maxModelTokens),
         mainModel: this.model,
+        ...(this.thinkingLevel === undefined ? {} : { mainThinkingLevel: this.thinkingLevel }),
         ...(this.allowShell
           ? { processJobs: await this.createProcessJobManager(runId) }
           : {}),
@@ -2687,6 +2777,10 @@ export class SessionController {
           ? { processJobs: await this.createProcessJobManager(runId) }
           : {}),
       };
+      const savedThinkingLevel = projection.lanes.main?.thinkingLevel;
+      if (savedThinkingLevel !== undefined && this.thinkingLevelsForModel(attached.mainModel).includes(savedThinkingLevel)) {
+        attached.mainThinkingLevel = savedThinkingLevel;
+      }
       if (projection.run.policy.workerEnabled === true) {
         attached.worker = this.createWorkerLaneRuntime(attached);
       }
@@ -3074,6 +3168,7 @@ export class SessionController {
         beforeCompletion: () => attached.team?.beforeMainCompletion(turn.controller.signal) ?? Promise.resolve(false),
         model,
         resolveModel: () => this.model,
+        resolveThinkingLevel: () => this.thinkingLevel,
         contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(attached.store)),
         conversationStore: attached.store,
         eventSink: attached.sink,

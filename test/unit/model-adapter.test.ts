@@ -180,6 +180,7 @@ describe("PiAiModelPort", () => {
     expect(adapter.capabilities("openrouter:vision")).toEqual({
       imageInput: true,
       contextWindowTokens: 128_000,
+      thinkingLevels: ["off"],
     });
   });
 
@@ -336,7 +337,7 @@ describe("PiAiModelPort", () => {
       models.setProvider(faux.provider);
       const adapter = new PiAiModelPort({ models });
 
-      expect(adapter.capabilities("openrouter:demo")).toEqual({ imageInput: false });
+      expect(adapter.capabilities("openrouter:demo")).toEqual({ imageInput: false, thinkingLevels: ["off"] });
     },
   );
 

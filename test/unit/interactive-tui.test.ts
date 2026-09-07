@@ -51,13 +51,69 @@ const TINY_PNG = Buffer.from(
 );
 
 describe("interactive TUI", () => {
+  it("opens MCP management without starting connections and restores the composer on cancel", async () => {
+    let mutations = 0;
+    const mcp: import("../../src/cli/mcp-management.js").McpManagement = {
+      list: async () => [{ name: "docs-server", transport: "http", origin: "user", enabled: true, status: "ready", toolCount: 2 }],
+      add: async () => { mutations += 1; },
+      remove: async () => { mutations += 1; },
+      setEnabled: async () => { mutations += 1; },
+      refresh: async () => { mutations += 1; },
+    };
+    await withAuthTui({ mcp }, async ({ terminal, mainModel }) => {
+      terminal.type("/mcp");
+      terminal.send("\r");
+      await waitForOutput(terminal, "MCP Servers");
+      await waitForOutput(terminal, "docs-server");
+      terminal.send("\x1b");
+      terminal.type("/login openai");
+      terminal.send("\r");
+      await waitForOutput(terminal, "openai API key input is hidden");
+      terminal.send("\x1b");
+      expect(mutations).toBe(0);
+      expect(mainModel.callCount).toBe(0);
+    });
+  });
+  it("adjusts supported reasoning levels through /effort and the centered /thinking picker", async () => {
+    await withAuthTui({ model: "openai:test-model", thinkingLevels: ["low", "high"] }, async ({ terminal, session, mainModel }) => {
+      terminal.type("/effort high");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Thinking set to high");
+      expect(session.thinkingLevel).toBe("high");
+      terminal.type("/thinking");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Provider default");
+      terminal.send("\x1b[A");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Thinking set to low");
+      expect(session.thinkingLevel).toBe("low");
+      terminal.type("/thinking impossible");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Unsupported thinking level");
+      expect(session.thinkingLevel).toBe("low");
+      expect(mainModel.callCount).toBe(0);
+    });
+  });
+
+  it("does not invent reasoning support for an ordinary model", async () => {
+    await withAuthTui({ model: "openai:test-model", thinkingLevels: [] }, async ({ terminal, session }) => {
+      terminal.type("/thinking");
+      terminal.send("\r");
+      await waitForOutput(terminal, "No adjustable reasoning levels");
+      terminal.send("\x1b");
+      terminal.type("/effort high");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Unsupported thinking level");
+      expect(session.thinkingLevel).toBeUndefined();
+    });
+  });
   it("rejects the removed providers command without invoking a model", async () => {
     await withAuthTui({}, async ({ terminal, mainModel }) => {
       terminal.type("/providers");
       terminal.send("\r");
       await waitForOutput(terminal, "Unknown command: /providers");
       expect(mainModel.callCount).toBe(0);
-      expect(terminal.output).not.toContain("Search providers");
+      expect(terminal.output).not.toContain("Connect with a subscription or API key.");
     });
   });
 
@@ -249,13 +305,13 @@ describe("interactive TUI", () => {
       await credentialStore.modify("openai", async () => ({ type: "api_key", key: "test-saved-key" }));
       terminal.type("/logout");
       terminal.send("\r");
-      await waitForOutput(terminal, "Search saved accounts");
+      await waitForOutput(terminal, "Saved Credentials");
       terminal.send("\x1b");
       await expect(credentialStore.read("openai")).resolves.toMatchObject({ type: "api_key" });
       const before = terminal.output.length;
       terminal.type("/logout");
       terminal.send("\r");
-      await waitForCondition(async () => terminal.output.slice(before).includes("Search saved accounts"), "single credential picker reopened");
+      await waitForCondition(async () => terminal.output.slice(before).includes("Saved Credentials"), "single credential picker reopened");
       terminal.send("\r");
       await waitForOutput(terminal, "Any environment credential remains available");
       await expect(credentialStore.read("openai")).resolves.toBeUndefined();
@@ -266,8 +322,8 @@ describe("interactive TUI", () => {
     await withAuthTui({}, async ({ terminal, session, credentialStore, mainModel }) => {
       terminal.type("/login");
       terminal.send("\r");
-      await waitForOutput(terminal, "Search providers");
-      terminal.type("openai");
+      await waitForOutput(terminal, "Connect with a subscription or API key.");
+      terminal.type("openai api key");
       terminal.send("\r");
       await waitForOutput(terminal, "openai API key input is hidden");
       terminal.send("test-openai-secret\r");
@@ -280,6 +336,99 @@ describe("interactive TUI", () => {
       terminal.send("\r");
       await waitForCondition(async () => session.model === "openai:test-model", "OpenAI model selection");
       expect(session.model).not.toBe("anthropic:openai-lookalike");
+    });
+  });
+
+  it("selects ChatGPT subscription separately from the OpenAI API key and persists it across stores", async () => {
+    await withAuthTui({ model: "anthropic:current-model" }, async ({ terminal, modelPort, credentialStore, session }) => {
+      const calls: string[] = [];
+      modelPort.login = async (authType, _interaction, provider) => {
+        calls.push(`${provider}:${authType}`);
+        const credential = { type: "oauth" as const, refresh: "test-refresh-secret", access: "test-access-secret", expires: Date.now() + 60_000 };
+        await credentialStore.modify(provider!, async () => credential);
+        return credential;
+      };
+      terminal.type("/login");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Connect with a subscription or API key.");
+      terminal.type("openai-codex");
+      await waitForOutput(terminal, "OpenAI (ChatGPT Plus/Pro)");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Signed in to openai-codex");
+      expect(calls).toEqual(["openai-codex:oauth"]);
+      const reopened = new FileCredentialStore({ filePath: credentialStore.filePath });
+      await expect(reopened.read("openai-codex")).resolves.toMatchObject({ type: "oauth", refresh: "test-refresh-secret" });
+      await expect(reopened.read("openai")).resolves.toBeUndefined();
+      expect(terminal.output).not.toContain("test-refresh-secret");
+      expect(terminal.output).not.toContain("test-access-secret");
+      expect(session.model).toBe("anthropic:current-model");
+    });
+  });
+
+  it("uses arrow-selected provider option ids without treating navigation as secret cancellation", async () => {
+    await withAuthTui({ model: "openai:test-model" }, async ({ terminal, modelPort, credentialStore }) => {
+      let chosen: string | undefined;
+      modelPort.login = async (_request, interaction) => {
+        chosen = await interaction.prompt({
+          type: "select", message: "Choose account region", options: [
+            { id: "region-us", label: "United States" },
+            { id: "region-eu", label: "Europe" },
+          ],
+        });
+        const key = await interaction.prompt({ type: "secret", message: "Enter region API key" });
+        await credentialStore.modify("openai", async () => ({ type: "api_key", key }));
+        return { type: "api_key", key };
+      };
+      terminal.type("/login openai");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Choose account region");
+      terminal.send("\x1b[B");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Enter region API key");
+      terminal.send("test-region-secret\r");
+      await waitForOutput(terminal, "Signed in to openai");
+      expect(chosen).toBe("region-eu");
+      await expect(credentialStore.read("openai")).resolves.toMatchObject({ type: "api_key", key: "test-region-secret" });
+      expect(terminal.output).not.toContain("test-region-secret");
+    });
+  });
+
+  it.each(["\x1b", "\x03"])("returns to the filtered provider menu after cancelling credentials with %j", async (cancel) => {
+    await withAuthTui({ model: "openai:test-model" }, async ({ terminal, credentialStore }) => {
+      await credentialStore.modify("openai", async () => ({ type: "api_key", key: "retain-test-secret" }));
+      terminal.type("/login");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Connect with a subscription or API key.");
+      terminal.type("openai api key");
+      terminal.send("\r");
+      await waitForOutput(terminal, "openai API key input is hidden");
+      const before = terminal.output.length;
+      terminal.send(cancel);
+      await waitForCondition(() => terminal.output.slice(before).includes("Connect with a subscription or API key."), "returned provider menu");
+      expect(normalizeTerminalOutput(terminal.output.slice(before))).toContain("openai api key");
+      await expect(credentialStore.read("openai")).resolves.toMatchObject({ key: "retain-test-secret" });
+      terminal.send("\x1b");
+      terminal.type("/login openai");
+      terminal.send("\r");
+      await waitForCondition(() => terminal.output.slice(before).includes("openai API key input is hidden"), "editor restored");
+      terminal.send("\x1b");
+    });
+  });
+
+  it("does not block or reopen login when local auth discovery settles after cancellation", async () => {
+    let resolveCheck!: (value: undefined) => void;
+    const pending = new Promise<undefined>((resolve) => { resolveCheck = resolve; });
+    await withAuthTui({ checkAuth: () => pending }, async ({ terminal, credentialStore }) => {
+      terminal.type("/login");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Connect with a subscription or API key.");
+      terminal.send("\x1b");
+      await waitForOutput(terminal, "Login cancelled.");
+      const before = terminal.output.length;
+      resolveCheck(undefined);
+      await delay(40);
+      expect(terminal.output.slice(before)).not.toContain("Connect with a subscription or API key.");
+      await expect(credentialStore.list()).resolves.toEqual([]);
     });
   });
 
@@ -299,7 +448,7 @@ describe("interactive TUI", () => {
     await withAuthTui({}, async ({ terminal, credentialStore }) => {
       terminal.type("/login anthropic");
       terminal.send("\r");
-      await waitForOutput(terminal, "supports more than one");
+      await waitForOutput(terminal, "Connect with a subscription or API key.");
       terminal.send("\x1b");
       await waitForOutput(terminal, "Login cancelled.");
       expect(terminal.output).not.toContain("No supported authentication method");
@@ -317,9 +466,11 @@ describe("interactive TUI", () => {
       terminal.send("\r");
       await waitForOutput(terminal, "openai API key input is hidden");
       terminal.send("test-openai-secret\r");
-      await waitForOutput(terminal, "Model catalog refresh failed for openai");
+      await waitForOutput(terminal, "Catalog refresh failed; showing cached models");
       await waitForOutput(terminal, "Search models");
       await expect(credentialStore.read("openai")).resolves.toMatchObject({ type: "api_key" });
+      terminal.send("\x1b");
+      await waitForOutput(terminal, "Signed in to openai");
       expect(terminal.output).toContain("Signed in to openai");
     });
   });
@@ -330,13 +481,13 @@ describe("interactive TUI", () => {
       await credentialStore.modify("anthropic", async () => ({ type: "api_key", key: "remove-anthropic-key" }));
       terminal.type("/logout");
       terminal.send("\r");
-      await waitForOutput(terminal, "Search saved accounts");
+      await waitForOutput(terminal, "Saved Credentials");
       terminal.send("\x1b");
       await expect(credentialStore.list()).resolves.toHaveLength(2);
       const before = terminal.output.length;
       terminal.type("/logout");
       terminal.send("\r");
-      await waitForCondition(async () => terminal.output.slice(before).includes("Search saved accounts"), "logout picker reopened");
+      await waitForCondition(async () => terminal.output.slice(before).includes("Saved Credentials"), "logout picker reopened");
       terminal.type("anthropic");
       terminal.send("\r");
       await waitForOutput(terminal, "Removed the saved anthropic credential");
@@ -375,16 +526,16 @@ describe("interactive TUI", () => {
       await expect(credentialStore.read("openai")).resolves.toMatchObject({ type: "api_key" });
       terminal.type("/logout");
       terminal.send("\r");
-      await waitForOutput(terminal, "Search saved accounts");
+      await waitForOutput(terminal, "Saved Credentials");
       terminal.send("\r");
       await waitForOutput(terminal, "Removed the saved openai credential");
     });
   });
 
   it.each([
-    ["/login", "Search providers"],
-    ["/login anthropic", "supports more than one"],
-    ["/logout", "Search saved accounts"],
+    ["/login", "Connect with a subscription or API key."],
+    ["/login anthropic", "Connect with a subscription or API key."],
+    ["/logout", "Saved Credentials"],
   ])("settles the pending %s selector during SIGTERM shutdown", async (command, marker) => {
     await withAuthTui({}, async ({ terminal, credentialStore, running }) => {
       await credentialStore.modify("openai", async () => ({ type: "api_key", key: "test-one" }));
@@ -469,7 +620,7 @@ describe("interactive TUI", () => {
 
       terminal.type("/logout");
       terminal.send("\r");
-      await waitForOutput(terminal, "Search saved accounts");
+      await waitForOutput(terminal, "Saved Credentials");
       terminal.send("\r");
       await waitForCondition(
         async () => (await credentialStore.read("openrouter")) === undefined,
@@ -530,10 +681,10 @@ describe("interactive TUI", () => {
       await terminal.started;
       terminal.type("/login");
       terminal.send("\r");
-      await waitForOutput(terminal, "Search providers");
+      await waitForOutput(terminal, "Connect with a subscription or API key.");
       terminal.type("openai");
       await waitForOutput(terminal, "OpenAI");
-      await waitForOutput(terminal, "ready locally");
+      await waitForOutput(terminal, "env: OPENAI_API_KEY");
       expect(normalizeTerminalOutput(terminal.output)).toContain("OPENAI_API_KEY");
 
       terminal.send("\x1b");
@@ -599,7 +750,11 @@ describe("interactive TUI", () => {
       await waitForOutput(terminal, "input is hidden");
       terminal.send("hidden-demo-key\r");
       await waitForOutput(terminal, "Enter demo account id");
-      terminal.send("account-visible\r");
+      terminal.type("account-visibl");
+      terminal.send("\x1b[D");
+      terminal.send("\x1b[C");
+      terminal.type("e");
+      terminal.send("\r");
       await waitForOutput(terminal, "Signed in to demo");
       expect(normalizeTerminalOutput(terminal.output)).toContain("account-visible");
       expect(terminal.output).not.toContain("hidden-demo-key");
@@ -698,6 +853,7 @@ describe("interactive TUI", () => {
       expect(visible).toContain("MAIN_ANSWER_SENTINEL");
       expect(visible).not.toContain("TETO_ANSWER_SENTINEL");
       expect(visible).not.toContain("Main output:");
+      await waitForCondition(async () => (await session.transcript()).some((entry) => entry.role === "assistant" && entry.content === "MAIN_ANSWER_SENTINEL"), "committed Main transcript");
       await expect(session.transcript()).resolves.toEqual([
         expect.objectContaining({ role: "user", content: "hello" }),
         expect.objectContaining({ role: "assistant", content: "MAIN_ANSWER_SENTINEL" }),
@@ -1352,16 +1508,20 @@ describe("interactive TUI", () => {
   it("shows shortcut help for an empty '?' but preserves '?' in normal input", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-shortcut-help-"));
     const previousExitCode = process.exitCode;
+    let session: SessionController | undefined;
+    let running: Promise<number> | undefined;
+    let stopped = false;
     try {
       const model = new ScriptedModel([response("QUESTION_ANSWER")]);
-      const session = await SessionController.open({
+      session = await SessionController.open({
         workspace: root,
         dataDir: join(root, "state"),
         model: "scripted",
         policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
       }, { mainModel: model });
       const terminal = new MemoryTerminal(100, 28);
-      const running = runInteractive({ session, terminal, forceAltScreen: true });
+      running = runInteractive({ session, terminal, forceAltScreen: true })
+        .finally(() => { stopped = true; });
 
       await terminal.started;
       terminal.send("?");
@@ -1379,24 +1539,32 @@ describe("interactive TUI", () => {
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
     } finally {
-      process.exitCode = previousExitCode;
-      await rm(root, { recursive: true, force: true });
+      if (running !== undefined && !stopped) process.emit("SIGTERM", "SIGTERM");
+      try { await running; }
+      finally {
+        await session?.close();
+        process.exitCode = previousExitCode;
+        await rm(root, { recursive: true, force: true });
+      }
     }
   });
 
   it("stashes and restores an image draft with Ctrl+S without submitting it", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-prompt-stash-"));
     const previousExitCode = process.exitCode;
+    let session: SessionController | undefined;
+    let running: Promise<number> | undefined;
+    let stopped = false;
     try {
       const model = new ScriptedModel([response("STASH_ANSWER")]);
-      const session = await SessionController.open({
+      session = await SessionController.open({
         workspace: root,
         dataDir: join(root, "state"),
         model: "scripted",
         policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
       }, { mainModel: model });
       const terminal = new MemoryTerminal(100, 28);
-      const running = runInteractive({
+      running = runInteractive({
         session,
         terminal,
         forceAltScreen: true,
@@ -1404,7 +1572,7 @@ describe("interactive TUI", () => {
           bytes: TINY_PNG,
           mimeType: "image/png",
         }),
-      });
+      }).finally(() => { stopped = true; });
 
       await terminal.started;
       terminal.send("\x16");
@@ -1436,8 +1604,13 @@ describe("interactive TUI", () => {
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
     } finally {
-      process.exitCode = previousExitCode;
-      await rm(root, { recursive: true, force: true });
+      if (running !== undefined && !stopped) process.emit("SIGTERM", "SIGTERM");
+      try { await running; }
+      finally {
+        await session?.close();
+        process.exitCode = previousExitCode;
+        await rm(root, { recursive: true, force: true });
+      }
     }
   });
 
@@ -1512,12 +1685,10 @@ describe("interactive TUI", () => {
       expect(terminal.output).toContain("\x1b[?1049l");
       expect(terminal.output).not.toContain("\x1b[48;2;232;232;232m");
       const plainOutput = stripTerminalSequences(terminal.output);
-      expect(plainOutput).toContain("Nausicaa v0.1.0");
-      expect(plainOutput).toContain("escape interrupt");
-      expect(plainOutput).toContain("ctrl+o more");
-      expect(plainOutput).toContain("Press ctrl+o to show full startup help");
-      expect(plainOutput).toContain("Nausicaa can explain its own features");
-      expect(plainOutput).not.toContain("cwd");
+      expect(plainOutput).toContain("version  v0.1.1");
+      expect(plainOutput).toContain("model    scripted");
+      expect(plainOutput).toContain("cwd      ");
+      expect(plainOutput).toContain('Try "fix bugs in @<filepath>"');
       expect(plainOutput).not.toContain("Ctrl+E");
       expect(terminal.cursorVisible).toBe(true);
       expect(exitFrame(terminal.output)).not.toContain('Try "inspect this project"');
@@ -2622,13 +2793,16 @@ describe("interactive TUI", () => {
       });
 
       await terminal.started;
-      await waitForOutput(terminal, "Local setup");
       await waitForOutput(terminal, "Models");
-      await waitForOutput(terminal, "Initial task is kept in the editor");
-      expect(terminal.output).toContain("****9876");
+      expect(terminal.output).not.toContain("### Local setup");
+      expect(terminal.output).not.toContain("Configuration: model");
+      expect(terminal.output).not.toContain("Selector: none configured");
+      expect(terminal.output).not.toContain("Credential source:");
+      expect(terminal.output).not.toContain("Credentials are managed with");
       expect(terminal.output).not.toContain(sentinelKey);
 
       terminal.send("\x1b");
+      await waitForOutput(terminal, "Initial task is kept in the editor");
       terminal.send("\r");
       await waitForOutput(terminal, "Choose a model with /model");
       expect(model.callCount).toBe(0);
@@ -4057,6 +4231,8 @@ async function withAuthTui(
     modelChoices?: InteractiveOptions["modelChoices"];
     environment?: NodeJS.ProcessEnv;
     checkAuth?: AuthModelPort["checkAuth"];
+    thinkingLevels?: readonly import("../../src/domain/ports.js").ThinkingLevel[];
+    mcp?: import("../../src/cli/mcp-management.js").McpManagement;
   },
   check: (fixture: {
     terminal: MemoryTerminal;
@@ -4080,6 +4256,7 @@ async function withAuthTui(
     });
     if (options.checkAuth !== undefined) modelPort.checkAuth = options.checkAuth;
     const mainModel = new ScriptedModel([]);
+    if (options.thinkingLevels !== undefined) Object.assign(mainModel, { capabilities: () => ({ imageInput: false, thinkingLevels: options.thinkingLevels }) });
     session = await SessionController.open({
       workspace: root,
       dataDir: join(root, "state"),
@@ -4091,6 +4268,7 @@ async function withAuthTui(
       session,
       terminal,
       forceAltScreen: true,
+      ...(options.mcp === undefined ? {} : { mcp: options.mcp }),
       modelChoices: options.modelChoices ?? [
         { value: "anthropic:openai-lookalike", label: "Other model mentioning openai" },
         { value: "openai:test-model", label: "OpenAI model" },

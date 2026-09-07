@@ -35,6 +35,10 @@ const REQUIRED_PACK_FILES = [
   "dist/cli.js",
   "dist/index.js",
   "dist/index.d.ts",
+  "assets/skills/codebase-map/SKILL.md",
+  "assets/skills/task-plan/SKILL.md",
+  "assets/skills/code-review/SKILL.md",
+  "assets/skills/LICENSE",
   "package.json",
 ] as const;
 
@@ -101,9 +105,7 @@ describe("npm package surface", () => {
     for (const command of [
       "--print",
       "--json",
-      "--worker",
       "--daemon",
-      "--daemon-worker-command",
       "--attach",
       "--topology",
     ]) {
@@ -115,7 +117,8 @@ describe("npm package surface", () => {
       "/permissions",
       "/plan",
       "/skills",
-      "/edges",
+      "/mcp",
+      "/thinking",
     ]) {
       expect(readme).toContain(command);
     }

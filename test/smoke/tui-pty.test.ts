@@ -38,7 +38,8 @@ if pid == 0:
     ])
 
 output = bytearray()
-marker = b'Nausicaa can explain its own features'
+# Label and value have separate ANSI styles; match the version token itself.
+marker = b'v0.1.1'
 awareness_marker = b'Nausicaa awareness'
 deadline = time.monotonic() + 5.0
 sent_agents = False
@@ -137,18 +138,14 @@ describe("built CLI PTY", () => {
         expect(stdout).toContain("\x1b[?1049h");
         expect(stdout).toContain("\x1b[?1049l");
         const plainStdout = stripTerminalSequences(stdout);
-        expect(plainStdout).toContain("Nausicaa v0.1.0");
-        expect(plainStdout).toContain("escape interrupt");
-        expect(stdout).not.toContain("▄▄████");
-        expect(plainStdout).not.toContain("version");
-        expect(plainStdout).toContain("v0.1.0");
-        // Setup diagnostics may still mention the configured model; the
-        // startup header itself intentionally omits session metadata.
-        const headerStart = plainStdout.indexOf("Nausicaa v0.1.0");
-        const nextHeaderRow = plainStdout.indexOf("Nausicaa can explain", headerStart);
-        const headerFrame = plainStdout.slice(headerStart, nextHeaderRow < 0 ? undefined : nextHeaderRow);
-        expect(headerFrame).not.toContain("deepseek");
-        expect(headerFrame).not.toContain("cwd");
+        expect(plainStdout).toContain("version  v0.1.1");
+        expect(plainStdout).toContain("model    deepseek");
+        expect(plainStdout).toContain("cwd      ");
+        expect(plainStdout).toContain('Try "fix bugs in @<filepath>"');
+        expect(plainStdout).toContain("████████");
+        expect(plainStdout).not.toContain("### Local setup");
+        expect(plainStdout).not.toContain("Configuration: model");
+        expect(plainStdout).not.toContain("Credential source:");
         expect(plainStdout).not.toContain('Type a task, or "/help" for commands');
         expect(plainStdout).not.toContain('Try "inspect this project"');
         expect(plainStdout).toContain("Nausicaa awareness");

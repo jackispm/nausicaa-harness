@@ -1497,6 +1497,15 @@ const payloadValidators = {
     ) {
       invalid(`${path}.model`, "a valid provider:model or model selector");
     }
+    if (item.thinkingLevel !== undefined) {
+      oneOf(item.thinkingLevel, `${path}.thinkingLevel`, ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const);
+    }
+  },
+  "thinking.selected": (value, path) => {
+    const item = payloadObject(value, path, ["level"]);
+    if (item.level !== null) {
+      oneOf(item.level, `${path}.level`, ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const);
+    }
   },
   "model.requested": (value, path) => {
     const item = payloadObject(value, path, [
@@ -1505,6 +1514,9 @@ const payloadValidators = {
       "contextWatermark",
     ]);
     string(item.model, `${path}.model`, false);
+    if (item.thinkingLevel !== undefined) {
+      oneOf(item.thinkingLevel, `${path}.thinkingLevel`, ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const);
+    }
     string(item.requestHash, `${path}.requestHash`, false);
     integer(item.contextWatermark, `${path}.contextWatermark`);
     if (item.deadlineMs !== undefined) {

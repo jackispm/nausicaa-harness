@@ -7,6 +7,11 @@ import type {
   ToolCall,
 } from "./types.js";
 import type { UserImage } from "./images.js";
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+
+/** Provider-neutral levels defined by the adopted Pi transport contract. */
+export type ThinkingLevel = ModelThinkingLevel;
+export type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 
 export interface JsonSchema {
   type: "object";
@@ -28,6 +33,8 @@ export interface ModelRequest {
   requestId?: EventId;
   sessionId: string;
   model: string;
+  /** Omission retains the provider default; explicit off follows Pi's simple API. */
+  thinkingLevel?: ThinkingLevel;
   systemPrompt: string;
   messages: ConversationMessage[];
   tools: ToolDefinition[];
@@ -49,6 +56,8 @@ export interface ModelResponse {
 export interface ModelCapabilities {
   imageInput: boolean;
   contextWindowTokens?: number;
+  /** Advertised by the provider catalog; absent means unknown, not unsupported. */
+  thinkingLevels?: readonly ThinkingLevel[];
 }
 
 export type ModelStreamEvent =

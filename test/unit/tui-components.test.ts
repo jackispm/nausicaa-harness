@@ -16,7 +16,7 @@ import {
   EdgeStatusBlock,
   EdgeSkillPickerSummary,
   NoticeBlock,
-  NAUSICAA_LOGO_MARK,
+  NAUSICAA_LOGO_ROWS,
   PromptSurface,
   parseExternalA2APrompt,
   QueuePreview,
@@ -539,7 +539,7 @@ describe("TUI components", () => {
     }
   });
 
-  it("keeps the Pi-style startup header expandable and free of session metadata", () => {
+  it("renders the Prime-style logo with live session metadata", () => {
     const header = new BrandSplashHeader({
       version: "0.1.0",
       getModel: () => "openrouter:openai/gpt-5-mini",
@@ -549,20 +549,15 @@ describe("TUI components", () => {
     const veryWide = stripTerminalSequences(header.render(100).join("\n"));
     const narrow = stripTerminalSequences(header.render(24).join("\n"));
     const colored = header.render(80).join("\n");
-    expect(wide).toContain("Nausicaa v0.1.0");
-    expect(wide).not.toContain(NAUSICAA_LOGO_MARK);
-    expect(wide).not.toContain("████████");
-    expect(wide).toContain("escape interrupt");
-    expect(wide).toContain("/ commands");
-    expect(veryWide).toContain("ctrl+o more");
-    expect(wide).toContain("Press ctrl+o to show full startup help and loaded resources.");
-    expect(wide).toContain("Nausicaa can explain its own features");
-    expect(wide).not.toContain("version");
-    expect(wide).not.toContain("openrouter");
-    expect(wide).not.toContain("cwd");
-    expect(narrow).toContain("Nausicaa");
-    expect(colored).toContain("\x1b[38;2;118;118;118mPress ctrl+o to show full startup help and loaded resources.");
-    expect(colored).toContain("\x1b[38;2;118;118;118mNausicaa can explain its own features");
+    expect(wide).toContain(NAUSICAA_LOGO_ROWS[0]);
+    expect(wide).toContain("version  v0.1.0");
+    expect(wide).toContain("model    openrouter:openai/gpt-5-mini");
+    expect(wide).toContain("cwd      /work/project");
+    expect(wide).toContain('Try "fix bugs in @<filepath>"');
+    expect(veryWide).toContain("version  v0.1.0");
+    expect(narrow).toContain("█");
+    expect(narrow).not.toContain("openrouter");
+    expect(colored).toContain("\x1b[38;2;118;118;118mTry \"fix bugs in @<filepath>\"");
     for (const [width, lines] of [[80, header.render(80)] as const, [24, header.render(24)] as const]) {
       for (const line of lines) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
     }
@@ -574,7 +569,7 @@ describe("TUI components", () => {
     const expandedLines = header.render(80);
     const expanded = stripTerminalSequences(expandedLines.join("\n"));
     expect(expanded).toContain("ctrl+o expand or collapse tool output");
-    expect(expanded).not.toContain("Press ctrl+o to show full startup help");
+    expect(expanded).toContain("Nausicaa can explain its own features");
     expect(expandedLines.length).toBeGreaterThan(compactLines.length);
   });
 

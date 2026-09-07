@@ -38,45 +38,71 @@ Main
 `- A2A -> another Run
 ```
 
-当前版本：`0.1.0` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
+当前版本：`0.1.1` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
 edge 集成仍在完善。
 
 ### 快速开始
 
-已发布包（全局 CLI）：
+需要 Node.js >=22.19.0。在要工作的目录启动：
 
 ```bash
 npm install -g nausicaa-harness
-nausicaa --help
+cd /path/to/project
+nausicaa
 ```
 
-模型与 provider：
+安装脚本和发布归档见 [Releases](https://github.com/jackispm/nausicaa-harness/releases)。
+默认可使用当前用户权限执行命令和修改文件；可通过 `/permissions` 限制权限。
 
-Nausicaa 默认加载 `pi-ai` 的完整 provider/model 目录，OpenRouter 只是其中一个选项。
-使用 `/login` 查看服务商及认证状态，选择 API key 或浏览器/设备 OAuth。
-`/model` 默认显示已配置服务商的模型，支持搜索、服务商筛选和显式浏览全部目录；
-选择尚未配置的模型会引导登录。非交互命令可用
-`--provider <provider> --model <id>`，也兼容 `provider:model` 选择器。
+### 登录与模型
+
+- `/login` 打开居中的可搜索菜单，直接选择服务商和登录方式。OpenAI API 与
+  ChatGPT 订阅是不同入口；Anthropic、OpenRouter 等只显示各自支持的 API Key 或 OAuth。
+- 完成登录后，凭据保存到 `~/.nausicaa/credentials.json`，下次启动可继续使用。
+  浏览菜单或取消不会保存账号；本地“已配置”状态不代表远端访问已验证。
+- `/model [搜索词]` 在同样居中的面板中切换当前会话模型，默认只显示已配置服务商；可筛选服务商或
+  切到 All 浏览完整目录。未选择模型时，登录成功会打开对应服务商的模型列表。
+- `/thinking [level|default]`（别名 `/effort`）选择当前模型支持的思考强度。
+  设置随当前会话保存，从下一次 Main 请求生效，不修改 Teto 或 Worker。
+- `/logout [provider]` 移除本地保存的凭据，不会删除环境变量中的密钥。
+
+也可在终端指定登录入口；以下是可选示例，不必全部执行：
 
 ```bash
-# OpenAI
-export OPENAI_API_KEY="..."
-export NAUSICAA_MODEL="openai:gpt-5.4"
-
-# Anthropic (API key or /login anthropic oauth)
-export ANTHROPIC_API_KEY="..."
-export NAUSICAA_MODEL="anthropic:claude-sonnet-4-5"
-
-# OpenRouter (one of the available providers)
-export OPENROUTER_API_KEY="..."
-export NAUSICAA_MODEL="openrouter:openai/gpt-5-mini"
+nausicaa auth login openai api-key
+nausicaa auth login openai-codex oauth
+nausicaa auth login openrouter api-key
 ```
 
-凭据也可以通过 `nausicaa auth login <provider> [api-key|oauth]` 或 TUI 的 `/login` 保存。
-`nausicaa auth status <provider>` 只显示本地配置状态，不会验证或打印密钥。
-尚未选择模型时，登录后会打开该 provider 的模型列表；`/logout` 选择并移除本地保存的凭据，不删除环境变量。
+`nausicaa config set-model <provider:model>` 保存启动默认模型；
+`--provider <provider> --model <id>` 只覆盖本次运行。
+`nausicaa auth status <provider>` 查看本地认证状态，`nausicaa --help` 查看完整 CLI 用法。
 
-源码开发：
+### 常用命令
+
+| TUI 命令 | 用途 |
+| --- | --- |
+| `/help`、`/hotkeys` | 命令与当前快捷键 |
+| `/list-agents` | 活跃会话与 Lane 拓扑 |
+| `/new`、`/resume`、`/session` | 创建、恢复、切换会话 |
+| `/name`、`/export`、`/import` | 会话命名、HTML/JSONL 导出、JSONL 导入 |
+| `/skills`、`/mcp`、`/reload` | 选择 Skill、管理 MCP、刷新资源 |
+| `/context`、`/compact` | 上下文用量与压缩 |
+| `/permissions`、`/plan`、`/stop` | 权限、规划模式、停止当前任务 |
+
+CLI：`--print` 单次回答，`--json` 输出事件，`--continue` 恢复最近会话，
+`--resume <run-id>` 恢复指定会话，`--topology` 查看拓扑；`--daemon` 启动后台控制主机，
+`--attach <run-id>` 以只读 TUI 查看 daemon 会话。
+
+内置 `codebase-map`、`task-plan`、`code-review` 三个 Skill，项目或配置来源的同名 Skill 优先。
+项目内 `.agents/skills`、`.pi/skills`、`skills` 默认发现元数据；完整内容按需加载，
+也可通过 `/skills` 插入 `/skill:name` 调用。`--no-edges` 关闭 Skill 和 MCP 来源；
+Worker 默认可按需委派，`--no-worker` 可禁用。
+
+`/mcp` 用居中菜单添加 HTTP/stdio 服务、明确授权、启用、禁用或移除配置；配置变更需重启生效。
+`/mcp refresh` 只刷新现有连接，`/mcp status` 查看状态。本版不提供通用 MCP OAuth。
+
+### 开发
 
 ```bash
 git clone https://github.com/jackispm/nausicaa-harness.git
@@ -84,20 +110,9 @@ cd nausicaa-harness
 npm ci
 npm run build
 npm link
-
-export OPENAI_API_KEY="..."
-export NAUSICAA_MODEL="openai:gpt-5.4"
-nausicaa "Summarize this workspace"
 ```
 
-项目内的 `.agents/skills`、`.pi/skills` 和 `skills` 目录会默认进行元数据发现；首轮只向模型提供 Skill 名称和描述，完整 `SKILL.md` 由模型按需通过 `skill` 工具加载。MCP 等外部 Edge 仍需显式配置和授权，并通过配置或 `--edges` 开启；`--no-edges` 会关闭本地 Skill 发现。
-
-常用入口：`--print`、`--json`、`--topology`、`--worker`、`--daemon`、
-`--daemon-worker-command <path>`、`--attach <run-id>`；TUI 提供
-`/model`、`/login`、`/logout`、`/list-agents`、`/permissions`、`/plan`、
-`/skills` 和 `/edges`。
-
-开发检查：`npm run typecheck`、`npm test`、`npm run test:smoke`、`npm run build`。
+检查：`npm run typecheck`、`npm test`、`npm run eval`、`npm run test:smoke`。
 
 ## English
 
@@ -125,48 +140,82 @@ Main
 `- A2A -> another Run
 ```
 
-Current version: `0.1.0` beta. Core runtime contracts have offline test coverage;
+Current version: `0.1.1` beta. Core runtime contracts have offline test coverage;
 provider, daemon, RPC, and edge integrations are still evolving.
 
 ### Quick start
 
-Published package (global CLI):
+Requires Node.js >=22.19.0. Start in the directory you want to work in:
 
 ```bash
 npm install -g nausicaa-harness
-nausicaa --help
+cd /path/to/project
+nausicaa
 ```
 
-Model and provider setup:
+Installers and archives are available in [Releases](https://github.com/jackispm/nausicaa-harness/releases).
+Commands and file writes use your user permissions by default; `/permissions` can restrict access.
 
-Nausicaa loads the complete `pi-ai` provider/model catalog by default; OpenRouter is
-one option among many. Use `/login` to view provider authentication status and
-connect with an API key or browser/device OAuth. `/model` defaults to configured
-providers, with search, provider filtering, and an explicit all-catalog view.
-Selecting an unconfigured model starts login. Non-interactive runs accept
-`--provider <provider> --model <id>` as well as the `provider:model` selector form.
+### Login and models
+
+- `/login` opens a centered, searchable menu of providers and login methods.
+  OpenAI API and ChatGPT subscription access are separate entries. Anthropic,
+  OpenRouter, and other providers show only their supported API-key or OAuth routes.
+- Successful login saves credentials in `~/.nausicaa/credentials.json` for future
+  launches. Browsing or cancelling does not save an account; a local configured
+  status does not verify remote access.
+- `/model [search]` uses the same centered panel to switch the current session's
+  model. It defaults to configured
+  providers, with provider filters and an All catalog view. When no model is
+  selected, successful login opens that provider's models.
+- `/thinking [level|default]` (alias `/effort`) selects a level supported by the
+  current model. It persists with this session and applies to the next Main
+  request, without changing Teto or Worker.
+- `/logout [provider]` removes a saved credential without changing environment keys.
+
+You can also select a login route from the shell. These are alternatives:
 
 ```bash
-# OpenAI
-export OPENAI_API_KEY="..."
-export NAUSICAA_MODEL="openai:gpt-5.4"
-
-# Anthropic (API key or /login anthropic oauth)
-export ANTHROPIC_API_KEY="..."
-export NAUSICAA_MODEL="anthropic:claude-sonnet-4-5"
-
-# OpenRouter (one available provider)
-export OPENROUTER_API_KEY="..."
-export NAUSICAA_MODEL="openrouter:openai/gpt-5-mini"
+nausicaa auth login openai api-key
+nausicaa auth login openai-codex oauth
+nausicaa auth login openrouter api-key
 ```
 
-Credentials can also be saved with `nausicaa auth login <provider> [api-key|oauth]`
-or the TUI `/login` command. `nausicaa auth status <provider>` reports local
-configuration only; it never verifies or prints a key.
-When no model is selected, login opens that provider's model list. `/logout`
-lets you choose a saved credential to remove; environment variables are unchanged.
+`nausicaa config set-model <provider:model>` saves the startup default;
+`--provider <provider> --model <id>` overrides only the current run.
+Use `nausicaa auth status <provider>` for local authentication status and
+`nausicaa --help` for the full CLI reference.
 
-Source checkout:
+### Useful commands
+
+| TUI command | Purpose |
+| --- | --- |
+| `/help`, `/hotkeys` | Commands and active keybindings |
+| `/list-agents` | Active sessions and Lane topology |
+| `/new`, `/resume`, `/session` | Create, resume, and switch sessions |
+| `/name`, `/export`, `/import` | Name sessions, export HTML/JSONL, import JSONL |
+| `/skills`, `/mcp`, `/reload` | Choose a Skill, manage MCP, refresh resources |
+| `/context`, `/compact` | Context usage and compaction |
+| `/permissions`, `/plan`, `/stop` | Permissions, Plan mode, stop the current task |
+
+CLI: `--print` returns one answer, `--json` emits events, `--continue` resumes the
+latest session, `--resume <run-id>` resumes a specific session, and `--topology`
+prints the topology. `--daemon` starts the control host; `--attach <run-id>` opens
+a read-only TUI for a daemon session.
+
+Three Skills are bundled: `codebase-map`, `task-plan`, and `code-review`.
+Same-name project or configured Skills take precedence. Project `.agents/skills`,
+`.pi/skills`, and `skills` directories are discovered as metadata by default;
+full instructions load on demand, or `/skills` inserts a `/skill:name` invocation.
+`--no-edges` disables Skill and MCP sources. Worker delegation is available on demand by
+default; `--no-worker` disables it.
+
+`/mcp` opens a centered menu to add HTTP/stdio servers, grant explicit access,
+enable, disable, or remove configurations. Changes require a restart.
+`/mcp refresh` refreshes existing connections; `/mcp status` shows status.
+Generic MCP OAuth is not available in this release.
+
+### Development
 
 ```bash
 git clone https://github.com/jackispm/nausicaa-harness.git
@@ -174,21 +223,9 @@ cd nausicaa-harness
 npm ci
 npm run build
 npm link
-
-export OPENAI_API_KEY="..."
-export NAUSICAA_MODEL="openai:gpt-5.4"
-nausicaa "Summarize this workspace"
 ```
 
-Project-local `.agents/skills`, `.pi/skills`, and `skills` directories are discovered by default at metadata level. The first request receives only Skill names and descriptions; the full `SKILL.md` is loaded on demand through the `skill` tool. External edges such as MCP still require explicit configuration and authorization, and are enabled through settings or `--edges`; `--no-edges` disables local Skill discovery.
-
-Common entry points are `--print`, `--json`, `--topology`, `--worker`, `--daemon`,
-`--daemon-worker-command <path>`, and `--attach <run-id>`. The TUI includes
-`/model`, `/login`, `/logout`, `/list-agents`, `/permissions`, `/plan`,
-`/skills`, and `/edges`.
-
-Development checks: `npm run typecheck`, `npm test`, `npm run test:smoke`, and
-`npm run build`.
+Checks: `npm run typecheck`, `npm test`, `npm run eval`, and `npm run test:smoke`.
 
 Nausicaa uses [`pi-ai`](https://github.com/earendil-works/pi) for provider
 transport and references Pi coding-agent, Prime Agent, and DeepSeek Harness for

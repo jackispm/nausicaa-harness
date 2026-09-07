@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
+import type { AuthPrompt } from "@earendil-works/pi-ai";
 
 import { FileCredentialStore } from "../../src/auth/index.js";
 import { BracketedPasteDecoder, runAuthCommand, runUtilityCommand, type AuthModelPort, type Output, type SecretInput } from "../../src/cli/auth.js";
@@ -21,6 +22,25 @@ class FakeSecretInput extends EventEmitter implements SecretInput {
   resume(): void {}
   pause(): void {}
   emitSecret(value: string): void { this.emit("data", Buffer.from(value)); }
+}
+
+const loginSelection = {
+  type: "select",
+  message: "Choose sign-in method",
+  options: [{ id: "browser", label: "Browser" }, { id: "device-code", label: "Device code" }],
+} satisfies Extract<AuthPrompt, { type: "select" }>;
+
+function selectionModel(store: FileCredentialStore, prompt: AuthPrompt = loginSelection): AuthModelPort {
+  return {
+    checkAuth: async () => undefined,
+    logout: async () => {},
+    login: async (_type, interaction) => {
+      const key = await interaction.prompt(prompt);
+      const credential = { type: "api_key" as const, key };
+      await store.modify("demo", async () => credential);
+      return credential;
+    },
+  };
 }
 
 describe("auth/config CLI", () => {
@@ -304,6 +324,275 @@ describe("auth/config CLI", () => {
       await expect(pending).rejects.toThrow("Invalid authentication selection");
       await expect(store.read("amazon-bedrock")).resolves.toBeUndefined();
       expect(output.value).toContain("credential chains are detected automatically");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("accepts an exact option id from the TUI without raw numeric input", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-select-tui-"));
+    try {
+      const input = new FakeSecretInput();
+      const output = new MemoryOutput();
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      const events: string[] = [];
+      await expect(runAuthCommand(
+        { action: "login", provider: "demo", json: false },
+        {
+          credentialStore: store,
+          modelPort: selectionModel(store),
+          input,
+          output,
+          onAuthPrompt: () => events.push("prompt"),
+          onAuthSelect: async (prompt) => {
+            events.push("select");
+            expect(prompt).toEqual(loginSelection);
+            return "device-code";
+          },
+        },
+      )).resolves.toBe(0);
+      expect(events).toEqual(["prompt", "select"]);
+      await expect(store.read("demo")).resolves.toEqual({ type: "api_key", key: "device-code" });
+      expect(input.modes).toEqual([]);
+      expect(input.listenerCount("data")).toBe(0);
+      expect(output.value).not.toContain("1. Browser");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("accepts visible text from the TUI editor without reading raw input", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-text-tui-"));
+    try {
+      const input = new FakeSecretInput();
+      const output = new MemoryOutput();
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      const prompt = { type: "text", message: "Account id", placeholder: "account-123" } as const;
+      const events: string[] = [];
+      await expect(runAuthCommand(
+        { action: "login", provider: "demo", json: false },
+        {
+          credentialStore: store,
+          modelPort: selectionModel(store, prompt),
+          input,
+          output,
+          onAuthPrompt: () => events.push("prompt"),
+          onAuthText: async (received) => {
+            events.push("text");
+            expect(received).toBe(prompt);
+            return "  edited-account  ";
+          },
+        },
+      )).resolves.toBe(0);
+      expect(events).toEqual(["prompt", "text"]);
+      await expect(store.read("demo")).resolves.toEqual({ type: "api_key", key: "edited-account" });
+      expect(input.modes).toEqual([]);
+      expect(input.listenerCount("data")).toBe(0);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ["", "Input cannot be empty"],
+    ["   ", "Input cannot be empty"],
+    ["x".repeat(64 * 1024 + 1), "Input is too long"],
+  ] as const)("rejects invalid TUI text input (case %#)", async (answer, error) => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-text-invalid-"));
+    try {
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      await expect(runAuthCommand(
+        { action: "login", provider: "demo", json: false },
+        {
+          credentialStore: store,
+          modelPort: selectionModel(store, { type: "text", message: "Account id" }),
+          input: new FakeSecretInput(),
+          output: new MemoryOutput(),
+          onAuthText: async () => answer,
+        },
+      )).rejects.toThrow(error);
+      await expect(store.read("demo")).resolves.toBeUndefined();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ["input", "before"], ["prompt", "before"],
+    ["input", "during"], ["prompt", "during"],
+    ["input", "after"], ["prompt", "after"],
+  ] as const)("cancels TUI text input through the %s signal %s the callback without saving", async (source, timing) => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-text-cancel-"));
+    try {
+      const controller = new AbortController();
+      const input = Object.assign(new FakeSecretInput(), source === "input" ? { signal: controller.signal } : {});
+      const prompt: AuthPrompt = {
+        type: "text",
+        message: "Account id",
+        ...(source === "prompt" ? { signal: controller.signal } : {}),
+      };
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      let called = false;
+      if (timing === "before") controller.abort();
+      await expect(runAuthCommand(
+        { action: "login", provider: "demo", json: false },
+        {
+          credentialStore: store,
+          modelPort: selectionModel(store, prompt),
+          input,
+          output: new MemoryOutput(),
+          onAuthText: async () => {
+            called = true;
+            if (timing === "during") {
+              queueMicrotask(() => controller.abort());
+              return new Promise<string>(() => {});
+            }
+            controller.abort();
+            return "account-123";
+          },
+        },
+      )).rejects.toThrow("Login cancelled");
+      expect(called).toBe(timing !== "before");
+      await expect(store.read("demo")).resolves.toBeUndefined();
+      expect(input.modes).toEqual([]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["secret", "manual_code"] as const)("never passes %s prompts to the visible text callback", async (type) => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-text-secret-boundary-"));
+    try {
+      const input = new FakeSecretInput();
+      const output = new MemoryOutput();
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      let called = false;
+      const pending = runAuthCommand(
+        { action: "login", provider: "demo", json: false },
+        {
+          credentialStore: store,
+          modelPort: selectionModel(store, { type, message: "Secret" }),
+          input,
+          output,
+          onAuthText: async () => { called = true; return "must-not-be-used"; },
+        },
+      );
+      input.emitSecret("hidden-value\r");
+      await expect(pending).resolves.toBe(0);
+      expect(called).toBe(false);
+      expect(output.value).not.toContain("hidden-value");
+      expect(input.modes).toEqual([true, false]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["unknown", "1", " device-code "])("rejects an invalid TUI option id %j without saving", async (answer) => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-select-invalid-"));
+    try {
+      const input = new FakeSecretInput();
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      await expect(runAuthCommand(
+        { action: "login", provider: "demo", json: false },
+        {
+          credentialStore: store,
+          modelPort: selectionModel(store),
+          input,
+          output: new MemoryOutput(),
+          onAuthSelect: async () => answer,
+        },
+      )).rejects.toThrow("Invalid authentication selection");
+      await expect(store.read("demo")).resolves.toBeUndefined();
+      expect(input.modes).toEqual([]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ["input", "before"], ["prompt", "before"],
+    ["input", "during"], ["prompt", "during"],
+    ["input", "after"], ["prompt", "after"],
+  ] as const)("cancels TUI selection through the %s signal %s the callback without saving", async (source, timing) => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-select-cancel-"));
+    try {
+      const controller = new AbortController();
+      const input = Object.assign(new FakeSecretInput(), source === "input" ? { signal: controller.signal } : {});
+      const prompt = { ...loginSelection, ...(source === "prompt" ? { signal: controller.signal } : {}) };
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      let called = false;
+      if (timing === "before") controller.abort();
+      await expect(runAuthCommand(
+        { action: "login", provider: "demo", json: false },
+        {
+          credentialStore: store,
+          modelPort: selectionModel(store, prompt),
+          input,
+          output: new MemoryOutput(),
+          onAuthSelect: async () => {
+            called = true;
+            if (timing === "during") {
+              queueMicrotask(() => controller.abort());
+              return new Promise<string>(() => {});
+            }
+            controller.abort();
+            return "browser";
+          },
+        },
+      )).rejects.toThrow("Login cancelled");
+      expect(called).toBe(timing !== "before");
+      await expect(store.read("demo")).resolves.toBeUndefined();
+      expect(input.modes).toEqual([]);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("passes only persistable Bedrock choices to the TUI callback", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-bedrock-select-"));
+    try {
+      const input = new FakeSecretInput();
+      const output = new MemoryOutput();
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      const modelPort = createBuiltinModelPort({
+        credentials: store,
+        authContext: { env: async () => undefined, fileExists: async () => false },
+      });
+      let displayed: AuthPrompt | undefined;
+      await expect(runAuthCommand(
+        { action: "login", provider: "amazon-bedrock", json: false },
+        {
+          credentialStore: store,
+          modelPort,
+          input,
+          output,
+          onAuthPrompt: (prompt) => { displayed = prompt; },
+          onAuthSelect: async (prompt) => {
+            expect(prompt).toBe(displayed);
+            expect(prompt.options).toHaveLength(2);
+            expect(prompt.options.map((option) => option.id)).not.toContain("credential-chain");
+            return "credential-chain";
+          },
+        },
+      )).rejects.toThrow("Invalid authentication selection");
+      await expect(store.read("amazon-bedrock")).resolves.toBeUndefined();
+      expect(input.modes).toEqual([]);
+      expect(output.value).toContain("credential chains are detected automatically");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["1garbage", "1.5", "1e0"])("rejects a partial numeric CLI selection %j", async (answer) => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-select-cli-"));
+    try {
+      const input = new FakeSecretInput();
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      const pending = runAuthCommand(
+        { action: "login", provider: "demo", json: false },
+        { credentialStore: store, modelPort: selectionModel(store), input, output: new MemoryOutput() },
+      );
+      input.emitSecret(`${answer}\r`);
+      await expect(pending).rejects.toThrow("Invalid authentication selection");
+      await expect(store.read("demo")).resolves.toBeUndefined();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["2", "device-code"])("keeps the CLI selection fallback for %j", async (answer) => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-auth-select-cli-valid-"));
+    try {
+      const input = new FakeSecretInput();
+      const store = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+      const pending = runAuthCommand(
+        { action: "login", provider: "demo", json: false },
+        { credentialStore: store, modelPort: selectionModel(store), input, output: new MemoryOutput() },
+      );
+      input.emitSecret(`${answer}\r`);
+      await expect(pending).resolves.toBe(0);
+      await expect(store.read("demo")).resolves.toEqual({ type: "api_key", key: "device-code" });
+      expect(input.modes).toEqual([true, false]);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

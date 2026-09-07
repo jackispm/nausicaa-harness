@@ -2,7 +2,7 @@ import { readFile, lstat, mkdtemp, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   DAEMON_SERVICE_DESCRIPTOR_VERSION,
@@ -229,48 +229,66 @@ describe("detached daemon service lifecycle", () => {
   });
 
   it("projects starting, ready, draining, failed, stale, and stopped states", async () => {
-    const host = new FakeServiceHost();
-    const probeGate = deferred<DaemonServiceProbeTransportResult>();
-    host.probe = async () => probeGate.promise;
-    const manager = await openService(host, { probeTimeoutMs: 60, readyTimeoutMs: 100 });
-    const start = manager.start();
-    await eventually(async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const host = new FakeServiceHost();
+      const probeEntered = deferred<void>();
+      const probeGate = deferred<DaemonServiceProbeTransportResult>();
+      host.probe = async () => {
+        probeEntered.resolve();
+        return probeGate.promise;
+      };
+      let elapsedMs = 0;
+      const manager = await openService(host, {
+        probeTimeoutMs: 60,
+        readyTimeoutMs: 100,
+        monotonicNow: () => elapsedMs,
+        sleep: async (milliseconds) => { elapsedMs += milliseconds; },
+      });
+      const start = manager.start();
+      // Descriptor publication precedes these ports; hold each phase independently of disk speed.
+      await probeEntered.promise;
       expect((await manager.status()).state).toBe("starting");
-    });
-    const starting = await readDescriptor(manager);
-    probeGate.resolve(readyProbe({
-      version: DAEMON_SERVICE_PROBE_VERSION,
-      controlProtocolVersion: 1,
-      instanceToken: starting.instanceToken,
-      socketPath: manager.socketPath,
-      timeoutMs: 1,
-    }));
-    expect((await start).state).toBe("ready");
-    expect((await manager.status()).state).toBe("ready");
+      const starting = await readDescriptor(manager);
+      probeGate.resolve(readyProbe({
+        version: DAEMON_SERVICE_PROBE_VERSION,
+        controlProtocolVersion: 1,
+        instanceToken: starting.instanceToken,
+        socketPath: manager.socketPath,
+        timeoutMs: 1,
+      }));
+      expect((await start).state).toBe("ready");
+      expect((await manager.status()).state).toBe("ready");
 
-    const shutdownGate = deferred<void>();
-    host.shutdown = async () => shutdownGate.promise;
-    const stop = manager.stop();
-    await eventually(async () => {
+      const shutdownEntered = deferred<void>();
+      const shutdownGate = deferred<void>();
+      host.shutdown = async () => {
+        shutdownEntered.resolve();
+        return shutdownGate.promise;
+      };
+      const stop = manager.stop();
+      await shutdownEntered.promise;
       expect((await manager.status()).state).toBe("draining");
-    });
-    host.exit(starting.pid, { code: 0, signal: null });
-    shutdownGate.resolve();
-    expect((await stop).state).toBe("stopped");
-    expect((await manager.status()).state).toBe("stopped");
+      host.exit(starting.pid, { code: 0, signal: null });
+      shutdownGate.resolve();
+      expect((await stop).state).toBe("stopped");
+      expect((await manager.status()).state).toBe("stopped");
 
-    host.probe = async () => ({ status: "unavailable" });
-    const failed = await manager.start();
-    expect(failed).toMatchObject({ state: "failed", error: { code: "ready_timeout" } });
-    expect((await manager.status()).state).toBe("failed");
-    const failedDescriptor = await readDescriptor(manager);
-    await writeFile(manager.descriptorPath, `${JSON.stringify({
-      ...failedDescriptor,
-      state: "ready",
-      failure: undefined,
-    }, (_key, value) => value === undefined ? undefined : value)}\n`, { mode: 0o600 });
-    expect((await manager.status()).state).toBe("stale");
-    await manager.close();
+      host.probe = async () => ({ status: "unavailable" });
+      const failed = await manager.start();
+      expect(failed).toMatchObject({ state: "failed", error: { code: "ready_timeout" } });
+      expect((await manager.status()).state).toBe("failed");
+      const failedDescriptor = await readDescriptor(manager);
+      await writeFile(manager.descriptorPath, `${JSON.stringify({
+        ...failedDescriptor,
+        state: "ready",
+        failure: undefined,
+      }, (_key, value) => value === undefined ? undefined : value)}\n`, { mode: 0o600 });
+      expect((await manager.status()).state).toBe("stale");
+      await manager.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("detects PID reuse and never signals the replacement", async () => {

@@ -6,6 +6,7 @@ import type {
 } from "../config/settings.js";
 
 export type OutputMode = "interactive" | "print" | "json";
+export type TuiMode = "regular" | "fullscreen";
 
 export type UtilityCommand = AuthCommand | ConfigCommand;
 
@@ -38,6 +39,8 @@ export interface CliOptions {
   attach?: string;
   mode: OutputMode;
   modeExplicit: boolean;
+  /** Interactive renderer; fullscreen is the shipped default. */
+  tuiMode?: TuiMode;
   continue: boolean;
   /** Legacy compatibility flag; the complete catalog is enabled by default. */
   allProviders?: boolean;
@@ -186,6 +189,15 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
         }
         options.mode = mode;
         options.modeExplicit = true;
+        index += 1;
+        break;
+      }
+      case "--tui-mode": {
+        const mode = readValue(args, index, argument);
+        if (mode !== "regular" && mode !== "fullscreen") {
+          throw new CliUsageError(`unsupported TUI mode: ${mode}`);
+        }
+        options.tuiMode = mode;
         index += 1;
         break;
       }
@@ -538,6 +550,8 @@ Options:
   --attach <run-id>       Attach a read-only TUI to a daemon-owned Run
   --mode <interactive|print|json>
                           Select the output mode
+  --tui-mode <regular|fullscreen>
+                          Legacy compatibility flag; CLI uses fullscreen
   --model <provider:id>   Main model, for example openrouter:openai/gpt-5-mini
                           Or set NAUSICAA_MODEL; provider auth is not pre-verified
   --provider <provider>   Prefix an unqualified --model id (for example --provider openai --model gpt-5.4)

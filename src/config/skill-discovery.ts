@@ -6,6 +6,7 @@ import type {
 
 /** Stable host-owned identity for the implicit project Skill source. */
 export const DEFAULT_LOCAL_SKILL_SOURCE_ID = "nausicaa-local-skills";
+export const DEFAULT_BUNDLED_SKILL_SOURCE_ID = "nausicaa-bundled-skills";
 
 /** Project roots shared by the Agent Skills, pi, and Nausicaa conventions. */
 export const DEFAULT_LOCAL_SKILL_ROOTS = [
@@ -27,6 +28,8 @@ export interface CliSkillDiscoveryPlan {
   readonly edges: ResolvedEdgeSettings;
   /** Undefined when local discovery was explicitly disabled or replaced by an explicit Skill source. */
   readonly localSkillSourceId?: string;
+  /** Package-owned fallback Skills, independent of configured project sources. */
+  readonly bundledSkillSourceId?: string;
   readonly localSkillRoots: readonly string[];
 }
 
@@ -49,6 +52,9 @@ export function planCliSkillDiscovery(
     (source) => source.sourceId === DEFAULT_LOCAL_SKILL_SOURCE_ID,
   );
   const includeLocalSource = !localOptOut && !hasExplicitSkillSource && !hasReservedSourceId;
+  const includeBundledSource = !localOptOut && !configured.sources.some(
+    (source) => source.sourceId === DEFAULT_BUNDLED_SKILL_SOURCE_ID,
+  );
   const externalEnabled = !localOptOut && configured.enabled === true;
 
   const configuredSources = configured.sources.map((source) => (
@@ -67,6 +73,12 @@ export function planCliSkillDiscovery(
   const sources = Object.freeze([
     ...(localSource === undefined ? [] : [localSource]),
     ...configuredSources,
+    ...(includeBundledSource ? [Object.freeze({
+      sourceId: DEFAULT_BUNDLED_SKILL_SOURCE_ID,
+      type: "skill" as const,
+      location: ".",
+      enabled: true,
+    })] : []),
   ]);
 
   return Object.freeze({
@@ -74,10 +86,11 @@ export function planCliSkillDiscovery(
       ...configured,
       // The implicit local source needs the registry gate open. Configured
       // external sources remain individually disabled when externalEnabled is false.
-      enabled: includeLocalSource || externalEnabled,
+      enabled: includeLocalSource || includeBundledSource || externalEnabled,
       sources,
     }),
     ...(localSource === undefined ? {} : { localSkillSourceId: localSource.sourceId }),
+    ...(includeBundledSource ? { bundledSkillSourceId: DEFAULT_BUNDLED_SKILL_SOURCE_ID } : {}),
     localSkillRoots: Object.freeze([...DEFAULT_LOCAL_SKILL_ROOTS]),
   });
 }

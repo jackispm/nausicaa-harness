@@ -4,6 +4,7 @@ import {
   Box,
   Container,
   type EditorTheme,
+  HStack,
   Loader,
   Markdown,
   type MarkdownTheme,
@@ -17,6 +18,7 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
+import { VERSION } from "../version.js";
 import type {
   SessionContextOverview,
   SessionSnapshot,
@@ -219,12 +221,16 @@ const ASSISTANT_PADDING_X = 1;
  * without requiring a Kitty/iTerm image protocol or a native rasterizer.
  */
 export const NAUSICAA_LOGO_ROWS = [
-  "█████        █████",
-  "████████     █████",
-  "██████████   █████",
-  "█████  ██████     ",
-  "█████     ████████",
-  "█████        █████",
+  "████████                ████████",
+  "█████████████           ████████",
+  "████████████████        ████████",
+  "██████████████████",
+  "████████  ██████████",
+  "████████    ██████████",
+  "████████      █████████████",
+  "████████        ████████████████",
+  "████████           █████████████",
+  "████████                ████████",
 ] as const;
 
 /** Multiline form retained for integrations that imported the previous logo export. */
@@ -233,26 +239,49 @@ export const NAUSICAA_LOGO = NAUSICAA_LOGO_ROWS.join("\n");
 /** Kept as a compatibility marker for callers that used the old one-cell API. */
 export const NAUSICAA_LOGO_MARK = "█";
 
+/** Render a component inside a stable horizontal margin without changing its height. */
+export class HorizontalInset extends HStack {
+  constructor(child: Component, padding = 1) {
+    const inset = Math.max(0, Math.floor(padding));
+    super([
+      { component: new Spacer(1), basis: inset, shrink: 1, minSize: 0 },
+      { component: child, basis: 0, grow: 1, shrink: 1, minSize: 1 },
+      { component: new Spacer(1), basis: inset, shrink: 1, minSize: 0 },
+    ]);
+  }
+}
+
 export interface BrandSplashHeaderOptions {
   version?: string;
-  /** Retained for compatibility; Pi's startup header intentionally omits it. */
+  /** Runtime model shown beside the logo. */
   getModel?: () => string;
-  /** Retained for compatibility; Pi's startup header intentionally omits it. */
+  /** Runtime working directory shown beside the logo. */
   getWorkspace?: () => string;
   startHint?: string;
-  /** Retained for compatibility; the default startup surface is text-only. */
+  /** Optional replacement for the Nausicaa mark. */
   logo?: string;
+  /** Keep one blank row above the mark, matching Prime's splash. */
+  topPadding?: boolean;
 }
 
 const STARTUP_ONBOARDING = "Nausicaa can explain its own features and look up its docs. Ask it how to use or extend Nausicaa.";
-const STARTUP_COMPACT_ONBOARDING = "Press ctrl+o to show full startup help and loaded resources.";
+const DEFAULT_START_HINT = 'Try "fix bugs in @<filepath>"';
 
-/** Pi-style startup surface with a compact and an expandable help view. */
+/** Prime-style startup surface: a brand mark with live version/model/cwd metadata. */
 export class BrandSplashHeader implements Component {
+  private readonly logoRaw: string[];
+  private readonly logoCanvasWidth: number;
+  private readonly gutter = 4;
+  private readonly labelWidth = 9;
   private expanded = false;
-  private readonly text = new Text("", 1, 0);
 
-  constructor(private readonly options: BrandSplashHeaderOptions = {}) {}
+  constructor(private readonly options: BrandSplashHeaderOptions = {}) {
+    this.logoRaw = (options.logo ?? NAUSICAA_LOGO).split("\n");
+    this.logoCanvasWidth = this.logoRaw.reduce(
+      (max, line) => Math.max(max, visibleWidth(line)),
+      0,
+    );
+  }
 
   /** Kept as a no-op for callers that used the former responsive Prime header. */
   setCompact(_compact: boolean): void {}
@@ -260,7 +289,6 @@ export class BrandSplashHeader implements Component {
   setExpanded(expanded: boolean): void {
     if (this.expanded === expanded) return;
     this.expanded = expanded;
-    this.text.invalidate();
   }
 
   isExpanded(): boolean {
@@ -269,42 +297,89 @@ export class BrandSplashHeader implements Component {
 
   render(width: number): string[] {
     const safeWidth = Math.max(1, width);
-    const version = this.options.version === undefined ? "" : ` v${this.options.version}`;
-    // Pi's startup surface is a compact textual introduction. The Nausicaa
-    // mark belongs to terminal/app metadata, not the scrollback header; a
-    // large block here pushes the first prompt away from the session flow.
-    const title = `${palette.strong(palette.accentBright("Nausicaa"))}${palette.dim(version)}`;
-    const compactInstructions = this.options.startHint === undefined
-      ? startupCompactInstructions()
-      : palette.dim(this.options.startHint);
-    const expandedInstructions = startupExpandedInstructions();
-    const logicalLines = this.expanded
-      ? [title, expandedInstructions, "", palette.dim(STARTUP_ONBOARDING)]
-      : [
-          title,
-          compactInstructions,
-          palette.dim(STARTUP_COMPACT_ONBOARDING),
+    const paddingX = safeWidth > 1 ? 1 : 0;
+    const contentWidth = Math.max(1, safeWidth - paddingX * 2);
+    const metaWidth = contentWidth - this.logoCanvasWidth - this.gutter;
+    const showMeta = metaWidth >= this.labelWidth + 8;
+    const valueWidth = Math.max(1, metaWidth - this.labelWidth);
+    const labelled = (label: string, value: string): string => {
+      const displayValue = label === "cwd"
+        ? truncatePathMiddle(value, valueWidth)
+        : truncateToWidth(value, valueWidth, "");
+      return palette.dim(label.padEnd(this.labelWidth)) + palette.muted(displayValue);
+    };
+    const metaLines = showMeta
+      ? [
+          labelled("version", `v${this.options.version ?? VERSION}`),
+          labelled("model", this.options.getModel?.() ?? "—"),
+          labelled("cwd", formatSplashCwd(this.options.getWorkspace?.() ?? "")),
           "",
-          palette.dim(STARTUP_ONBOARDING),
-        ];
-    this.text.setText(logicalLines.join("\n"));
-    return this.text.render(safeWidth);
+          palette.dim(this.options.startHint ?? DEFAULT_START_HINT),
+        ]
+      : [];
+    const metaStart = Math.max(0, Math.floor((this.logoRaw.length - metaLines.length) / 2));
+    const lines: string[] = [];
+    if (this.options.topPadding !== false) lines.push(" ".repeat(safeWidth));
+    for (const [index, rawLine] of this.logoRaw.entries()) {
+      const logoLine = palette.accentBright(rawLine);
+      const meta = index >= metaStart && index < metaStart + metaLines.length
+        ? metaLines[index - metaStart]
+        : "";
+      const separator = showMeta
+        ? " ".repeat(Math.max(0, this.logoCanvasWidth - visibleWidth(rawLine) + this.gutter))
+        : "";
+      const content = truncateToWidth(logoLine + separator + meta, contentWidth, "");
+      lines.push(
+        " ".repeat(paddingX)
+        + content
+        + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(content))),
+      );
+    }
+    if (this.expanded) {
+      lines.push(" ".repeat(safeWidth));
+      for (const instruction of startupExpandedInstructions().split("\n")) {
+        const content = truncateToWidth(instruction, contentWidth, "");
+        lines.push(
+          " ".repeat(paddingX)
+          + content
+          + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(content))),
+        );
+      }
+      lines.push(" ".repeat(safeWidth));
+      const onboarding = truncateToWidth(STARTUP_ONBOARDING, contentWidth, "");
+      lines.push(
+        " ".repeat(paddingX)
+        + palette.dim(onboarding)
+        + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(onboarding))),
+      );
+    }
+    return lines;
   }
 
-  invalidate(): void { this.text.invalidate(); }
+  invalidate(): void {}
 }
 
-function startupCompactInstructions(): string {
-  const key = (text: string): string => palette.dim(text);
-  const label = (text: string): string => palette.muted(text);
-  const separator = label(" · ");
-  return [
-    `${key("escape")}${label(" interrupt")}`,
-    `${key("ctrl+c/ctrl+d")}${label(" clear/exit")}`,
-    `${key("/")}${label(" commands")}`,
-    `${key("!")}${label(" bash")}`,
-    `${key("ctrl+o")}${label(" more")}`,
-  ].join(separator);
+function formatSplashCwd(workspace: string): string {
+  const normalized = terminalSafeText(workspace).replace(/\\/g, "/");
+  if (normalized.length === 0) return "—";
+  const home = (process.env.HOME ?? process.env.USERPROFILE ?? "").replace(/\\/g, "/");
+  if (home.length > 0 && (normalized === home || normalized.startsWith(`${home}/`))) {
+    return normalized === home ? "~" : `~${normalized.slice(home.length)}`;
+  }
+  return normalized;
+}
+
+function truncatePathMiddle(value: string, width: number): string {
+  if (visibleWidth(value) <= width) return value;
+  if (width <= 1) return truncateToWidth(value, width, "");
+  const normalized = value.replace(/\\/g, "/");
+  const prefix = normalized.startsWith("~/") ? "~/" : normalized.startsWith("/") ? "/" : "";
+  const body = prefix.length > 0 ? normalized.slice(prefix.length) : normalized;
+  const parts = body.split("/").filter(Boolean);
+  const last = parts.pop() ?? "";
+  const previous = parts.pop();
+  const candidate = `${prefix}…/${previous === undefined ? last : `${previous}/${last}`}`;
+  return truncateToWidth(candidate, width, "");
 }
 
 function startupExpandedInstructions(): string {

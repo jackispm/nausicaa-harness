@@ -1,6 +1,7 @@
 import {
   CombinedAutocompleteProvider,
   Container,
+  Input,
   Markdown,
   matchesKey,
   ProcessTerminal,
@@ -12,8 +13,10 @@ import {
   VStack,
   type Component,
   type Focusable,
+  type OverlayHandle,
   type TUI,
   truncateToWidth,
+  wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
 import {
@@ -74,6 +77,10 @@ import {
 } from "./onboarding.js";
 import type { CredentialStatus } from "./onboarding.js";
 import { SelectorOverlay } from "./selector-component.js";
+import { AuthMenu, renderAuthPanel } from "./auth-menu.js";
+import { McpMenu } from "./mcp-menu.js";
+import type { McpManagement } from "./mcp-management.js";
+import { authProviderChoices, type AuthProviderChoice, type AuthProviderState } from "./auth-provider-options.js";
 import { CustomEditor } from "./custom-editor.js";
 import type { SelectorFilter } from "./selector-component.js";
 import { createKeybindings, formatHotkeys, reloadKeybindings } from "./keybindings.js";
@@ -93,6 +100,8 @@ import {
   BrandSplashHeader,
   ContextUsageBlock,
   getNausicaaColorScheme,
+  HorizontalInset,
+  NAUSICAA_LOGO,
   nausicaaEditorTheme,
   nausicaaMarkdownTheme,
   NoticeBlock,
@@ -181,6 +190,8 @@ export interface InteractiveOptions {
   edgeStatus?: () => EdgeStatusProjection;
   /** Optional host-injected Skill selection seam. */
   edgeSelection?: EdgeSelectionController;
+  /** Host-owned MCP configuration; connection changes apply after restart. */
+  mcp?: McpManagement;
   /** Optional host-owned, read-only Awareness topology source. */
   awareness?:
     | AgentAwarenessQuery
@@ -288,11 +299,57 @@ class TuiAuthPromptView implements Component, Focusable {
   private value = "";
   private secretLength = 0;
   private _focused = false;
+  private instructions: string[] = [];
+  private progress = "";
+  private textInput: Input | undefined;
+  private textPending = false;
+
+  constructor(private readonly title = "Sign in", private readonly getRows: () => number = () => 24) {}
+
+  setEvent(event: AuthEvent): void {
+    if (event.type === "auth_url") this.instructions = [event.instructions ?? "Open the sign-in page", event.url];
+    else if (event.type === "device_code") this.instructions = [`Code: ${event.userCode}`, event.verificationUri];
+    else if (event.type === "info" && event.links !== undefined) {
+      this.instructions = [event.message, ...event.links.map((link) => `${link.label ?? "Open"}: ${link.url}`)];
+    } else this.progress = event.message;
+  }
 
   setPrompt(prompt: AuthPrompt): void {
     this.prompt = prompt;
     this.value = "";
     this.secretLength = 0;
+    this.textInput = undefined;
+  }
+
+  get acceptsText(): boolean { return this.textPending; }
+
+  readText(prompt: Extract<AuthPrompt, { type: "text" }>, signal: AbortSignal, render: () => void): Promise<string> {
+    const field = new Input();
+    this.textInput = field;
+    field.focused = this.focused;
+    this.textPending = true;
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      const signals = [signal, prompt.signal].filter((entry): entry is AbortSignal => entry !== undefined);
+      const finish = (value?: string): void => {
+        if (settled) return;
+        settled = true;
+        render();
+        this.textPending = false;
+        for (const entry of signals) entry.removeEventListener("abort", cancel);
+        if (value === undefined) reject(new Error("Login cancelled"));
+        else resolve(value);
+      };
+      const cancel = (): void => finish();
+      field.onSubmit = (value) => finish(value);
+      field.onEscape = cancel;
+      for (const entry of signals) entry.addEventListener("abort", cancel, { once: true });
+      if (signals.some((entry) => entry.aborted)) cancel();
+    });
+  }
+
+  handleInput(data: string): void {
+    if (this.textPending) this.textInput?.handleInput(data);
   }
 
   setValue(value: string): void {
@@ -309,23 +366,26 @@ class TuiAuthPromptView implements Component, Focusable {
 
   set focused(value: boolean) {
     this._focused = value;
+    if (this.textInput !== undefined) this.textInput.focused = value;
   }
 
   render(width: number): string[] {
-    const safeWidth = Math.max(1, width);
+    const safeWidth = Math.max(1, width - 4);
     const prompt = this.prompt;
-    if (prompt === undefined) {
-      return [truncateToWidth(" Authentication input", safeWidth, "")];
-    }
-    const label = prompt.type === "secret" || prompt.type === "manual_code" ? "Credential" : "Input";
-    const display = prompt.type === "secret" || prompt.type === "manual_code"
+    const label = prompt?.type === "secret" || prompt?.type === "manual_code" ? "Credential" : "Input";
+    const display = prompt?.type === "secret" || prompt?.type === "manual_code"
       ? "*".repeat(this.secretLength)
       : this.value;
-    return [
-      truncateToWidth(` ${terminalSafeText(prompt.message)}`, safeWidth, ""),
-      truncateToWidth(` ${label}: ${display || "_"}`, safeWidth, ""),
-      truncateToWidth(" Enter submit · Esc/Ctrl+C cancel", safeWidth, ""),
+    const input = prompt === undefined ? ["Waiting for authentication..."] : [
+      terminalSafeText(prompt.message), this.textInput?.render(safeWidth)[0] ?? `${label}: ${display || "_"}`,
     ];
+    const instructions = [...this.instructions, ...(this.progress ? [this.progress] : [])]
+      .flatMap((line) => wrapTextWithAnsi(terminalSafeText(line), safeWidth));
+    const available = Math.max(0, this.getRows() - input.length - 8);
+    return renderAuthPanel([
+      terminalSafeText(this.title), "", ...instructions.slice(0, available), ...input,
+      "Enter submit · Esc/Ctrl+C cancel",
+    ], width);
   }
 
   invalidate(): void {}
@@ -364,11 +424,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   // Pi leaves clearOnShrink under the TUI/settings/environment default. Do not
   // force it here: forcing a main-screen full redraw clears scrollback and
   // moves the regular welcome stream back to the top of the terminal.
-  // A forced render resets pi-tui's differential-render state. That is safe
-  // in the alternate screen, where the next frame starts at a known origin,
-  // but it leaves stale rows behind on the main screen because the terminal
-  // cursor is already below the previous frame. Keep the previous frame for
-  // regular-mode updates while matching Pi's immediate fullscreen path.
   const requestTuiRender = (force = false): void => {
     tui.invalidate();
     if (force && tui instanceof TuiAltScreen) {
@@ -487,6 +542,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   let activeSelectorDispose: (() => void) | undefined;
   let activeSelectorDone: (() => void) | undefined;
   let activeSelectorRestorePreview: (() => void) | undefined;
+  let activeSelectorOverlay: OverlayHandle | undefined;
   let pendingPermissionApproval: (() => void) | undefined;
   let permissionApprovalTail: Promise<void> = Promise.resolve();
   let permissionApprovalGranted = false;
@@ -519,12 +575,18 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   const pasteImageLabel = pasteImageKey === "alt+v" ? "Alt+V" : "Ctrl+V";
 
   const header = new BrandSplashHeader({
-    version: "0.1.0",
+    logo: NAUSICAA_LOGO,
+    getModel: () => options.session.snapshot().model,
+    getWorkspace: () => options.session.workspace,
   });
   const headerContainer = new Container();
   documentContainer.addChild(headerContainer);
   documentContainer.addChild(transcript);
-  const transcriptViewport = new ScrollView(documentContainer, {
+  // Fullscreen keeps a one-cell breathing margin around the scrollable
+  // conversation. The ScrollView remains the primary viewport node; only its
+  // rendered child is inset so cursor and scroll bookkeeping stay intact.
+  const transcriptContent = new HorizontalInset(documentContainer, 1);
+  const transcriptViewport = new ScrollView(transcriptContent, {
     follow: "end",
     primary: true,
     scrollbar: "auto",
@@ -545,9 +607,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     { component: widgetContainerBelow, shrink: 1, minSize: 0 },
     { component: footerContainer, shrink: 1, minSize: 1 },
   ]);
+  const dockContent = new HorizontalInset(dock, 1);
   screen.addChild(transcriptViewport, { basis: 0, grow: 1, shrink: 1, minSize: 1 });
   if (tui instanceof TuiAltScreen) {
-    screen.addChild(dock, { basis: "auto", grow: 0, shrink: 1, minSize: 1 });
+    screen.addChild(dockContent, { basis: "auto", grow: 0, shrink: 1, minSize: 1 });
     tui.setLayoutRoot(screen);
   } else {
     tui.addChild(documentContainer);
@@ -589,6 +652,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     } else if (spec.name === "mode") {
       completion.getArgumentCompletions = (prefix) => commandArgumentCompletions(
         collaborationModeOptions(options.session.snapshot().collaborationMode),
+        prefix,
+      );
+    } else if (spec.name === "thinking") {
+      completion.getArgumentCompletions = (prefix) => commandArgumentCompletions(
+        ["default", ...options.session.getAvailableThinkingLevels()].map((value) => ({ value, label: value })),
         prefix,
       );
     } else if (spec.name === "theme") {
@@ -1965,7 +2033,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     pendingPermissionApproval?.();
     // A selector may have temporarily previewed a theme. Restore its committed
     // palette before waiting for queued submissions or stopping the renderer.
-    closeSelector(true);
+    cancelActiveSelector(true);
     finishPromise = (async () => {
       // A hidden `/login` prompt owns the active input stream. Cancel it
       // before draining submissions so SIGINT/SIGTERM/EOF can always settle
@@ -2010,7 +2078,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       // Let the mounted selector settle any awaiting Promise (provider/auth
       // selection, permissions, skills, etc.) before restoring editor focus.
       selector.handleInput("\x1b");
-      if (activeSelectorComponent === selector) closeSelector(true, selector);
+      if (activeSelectorComponent === selector) cancelActiveSelector(true, selector);
       return;
     }
     if (activeSecretInput !== undefined) {
@@ -2022,7 +2090,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     void finish(130);
   };
   process.once("SIGTERM", onSignal);
-  process.once("SIGINT", onSigint);
+  process.on("SIGINT", onSigint);
   process.stdin.once("end", onSignal);
 
   const writeStatus = (snapshot: SessionSnapshot): void => {
@@ -2036,6 +2104,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       "### Session",
       `- **Workspace:** \`${snapshot.workspace}\``,
       `- **Model:** \`${snapshot.model}\``,
+      `- **Thinking:** ${snapshot.thinkingLevel ?? "default (provider)"}`,
       `- **Run / Turn:** \`${snapshot.runId ?? "new"}\` / \`${snapshot.turnId ?? "idle"}\``,
       `- **State:** ${snapshot.status}; ${snapshot.collaborationMode} mode; Teto ${snapshot.tetoEnabled ? "on" : "off"}`,
       `- **Permissions:** ${snapshot.permissionProfile}; ${snapshot.allowWrite ? "write enabled" : "file writes off"}; ${shellStatus}; ${snapshot.allowNetwork ? "network enabled" : "network off"}`,
@@ -2122,51 +2191,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     options.auth?.modelPort.providerAuthTypes?.(provider) ?? ["api_key"]
   );
 
-  const authTypeLabel = (type: AuthType, provider: string): string => {
-    const info = providerInfos().find((candidate) => candidate.id === provider);
-    if (type === "oauth") {
-      return info?.oauthLoginLabel ?? info?.oauthName ?? "Browser/device sign-in (OAuth)";
-    }
-    return info?.apiKeyName ?? "API key";
-  };
-
-  const providerAuthStatus = async (
-    provider: ModelProviderInfo,
-    saved: ReadonlySet<string>,
-  ): Promise<string> => {
-    let auth: Awaited<ReturnType<AuthModelPort["checkAuth"]>>;
-    let checkFailed = false;
-    try {
-      auth = await options.auth!.modelPort.checkAuth(provider.id);
-    } catch {
-      checkFailed = true;
-      auth = undefined;
-    }
-    if (auth !== undefined) {
-      const source = auth.source?.trim().toLocaleLowerCase();
-      if (auth.type === "oauth" || source === "oauth") {
-        return "saved OAuth credential · auth unverified";
-      }
-      if (source === "stored credential") {
-        return "saved API key · auth unverified";
-      }
-      return `ready locally · ${auth.source ?? auth.type}`;
-    }
-    if (saved.has(provider.id)) {
-      return checkFailed
-        ? "saved credential · local check unavailable"
-        : "saved credential · auth unavailable";
-    }
-    const environment = inspectEnvironmentCredential(
-      provider.id,
-      options.auth?.environment ?? process.env,
-    );
-    if (environment.present) return "environment configured · auth unverified";
-    if (environment.partial) return "partial environment · setup incomplete";
-    if (checkFailed) return "local auth check unavailable";
-    return "not configured";
-  };
-
   const authProvider = (argument: string, commandName: "login" | "logout"): string => {
     if (argument.length > 0 && argument.split(/\s+/u).length !== 1) {
       throw new Error(`Usage: /${commandName} [provider]`);
@@ -2188,48 +2212,40 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     return provider;
   };
 
-  const selectLoginProvider = async (): Promise<string | undefined> => {
-    const providers = providerInfos()
-      // Dynamic providers may have no models until their first authenticated
-      // refresh (for example Radius), but they must remain selectable.
-      .filter((provider) => provider.authTypes.length > 0)
-      .sort((left, right) => left.name.localeCompare(right.name));
-    if (providers.length <= 1) return providers[0]?.id;
-    let saved = new Set<string>();
-    try {
-      saved = new Set((await options.auth!.credentialStore.list()).map((entry) => entry.providerId));
-    } catch {
-      // The selector remains useful even if the credential store is unavailable.
-    }
-    const status = new Map<string, string>();
-    await Promise.all(providers.map(async (provider) => {
-      status.set(provider.id, await providerAuthStatus(provider, saved));
-    }));
-    if (closing) return undefined;
-    return new Promise<string | undefined>((resolve) => {
+  const selectLoginProvider = async (
+    onlyProvider?: string,
+    viewState?: { query: string; current?: string; message?: string },
+  ): Promise<AuthProviderChoice | undefined> => {
+    const providers = providerInfos().filter((provider) => onlyProvider === undefined || provider.id === onlyProvider);
+    const states = new Map<string, AuthProviderState>();
+    const choices = authProviderChoices(providers, states);
+    return new Promise<AuthProviderChoice | undefined>((resolve) => {
       let settled = false;
-      const settle = (value: string | undefined): void => {
+      let selector!: AuthMenu;
+      const settle = (value: AuthProviderChoice | undefined): void => {
         if (settled) return;
         settled = true;
+        if (viewState !== undefined) {
+          viewState.query = selector.getQuery();
+          const current = selector.getSelectedValue();
+          if (current !== undefined) viewState.current = current;
+        }
         resolve(value);
       };
       showSelector((done) => {
-        const selector = new SelectorOverlay({
+        selector = new AuthMenu({
           title: "Providers",
-          subtitle: "Choose where to authenticate. Search by provider name or id.",
-          searchLabel: "Search providers",
-          options: providers.map((provider) => ({
-            value: provider.id,
-            label: `${provider.name} (${provider.id})`,
-            description: `${provider.modelCount} models · ${provider.authTypes.map((type) => authTypeLabel(type, provider.id)).join(" / ")} · ${status.get(provider.id) ?? "status unavailable"}`,
-          })),
+          subtitle: viewState?.message ?? "Connect with a subscription or API key.",
+          choices,
+          getRows: () => terminal.rows,
+          ...(viewState === undefined ? {} : { initialQuery: viewState.query, ...(viewState.current === undefined ? {} : { current: viewState.current }) }),
           onSelect: (value) => {
-            settle(value);
+            settle(choices.find((choice) => choice.value === value));
             done();
           },
           onCancel: () => {
-            done();
             settle(undefined);
+            done();
           },
         });
         return {
@@ -2237,53 +2253,31 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           focus: selector,
           dispose: () => settle(undefined),
         };
-      });
-    });
-  };
-
-  const selectLoginAuthType = async (
-    provider: string,
-    showChoice = true,
-  ): Promise<AuthType | undefined> => {
-    const authTypes = authTypesForProvider(provider);
-    if (authTypes.length <= 1) return authTypes[0];
-    // Keep the established one-provider `/login` shortcut ergonomic. Users
-    // can still select OAuth explicitly with `/login <provider> oauth`.
-    if (!showChoice) return authTypes.includes("api_key") ? "api_key" : authTypes[0];
-    const info = providerInfos().find((candidate) => candidate.id === provider);
-    return new Promise<AuthType | undefined>((resolve) => {
-      let settled = false;
-      const settle = (value: AuthType | undefined): void => {
-        if (settled) return;
-        settled = true;
-        resolve(value);
-      };
-      showSelector((done) => {
-        const selector = new SelectorOverlay({
-          title: "Sign in",
-          subtitle: `${info?.name ?? provider} supports more than one authentication method.`,
-          options: authTypes.map((type) => ({
-            value: type,
-            label: authTypeLabel(type, provider),
-            description: type === "oauth"
-              ? "Open a browser or device flow; no API key is entered"
-              : "Enter a provider key through a hidden prompt",
-          })),
-          onSelect: (value) => {
-            settle(value as AuthType);
-            done();
-          },
-          onCancel: () => {
-            done();
-            settle(undefined);
-          },
-        });
-        return {
-          component: selector,
-          focus: selector,
-          dispose: () => settle(undefined),
-        };
-      });
+      }, true);
+      // Render immediately; a slow credential helper must not block selection or Escape.
+      void (async () => {
+        try {
+          const saved = await options.auth!.credentialStore.list();
+          for (const credential of saved) states.set(credential.providerId, { savedType: credential.type, checked: false });
+        } catch { /* Status is optional; authentication remains available. */ }
+        if (settled || closing) return;
+        selector.setChoices(authProviderChoices(providers, states));
+        requestTuiRender();
+        await Promise.all(providers.map(async (provider) => {
+          const state: AuthProviderState = { ...states.get(provider.id), checked: true };
+          try {
+            const auth = await options.auth!.modelPort.checkAuth(provider.id);
+            if (auth !== undefined) state.auth = auth;
+          } catch { state.failed = true; }
+          const environment = inspectEnvironmentCredential(provider.id, options.auth?.environment ?? process.env);
+          if (environment.present) state.environment = "configured";
+          else if (environment.partial) state.environment = "partial";
+          states.set(provider.id, state);
+          if (settled || closing) return;
+          selector.setChoices(authProviderChoices(providers, states));
+          requestTuiRender();
+        }));
+      })();
     });
   };
 
@@ -2297,14 +2291,19 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const names = new Map(providerInfos().map((provider) => [provider.id, provider.name]));
     return new Promise<string | undefined>((resolve) => {
       showSelector((done) => {
-        const selector = new SelectorOverlay({
-          title: "Sign out",
-          searchLabel: "Search saved accounts",
-          options: credentials
+        const selector = new AuthMenu({
+          title: "Saved Credentials",
+          subtitle: "Choose a credential to remove.",
+          getRows: () => terminal.rows,
+          choices: credentials
             .map((credential) => ({
               value: credential.providerId,
-              label: names.get(credential.providerId) ?? credential.providerId,
-              description: `${credential.providerId} · ${credential.type === "oauth" ? "Saved OAuth credential" : "Saved API key"}`,
+              label: credential.type === "oauth"
+                ? providerInfos().find((info) => info.id === credential.providerId)?.oauthName ?? names.get(credential.providerId) ?? credential.providerId
+                : names.get(credential.providerId) ?? credential.providerId,
+              detail: credential.type === "oauth" ? "saved account" : "api key",
+              status: "saved",
+              searchText: credential.providerId,
             }))
             .sort((left, right) => left.label.localeCompare(right.label)),
           onSelect: (value) => {
@@ -2321,7 +2320,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           focus: selector,
           dispose: () => resolve(undefined),
         };
-      });
+      }, true);
     });
   };
 
@@ -2329,10 +2328,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const message = terminalSafeText(prompt.message);
     activeAuthPromptView?.setPrompt(prompt);
     if (prompt.type === "select") {
-      appendNotice(
-        `${message}\n${prompt.options.map((option, index) => `${index + 1}. ${terminalSafeText(option.label)}`).join("\n")}\nEnter a number or option id.`,
-        "info",
-      );
       return;
     }
     const inputHint = prompt.type === "secret" || prompt.type === "manual_code"
@@ -2342,6 +2337,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   };
 
   const renderAuthEvent = (event: AuthEvent): void => {
+    activeAuthPromptView?.setEvent(event);
+    requestTuiRender();
     switch (event.type) {
       case "auth_url":
         appendNotice(
@@ -2367,7 +2364,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
   };
 
-  const loginInTui = async (argument: string, openModels = true): Promise<boolean> => {
+  const loginInTui = async (argument: string, openModels = true, feedback?: { message?: string }): Promise<boolean> => {
     if (closing) return false;
     if (options.auth === undefined) {
       appendNotice(
@@ -2378,27 +2375,29 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
     const parts = argument.split(/\s+/u).filter(Boolean);
     if (parts.length > 2) throw new Error("Usage: /login [provider] [api-key|oauth]");
-    const providerWasExplicit = parts[0] !== undefined;
-    const multipleProviders = providerInfos().length > 1;
-    const provider = parts[0] === undefined
-      ? multipleProviders
-        ? await selectLoginProvider()
-        : authProvider("", "login")
-      : authProvider(parts[0], "login");
-    if (provider === undefined) {
-      appendNotice("Login cancelled.", "info");
+    if (parts.length === 0 && providerInfos().length > 1) {
+      const viewState: { query: string; current?: string; message?: string } = { query: "" };
+      while (!closing) {
+        const choice = await selectLoginProvider(undefined, viewState);
+        if (choice === undefined || closing) {
+          if (!closing) appendNotice("Login cancelled.", "info");
+          return false;
+        }
+        delete viewState.message;
+        if (await loginInTui(`${choice.provider} ${choice.authType}`, openModels, viewState)) return true;
+      }
       return false;
     }
+    const provider = authProvider(parts[0] ?? "", "login");
     const authTypes = authTypesForProvider(provider);
     if (authTypes.length === 0) {
       appendNotice(`No supported authentication method is available for ${provider}.`, "error");
       return false;
     }
-    const showAuthTypeChoice = providerWasExplicit || multipleProviders;
     const requestedAuthType = parts[1] === undefined
-      ? authTypes.length <= 1 || !showAuthTypeChoice
+      ? authTypes.length <= 1 || parts[0] === undefined
         ? authTypes[0]
-        : await selectLoginAuthType(provider)
+        : (await selectLoginProvider(provider))?.authType
       : normalizeAuthType(parts[1]);
     if (requestedAuthType === undefined) {
       appendNotice("Login cancelled.", "info");
@@ -2406,10 +2405,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
     if (closing) return false;
     const input = new TuiSecretInput();
-    const authPromptView = new TuiAuthPromptView();
+    const info = providerInfos().find((candidate) => candidate.id === provider);
+    const authPromptView = new TuiAuthPromptView(
+      requestedAuthType === "oauth" ? info?.oauthName ?? provider : info?.apiKeyName ?? provider,
+      () => terminal.rows,
+    );
     activeAuthPromptView = authPromptView;
     activeSecretInput = input;
-    mountEditorSlot(authPromptView, authPromptView);
+    const promptOverlay = tui.showOverlay(authPromptView, { anchor: "center", width: 78, maxHeight: "100%", margin: 1 });
     appendNotice(
       requestedAuthType === "oauth"
         ? `${provider} browser/device sign-in started. Follow the authorization instructions below.`
@@ -2427,6 +2430,37 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           ...(options.auth.environment === undefined ? {} : { environment: options.auth.environment }),
           onAuthEvent: renderAuthEvent,
           onAuthPrompt: renderAuthPrompt,
+          onAuthText: (prompt) => authPromptView.readText(prompt, input.signal, () => tui.renderNow()),
+          onAuthSelect: (prompt) => new Promise<string>((resolve, reject) => {
+            let settled = false;
+            let close: (() => void) | undefined;
+            const signals = [input.signal, prompt.signal].filter((signal): signal is AbortSignal => signal !== undefined);
+            const settle = (value?: string): void => {
+              if (settled) return;
+              settled = true;
+              for (const signal of signals) signal.removeEventListener("abort", cancel);
+              if (value === undefined) reject(new Error("Login cancelled"));
+              else resolve(value);
+            };
+            const cancel = (): void => { settle(); close?.(); };
+            for (const signal of signals) signal.addEventListener("abort", cancel, { once: true });
+            if (signals.some((signal) => signal.aborted)) { cancel(); return; }
+            showSelector((done) => {
+              close = done;
+              const selector = new AuthMenu({
+                title: prompt.message,
+                searchable: false,
+                getRows: () => terminal.rows,
+                choices: prompt.options.map((option) => ({
+                  value: option.id, label: option.label,
+                  ...(option.description === undefined ? {} : { detail: option.description }),
+                })),
+                onSelect: (value) => { settle(value); done(); },
+                onCancel: cancel,
+              });
+              return { component: selector, focus: selector, dispose: () => settle() };
+            }, true);
+          }),
           onAuthInput: (value) => {
             authPromptView.setValue(value);
             // Provider-owned text prompts can be submitted in the same input
@@ -2443,6 +2477,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       );
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
+      if (message !== "Login cancelled" && feedback !== undefined) feedback.message = `Login failed: ${oneLine(message)}`;
       appendNotice(
         message === "Login cancelled" ? "Login cancelled." : `Login failed: ${oneLine(message)}`,
         message === "Login cancelled" ? "info" : "error",
@@ -2451,11 +2486,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     } finally {
       if (activeSecretInput === input) activeSecretInput = undefined;
       if (activeAuthPromptView === authPromptView) activeAuthPromptView = undefined;
-      restoreEditorSlot();
+      promptOverlay.hide();
+      requestTuiRender();
     }
+    let modelRefreshFailed = false;
     try {
       await options.auth.refreshModels?.(provider);
     } catch (error: unknown) {
+      modelRefreshFailed = true;
       appendNotice(
         `Model catalog refresh failed for ${provider}: ${oneLine(error instanceof Error ? error.message : String(error))}. You can retry with --refresh-models.`,
         "warning",
@@ -2472,7 +2510,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     );
     if (!closing && openModels && options.session.snapshot().model === UNCONFIGURED_MODEL) {
       const hasModels = readModelOptions().some((option) => modelProviderOf(option.value) === provider);
-      if (hasModels) showModelSelector("", provider);
+      if (hasModels) showModelSelector("", provider, modelRefreshFailed ? "Catalog refresh failed; showing cached models" : undefined);
       else appendNotice(`No models are available for ${provider} yet. Retry with --refresh-models.`, "warning");
     }
     return !closing;
@@ -2595,7 +2633,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     editorContainer.clear();
     editorContainer.addChild(component);
     tui.setFocus(focus);
-    requestTuiRender();
+    // Pi requests the normal differential frame after replacing the child.
+    tui.requestRender();
   };
 
   const restoreEditorSlot = (): void => {
@@ -2612,11 +2651,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
    */
   function disposeActiveSelector(): void {
     const dispose = activeSelectorDispose;
+    const overlay = activeSelectorOverlay;
     activeSelectorToken = undefined;
     activeSelectorComponent = undefined;
     activeSelectorDispose = undefined;
     activeSelectorDone = undefined;
     activeSelectorRestorePreview = undefined;
+    activeSelectorOverlay = undefined;
+    overlay?.hide();
     dispose?.();
   }
 
@@ -2627,6 +2669,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       dispose?: () => void;
       restorePreview?: () => void;
     },
+    centered = false,
   ): void {
     const token = {};
     let dispose: (() => void) | undefined;
@@ -2634,12 +2677,20 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       // Match Pi's ordering: dispose first, then ignore stale completions.
       dispose?.();
       if (activeSelectorToken !== token) return;
+      const overlay = activeSelectorOverlay;
       activeSelectorToken = undefined;
       activeSelectorComponent = undefined;
       activeSelectorDispose = undefined;
       activeSelectorDone = undefined;
       activeSelectorRestorePreview = undefined;
-      restoreEditorSlot();
+      activeSelectorOverlay = undefined;
+      // Keep the editorContainer object and the original Editor instance.
+      // TuiBase.handleTerminalInput() schedules the immediate frame after the
+      // selector's callback returns, exactly as in Pi.
+      if (overlay !== undefined) {
+        overlay.hide();
+        requestTuiRender();
+      } else restoreEditorSlot();
     };
     const created = create(done);
     dispose = created.dispose;
@@ -2650,10 +2701,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     activeSelectorDispose = dispose;
     activeSelectorDone = done;
     activeSelectorRestorePreview = created.restorePreview;
-    mountEditorSlot(created.component, created.focus);
+    if (centered) {
+      activeSelectorOverlay = tui.showOverlay(created.component, { anchor: "center", width: 78, maxHeight: "100%", margin: 1 });
+    } else mountEditorSlot(created.component, created.focus);
   }
 
-  function closeSelector(
+  function cancelActiveSelector(
     restorePreview: boolean,
     expectedComponent?: Component,
   ): void {
@@ -2678,22 +2731,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     activeSelectorDone?.();
   }
 
-  // Compatibility adapter for the existing option builders. It still routes
-  // every selector through showSelector(), so there is one mount/restore path.
-  function mountSelector(
-    component: InteractiveSelector,
-    restorePreview: () => void = () => {},
-    dispose?: () => void,
-  ): void {
-    showSelector(() => ({
-      component,
-      focus: component,
-      ...(dispose === undefined ? {} : { dispose }),
-      restorePreview,
-    }));
-  }
-
-  const showModelSelector = (initialQuery = "", initialProvider = "all"): void => {
+  const showModelSelector = (initialQuery = "", initialProvider = "all", notice?: string): void => {
     const current = options.session.snapshot().model;
     const modelOptions = readModelOptions();
     const providerNames = new Map(providerInfos().map((provider) => [provider.id, provider.name]));
@@ -2712,60 +2750,72 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           : `Configured locally (${terminalSafeText(auth.source ?? auth.type)})`;
         return { ...option, description: [status, option.description].filter(Boolean).join(" · ") };
       }).sort((left, right) => Number(configured(right.value)) - Number(configured(left.value)));
-      const selector = new SelectorOverlay({
-        title: "Models",
-        searchLabel: "Search models",
-        subtitle: (visible) => `${visible.length} model${visible.length === 1 ? "" : "s"}${authStates === undefined ? "" : " · account access unverified"}`,
-        filters: [
-          ...(authStates === undefined ? [] : [{
-            key: "scope",
-            label: "Scope",
-            options: [{ value: "configured", label: "Configured" }, { value: "all", label: "All" }],
-            current: "configured",
-          }]),
-          ...(providerIds.length <= 1 ? [] : [{
-            key: "provider",
-            label: "Provider",
-            options: [
-              { value: "all", label: "All" },
-              ...providerIds.map((provider) => ({
-                value: provider,
-                label: provider === "default" ? "Local" : providerNames.get(provider) ?? provider,
-              })),
-            ],
-            current: initialProvider,
-          }]),
-        ],
-        filterOptions: (items, values) => items.filter((item) => (
-          (values.scope === "all" || configured(item.value))
-          && ((values.provider ?? initialProvider) === "all"
-            || modelProviderOf(item.value) === (values.provider ?? initialProvider))
-        )),
-        options: candidates,
-        ...(current === UNCONFIGURED_MODEL ? {} : { current }),
-        initialQuery: query,
-        onSelect: (value) => {
-          closeSelector(false, selector);
-          void applyModelSelection(value);
-        },
-        onCancel: () => closeSelector(true, selector),
-      });
-      mountSelector(selector);
+      showSelector((done) => {
+        const selector = new SelectorOverlay({
+          title: "Models",
+          presentation: "panel",
+          getRows: () => terminal.rows,
+          searchLabel: "Search models",
+          subtitle: (visible) => notice ?? `${visible.length} model${visible.length === 1 ? "" : "s"}${authStates === undefined ? "" : " · account access unverified"}`,
+          filters: [
+            ...(authStates === undefined ? [] : [{
+              key: "scope",
+              label: "Scope",
+              options: [{ value: "configured", label: "Configured" }, { value: "all", label: "All" }],
+              current: "configured",
+            }]),
+            ...(providerIds.length <= 1 ? [] : [{
+              key: "provider",
+              label: "Provider",
+              options: [
+                { value: "all", label: "All" },
+                ...providerIds.map((provider) => ({
+                  value: provider,
+                  label: provider === "default" ? "Local" : providerNames.get(provider) ?? provider,
+                })),
+              ],
+              current: initialProvider,
+            }]),
+          ],
+          filterOptions: (items, values) => items.filter((item) => (
+            (values.scope === "all" || configured(item.value))
+            && ((values.provider ?? initialProvider) === "all"
+              || modelProviderOf(item.value) === (values.provider ?? initialProvider))
+          )),
+          options: candidates,
+          ...(current === UNCONFIGURED_MODEL ? {} : { current }),
+          initialQuery: query,
+          onSelect: (value) => {
+            done();
+            void applyModelSelection(value);
+          },
+          onCancel: () => done(),
+        });
+        return { component: selector, focus: selector };
+      }, true);
     };
     if (options.auth === undefined) {
       show();
       return;
     }
     const authModel = options.auth.modelPort;
-    const loading = new SelectorOverlay({
-      title: "Models",
-      searchLabel: "Checking local credentials...",
-      options: [],
-      initialQuery,
-      onSelect: () => {},
-      onCancel: () => closeSelector(true, loading),
-    });
-    mountSelector(loading);
+    let loading: SelectorOverlay | undefined;
+    showSelector((done) => {
+      const selector = new SelectorOverlay({
+        title: "Models",
+        presentation: "panel",
+        getRows: () => terminal.rows,
+        searchLabel: "Checking local credentials...",
+        options: [],
+        initialQuery,
+        onSelect: () => {},
+        onCancel: () => done(),
+      });
+      loading = selector;
+      return { component: selector, focus: selector };
+    }, true);
+    if (loading === undefined) return;
+    const mountedLoading = loading;
     // Auth discovery must not hold the submission queue or reopen a dismissed picker.
     void Promise.all(providerIds.map(async (provider): Promise<[string, AuthState]> => {
       try {
@@ -2774,11 +2824,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         return [provider, null];
       }
     })).then((states) => {
-      if (closing || activeSelectorComponent !== loading) return;
-      show(new Map(states), loading.getSearchInput().getValue());
+      if (closing || activeSelectorComponent !== mountedLoading) return;
+      show(new Map(states), mountedLoading.getSearchInput().getValue());
     }).catch(() => {
-      if (closing || activeSelectorComponent !== loading) return;
-      closeSelector(true, loading);
+      if (closing || activeSelectorComponent !== mountedLoading) return;
+      cancelActiveSelector(true, mountedLoading);
       appendNotice("Model authentication status could not be loaded. Retry /model.", "warning");
     });
   };
@@ -2800,6 +2850,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         }
       }
       if (closing) return;
+      const previousThinking = options.session.thinkingLevel;
       const result = await options.session.selectModel(value);
       if (!result.changed) {
         appendNotice(`Already using model ${result.model}.`, "info");
@@ -2811,6 +2862,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           : `Main model set to ${result.model}. The next request will use it.`,
         "success",
       );
+      if (previousThinking !== undefined && options.session.thinkingLevel === undefined) {
+        appendNotice(`Thinking returned to provider default; ${result.model} does not support ${previousThinking}.`, "info");
+      }
       try {
         await options.auth?.onChanged?.();
       } catch {
@@ -2849,23 +2903,63 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
   };
 
+  const applyThinkingLevel = async (value: string): Promise<void> => {
+    const level = value === "default" ? undefined : options.session.getAvailableThinkingLevels().find((entry) => entry === value);
+    if (value !== "default" && level === undefined) {
+      throw new Error(`Unsupported thinking level for this model. Available: ${["default", ...options.session.getAvailableThinkingLevels()].join(", ")}`);
+    }
+    const result = await options.session.setThinkingLevel(level);
+    appendNotice(`Thinking set to ${level ?? "provider default"}.${result.activeRequestUnaffected ? " The current request is unchanged; subsequent requests use this setting." : ""}`, "success");
+  };
+
+  const showThinkingSelector = (): void => {
+    if (options.session.model === UNCONFIGURED_MODEL) {
+      appendNotice("Choose a model with /model first.", "warning");
+      return;
+    }
+    const levels = options.session.getAvailableThinkingLevels();
+    showSelector((done) => {
+      const menu = new AuthMenu({
+        title: "Thinking",
+        subtitle: options.session.model,
+        searchable: false,
+        getRows: () => terminal.rows,
+        current: options.session.thinkingLevel ?? "default",
+        choices: ["default", ...levels].map((value) => ({
+          value,
+          label: value === "default" ? "Provider default" : value,
+          detail: value === "default" && levels.length === 0 ? "No adjustable reasoning levels" : "",
+          status: value === (options.session.thinkingLevel ?? "default") ? "current" : "",
+        })),
+        onSelect: (value) => {
+          done();
+          void applyThinkingLevel(value).catch((error: unknown) => appendNotice(error instanceof Error ? error.message : String(error), "error"));
+        },
+        onCancel: done,
+      });
+      return { component: menu, focus: menu };
+    }, true);
+  };
+
   const showPermissionSelector = (): void => {
     const current = options.session.snapshot().permissionProfile;
-    const selector = new SelectorOverlay({
-      title: "Permissions",
-      subtitle: "Choose the capability boundary for future tool calls.",
-      options: permissionProfileOptions(
+    showSelector((done) => {
+      const selector = new SelectorOverlay({
+        title: "Permissions",
+        subtitle: "Choose the capability boundary for future tool calls.",
+        options: permissionProfileOptions(
+          current,
+          options.session.snapshot().workspaceBashAvailability,
+        ),
         current,
-        options.session.snapshot().workspaceBashAvailability,
-      ),
-      current,
-      onSelect: (value) => {
-        closeSelector(false, selector);
-        void applyPermissionProfile(value);
-      },
-      onCancel: () => closeSelector(true, selector),
+        onSelect: (value) => {
+          done();
+          void applyPermissionProfile(value);
+        },
+        onCancel: () => done(),
+      });
+      return { component: selector, focus: selector };
     });
-    mountSelector(selector);
   };
 
   const applyCollaborationMode = async (value: string): Promise<void> => {
@@ -2892,18 +2986,20 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
 
   const showCollaborationModeSelector = (): void => {
     const current = options.session.snapshot().collaborationMode;
-    const selector = new SelectorOverlay({
-      title: "Mode",
-      subtitle: "Default can act; Plan investigates read-only and proposes the work.",
-      options: collaborationModeOptions(current),
-      current,
-      onSelect: (value) => {
-        closeSelector(false, selector);
-        void applyCollaborationMode(value);
-      },
-      onCancel: () => closeSelector(true, selector),
+    showSelector((done) => {
+      const selector = new SelectorOverlay({
+        title: "Mode",
+        subtitle: "Default can act; Plan investigates read-only and proposes the work.",
+        options: collaborationModeOptions(current),
+        current,
+        onSelect: (value) => {
+          done();
+          void applyCollaborationMode(value);
+        },
+        onCancel: () => done(),
+      });
+      return { component: selector, focus: selector };
     });
-    mountSelector(selector);
   };
 
   const applyThemeChoice = (choice: ThemeChoice): void => {
@@ -2929,24 +3025,29 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       );
       tui.invalidate();
     };
-    const selector = new SelectorOverlay({
-      title: "Theme",
-      subtitle: "Preview with Up/Down, Enter to keep, Esc to restore.",
-      options: themeSelectorOptions(themePreference),
-      current: themePreference,
-      onPreview: (value) => {
-        if (value !== "auto" && value !== "light" && value !== "dark") return;
-        setNausicaaColorScheme(value === "auto" ? detectedColorScheme : value);
-        requestTuiRender(true);
-      },
-      onSelect: (value) => {
-        const choice = parseThemeChoice(value);
-        closeSelector(false, selector);
-        applyThemeChoice(choice);
-      },
-      onCancel: () => closeSelector(true, selector),
+    showSelector((done) => {
+      const selector = new SelectorOverlay({
+        title: "Theme",
+        subtitle: "Preview with Up/Down, Enter to keep, Esc to restore.",
+        options: themeSelectorOptions(themePreference),
+        current: themePreference,
+        onPreview: (value) => {
+          if (value !== "auto" && value !== "light" && value !== "dark") return;
+          setNausicaaColorScheme(value === "auto" ? detectedColorScheme : value);
+          requestTuiRender(true);
+        },
+        onSelect: (value) => {
+          const choice = parseThemeChoice(value);
+          done();
+          applyThemeChoice(choice);
+        },
+        onCancel: () => {
+          restorePreview();
+          done();
+        },
+      });
+      return { component: selector, focus: selector, restorePreview };
     });
-    mountSelector(selector, restorePreview);
   };
 
   const switchSession = async (runId: string): Promise<boolean> => {
@@ -3053,23 +3154,25 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const selectionByValue = new Map(
       selectorOptions.map((option) => [option.value, parseWorkspaceTreeSelection(option.value)]),
     );
-    const selector = new SelectorOverlay({
-      title: "Session tree",
-      searchLabel: "Type to search",
-      subtitle: "Select a Run to attach, or a checkpoint to fork from that history point.",
-      options: selectorOptions,
-      ...(snapshot.runId === undefined ? {} : { current: snapshot.runId }),
-      onSelect: (value) => {
-        closeSelector(false, selector);
-        const selection = selectionByValue.get(value);
-        if (selection === undefined) return;
-        void navigateWorkspaceTreeSelection(selection).catch((error: unknown) => {
-          appendNotice(error instanceof Error ? error.message : String(error), "error");
-        });
-      },
-      onCancel: () => closeSelector(true, selector),
+    showSelector((done) => {
+      const selector = new SelectorOverlay({
+        title: "Session tree",
+        searchLabel: "Type to search",
+        subtitle: "Select a Run to attach, or a checkpoint to fork from that history point.",
+        options: selectorOptions,
+        ...(snapshot.runId === undefined ? {} : { current: snapshot.runId }),
+        onSelect: (value) => {
+          done();
+          const selection = selectionByValue.get(value);
+          if (selection === undefined) return;
+          void navigateWorkspaceTreeSelection(selection).catch((error: unknown) => {
+            appendNotice(error instanceof Error ? error.message : String(error), "error");
+          });
+        },
+        onCancel: () => done(),
+      });
+      return { component: selector, focus: selector };
     });
-    mountSelector(selector);
   };
 
   const navigateWorkspaceTreeSelection = async (
@@ -3137,43 +3240,45 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         current: "updated",
       },
     ];
-    const selector = new SelectorOverlay({
-      title: "Resume a previous session",
-      // Codex keeps this surface quiet: the title, search, and facets explain
-      // the operation without a second prose subtitle.
-      searchLabel: "Type to search",
-      filters,
-      options: selectorOptions,
-      filterOptions: (options: readonly SelectorOption[], values: Readonly<Record<string, string>>) => {
-        const status = values.status ?? "active";
-        const selected = options.filter((option) => {
-          const run = runById.get(option.value);
-          if (run === undefined || status === "all") return run !== undefined;
-          const archived = run.status === "completed"
-            || run.status === "failed"
-            || run.status === "cancelled";
-          return status === "archived" ? archived : !archived;
-        });
-        const sort = values.sort ?? "updated";
-        return [...selected].sort((left, right) => {
-          const leftRun = runById.get(left.value);
-          const rightRun = runById.get(right.value);
-          if (leftRun === undefined || rightRun === undefined) return 0;
-          const leftTime = sort === "created" ? leftRun.createdAt : leftRun.updatedAt;
-          const rightTime = sort === "created" ? rightRun.createdAt : rightRun.updatedAt;
-          return rightTime.localeCompare(leftTime) || rightRun.runId.localeCompare(leftRun.runId);
-        });
-      },
-      ...(snapshot.runId === undefined ? {} : { current: snapshot.runId }),
-      onSelect: (value) => {
-        closeSelector(false, selector);
-        void switchSession(value).catch((error: unknown) => {
-          appendNotice(error instanceof Error ? error.message : String(error), "error");
-        });
-      },
-      onCancel: () => closeSelector(true, selector),
+    showSelector((done) => {
+      const selector = new SelectorOverlay({
+        title: "Resume a previous session",
+        // Codex keeps this surface quiet: the title, search, and facets explain
+        // the operation without a second prose subtitle.
+        searchLabel: "Type to search",
+        filters,
+        options: selectorOptions,
+        filterOptions: (options: readonly SelectorOption[], values: Readonly<Record<string, string>>) => {
+          const status = values.status ?? "active";
+          const selected = options.filter((option) => {
+            const run = runById.get(option.value);
+            if (run === undefined || status === "all") return run !== undefined;
+            const archived = run.status === "completed"
+              || run.status === "failed"
+              || run.status === "cancelled";
+            return status === "archived" ? archived : !archived;
+          });
+          const sort = values.sort ?? "updated";
+          return [...selected].sort((left, right) => {
+            const leftRun = runById.get(left.value);
+            const rightRun = runById.get(right.value);
+            if (leftRun === undefined || rightRun === undefined) return 0;
+            const leftTime = sort === "created" ? leftRun.createdAt : leftRun.updatedAt;
+            const rightTime = sort === "created" ? rightRun.createdAt : rightRun.updatedAt;
+            return rightTime.localeCompare(leftTime) || rightRun.runId.localeCompare(leftRun.runId);
+          });
+        },
+        ...(snapshot.runId === undefined ? {} : { current: snapshot.runId }),
+        onSelect: (value) => {
+          done();
+          void switchSession(value).catch((error: unknown) => {
+            appendNotice(error instanceof Error ? error.message : String(error), "error");
+          });
+        },
+        onCancel: () => done(),
+      });
+      return { component: selector, focus: selector };
     });
-    mountSelector(selector);
   };
 
   const refreshEdgeSelection = async (): Promise<void> => {
@@ -3225,22 +3330,26 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       appendNotice(snapshot.stale ? "No fresh Skills; the displayed resource snapshot is stale." : "No Skills discovered.", "info");
       return;
     }
-    const selector = new SelectorOverlay({
-      title: "Skills",
-      searchLabel: "Search Skills",
-      ...(snapshot.stale ? { subtitle: "Last available catalog; resource refresh did not complete." } : {}),
-      options: skillSelectorOptions(snapshot.skills),
-      onSelect: (value) => {
-        const skill = snapshot.skills.find((entry) => entry.id === value);
-        if (skill === undefined) return;
-        closeSelector(false, selector);
-        const draft = editor.getExpandedText();
-        editor.setText(`/skill:${skill.name} ${draft}`);
-        requestTuiRender();
-      },
-      onCancel: () => closeSelector(true, selector),
-    });
-    mountSelector(selector);
+    showSelector((done) => {
+      const selector = new SelectorOverlay({
+        title: "Skills",
+        presentation: "panel",
+        getRows: () => terminal.rows,
+        searchLabel: "Search Skills",
+        ...(snapshot.stale ? { subtitle: "Last available catalog; resource refresh did not complete." } : {}),
+        options: skillSelectorOptions(snapshot.skills),
+        onSelect: (value) => {
+          const skill = snapshot.skills.find((entry) => entry.id === value);
+          if (skill === undefined) return;
+          done();
+          const draft = editor.getExpandedText();
+          editor.setText(`/skill:${skill.name} ${draft}`);
+          tui.requestRender();
+        },
+        onCancel: () => done(),
+      });
+      return { component: selector, focus: selector };
+    }, true);
   };
 
   const handleCommand = async (
@@ -3314,8 +3423,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             await refreshEdgeSelection();
             break;
           }
-          if (argument.length > 0) throw new Error("Usage: /mcp [refresh]");
-          appendBlock(new Markdown(formatMcpStatus(readEdgeStatus()), 1, 0, nausicaaMarkdownTheme));
+          if (argument === "status" || options.mcp === undefined) {
+            if (argument.length > 0 && argument !== "status") throw new Error("Usage: /mcp [status|refresh]");
+            appendBlock(new Markdown(formatMcpStatus(readEdgeStatus()), 1, 0, nausicaaMarkdownTheme));
+            break;
+          }
+          if (argument.length > 0) throw new Error("Usage: /mcp [status|refresh]");
+          showSelector((done) => {
+            const menu = new McpMenu({ controller: options.mcp!, getRows: () => terminal.rows, onCancel: done, requestRender: requestTuiRender });
+            return { component: menu, focus: menu, dispose: () => menu.dispose() };
+          }, true);
           break;
         case "/skills": {
           const parts = argument.split(/\s+/u).filter(Boolean);
@@ -3390,6 +3507,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             break;
           }
           await applyPermissionProfile(argument);
+          break;
+        }
+        case "/thinking": {
+          if (argument.length === 0) showThinkingSelector();
+          else await applyThinkingLevel(argument.toLowerCase());
           break;
         }
         case "/mode": {
@@ -3722,7 +3844,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const isBashCommand = value.startsWith("!");
     if (!isInteractiveSlashCommand(value) && !isBashCommand && options.session.snapshot().model === UNCONFIGURED_MODEL) {
       editor.setText(value);
-      appendNotice("Choose a model with /model before sending a task. Local setup status is shown at startup.", "warning");
+      appendNotice("Choose a model with /model before sending a task.", "warning");
       return Promise.resolve();
     }
     if (submittedImages.length > 0 && options.session.modelCapabilities().imageInput === "unsupported") {
@@ -3791,6 +3913,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
   };
   tui.addInputListener((data) => {
+    if (activeSelectorComponent !== undefined) return undefined;
+    if (activeAuthPromptView?.acceptsText && !matchesKey(data, "ctrl+c") && data !== "\x1b") return undefined;
     if (activeSecretInput !== undefined) {
       if (matchesKey(data, "ctrl+c") || data === "\x1b") {
         activeSecretInput.cancel();
@@ -3902,19 +4026,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   } catch {
     // Some terminals do not answer OSC 10/11 queries; the light palette remains valid.
   }
-  // Pi mounts its expandable startup header after the renderer has produced
-  // the first empty composer frame. Keeping that ordering matters in regular
-  // mode: the introduction becomes scrollback content instead of a permanent
-  // banner that pushes the composer down from the moment the process starts.
-  headerContainer.addChild(new Spacer(1));
+  // Mount the splash after the first empty frame, as Pi does. Its own top
+  // padding supplies the single blank row above the mark.
   headerContainer.addChild(header);
   headerContainer.addChild(new Spacer(1));
   requestTuiRender();
   await refreshQueue();
   if (keybindingsWarning !== undefined) appendNotice(keybindingsWarning, "warning");
   if (options.showStartupSetup === true || options.startupModelMissing === true) {
-    // Setup status is a startup diagnostic, not a public slash command.
-    showSetup();
+    // Keep the splash minimal. Setup details remain available through /setup;
+    // first-run sessions only need the model selector in the opening frame.
     if (options.startupModelMissing === true) showModelSelector();
   }
   if (options.resumeOnStart === true) {

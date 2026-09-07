@@ -11,6 +11,7 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 
+import { VERSION } from "../version.js";
 import type {
   DaemonRemoteSessionState,
   SessionCompactionNotice,
@@ -24,6 +25,8 @@ import {
   agentMessagePresentationFromTranscript,
   AssistantMessageBlock,
   BrandSplashHeader,
+  HorizontalInset,
+  NAUSICAA_LOGO,
   getNausicaaColorScheme,
   NoticeBlock,
   parseExternalA2APrompt,
@@ -91,12 +94,15 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
     }
   };
   const header = new BrandSplashHeader({
-    version: "0.1.0",
+    version: VERSION,
+    logo: NAUSICAA_LOGO,
+    getModel: () => options.session.snapshot().model,
+    getWorkspace: () => options.session.workspace,
   });
   const headerContainer = new Container();
   documentContainer.addChild(headerContainer);
   documentContainer.addChild(transcript);
-  const viewport = new ScrollView(documentContainer, {
+  const viewport = new ScrollView(new HorizontalInset(documentContainer, 1), {
     follow: "end",
     primary: true,
     scrollbar: "auto",
@@ -128,9 +134,10 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
     { component: widgetContainerAbove, shrink: 1, minSize: 0 },
     { component: footerContainer, shrink: 1, minSize: 1 },
   ]);
+  const dockContent = new HorizontalInset(dock, 1);
   screen.addChild(viewport, { basis: 0, grow: 1, shrink: 1, minSize: 1 });
   if (tui instanceof TuiAltScreen) {
-    screen.addChild(dock, { basis: "auto", grow: 0, shrink: 1, minSize: 1 });
+    screen.addChild(dockContent, { basis: "auto", grow: 0, shrink: 1, minSize: 1 });
     tui.setLayoutRoot(screen);
   } else {
     tui.addChild(documentContainer);
@@ -320,7 +327,6 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
     } catch {
       // Not every terminal answers OSC color queries.
     }
-    headerContainer.addChild(new Spacer(1));
     headerContainer.addChild(header);
     headerContainer.addChild(new Spacer(1));
     requestTuiRender();

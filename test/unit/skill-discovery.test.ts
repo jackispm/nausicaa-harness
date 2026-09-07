@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  DEFAULT_BUNDLED_SKILL_SOURCE_ID,
   DEFAULT_LOCAL_SKILL_ROOTS,
   DEFAULT_LOCAL_SKILL_SOURCE_ID,
   planCliSkillDiscovery,
@@ -11,6 +12,7 @@ import {
 import { createConfiguredEdgeComposition } from "../../src/config/edge-factory.js";
 import type { ResolvedSettings } from "../../src/config/settings.js";
 import { createSkillsEdgeAdapter } from "../../src/mowe/edges/skills.js";
+import { createBundledSkillsEdgeAdapter } from "../../src/mowe/edges/bundled-skills.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import {
   createRegistryEdgeTurnSnapshotProvider,
@@ -69,6 +71,7 @@ describe("CLI Skill discovery policy", () => {
         enabled: true,
       }),
       expect.objectContaining({ sourceId: "docs", type: "mcp", enabled: false }),
+      expect.objectContaining({ sourceId: DEFAULT_BUNDLED_SKILL_SOURCE_ID, type: "skill", enabled: true }),
     ]);
   });
 
@@ -92,21 +95,24 @@ describe("CLI Skill discovery policy", () => {
     }), { cliEdgesEnabled: false });
 
     expect(plan.localSkillSourceId).toBeUndefined();
+    expect(plan.bundledSkillSourceId).toBeUndefined();
     expect(plan.edges.enabled).toBe(false);
     expect(plan.edges.sources).toEqual([
       expect.objectContaining({ sourceId: "docs", enabled: false }),
     ]);
   });
 
-  it("does not duplicate the implicit source when an explicit Skill source is configured", () => {
+  it("keeps bundled fallbacks when an explicit Skill source replaces project discovery", () => {
     const plan = planCliSkillDiscovery(settings({
       enabled: true,
       sources: [{ sourceId: "team-skills", type: "skill", location: "team-skills" }],
     }));
 
     expect(plan.localSkillSourceId).toBeUndefined();
+    expect(plan.bundledSkillSourceId).toBe(DEFAULT_BUNDLED_SKILL_SOURCE_ID);
     expect(plan.edges.sources).toEqual([
       expect.objectContaining({ sourceId: "team-skills", type: "skill" }),
+      expect.objectContaining({ sourceId: DEFAULT_BUNDLED_SKILL_SOURCE_ID, type: "skill" }),
     ]);
   });
 
@@ -118,6 +124,18 @@ describe("CLI Skill discovery policy", () => {
     expect(plan.localSkillSourceId).toBeUndefined();
     expect(plan.edges.sources).toEqual([
       expect.objectContaining({ sourceId: DEFAULT_LOCAL_SKILL_SOURCE_ID, type: "mcp" }),
+      expect.objectContaining({ sourceId: DEFAULT_BUNDLED_SKILL_SOURCE_ID, type: "skill" }),
+    ]);
+  });
+
+  it("does not replace a configured source using the bundled source id", () => {
+    const plan = planCliSkillDiscovery(settings({
+      sources: [{ sourceId: DEFAULT_BUNDLED_SKILL_SOURCE_ID, type: "skill", location: "custom-skills" }],
+    }));
+
+    expect(plan.bundledSkillSourceId).toBeUndefined();
+    expect(plan.edges.sources).toEqual([
+      expect.objectContaining({ sourceId: DEFAULT_BUNDLED_SKILL_SOURCE_ID, location: "custom-skills" }),
     ]);
   });
 
@@ -138,7 +156,9 @@ describe("CLI Skill discovery policy", () => {
       workspace,
       settings: plan.edges,
       constructors: {
-        skill: (source) => createSkillsEdgeAdapter({
+        skill: (source) => source.sourceId === plan.bundledSkillSourceId
+          ? createBundledSkillsEdgeAdapter({ sourceId: source.sourceId })
+          : createSkillsEdgeAdapter({
           sourceId: source.sourceId,
           roots: source.sourceId === DEFAULT_LOCAL_SKILL_SOURCE_ID
             ? plan.localSkillRoots
@@ -148,12 +168,15 @@ describe("CLI Skill discovery policy", () => {
       startupRefresh: true,
     });
     try {
-      expect(composition.snapshot().contextContributions).toEqual([
+      expect(composition.snapshot().contextContributions).toEqual(expect.arrayContaining([
         expect.objectContaining({
           sourceType: "skill",
           name: "review-code",
           description: "Review project changes",
         }),
+      ]));
+      expect(composition.snapshot().contextContributions.map((item) => item.name).sort()).toEqual([
+        "code-review", "codebase-map", "review-code", "task-plan",
       ]);
       expect(composition.snapshot().tools).toEqual([]);
     } finally {
@@ -179,7 +202,9 @@ describe("CLI Skill discovery policy", () => {
       workspace,
       settings: plan.edges,
       constructors: {
-        skill: (source) => createSkillsEdgeAdapter({
+        skill: (source) => source.sourceId === plan.bundledSkillSourceId
+          ? createBundledSkillsEdgeAdapter({ sourceId: source.sourceId })
+          : createSkillsEdgeAdapter({
           sourceId: source.sourceId,
           roots: source.sourceId === DEFAULT_LOCAL_SKILL_SOURCE_ID
             ? plan.localSkillRoots

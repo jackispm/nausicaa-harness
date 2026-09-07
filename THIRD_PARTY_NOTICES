@@ -15,6 +15,10 @@ The thinkingRecap helper in src/cli/tui-components.ts minimally adapts
 packages/coding-agent/src/modes/interactive/components/assistant-message.ts
 from the same Prime Agent commit
 7787f07415d843b9a800f6a4720e0c739bd608e5.
+The centered authentication menu in src/cli/auth-menu.ts minimally adapts
+OAuthSelector, model-selector panel rows, and MenuPanel/MenuRow from Prime Agent 0.7.2 at that same
+commit. Provider authentication and credential storage remain pi-ai and
+Nausicaa responsibilities; Prime's AuthStorage is not ported.
 The queued-input browse/edit state machine in src/cli/queue-selection.ts
 minimally adapts packages/coding-agent/src/modes/interactive/queue-selection.ts
 from that same commit; durable mutation and recovery remain Nausicaa Ledger
@@ -31,6 +35,20 @@ resource-loader.ts, audited at commit
 instruction contract; Pi's extension/package resource framework and global
 agent directory are intentionally not ported. Canonical-path checks, no-follow
 reads, bounded sizes, request-time reload, and CAS/manifest identity are local.
+
+The data-only presets in assets/skills are adapted from these MIT sources:
+- codebase-map: Pi's packages/coding-agent/examples/extensions/subagent/agents/scout.md,
+  commit 1defa151e0c1dac87d38a2d0ac09d67f817b30f9, Copyright (c) 2025 Mario Zechner.
+- task-plan: Prime Agent's packages/coding-agent/examples/extensions/subagent/agents/planner.md,
+  commit 7787f07415d843b9a800f6a4720e0c739bd608e5, Copyright (c) 2025 Mario Zechner
+  and Copyright (c) 2026 Prime Intellect.
+- code-review: DeepSeek Harness's .agents/skills/dsh-code-review/SKILL.md,
+  commit b150a551b8d465e31e418e1b2eaf5e79bbb7d28e, Copyright (c) 2026 DeepSeek,
+  plus Pi's packages/coding-agent/examples/extensions/subagent/agents/reviewer.md
+  at the Pi commit above, Copyright (c) 2025 Mario Zechner.
+Upstream-only runtime APIs, tool/model bindings, and repository-specific paths
+are omitted. Exact adaptations are recorded in each SKILL.md and
+docs/builtin-skills.md; the full MIT notice also ships in assets/skills/LICENSE.
 
 The workspace Bash sandbox's Seatbelt/bubblewrap provider shape, functional
 probe, and fail-closed runner selection minimally adapt DeepSeek Harness's

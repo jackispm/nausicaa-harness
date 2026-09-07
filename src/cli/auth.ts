@@ -96,6 +96,10 @@ export interface UtilityCommandDependencies {
   readonly onAuthEvent?: (event: AuthEvent) => void;
   /** Render provider-owned prompt metadata before reading the input stream. */
   readonly onAuthPrompt?: (prompt: AuthPrompt) => void;
+  /** Choose a provider-owned option by its exact id without reading raw input. */
+  readonly onAuthSelect?: (prompt: Extract<AuthPrompt, { type: "select" }>) => Promise<string>;
+  /** Edit a non-secret provider field without using the raw secret reader. */
+  readonly onAuthText?: (prompt: Extract<AuthPrompt, { type: "text" }>) => Promise<string>;
   /** Render non-secret prompt input without ever receiving a secret value. */
   readonly onAuthInput?: (value: string, prompt: AuthPrompt) => void;
   /** Render secret input progress without receiving the secret itself. */
@@ -315,12 +319,13 @@ async function runConfigCommand(
 function createSecretInteraction(
   input: SecretInput,
   output: Output,
-  callbacks: Pick<UtilityCommandDependencies, "onAuthEvent" | "onAuthPrompt" | "onAuthInput" | "onAuthSecretInput"> = {},
+  callbacks: Pick<UtilityCommandDependencies, "onAuthEvent" | "onAuthPrompt" | "onAuthSelect" | "onAuthText" | "onAuthInput" | "onAuthSecretInput"> = {},
   provider?: string,
 ) {
   return {
     ...(input.signal === undefined ? {} : { signal: input.signal }),
     prompt: async (prompt: AuthPrompt): Promise<string> => {
+      if (input.signal?.aborted || prompt.signal?.aborted) throw new Error("Login cancelled");
       const displayPrompt = prompt.type === "select" && provider === "amazon-bedrock"
         ? {
             ...prompt,
@@ -339,6 +344,12 @@ function createSecretInteraction(
       }
       callbacks.onAuthPrompt?.(displayPrompt);
       if (displayPrompt.type === "select") {
+        if (callbacks.onAuthSelect !== undefined) {
+          const answer = await readAuthCallback(displayPrompt, callbacks.onAuthSelect, input.signal);
+          const matching = displayPrompt.options.find((option) => option.id === answer);
+          if (matching !== undefined) return matching.id;
+          throw new Error("Invalid authentication selection");
+        }
         const options = displayPrompt.options
           .map((option, index) => `${index + 1}. ${option.label}${option.description === undefined ? "" : ` - ${option.description}`}`)
           .join("\n");
@@ -350,13 +361,19 @@ function createSecretInteraction(
           "Selection cannot be empty",
           { hidden: false, onValueChange: (value) => callbacks.onAuthInput?.(value, prompt) },
         );
-        const numeric = Number.parseInt(answer, 10);
+        const numeric = /^\d+$/.test(answer) ? Number(answer) : Number.NaN;
         if (Number.isSafeInteger(numeric) && numeric >= 1 && numeric <= displayPrompt.options.length) {
           return displayPrompt.options[numeric - 1]!.id;
         }
         const matching = displayPrompt.options.find((option) => option.id === answer);
         if (matching !== undefined) return matching.id;
         throw new Error("Invalid authentication selection");
+      }
+      if (prompt.type === "text" && callbacks.onAuthText !== undefined) {
+        const answer = await readAuthCallback(prompt, callbacks.onAuthText, input.signal);
+        if (answer.length > MAX_SECRET_INPUT_CHARS) throw new Error("Input is too long");
+        if (answer.trim().length === 0) throw new Error("Input cannot be empty");
+        return answer.trim();
       }
       return readPromptValue(
         prompt.message,
@@ -408,6 +425,32 @@ function createSecretInteraction(
       }
     },
   };
+}
+
+async function readAuthCallback<Prompt extends AuthPrompt>(
+  prompt: Prompt,
+  read: (prompt: Prompt) => Promise<string>,
+  inputSignal: AbortSignal | undefined,
+): Promise<string> {
+  const signal = AbortSignal.any(
+    [inputSignal, prompt.signal].filter((value): value is AbortSignal => value !== undefined),
+  );
+  if (signal.aborted) throw new Error("Login cancelled");
+  let onAbort: () => void = () => {};
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new Error("Login cancelled"));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    const answer = await Promise.race([cancelled, Promise.resolve().then(() => {
+      if (signal.aborted) throw new Error("Login cancelled");
+      return read(prompt);
+    })]);
+    if (signal.aborted) throw new Error("Login cancelled");
+    return answer;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function isConfigCommand(

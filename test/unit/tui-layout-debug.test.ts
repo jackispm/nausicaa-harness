@@ -69,7 +69,7 @@ describe("debug prompt layout", () => {
     try {
       const running = runInteractive({ session, terminal, forceAltScreen: true });
       await terminal.started;
-      await waitFor(() => stripTerminalSequences(terminal.output.join("")).includes("Nausicaa can explain"));
+      await waitFor(() => stripTerminalSequences(terminal.output.join("")).includes("version  v0.1.1"));
       const rootComponent = captured?.root;
       expect(rootComponent).toBeDefined();
       const findEditorContainer = (component: unknown): Container | undefined => {
@@ -135,7 +135,9 @@ describe("debug prompt layout", () => {
     try {
       const running = runInteractive({ session, terminal, forceAltScreen: false });
       await terminal.started;
-      await waitFor(() => frames.some((frame) => frame.some((line) => line.includes("Nausicaa can explain"))));
+      await waitFor(() => frames.some((frame) => (
+        stripTerminalSequences(frame.join("\n")).includes("version  v0.1.1")
+      )));
       // Pi leaves this setting disabled unless the host or PI_CLEAR_ON_SHRINK
       // explicitly enables it. Regular mode therefore keeps its scrollback
       // differential-render path intact.
@@ -187,7 +189,6 @@ describe("debug prompt layout", () => {
         modelChoices: ["openrouter:next-model"],
       });
       await terminal.started;
-      await waitFor(() => stripTerminalSequences(terminal.output.join("")).includes("Nausicaa can explain"));
       const findEditorContainer = (component: unknown): Container | undefined => {
         if (!(component instanceof Container)) return undefined;
         if (component.children.some((nested) => nested instanceof Editor)) return component;
@@ -224,7 +225,9 @@ describe("debug prompt layout", () => {
       terminal.send("/model");
       terminal.send("\r");
       await waitFor(() => stripTerminalSequences(terminal.output.join("")).includes("Models"));
-      await waitFor(() => (getBox()?.height ?? 0) > (before?.height ?? 0));
+      expect(captured?.tui.hasOverlay()).toBe(true);
+      expect(getBox()?.height).toBe(before?.height);
+      expect(getBox()?.y).toBe(before?.y);
       terminal.send("\x1b");
       await waitFor(() => getBox()?.height === before?.height);
       expect(getBox()?.y).toBe(before?.y);
@@ -267,7 +270,9 @@ describe("debug prompt layout", () => {
         modelChoices: ["openrouter:next-model"],
       });
       await terminal.started;
-      await waitFor(() => frames.some((frame) => frame.some((line) => line.includes("Nausicaa can explain"))));
+      await waitFor(() => frames.some((frame) => (
+        stripTerminalSequences(frame.join("\n")).includes("version  v0.1.1")
+      )));
       // Capture the settled baseline after the initial composer frame.
       await new Promise((resolve) => setTimeout(resolve, 100));
       const settledFrame = (): readonly string[] => frames.at(-1) ?? [];
@@ -287,20 +292,20 @@ describe("debug prompt layout", () => {
       if (process.env.PI_CLEAR_ON_SHRINK === "1") {
         expect(viewportTop()).toBe(baselineViewportTop);
       } else {
-        // This explicit regular-mode seam preserves Pi's main-screen
-        // differential viewport when clearOnShrink is disabled. Production
-        // uses the fullscreen dock above, so the prompt remains anchored.
+        // Pi's regular differential renderer preserves its viewport when
+        // clearOnShrink is disabled.
         expect(viewportTop()).toBeGreaterThanOrEqual(baselineViewportTop);
       }
 
       terminal.send("\x7f");
       terminal.send("/model");
       terminal.send("\r");
-      await waitFor(() => stripTerminalSequences(settledFrame().join("\n")).includes("Models"));
-      expect(settledFrame().length).toBeGreaterThan(baselineHeight);
+      await waitFor(() => capturedTui?.hasOverlay() === true);
+      await waitFor(() => stripTerminalSequences(terminal.output.join("")).includes("Models"));
+      expect(settledFrame().length).toBe(baselineHeight);
       const framesBeforeModelClose = frames.length;
       terminal.send("\x1b");
-      await waitFor(() => !stripTerminalSequences(settledFrame().join("\n")).includes("Models"));
+      await waitFor(() => capturedTui?.hasOverlay() === false && frames.length > framesBeforeModelClose);
       expect(frames.length).toBeGreaterThan(framesBeforeModelClose);
       expect(settledFrame().length).toBe(baselineHeight);
       if (process.env.PI_CLEAR_ON_SHRINK === "1") {
@@ -338,12 +343,14 @@ describe("debug prompt layout", () => {
     try {
       const running = runInteractive({ session, terminal, forceAltScreen: false });
       await terminal.started;
-      await waitFor(() => frames.some((frame) => frame.some((line) => line.includes("Nausicaa can explain"))));
+      await waitFor(() => frames.some((frame) => (
+        stripTerminalSequences(frame.join("\n")).includes("version  v0.1.1")
+      )));
       terminal.send("/help");
       terminal.send("\r");
       await waitFor(() => stripTerminalSequences((frames.at(-1) ?? []).join("\n")).includes("Commands"));
       const welcomeFrame = frames.findIndex((frame) => (
-        stripTerminalSequences(frame.join("\n")).includes("Nausicaa can explain")
+        stripTerminalSequences(frame.join("\n")).includes("version  v0.1.1")
       ));
       const helpFrame = frames.findIndex((frame) => (
         stripTerminalSequences(frame.join("\n")).includes("Commands")

@@ -25,10 +25,40 @@ retaining another status-only screen or alias.
 
 ## User flow
 
-- `/login` offers the registered providers, including dynamic providers with an
-  initially empty catalog. Each provider supplies its available login methods.
-- Secret prompts are separate from the composer and transcript. Cancelling any
-  selector or prompt returns to the composer without saving a credential.
+### Centered Login Menu (0.1.1)
+
+The 2026-09-08 update follows the local Prime Agent 0.7.2 snapshot
+`7787f07415d843b9a800f6a4720e0c739bd608e5` (MIT), specifically
+`components/oauth-selector.ts`, `components/menu-panel.ts`, and
+`auth-flows.ts`. Prime exposes these components, but importing them directly
+also requires its AuthStorage, theme, and provider registry. A minimal
+attributed port of its panel, row, search, and adaptive layout behavior uses
+our existing pi-tui dependency and plain authentication metadata instead.
+The established credential store and provider-owned authentication remain
+unchanged. Prime-specific services and ranking preferences are not imported.
+
+Each row identifies a provider and authentication method together. OAuth-only
+providers never acquire a synthetic API-key option. OpenAI API (`openai`) and
+ChatGPT subscription (`openai-codex`) are distinct routes. Subscription and
+usage-based access are also distinguished in the official OpenAI
+[authentication documentation](https://learn.chatgpt.com/docs/auth), consulted
+on 2026-09-08. An OAuth login is labeled as a subscription only when the
+provider declares that property.
+
+The menu uses pi-tui's centered overlay positioning and focus restoration.
+The `/model` picker uses the same centered panel treatment with search and facets.
+Provider-owned choice prompts use selectable options, while secret and pasted
+authorization-code input remains hidden. Successful authentication persists
+credentials; navigation and cancellation do not persist an account or change
+the selected model. With bare `/login`, cancelling a provider flow returns to
+the provider menu with its search and selection retained; cancelling that menu
+restores the composer.
+
+- `/login` offers supported authentication routes from registered providers,
+  including dynamic providers with an initially empty catalog. Ambient-only
+  credential chains are not presented as synthetic manual login methods.
+- Secret prompts are separate from the composer and transcript. Cancelling a
+  selector or prompt does not save a credential.
 - If no model is selected, successful login opens that provider's models.
   Selecting a model is explicit; logging in never issues an inference request.
   A session with a model keeps its current selection.
@@ -44,9 +74,20 @@ retaining another status-only screen or alias.
 - `/logout` lists saved credentials even when only one exists. An explicit
   `/logout <provider>` targets that account. Environment credentials remain in
   the environment.
+- Credentials persist in `~/.nausicaa/credentials.json`, separately from settings
+  and Run history. `/model` changes the current session; the shell command
+  `nausicaa config set-model <provider:model>` saves a startup default.
 - Closing the TUI settles pending authentication selectors so shutdown can drain.
 - CLI tasks accept `--provider <id> --model <model>` and `provider:model`.
   Existing unqualified model IDs retain their OpenRouter compatibility default.
+- `/thinking [level|default]` (alias `/effort`) offers only the current model's
+  supported levels. The preference belongs to the current Main session and
+  applies to the next request; it is not a global provider setting. See
+  [Thinking Levels](thinking-levels.md).
+- `/mcp` manages server configuration separately from provider authentication.
+  Configuration changes require restart; `/mcp refresh` only refreshes existing
+  connections. There is no generic MCP OAuth flow. See
+  [MCP Management](mcp-menu-alignment.md).
 
 ## Verification
 

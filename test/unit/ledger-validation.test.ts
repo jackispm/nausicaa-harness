@@ -323,6 +323,7 @@ const validPayloads = {
   "assistant.message": { messageRef: artifact },
   "navigation.updated": { delta },
   "model.selected": { model: "openrouter:model-1" },
+  "thinking.selected": { level: "high" },
   "model.requested": {
     model: "model-1",
     requestHash: "request-hash",
@@ -617,6 +618,7 @@ const invalidPayloads = {
   "assistant.message": { messageRef: null },
   "navigation.updated": { delta: { ...delta, triggerKind: "wander" } },
   "model.selected": { model: "openrouter:model 1" },
+  "thinking.selected": { level: "invented" },
   "model.requested": { model: "model-1", requestHash: "hash", contextWatermark: -1 },
   "model.retrying": {
     requestId: "",

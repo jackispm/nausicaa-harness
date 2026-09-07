@@ -1,5 +1,6 @@
 import {
   createModels,
+  getSupportedThinkingLevels,
   type AuthOperationOptions,
   type AuthCheck,
   type AuthContext,
@@ -98,6 +99,8 @@ export interface ModelProviderInfo {
   authTypes: readonly AuthType[];
   /** Provider-owned labels used by setup surfaces when available. */
   apiKeyName?: string;
+  /** False for ambient-only sources that cannot perform an interactive login. */
+  apiKeyLogin?: boolean;
   oauthName?: string;
   oauthLoginLabel?: string;
   oauthSubscription?: boolean;
@@ -126,6 +129,7 @@ export class PiAiModelPort implements ModelPort {
     }
     return {
       imageInput: model.input.includes("image"),
+      thinkingLevels: getSupportedThinkingLevels(model),
       ...(isPositiveInteger(model.contextWindow)
         ? { contextWindowTokens: model.contextWindow }
         : {}),
@@ -149,7 +153,10 @@ export class PiAiModelPort implements ModelPort {
         ...(provider.auth.apiKey === undefined ? [] : ["api_key" as const]),
         ...(provider.auth.oauth === undefined ? [] : ["oauth" as const]),
       ]),
-      ...(provider.auth.apiKey === undefined ? {} : { apiKeyName: provider.auth.apiKey.name }),
+      ...(provider.auth.apiKey === undefined ? {} : {
+        apiKeyName: provider.auth.apiKey.name,
+        apiKeyLogin: typeof provider.auth.apiKey.login === "function",
+      }),
       ...(provider.auth.oauth === undefined ? {} : {
         oauthName: provider.auth.oauth.name,
         ...(provider.auth.oauth.loginLabel === undefined
@@ -246,6 +253,8 @@ export class PiAiModelPort implements ModelPort {
           sessionId: request.sessionId,
           maxRetries: 0,
           fetch: probe.fetch,
+          ...(request.thinkingLevel === undefined || request.thinkingLevel === "off"
+            ? {} : { reasoning: request.thinkingLevel }),
           ...(request.signal === undefined ? {} : { signal: request.signal }),
         }),
         request.signal,
@@ -296,6 +305,8 @@ export class PiAiModelPort implements ModelPort {
         sessionId: request.sessionId,
         maxRetries: 0,
         fetch: probe.fetch,
+        ...(request.thinkingLevel === undefined || request.thinkingLevel === "off"
+          ? {} : { reasoning: request.thinkingLevel }),
         ...(request.signal === undefined ? {} : { signal: request.signal }),
       });
       let textBlockCount = 0;

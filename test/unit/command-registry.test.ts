@@ -29,6 +29,7 @@ describe("interactive command registry", () => {
       "context",
       "compact",
       "model",
+      "thinking",
       "permissions",
       "mode",
       "plan",
@@ -63,6 +64,8 @@ describe("interactive command registry", () => {
     expect(findInteractiveCommand("/list-agents")?.name).toBe("list-agents");
     expect(findInteractiveCommand("/mode")?.name).toBe("mode");
     expect(canonicalInteractiveCommandName("branch")).toBe("fork");
+    expect(canonicalInteractiveCommandName("effort")).toBe("thinking");
+    expect(findInteractiveCommand("/thinking")?.name).toBe("thinking");
     expect(findInteractiveCommand("/branch")?.name).toBe("fork");
   });
 
@@ -78,7 +81,8 @@ describe("interactive command registry", () => {
     expect(help).not.toContain("/topology");
     expect(help).not.toContain("/providers");
     expect(findInteractiveCommand("/providers")).toBeUndefined();
-    expect(help).toContain("/mcp [refresh]");
+    expect(help).toContain("/mcp [status|refresh]");
+    expect(help).toContain("/thinking [level|default]");
     expect(help).toContain("/mode [default|plan]");
     expect(help).toContain("/fork [run-id]");
     expect(help).toContain("/tree");

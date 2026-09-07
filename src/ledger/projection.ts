@@ -1,4 +1,5 @@
 import type { AnyEvent, InputDelivery, UserMessageKind } from "../domain/events.js";
+import type { ThinkingLevel } from "../domain/ports.js";
 import type {
   A2AMessage,
   AdviceDisposition,
@@ -56,6 +57,7 @@ export interface LaneView {
   activated?: boolean;
   /** Latest durable selector for this lane, when explicitly recorded. */
   model?: string;
+  thinkingLevel?: ThinkingLevel;
   status: LaneStatus;
   reason?: string;
   lastSeq: number;
@@ -534,6 +536,12 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
         break;
       case "model.selected":
         lane.model = event.payload.model;
+        if (event.payload.thinkingLevel === undefined) delete lane.thinkingLevel;
+        else lane.thinkingLevel = event.payload.thinkingLevel;
+        break;
+      case "thinking.selected":
+        if (event.payload.level === null) delete lane.thinkingLevel;
+        else lane.thinkingLevel = event.payload.level;
         break;
       case "user.message":
       case "assistant.message":
