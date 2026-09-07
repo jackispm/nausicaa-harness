@@ -461,7 +461,18 @@ export class TeamBranchExecutor {
   }
 
   private branchTools(spawnContext?: import("../domain/types.js").SpawnContext): readonly AgentTool[] {
-    const awareness = createAgentAwarenessTool({ read: () => this.options.readAwareness() });
+    const identity = spawnContext?.child;
+    const awareness = createAgentAwarenessTool({
+      read: () => this.options.readAwareness(),
+      ...(identity === undefined ? {} : {
+        self: {
+          workspaceId: identity.workspaceId,
+          sessionId: identity.sessionId,
+          runId: this.options.runId,
+          laneId: this.options.branchLaneId,
+        },
+      }),
+    });
     const controls = this.options.reducer ? [] : createTetoControlTools(this.teto);
     const names = new Set<string>();
     const tools: AgentTool[] = [];

@@ -234,7 +234,12 @@ export const commitRunCheckpoint = async (
 export const projectionChecksum = (
   events: readonly AnyEvent[],
   runId: RunId,
-): string => sha256(stableJson(projectRun(events, runId)));
+): string => {
+  const projection = projectRun(events, runId);
+  // Derived presence metadata must not invalidate checkpoints written before it existed.
+  for (const lane of Object.values(projection.lanes)) delete lane.activated;
+  return sha256(stableJson(projection));
+};
 
 const verifyLatestCheckpoint = async (
   events: readonly AnyEvent[],

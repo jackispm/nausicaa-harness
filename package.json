@@ -54,7 +54,7 @@
     "start": "node dist/cli.js",
     "clean": "node --input-type=module --eval \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
     "build": "npm run clean && tsc -p tsconfig.build.json",
-    "postbuild": "node --input-type=module --eval \"import { chmodSync } from 'node:fs'; chmodSync('dist/cli.js', 0o755);\"",
+    "postbuild": "node scripts/write-build-identity.mjs",
     "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run --exclude 'test/live/**' --exclude 'test/eval/**' --exclude 'test/smoke/**' --exclude '.local/**' --exclude 'logs/**' --no-file-parallelism",

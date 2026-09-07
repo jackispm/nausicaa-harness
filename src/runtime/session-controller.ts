@@ -2565,7 +2565,8 @@ export class SessionController {
         attached.sink.cachedEvents,
         attached.runId,
         this.clock.now().toISOString(),
-        "interactive-session",
+        this.sessionId,
+        this.deps.crossRun?.workspaceId ?? "local-workspace",
       ),
       clock: this.clock,
       policy: attached.policy,
@@ -2958,14 +2959,22 @@ export class SessionController {
         }
         tools.push(crossRunTool);
       }
+      const self = crossRunTool?.sourceEndpoint ?? {
+        workspaceId: this.deps.crossRun?.workspaceId ?? "local-workspace",
+        sessionId: this.sessionId,
+        runId: attached.runId,
+        laneId: "main",
+      };
       const readLocalAwareness = async () => projectRunAwareness(
         attached.sink.cachedEvents,
         attached.runId,
         this.clock.now().toISOString(),
-        "interactive-session",
+        self.sessionId,
+        self.workspaceId,
       );
       pushSessionRuntimeTool(tools, createAgentAwarenessTool({
         read: this.deps.awareness ?? (() => readLocalAwareness()),
+        self,
       }));
       if (attached.teto !== undefined) {
         for (const tool of createTetoControlTools(attached.teto)) {
@@ -4548,6 +4557,7 @@ export async function listWorkspaceRuns(
         goal,
       );
       const checkpoints = verifiedWorkspaceRunCheckpoints(events, entry.name);
+      const status = workspaceRunStatus(projection, events);
       const parentRunId = projection.run.parentRunId;
       const parentCheckpoint = projection.run.parentCheckpoint;
       candidates.push({
@@ -4566,14 +4576,14 @@ export async function listWorkspaceRuns(
                 runId: entry.name,
                 parentRunId,
                 goal,
-                status: workspaceRunStatus(projection),
+                status,
                 ...(parentCheckpoint === undefined ? {} : { parentCheckpoint }),
                 ...(title === undefined ? {} : { title }),
               }),
             }),
         ...(title === undefined ? {} : { title }),
         goal,
-        status: workspaceRunStatus(projection),
+        status,
         createdAt: created.occurredAt,
         updatedAt: events.at(-1)?.occurredAt ?? created.occurredAt,
       });
@@ -4763,12 +4773,20 @@ async function readWorkspaceRunTitle(
 
 function workspaceRunStatus(
   projection: ReturnType<typeof projectRun>,
+  events: readonly AnyEvent[],
 ): WorkspaceRunStatus {
   if (projection.run.status === "completed" || projection.run.status === "failed") {
     return projection.run.status;
   }
-  const latestTurn = Object.values(projection.turns)
-    .sort((left, right) => right.lastOffset - left.lastOffset)[0];
+  // Auxiliary events without a turnId share the legacy projection bucket.
+  // Select Main's lifecycle without changing historical checkpoint hashes.
+  const started = events.findLast((event) => event.laneId === "main" && event.type === "turn.started");
+  const latestTurn = started?.type === "turn.started"
+    ? projection.turns[started.payload.turnId]
+    : Object.values(projectRun(
+        events.filter((event) => event.laneId === "main"),
+        projection.run.runId,
+      ).turns).sort((left, right) => right.lastOffset - left.lastOffset)[0];
   if (latestTurn === undefined || latestTurn.status === "completed") return "ready";
   return latestTurn.status;
 }

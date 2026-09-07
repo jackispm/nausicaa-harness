@@ -52,6 +52,8 @@ export interface RunView {
 export interface LaneView {
   laneId: LaneId;
   kind?: LaneKind;
+  /** Durable start, task admission, or execution evidence, not capability registration. */
+  activated?: boolean;
   /** Latest durable selector for this lane, when explicitly recorded. */
   model?: string;
   status: LaneStatus;
@@ -224,6 +226,7 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
   const inputById = new Map<InputId, InputView>();
   const unknownByOperation = new Map<string, UnknownOperationView>();
   const approvalByOperation = new Map<string, ApprovalView>();
+  const activatedLanes = new Set<LaneId>();
   const legacyTurnId = legacyTurnIdForRun(runId);
 
   const ensureTurn = (
@@ -266,6 +269,7 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
     } else {
       lane.lastSeq = event.laneSeq;
     }
+    if (isLaneExecutionEvidence(event)) activatedLanes.add(event.laneId);
 
     const attributedTurnId = event.turnId ?? (
       event.type === "step.started"
@@ -371,11 +375,20 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
         break;
       case "lane.status":
         lane.status = event.payload.status;
+        if (event.payload.control?.action === "start" || event.payload.status === "running") {
+          activatedLanes.add(event.laneId);
+        }
         if (event.payload.reason === undefined) {
           delete lane.reason;
         } else {
           lane.reason = event.payload.reason;
         }
+        break;
+      case "team.created":
+        for (const member of event.payload.members) activatedLanes.add(member.laneId);
+        break;
+      case "team.reduction.requested":
+        activatedLanes.add(event.payload.reducer.laneId);
         break;
       case "step.started":
       case "step.completed":
@@ -584,6 +597,17 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
         });
         break;
       case "message.sent": {
+        const message = event.payload.message;
+        if (
+          message.payload.type === "task.request"
+          && message.runId === runId
+          && message.from === event.laneId
+          && message.routeId === undefined
+          && message.sourceEndpoint === undefined
+          && message.targetEndpoint === undefined
+        ) {
+          activatedLanes.add(message.to);
+        }
         const item: InboxMessageView = {
           message: cloneJson(event.payload.message),
           status: "pending",
@@ -623,6 +647,7 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
         break;
       }
       case "budget.charged": {
+        activatedLanes.add(event.payload.laneId);
         projection.budget.charged = addUsage(
           projection.budget.charged,
           event.payload.usage,
@@ -642,6 +667,9 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
     }
   }
 
+  for (const lane of Object.values(projection.lanes)) {
+    lane.activated = lane.kind === "main" || activatedLanes.has(lane.laneId);
+  }
   projection.inputs.sort((left, right) => (
     left.sequence - right.sequence || left.admittedAtOffset - right.admittedAtOffset
   ));
@@ -653,4 +681,27 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
   projection.revision = projectionCheckpoint(ordered, runId);
 
   return projection;
+}
+
+function isLaneExecutionEvidence(event: AnyEvent): boolean {
+  switch (event.type) {
+    case "step.started":
+    case "step.completed":
+    case "step.failed":
+    case "model.requested":
+    case "model.retrying":
+    case "model.completed":
+    case "model.failed":
+    case "assistant.message":
+    case "navigation.updated":
+    case "tool.requested":
+    case "tool.admitted":
+    case "tool.started":
+    case "tool.succeeded":
+    case "tool.failed":
+    case "tool.unknown":
+      return true;
+    default:
+      return false;
+  }
 }

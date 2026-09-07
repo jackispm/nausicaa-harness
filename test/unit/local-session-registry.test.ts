@@ -1,6 +1,7 @@
 import {
   mkdir,
   mkdtemp,
+  readFile,
   rm,
   symlink,
   writeFile,
@@ -54,6 +55,7 @@ function createRegistry(
   workspace: string,
   clock: MutableClock,
   sessionId?: string,
+  runtimeBuildId?: string,
 ): LocalSessionRegistry {
   const registry = new LocalSessionRegistry({
     dataDir,
@@ -62,6 +64,7 @@ function createRegistry(
     heartbeatMs: 60_000,
     staleMs: 10_000,
     ...(sessionId === undefined ? {} : { sessionId }),
+    ...(runtimeBuildId === undefined ? {} : { runtimeBuildId }),
   });
   registries.push(registry);
   return registry;
@@ -147,6 +150,51 @@ describe("LocalSessionRegistry", () => {
     expect(updated.lastSeen).toBe("2026-09-05T12:00:01.500Z");
     expect(updated.activitySummary).toBe("still working");
     expect(updated.live).toBe(true);
+  });
+
+  it("retains each process build identity across heartbeat and state updates", async () => {
+    const { dataDir, workspace } = await fixture();
+    const clock = new MutableClock(new Date("2026-09-05T12:00:00.000Z"));
+    const first = createRegistry(dataDir, workspace, clock, "session-first", "aaaaaaaaaaaa");
+    const second = createRegistry(dataDir, workspace, clock, "session-second", "bbbbbbbbbbbb");
+    const source = createRegistry(dataDir, workspace, clock, "session-source");
+    await first.start({ state: "active", runId: "run-first" });
+    await second.start({ state: "idle", runId: "run-second" });
+    await source.start({ state: "idle" });
+
+    clock.advance(1_500);
+    await first.update({});
+    await second.update({ state: "active", activitySummary: "working" });
+    const observations = await first.list();
+    expect(observations.find((entry) => entry.sessionId === "session-first"))
+      .toMatchObject({ runtimeBuildId: "aaaaaaaaaaaa", lastSeen: "2026-09-05T12:00:01.500Z" });
+    expect(observations.find((entry) => entry.sessionId === "session-second"))
+      .toMatchObject({ runtimeBuildId: "bbbbbbbbbbbb", state: "active" });
+    expect(observations.find((entry) => entry.sessionId === "session-source"))
+      .not.toHaveProperty("runtimeBuildId");
+  });
+
+  it("does not infer a build for legacy records and drops invalid identity metadata", async () => {
+    const { dataDir, workspace } = await fixture();
+    const clock = new MutableClock(new Date("2026-09-05T12:00:00.000Z"));
+    const registry = createRegistry(dataDir, workspace, clock, "session-legacy");
+    await registry.start({ state: "idle" });
+    const path = join(dataDir, "sessions", "session-legacy.json");
+    const original: Record<string, unknown> = JSON.parse(await readFile(path, "utf8"));
+
+    expect((await registry.list())[0]).not.toHaveProperty("runtimeBuildId");
+    for (const runtimeBuildId of ["/Users/private/repo", "secret=not-public", "AAAAAAAAAAAA", 123]) {
+      await writeFile(path, JSON.stringify({ ...original, runtimeBuildId }), "utf8");
+      const observation = (await registry.list())[0];
+      expect(observation).toMatchObject({ sessionId: "session-legacy", state: "idle" });
+      expect(observation).not.toHaveProperty("runtimeBuildId");
+    }
+  });
+
+  it("rejects an invalid host-supplied build identity", async () => {
+    const { dataDir, workspace } = await fixture();
+    expect(() => new LocalSessionRegistry({ dataDir, workspace, runtimeBuildId: "not-a-build" }))
+      .toThrow(/runtimeBuildId is invalid/u);
   });
 
   it("projects an active session as offline after its heartbeat becomes stale", async () => {

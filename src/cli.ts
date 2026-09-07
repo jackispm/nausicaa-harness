@@ -42,6 +42,7 @@ import {
 } from "./runtime/index.js";
 import type { AgentAwarenessReader } from "./runtime/agent-awareness-tool.js";
 import { projectAgentTopology } from "./runtime/agent-awareness.js";
+import { RUNTIME_BUILD_ID } from "./runtime/build-identity.js";
 import { createLocalCrossRunComposition } from "./runtime/local-cross-run-composition.js";
 import {
   createRegistryEdgeTurnSnapshotProvider,
@@ -446,8 +447,17 @@ const main = async (): Promise<number> => {
       dataDir: resolvedSettings.dataDir,
       sessionId: localSessionId,
     });
-    const readWorkspaceAwareness: AgentAwarenessReader = async () => projectAgentTopology(
-      await readWorkspaceAgentAwareness(resolvedSettings.dataDir, workspace),
+    const readWorkspaceAwareness: AgentAwarenessReader = async (context) => projectAgentTopology(
+      await readWorkspaceAgentAwareness(resolvedSettings.dataDir, workspace, {
+        currentSession: {
+          sessionId: localSessionId,
+          runId: context.runId,
+          laneId: "main",
+          ...(context.laneId === "main" ? { state: "active" as const } : {}),
+          lastSeen: new Date().toISOString(),
+          ...(RUNTIME_BUILD_ID === undefined ? {} : { runtimeBuildId: RUNTIME_BUILD_ID }),
+        },
+      }),
     );
     if (options.daemon) {
       return await runDaemonMode({
@@ -652,9 +662,9 @@ const main = async (): Promise<number> => {
               resolvedSettings.dataDir,
               workspace,
               {
-                now: observedAt,
                 currentSession: {
                   sessionId: session.sessionId,
+                  ...(RUNTIME_BUILD_ID === undefined ? {} : { runtimeBuildId: RUNTIME_BUILD_ID }),
                   ...(current.runId === undefined ? {} : { runId: current.runId }),
                   laneId: "main",
                   state: awarenessStateForSession(current.status),
@@ -680,6 +690,7 @@ const main = async (): Promise<number> => {
       const result = await executeRun({
         workspace,
         dataDir: resolvedSettings.dataDir,
+        sessionId: localSessionId,
         model: resolvedSettings.model,
         tetoModel: resolvedSettings.tetoModel,
         ...(fukaiCompaction === undefined ? {} : { fukaiCompaction }),

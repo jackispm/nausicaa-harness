@@ -461,6 +461,7 @@ export const executeRun = async (
       : await createCrossRunRuntimeTool(deps.crossRun, {
           runId,
           laneId: "main",
+          sessionId,
           workspace,
           ledger,
           store,
@@ -509,10 +510,18 @@ export const executeRun = async (
       }
       tools.push(crossRunTool);
     }
+    const self = crossRunTool?.sourceEndpoint ?? {
+      workspaceId: deps.crossRun?.workspaceId ?? "local-workspace",
+      sessionId,
+      runId,
+      laneId: "main",
+    };
     const readLocalAwareness = async () => projectRunAwareness(
       await ledger.read({ runId }),
       runId,
       clock.now().toISOString(),
+      self.sessionId,
+      self.workspaceId,
     );
     const readAwareness: AgentAwarenessReader = deps.awareness === undefined
       ? async () => readLocalAwareness()
@@ -685,7 +694,10 @@ export const executeRun = async (
     });
     await teamRuntime.restore();
     if (!evaluationAuxiliaryMode) {
-      pushRuntimeTool(tools, createAgentAwarenessTool({ read: readAwareness }));
+      pushRuntimeTool(tools, createAgentAwarenessTool({
+        read: readAwareness,
+        self,
+      }));
       if (scheduler instanceof TetoLaneController) {
         for (const tool of createTetoControlTools(scheduler)) pushRuntimeTool(tools, tool);
       }

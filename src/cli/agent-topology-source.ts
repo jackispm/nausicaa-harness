@@ -1,4 +1,3 @@
-import type { RunProjection } from "../ledger/projection.js";
 import { projectRun } from "../ledger/projection.js";
 import {
   FileDaemonRunEventSource,
@@ -23,6 +22,7 @@ const LOCAL_SESSION_ID = "local-session";
 
 /** Optional host-owned observations to append to the Ledger projection. */
 export interface WorkspaceAgentAwarenessOptions {
+  /** Explicit replay time; live callers omit this to timestamp the completed observation. */
   readonly now?: string;
   /** Host-owned observation for the Session rendering this view. */
   readonly currentSession?: AgentAwarenessSessionSource;
@@ -49,15 +49,17 @@ export interface WorkspaceAgentAwarenessOptions {
 export async function readWorkspaceAgentAwareness(
   dataDir: string,
   workspace: string,
-  nowOrOptions: string | WorkspaceAgentAwarenessOptions = new Date().toISOString(),
+  nowOrOptions: string | WorkspaceAgentAwarenessOptions = {},
   maybeOptions: WorkspaceAgentAwarenessOptions = {},
 ): Promise<AgentTopologyProjectionInput> {
-  const now = typeof nowOrOptions === "string"
+  const explicitNow = typeof nowOrOptions === "string"
     ? nowOrOptions
-    : nowOrOptions.now ?? new Date().toISOString();
+    : nowOrOptions.now;
   const options = typeof nowOrOptions === "string" ? maybeOptions : nowOrOptions;
   const summaries = await listWorkspaceRuns(dataDir, workspace);
-  const sessions = await readLocalSessionRegistry(dataDir, workspace);
+  const sessions = await readLocalSessionRegistry(dataDir, workspace, explicitNow === undefined
+    ? {}
+    : { clock: { now: () => new Date(explicitNow) } });
   // The local registry is intentionally advisory. The Session that is
   // rendering this view has a stronger in-process snapshot, so merge that one
   // observation before projecting stale heartbeats. This prevents the current
@@ -71,6 +73,7 @@ export async function readWorkspaceAgentAwareness(
       laneId: session.laneId,
       state: session.state,
       lastSeen: session.lastSeen,
+      ...(session.runtimeBuildId === undefined ? {} : { runtimeBuildId: session.runtimeBuildId }),
       ...(session.activitySummary === undefined ? {} : { activitySummary: session.activitySummary }),
     });
   }
@@ -83,7 +86,7 @@ export async function readWorkspaceAgentAwareness(
         ? previousWithoutRun ?? { sessionId: current.sessionId, laneId: "main" }
         : previous ?? { sessionId: current.sessionId, laneId: "main" }),
       ...current,
-      lastSeen: current.lastSeen ?? now,
+      lastSeen: current.lastSeen ?? explicitNow ?? new Date().toISOString(),
     });
   }
   const sessionsForProjection = [...sessionSources.values()];
@@ -127,6 +130,7 @@ export async function readWorkspaceAgentAwareness(
             ...(snapshot.generation === undefined ? {} : { generation: snapshot.generation }),
             generationTrusted: true,
             sourceValid: true,
+            ...(session.runtimeBuildId === undefined ? {} : { runtimeBuildId: session.runtimeBuildId }),
             activitySummary: observedActivitySummary(session, summary),
             lastSeen: session.lastSeen ?? summary.updatedAt,
           });
@@ -137,6 +141,8 @@ export async function readWorkspaceAgentAwareness(
       // topology output bounded and fail closed for that individual source.
     }
   }
+  // Heartbeats read during I/O must not become "future" relative to query start.
+  const now = explicitNow ?? new Date().toISOString();
   return composeAgentAwarenessProjectionInput({
     workspaceId: LOCAL_WORKSPACE_ID,
     sessionId: LOCAL_SESSION_ID,
@@ -164,6 +170,7 @@ function withoutRunId(source: AgentAwarenessSessionSource): AgentAwarenessSessio
     ...(source.laneId === undefined ? {} : { laneId: source.laneId }),
     ...(source.state === undefined ? {} : { state: source.state }),
     ...(source.lastSeen === undefined ? {} : { lastSeen: source.lastSeen }),
+    ...(source.runtimeBuildId === undefined ? {} : { runtimeBuildId: source.runtimeBuildId }),
     ...(source.activitySummary === undefined ? {} : { activitySummary: source.activitySummary }),
   };
 }

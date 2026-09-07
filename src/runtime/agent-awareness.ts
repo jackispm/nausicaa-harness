@@ -69,6 +69,7 @@ export interface AgentTopologyNode {
   readonly activitySummary?: string;
   readonly generation?: number;
   readonly lastSeen: string;
+  readonly runtimeBuildId?: string;
 }
 
 /** An explicit relationship; the projection never infers one from names. */
@@ -127,6 +128,8 @@ export interface AgentAwarenessRecord {
   readonly authorized?: boolean;
   readonly visible?: boolean;
   readonly lastSeen?: string;
+  /** Immutable code identity provided by the observed host, never read from disk here. */
+  readonly runtimeBuildId?: string;
   /** A retained daemon registration with no current activation. */
   readonly retained?: boolean;
   readonly daemonReserved?: boolean;
@@ -207,6 +210,7 @@ interface NormalizedRecord {
   readonly activitySummary?: string;
   readonly generation?: number;
   readonly lastSeen: string;
+  readonly runtimeBuildId?: string;
   readonly lastSeenMs: number;
   readonly lastSeenPresent: boolean;
   readonly generationTrusted: boolean;
@@ -247,7 +251,7 @@ export function projectAgentTopology(
   }
 
   const orderedRecords = [...winners.values()].sort(compareRecords);
-  const retainedRecords = orderedRecords.slice(0, limits.maxNodes);
+  const retainedRecords = retainLiveNodesFirst(orderedRecords, limits.maxNodes);
   const retainedKeys = new Set(retainedRecords.map((record) => record.key));
   const nodes = retainedRecords.map(toNode);
 
@@ -453,6 +457,7 @@ function normalizeRecord(record: AgentAwarenessRecord, clock: ProjectionClock): 
     lastSeenPresent,
   );
   const activitySummary = sanitizeAgentActivitySummary(record.activitySummary ?? "");
+  const runtimeBuildId = safeRuntimeBuildId(record.runtimeBuildId);
   const relations = collectRecordRelations(record, key);
   const canonical = JSON.stringify({
     key,
@@ -461,6 +466,7 @@ function normalizeRecord(record: AgentAwarenessRecord, clock: ProjectionClock): 
     activitySummary: activitySummary ?? "",
     generation: generation ?? null,
     lastSeen,
+    runtimeBuildId: runtimeBuildId ?? null,
     generationTrusted,
     sourceValid,
     retained,
@@ -475,6 +481,7 @@ function normalizeRecord(record: AgentAwarenessRecord, clock: ProjectionClock): 
     ...(activitySummary === undefined ? {} : { activitySummary }),
     ...(generation === undefined ? {} : { generation }),
     lastSeen,
+    ...(runtimeBuildId === undefined ? {} : { runtimeBuildId }),
     lastSeenMs,
     lastSeenPresent,
     generationTrusted,
@@ -602,6 +609,22 @@ function compareRecords(left: NormalizedRecord, right: NormalizedRecord): number
     || compareText(left.key, right.key);
 }
 
+function retainLiveNodesFirst<T extends { readonly state: AgentAwarenessState }>(
+  records: readonly T[],
+  limit: number,
+): T[] {
+  // Historical Runs must not consume the budget before live nodes are selected.
+  const retained = new Set<number>();
+  for (const [index, record] of records.entries()) {
+    if (retained.size >= limit) break;
+    if (["active", "waiting", "idle", "sleeping"].includes(record?.state)) retained.add(index);
+  }
+  for (let index = 0; index < records.length && retained.size < limit; index += 1) {
+    retained.add(index);
+  }
+  return records.filter((_record, index) => retained.has(index));
+}
+
 function collectRecordRelations(record: AgentAwarenessRecord, source: string): readonly AgentTopologyEdge[] {
   const edges: AgentTopologyEdge[] = [];
   const add = (target: CrossRunEndpoint, relation: AgentAwarenessRelation): void => {
@@ -682,6 +705,7 @@ function toNode(record: NormalizedRecord): AgentTopologyNode {
     ...(record.activitySummary === undefined ? {} : { activitySummary: record.activitySummary }),
     ...(record.generation === undefined ? {} : { generation: record.generation }),
     lastSeen: record.lastSeen,
+    ...(record.runtimeBuildId === undefined ? {} : { runtimeBuildId: record.runtimeBuildId }),
   });
 }
 
@@ -758,7 +782,7 @@ export function redactAgentTopologySnapshot(snapshot: AgentTopologySnapshot): Ag
   const seenKeys = new Set<string>();
   const maxNodes = DEFAULT_AGENT_AWARENESS_MAX_NODES;
   const maxEdges = DEFAULT_AGENT_AWARENESS_MAX_EDGES;
-  for (const node of snapshot.nodes.slice(0, maxNodes)) {
+  for (const node of retainLiveNodesFirst(snapshot.nodes, maxNodes)) {
     if (node === null || typeof node !== "object" || Array.isArray(node)) {
       throw new TypeError("invalid agent topology node");
     }
@@ -775,6 +799,7 @@ export function redactAgentTopologySnapshot(snapshot: AgentTopologySnapshot): Ag
     const role = safeRole(node.role);
     const state = safeState(node.state);
     const lastSeen = safeTimestamp(node.lastSeen);
+    const runtimeBuildId = safeRuntimeBuildId(node.runtimeBuildId);
     const generation = Number.isSafeInteger(node.generation) && node.generation! >= 0
       ? node.generation
       : undefined;
@@ -789,6 +814,7 @@ export function redactAgentTopologySnapshot(snapshot: AgentTopologySnapshot): Ag
       ...(activitySummary === undefined ? {} : { activitySummary }),
       ...(generation === undefined ? {} : { generation }),
       lastSeen,
+      ...(runtimeBuildId === undefined ? {} : { runtimeBuildId }),
     }));
   }
   const edges: AgentTopologyEdge[] = [];
@@ -854,6 +880,10 @@ function safeTimestamp(value: unknown): string {
   if (typeof value !== "string" || value.includes("\0")) return MISSING_LAST_SEEN;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : MISSING_LAST_SEEN;
+}
+
+function safeRuntimeBuildId(value: unknown): string | undefined {
+  return typeof value === "string" && /^[a-f0-9]{12}$/u.test(value) ? value : undefined;
 }
 
 function safeRole(value: unknown): AgentAwarenessRole {

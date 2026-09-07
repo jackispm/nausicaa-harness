@@ -20,4 +20,24 @@ Validation: 53 focused tests passed across observer projection, scheduling,
 runtime activation parity, runtime lane contracts, and Run policy;
 `npm run typecheck` passed. Stored historical artifacts are not rewritten.
 
-Rounds 2 through 5 are pending.
+The first commit also passed the same typecheck and 53 tests from an isolated
+`git archive`, without using uncommitted runtime changes.
+
+## Round 2: Truthful, Bounded Discovery
+
+Five new regressions exposed historical Runs consuming the live-node budget
+(including a second truncation during redaction), and historical registry
+observations being expired against today's clock. Live nodes now receive
+capacity before diagnostic history; output ordering and limits are preserved.
+An explicit observation time is also passed to registry freshness checks.
+
+This commit records the earlier activation-evidence filtering, host-bound
+Awareness identity, independent Main status, checkpoint compatibility, and
+process-loaded build identity. Unused capabilities are not live agents; a
+rebuild does not silently relabel an old process with the new build.
+
+Validation: the five new tests failed before the fix; 86 focused tests across
+10 discovery, registry, activation, status, identity, and build suites passed.
+`npm run typecheck` and `git diff --check` passed.
+
+Rounds 3 through 5 are pending.

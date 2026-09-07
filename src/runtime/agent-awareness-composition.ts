@@ -1,7 +1,7 @@
 import type { CrossRunRoster, CrossRunRosterEntry } from "../a2a/cross-run-contract.js";
 import { endpointKey, normalizeEndpoint } from "../a2a/cross-run-contract.js";
 import type { CrossRunEndpoint } from "../domain/types.js";
-import type { RunProjection } from "../ledger/projection.js";
+import type { LaneView, RunProjection } from "../ledger/projection.js";
 import type {
   AgentAwarenessEdgeInput,
   AgentAwarenessAvailability,
@@ -31,6 +31,7 @@ export interface AgentAwarenessIdentityScope {
 /** A projected Run and its optional local Session surface. */
 export interface AgentAwarenessRunSource {
   readonly projection: RunProjection;
+  readonly runtimeBuildId?: string;
   readonly session?: SessionSnapshot;
   /** Overrides the composition-wide scope for this Run. */
   readonly scope?: Partial<AgentAwarenessIdentityScope>;
@@ -51,6 +52,7 @@ export interface AgentAwarenessRunSource {
 /** A live CLI session which has not attached a Run yet. */
 export interface AgentAwarenessSessionSource {
   readonly sessionId: string;
+  readonly runtimeBuildId?: string;
   readonly runId?: string;
   readonly laneId?: string;
   readonly state?: AgentAwarenessState | string;
@@ -171,6 +173,7 @@ export function composeAgentAwarenessProjectionInput(
       state: session.state ?? "idle",
       ...(session.activitySummary === undefined ? {} : { activitySummary: session.activitySummary }),
       lastSeen: session.lastSeen ?? generatedAt,
+      ...(session.runtimeBuildId === undefined ? {} : { runtimeBuildId: session.runtimeBuildId }),
       authorized: true,
       visible: true,
     }, RECORD_PRIORITY.host);
@@ -306,12 +309,13 @@ function addRunSource(
     authorized: true,
     visible: true,
     lastSeen: source.lastSeen ?? generatedAt,
+    ...(source.runtimeBuildId === undefined ? {} : { runtimeBuildId: source.runtimeBuildId }),
   }, RECORD_PRIORITY.run);
 
   const laneIds = Object.keys(projection.lanes).sort(compareText);
   for (const laneId of laneIds) {
     const lane = projection.lanes[laneId];
-    if (lane === undefined || laneId === "main") continue;
+    if (lane === undefined || laneId === "main" || !hasLaneActivation(lane)) continue;
     const laneEndpoint = endpoint(scope, runId, laneId);
     // A Run-level offline/terminal observation dominates durable lane status.
     // Otherwise a closed Run with a dormant Teto or Worker lane appears live
@@ -340,6 +344,7 @@ function addRunSource(
       authorized: true,
       visible: true,
       lastSeen: source.lastSeen ?? generatedAt,
+      ...(source.runtimeBuildId === undefined ? {} : { runtimeBuildId: source.runtimeBuildId }),
     }, RECORD_PRIORITY.lane);
     const parentLane = role === "teto" && laneId.endsWith(":teto")
       ? laneId.slice(0, -":teto".length)
@@ -371,6 +376,12 @@ function addRunSource(
       }, edges);
     }
   }
+}
+
+function hasLaneActivation(lane: LaneView): boolean {
+  if (lane.activated !== undefined) return lane.activated;
+  // Older host projections lack the durable marker; idle alone is not evidence.
+  return lane.lastStep !== undefined || lane.status === "running";
 }
 
 function addHostRun(
@@ -664,10 +675,12 @@ function addRecord(
     current,
   ) ? normalized : current.record;
   const loser = winner === normalized ? current.record : normalized;
+  // A prior observation's code identity cannot identify the winning process.
+  const { runtimeBuildId: _loserBuildId, ...loserFields } = loser;
   records.set(key, {
     priority: Math.max(priority, current.priority),
     record: {
-      ...loser,
+      ...loserFields,
       ...winner,
       endpoint: endpointValue,
       ...(winner.activitySummary === undefined && loser.activitySummary !== undefined

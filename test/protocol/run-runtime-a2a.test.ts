@@ -16,6 +16,7 @@ import type {
 import { executeRun, SessionController } from "../../src/runtime/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import { JsonlLedger } from "../../src/ledger/index.js";
+import type { CrossRunRuntimeComposition } from "../../src/runtime/cross-run-runtime.js";
 
 const roots: string[] = [];
 
@@ -24,6 +25,52 @@ afterEach(async () => {
 });
 
 describe("executeRun Cross-Run A2A composition", () => {
+  it.each(["one-shot", "session"] as const)("uses the authenticated sender as awareness self in %s", async (mode) => {
+    const root = await temporaryRoot();
+    const self = { workspaceId: "workspace-auth", sessionId: "session-auth", runId: `awareness-${mode}`, laneId: "main" };
+    const model = new ScriptedModel([
+      { ...response("check identity"), stopReason: "toolUse", toolCalls: [{ id: "self-check", name: "agent_awareness", arguments: {} }] },
+      (request) => {
+        const result = request.messages.findLast((message) => message.role === "tool" && message.toolName === "agent_awareness");
+        if (result?.role !== "tool") throw new Error("Missing awareness result");
+        expect(result.isError).toBe(false);
+        const output = JSON.parse(result.content);
+        expect(output.self).toEqual(self);
+        expect(output.snapshot.nodes.find((node: { endpoint: CrossRunEndpoint }) => node.endpoint.laneId === "main")?.endpoint).toEqual(self);
+        expect(result.content).not.toContain("private-host-proof");
+        return response("identity confirmed");
+      },
+    ]);
+    let senderCalls = 0;
+    const crossRun: CrossRunRuntimeComposition = {
+      sender: () => {
+        senderCalls += 1;
+        return { endpoint: self, proof: { kind: "attach", authenticated: true, token: "private-host-proof" } };
+      },
+      router: { send: async () => { throw new Error("Read-only awareness must not send"); } },
+    };
+    const options = {
+      workspace: root, dataDir: join(root, "state"), model: "scripted",
+      policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+    };
+    const deps = { mainModel: model, crossRun, createRunId: () => self.runId, tools: [] };
+    if (mode === "one-shot") {
+      const result = await executeRun({ ...options, message: "Who are you?" }, deps);
+      expect(result.completed).toBe(true);
+    } else {
+      const session = await SessionController.open(options, deps);
+      try {
+        await session.submit({ inputId: "identity-input", text: "Who are you?" });
+        await session.waitForIdle();
+        expect((await session.transcript()).at(-1)?.content).toBe("identity confirmed");
+      } finally {
+        await session.close();
+      }
+    }
+    expect(model.callCount).toBe(2);
+    expect(senderCalls).toBe(1);
+  });
+
   it("binds an authenticated sender and durable source outbox to agent_message", async () => {
     const root = await temporaryRoot();
     const target: CrossRunEndpoint = {

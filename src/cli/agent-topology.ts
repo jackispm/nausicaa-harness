@@ -42,6 +42,9 @@ export function renderAgentTopologyText(snapshot: AgentTopologySnapshot): string
   const lines: string[] = [
     `Nausicaa awareness · ${safeSnapshot.nodes.length} nodes · source ${safeSnapshot.availability} · updated ${safeSnapshot.generatedAt}`,
   ];
+  for (const [sessionId, nodes] of groupPanelNodesBySession(safeSnapshot.nodes)) {
+    lines.push(`session:${compactIdentity(sessionId)} · ${sessionBuildLabel(nodes)}`);
+  }
   const rendered = new Set<string>();
   const roots = safeSnapshot.roots.length > 0
     ? safeSnapshot.roots
@@ -175,6 +178,7 @@ export function renderAgentTopologyPanel(
   const hierarchy = panelHierarchy(safeSnapshot);
   const lines = [
     formatPanelHeading(safeSnapshot),
+    nausicaaPalette.dim(`Snapshot: ${safeSnapshot.generatedAt}`),
     "",
     nausicaaPalette.strong(nausicaaPalette.accentBright("Agent Family")),
   ];
@@ -275,6 +279,7 @@ function appendSessionGroup(
     "",
     `${nausicaaPalette.strong(title)} ${nausicaaPalette.dim("·")} ${nausicaaPalette.accent(`session:${compactIdentity(sessionId)}`)} ${nausicaaPalette.dim(`· ${nodes.length} agents`)}`,
   );
+  lines.push(`  ${nausicaaPalette.dim(sessionBuildLabel(nodes, current))}`);
   if (nodes.length === 0) {
     lines.push(`  ${nausicaaPalette.dim("none")}`);
     return;
@@ -284,6 +289,14 @@ function appendSessionGroup(
     current: node.key === current?.key,
     relation: panelRelation(node, current, edges),
   })), width));
+}
+
+function sessionBuildLabel(nodes: readonly AgentTopologyNode[], current?: AgentTopologyNode): string {
+  const builds = [...new Set(nodes.map((node) => node.runtimeBuildId ?? "unknown"))].sort(compareText);
+  const label = builds.length > 1 ? `mixed (${builds.join(", ")})` : builds[0] ?? "unknown";
+  const different = current?.runtimeBuildId !== undefined
+    && builds.some((build) => build !== "unknown" && build !== current.runtimeBuildId);
+  return `Build: ${label}${different ? " (different)" : ""}`;
 }
 
 interface PanelTableRow {

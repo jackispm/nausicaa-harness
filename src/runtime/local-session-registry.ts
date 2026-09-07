@@ -12,6 +12,7 @@ import { join, resolve } from "node:path";
 
 import type { Clock } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
+import { RUNTIME_BUILD_ID } from "./build-identity.js";
 import {
   assertNoSymlinkComponents,
   ensureRealDirectory,
@@ -40,6 +41,8 @@ export interface LocalSessionRegistryEntry {
   readonly state: LocalSessionState;
   readonly startedAt: string;
   readonly lastSeen: string;
+  /** Identity of the code loaded by this process; absent for legacy/source-mode hosts. */
+  readonly runtimeBuildId?: string;
   readonly activitySummary?: string;
 }
 
@@ -55,6 +58,7 @@ export interface LocalSessionRegistryOptions {
   readonly clock?: Clock;
   readonly heartbeatMs?: number;
   readonly staleMs?: number;
+  readonly runtimeBuildId?: string;
 }
 
 export interface LocalSessionPresenceUpdate {
@@ -126,6 +130,11 @@ export class LocalSessionRegistry {
       startedAt: this.startedAt,
       lastSeen: this.startedAt,
     };
+    const runtimeBuildId = options.runtimeBuildId ?? RUNTIME_BUILD_ID;
+    if (runtimeBuildId !== undefined) {
+      if (!validRuntimeBuildId(runtimeBuildId)) throw new TypeError("session registry runtimeBuildId is invalid");
+      this.current = { ...this.current, runtimeBuildId };
+    }
   }
 
   async start(update: LocalSessionPresenceUpdate = {}): Promise<void> {
@@ -160,6 +169,7 @@ export class LocalSessionRegistry {
       state: update.state === undefined ? this.current.state : validateState(update.state),
       startedAt: this.current.startedAt,
       lastSeen: this.nowIso(),
+      ...(this.current.runtimeBuildId === undefined ? {} : { runtimeBuildId: this.current.runtimeBuildId }),
       ...(nextRunId === undefined ? {} : { runId: nextRunId }),
       ...(nextSummary === undefined ? {} : { activitySummary: nextSummary }),
     };
@@ -313,12 +323,17 @@ function parseRegistryRecord(value: unknown): ParsedRegistryRecord | undefined {
       state: validateState(item.state),
       startedAt: new Date(Date.parse(item.startedAt)).toISOString(),
       lastSeen: new Date(Date.parse(item.lastSeen)).toISOString(),
+      ...(validRuntimeBuildId(item.runtimeBuildId) ? { runtimeBuildId: item.runtimeBuildId } : {}),
       ...(activitySummary === undefined ? {} : { activitySummary }),
       ...(typeof item.instanceToken === "string" ? { instanceToken: item.instanceToken } : {}),
     };
   } catch {
     return undefined;
   }
+}
+
+function validRuntimeBuildId(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{12}$/u.test(value);
 }
 
 function validateState(value: string): LocalSessionState {

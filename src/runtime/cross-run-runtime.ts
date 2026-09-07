@@ -75,7 +75,7 @@ export class CrossRunRuntimeCompositionError extends Error {
 export async function createCrossRunRuntimeTool(
   composition: CrossRunRuntimeComposition,
   context: CrossRunRuntimeSenderContext,
-): Promise<MoweAgentTool> {
+): Promise<MoweAgentTool & { readonly sourceEndpoint: CrossRunEndpoint }> {
   validateComposition(composition);
   if (composition.router !== undefined && composition.routerOptions !== undefined) {
     throw new CrossRunRuntimeCompositionError(
@@ -100,7 +100,11 @@ export async function createCrossRunRuntimeTool(
     ...(composition.visibility === undefined ? {} : { visibility: composition.visibility }),
     ...(composition.priority === undefined ? {} : { priority: composition.priority }),
   };
-  return createAgentMessageTool(options);
+  const tool = createAgentMessageTool(options);
+  return Object.freeze({
+    ...tool,
+    sourceEndpoint: Object.freeze({ ...sender.endpoint }),
+  });
 }
 
 function createRouter(

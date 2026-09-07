@@ -1,5 +1,8 @@
 import type { AgentTool, ToolExecutionContext, ToolResult } from "../domain/ports.js";
+import type { CrossRunEndpoint } from "../domain/types.js";
+import { normalizeEndpoint } from "../a2a/cross-run-contract.js";
 import {
+  redactAgentEndpoint,
   redactAgentTopologySnapshot,
   type AgentTopologySnapshot,
 } from "./agent-awareness.js";
@@ -8,6 +11,8 @@ import { annotateTool } from "../mowe/catalog.js";
 export interface AgentAwarenessToolOptions {
   /** Host-owned read; the tool never retains a registry or transcript. */
   read: (context: ToolExecutionContext) => AgentTopologySnapshot | Promise<AgentTopologySnapshot>;
+  /** Calling lane identity, never inferred from the discovered nodes. */
+  self?: CrossRunEndpoint;
 }
 
 /** Reusable type for a host-provided, permission-filtered Awareness reader. */
@@ -21,6 +26,8 @@ export type AgentAwarenessReader = AgentAwarenessToolOptions["read"];
  */
 export function createAgentAwarenessTool(options: AgentAwarenessToolOptions): AgentTool {
   if (typeof options.read !== "function") throw new TypeError("awareness read must be a function");
+  const self = options.self === undefined ? undefined : normalizeEndpoint(options.self, "awareness.self");
+  const publicSelf = self === undefined ? null : redactAgentEndpoint(self);
   const tool: AgentTool = {
     definition: {
       name: "agent_awareness",
@@ -33,14 +40,24 @@ export function createAgentAwarenessTool(options: AgentAwarenessToolOptions): Ag
     },
     async execute(_arguments_, context): Promise<ToolResult> {
       try {
+        if (self !== undefined && (
+          context.runId !== self.runId
+          || context.laneId !== undefined && context.laneId !== self.laneId
+        )) {
+          throw new Error("Agent awareness capability is bound to another Run or lane");
+        }
         const snapshot = liveAgentTopologySnapshot(
           redactAgentTopologySnapshot(await options.read(context)),
         );
         return {
           content: JSON.stringify({
+            self: publicSelf,
             snapshot,
             guidance: {
+              identity: "self is your host-bound endpoint, even if absent from the snapshot. Match its full workspaceId/sessionId/runId/laneId to identify yourself. If self is null, your identity was not supplied; do not guess it from a Main or Teto node.",
               liveOnly: "The snapshot excludes offline and terminal lanes. Group nodes by endpoint.sessionId to distinguish sessions.",
+              discovery: "This is a bounded point-in-time observation. Missing nodes do not prove an agent does not exist. A different sessionId identifies another session; its Main and Teto are not your own lanes.",
+              messaging: "Visibility does not grant permission to send. A target lane ID string such as 'teto' addresses your own Run only. When the host provides cross-Run agent_message, use a selector such as {relationship:'direct',id:'session-id'} for another reachable session's Main. Visible Teto or Team nodes in another session are not automatically direct message targets; the router validates reachability and permissions.",
               taskSummary: "Use node.activitySummary as the bounded host-provided task/status summary; it is not a private transcript.",
               teto: "Teto is an optional feedback lane. Each parent lane may have at most one active Teto.",
               team: "Team members are independent task lanes; Main is the Team Lead and default synthesizer. A member may open its own Teto. Historical Run forks are not Team members.",

@@ -16,10 +16,11 @@ export function projectRunAwareness(
   runId: RunId,
   now: string,
   sessionId = "local-session",
+  workspaceId = "local-workspace",
 ): AgentTopologySnapshot {
   const projection = projectRun(events, runId);
   const input = composeAgentAwarenessProjectionInput({
-    workspaceId: "local-workspace",
+    workspaceId,
     sessionId,
     now,
     generatedAt: now,

@@ -31,6 +31,60 @@ const endpoint = (runId: string, laneId: string, workspaceId = "repo", sessionId
 });
 
 describe("agent awareness topology", () => {
+  it.each([512, 1_024])("keeps live agents visible when historical Runs fill a %i node budget", (maxNodes) => {
+    const current = endpoint("current", "main", "repo", "session-current");
+    const snapshot = projectAgentTopology({
+      now,
+      maxNodes,
+      records: [
+        ...Array.from({ length: 600 }, (_, index) => ({
+          endpoint: endpoint(`archived-${String(index).padStart(3, "0")}`, "main", "repo", "local-session"),
+          state: "offline", lastSeen: now,
+        })),
+        { endpoint: current, state: "active", lastSeen: now },
+      ],
+    });
+    expect(snapshot.nodes).toHaveLength(Math.min(601, maxNodes));
+    expect(snapshot.truncated).toBe(maxNodes < 601);
+    expect(snapshot.nodes.find((node) => node.key === endpointKey(current))?.state).toBe("active");
+    const panel = stripTerminalSequences(renderAgentTopologyPanel(snapshot, 160, { currentEndpoint: current }).join("\n"));
+    expect(panel).toContain("1 live agents");
+    expect(panel).toContain("run:current");
+    expect(renderAgentTopologyText(snapshot)).toContain("offline");
+  });
+
+  it("reserves a small node budget for live nodes before retaining diagnostic history", () => {
+    const historical = { endpoint: endpoint("a-history", "main"), state: "terminal", lastSeen: now };
+    const live = { endpoint: endpoint("z-live", "main"), state: "idle", lastSeen: now };
+    const bounded = projectAgentTopology({ now, records: [historical, live], maxNodes: 1 });
+    expect(bounded.nodes.map((node) => node.endpoint.runId)).toEqual(["z-live"]);
+    expect(bounded.truncated).toBe(true);
+
+    const diagnostic = projectAgentTopology({ now, records: [historical, live], maxNodes: 2 });
+    expect(diagnostic.nodes.map((node) => node.endpoint.runId)).toEqual(["a-history", "z-live"]);
+    expect(diagnostic.truncated).toBe(false);
+    expect(JSON.parse(renderAgentTopologyJson(diagnostic)).nodes).toHaveLength(2);
+  });
+
+  it("preserves host build identity through projection, redaction and JSON without guessing unknown builds", () => {
+    const snapshot = projectAgentTopology({
+      now,
+      records: [
+        { endpoint: endpoint("known", "main"), state: "idle", lastSeen: now, runtimeBuildId: "123456abcdef" },
+        { endpoint: endpoint("unknown", "main"), state: "idle", lastSeen: now },
+        { endpoint: endpoint("invalid", "main"), state: "idle", lastSeen: now, runtimeBuildId: "secret=private" },
+      ],
+    });
+    for (const result of [snapshot, redactAgentTopologySnapshot(snapshot), JSON.parse(renderAgentTopologyJson(snapshot)) as typeof snapshot]) {
+      expect(result.nodes.find((node) => node.endpoint.runId === "known")?.runtimeBuildId).toBe("123456abcdef");
+      expect(result.nodes.find((node) => node.endpoint.runId === "unknown")).not.toHaveProperty("runtimeBuildId");
+      expect(result.nodes.find((node) => node.endpoint.runId === "invalid")).not.toHaveProperty("runtimeBuildId");
+      expect(JSON.stringify(result)).not.toContain("secret=private");
+    }
+    const hostile = { ...snapshot, nodes: [{ ...snapshot.nodes[0]!, runtimeBuildId: "/Users/private" }] };
+    expect(renderAgentTopologyJson(hostile)).not.toContain("/Users/private");
+  });
+
   it("projects multi-run lanes, maps Teto/Worker, and renders one snapshot", () => {
     const main = endpoint("run-7", "main");
     const teto = endpoint("run-7", "teto");
@@ -289,5 +343,28 @@ describe("agent awareness topology", () => {
     expect(renderAgentTopologyText(snapshot)).toContain("offline");
     expect(renderAgentTopologyText(snapshot)).toContain("terminal");
     expect(renderAgentTopologyJson(snapshot)).toContain("family-sibling");
+  });
+
+  it("shows snapshot time and distinct session builds while leaving unknown sessions explicit", () => {
+    const current = endpoint("current-build", "main");
+    const snapshot = projectAgentTopology({
+      now,
+      generatedAt: now,
+      records: [
+        { endpoint: current, state: "idle", lastSeen: now, runtimeBuildId: "aaaaaaaaaaaa" },
+        { endpoint: endpoint("other-build", "main", "repo", "session-b"), state: "idle", lastSeen: now, runtimeBuildId: "bbbbbbbbbbbb" },
+        { endpoint: endpoint("unknown-build", "main", "repo", "session-c"), state: "idle", lastSeen: now },
+      ],
+    });
+    for (const width of [40, 80, 160]) {
+      const lines = renderAgentTopologyPanel(snapshot, width, { currentEndpoint: current });
+      const output = stripTerminalSequences(lines.join("\n"));
+      expect(output).toContain(`Snapshot: ${now}`);
+      expect(output).toContain("Build: aaaaaaaaaaaa");
+      expect(output).toContain("Build: bbbbbbbbbbbb (different)");
+      expect(output).toContain("Build: unknown");
+      expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+    }
+    expect(renderAgentTopologyText(snapshot)).toContain("session:session-b · Build: bbbbbbbbbbbb");
   });
 });
