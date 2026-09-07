@@ -11,6 +11,8 @@ import { createBuiltinModelPort, createOpenRouterModelPort } from "../../src/mod
 import {
   clipboardImagePasteKey,
   runInteractive,
+  type InteractiveAuthOptions,
+  type InteractiveOptions,
 } from "../../src/cli/interactive.js";
 import {
   inspectCredential,
@@ -48,6 +50,353 @@ const TINY_PNG = Buffer.from(
 );
 
 describe("interactive TUI", () => {
+  it("rejects the removed providers command without invoking a model", async () => {
+    await withAuthTui({}, async ({ terminal, mainModel }) => {
+      terminal.type("/providers");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Unknown command: /providers");
+      expect(mainModel.callCount).toBe(0);
+      expect(terminal.output).not.toContain("Search providers");
+    });
+  });
+
+  it("defaults to configured providers and counts only the visible models", async () => {
+    await withAuthTui({}, async ({ terminal, credentialStore }) => {
+      await credentialStore.modify("openai", async () => ({ type: "api_key", key: "test-openai" }));
+      terminal.type("/model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search models");
+      expect(terminal.output).toContain("1 model");
+      expect(terminal.output).toContain("Configured locally");
+      expect(terminal.output).not.toContain("Other model mentioning openai");
+      terminal.send("\x1b[C");
+      await waitForOutput(terminal, "2 models");
+      await waitForOutput(terminal, "Login required");
+      const beforeFilter = terminal.output.length;
+      terminal.send("\t");
+      terminal.send("\x1b[C");
+      await waitForCondition(async () => terminal.output.slice(beforeFilter).includes("1 model"), "provider-filtered count");
+      expect(terminal.output.slice(beforeFilter)).toContain("Other model mentioning openai");
+      const beforeSearch = terminal.output.length;
+      terminal.type("no-such-model-xyz");
+      await waitForCondition(async () => terminal.output.slice(beforeSearch).includes("0 models"), "search-filtered count");
+    });
+  });
+
+  it("keeps models from every configured provider, including environment credentials", async () => {
+    await withAuthTui({ environment: { OPENAI_API_KEY: "test-env-key" } }, async ({ terminal, credentialStore }) => {
+      await credentialStore.modify("anthropic", async () => ({ type: "api_key", key: "test-anthropic" }));
+      terminal.type("/model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search models");
+      expect(terminal.output).toContain("2 models");
+      expect(terminal.output).toContain("OPENAI_API_KEY");
+      expect(terminal.output).not.toContain("Login required");
+      expect(terminal.output).not.toContain("test-env-key");
+    });
+  });
+
+  it("scopes the installed catalog to OpenRouter when only OpenRouter is configured", async () => {
+    let choices: readonly string[] = [];
+    await withAuthTui({ modelChoices: () => choices }, async ({ terminal, credentialStore, modelPort }) => {
+      const catalog = modelPort.catalog();
+      choices = catalog.map((entry) => entry.selector);
+      const openRouterCount = catalog.filter((entry) => entry.provider === "openrouter").length;
+      expect(openRouterCount).toBeGreaterThan(0);
+      expect(openRouterCount).toBeLessThan(catalog.length);
+      await credentialStore.modify("openrouter", async () => ({ type: "api_key", key: "test-router-key" }));
+      terminal.type("/model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search models");
+      expect(terminal.output).toContain(`${openRouterCount} models`);
+      expect(terminal.output).not.toContain(`${catalog.length} models`);
+      expect(terminal.output).not.toContain("Login required");
+      expect(terminal.output).not.toContain("test-router-key");
+      terminal.send("\x1b[C");
+      await waitForOutput(terminal, `${catalog.length} models`);
+    });
+  });
+
+  it("does not silently expose the full catalog when no credentials are configured", async () => {
+    await withAuthTui({}, async ({ terminal, session }) => {
+      terminal.type("/model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search models");
+      expect(terminal.output).toContain("0 models");
+      expect(terminal.output).not.toContain("Other model mentioning openai");
+      terminal.send("\r");
+      expect(session.model).toBe(UNCONFIGURED_MODEL);
+      terminal.send("\x1b[C");
+      await waitForOutput(terminal, "2 models");
+    });
+  });
+
+  it("treats model command arguments as search terms and preserves the model until selection", async () => {
+    await withAuthTui({}, async ({ terminal, credentialStore, session }) => {
+      await credentialStore.modify("openai", async () => ({ type: "api_key", key: "test-openai" }));
+      terminal.type("/model openai model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search models");
+      expect(terminal.output).toContain("1 model");
+      expect(terminal.output).not.toContain("without spaces");
+      expect(session.model).toBe(UNCONFIGURED_MODEL);
+      terminal.send("\r");
+      await waitForCondition(async () => session.model === "openai:test-model", "searched model selected");
+    });
+  });
+
+  it("authenticates an unconfigured model from the full catalog before switching", async () => {
+    await withAuthTui({}, async ({ terminal, session, credentialStore, mainModel }) => {
+      terminal.type("/model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search models");
+      terminal.send("\x1b[C");
+      terminal.type("OpenAI model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "openai API key input is hidden");
+      expect(session.model).toBe(UNCONFIGURED_MODEL);
+      terminal.send("test-handoff-secret\r");
+      await waitForCondition(async () => session.model === "openai:test-model", "model selected after login");
+      await expect(credentialStore.read("openai")).resolves.toMatchObject({ type: "api_key" });
+      expect(terminal.output).not.toContain("test-handoff-secret");
+      expect(mainModel.callCount).toBe(0);
+    });
+  });
+
+  it("keeps the current model if login for an exact model selection is cancelled", async () => {
+    await withAuthTui({ model: "anthropic:current-model" }, async ({ terminal, session, credentialStore }) => {
+      terminal.type("/model openai:test-model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "openai API key input is hidden");
+      terminal.send("\x1b");
+      await waitForOutput(terminal, "Login cancelled.");
+      expect(session.model).toBe("anthropic:current-model");
+      await expect(credentialStore.list()).resolves.toEqual([]);
+    });
+  });
+
+  it("keeps auth-check failures out of the configured scope", async () => {
+    await withAuthTui({ checkAuth: async () => { throw new Error("test auth failure"); } }, async ({ terminal, session }) => {
+      terminal.type("/model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search models");
+      expect(terminal.output).toContain("0 models");
+      terminal.send("\x1b[C");
+      await waitForOutput(terminal, "Auth status unavailable");
+      terminal.type("OpenAI model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Model was not changed");
+      expect(session.model).toBe(UNCONFIGURED_MODEL);
+    });
+  });
+
+  it("does not reopen a dismissed model picker when auth discovery finishes late", async () => {
+    let complete!: (value: undefined) => void;
+    const pending = new Promise<undefined>((resolve) => { complete = resolve; });
+    await withAuthTui({ checkAuth: () => pending }, async ({ terminal }) => {
+      try {
+        terminal.type("/model");
+        terminal.send("\r");
+        await waitForOutput(terminal, "Checking local credentials");
+        terminal.send("\x1b");
+        complete(undefined);
+        terminal.type("/status");
+        terminal.send("\r");
+        await waitForOutput(terminal, "Model:");
+        expect(terminal.output).not.toContain("Search models");
+      } finally {
+        complete(undefined);
+      }
+    });
+  });
+
+  it("shuts down without waiting for model authentication discovery", async () => {
+    let complete!: (value: undefined) => void;
+    const pending = new Promise<undefined>((resolve) => { complete = resolve; });
+    await withAuthTui({ checkAuth: () => pending }, async ({ terminal, running }) => {
+      try {
+        terminal.type("/model");
+        terminal.send("\r");
+        await waitForOutput(terminal, "Checking local credentials");
+        process.emit("SIGTERM", "SIGTERM");
+        await expect(running).resolves.toBe(0);
+        complete(undefined);
+        expect(terminal.output).not.toContain("Search models");
+      } finally {
+        complete(undefined);
+      }
+    });
+  });
+
+  it("drops a logged-out provider from the next model picker even if its model is current", async () => {
+    await withAuthTui({ model: "openai:test-model" }, async ({ terminal, credentialStore, session }) => {
+      await credentialStore.modify("openai", async () => ({ type: "api_key", key: "test-key" }));
+      terminal.type("/logout openai");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Removed the saved openai credential");
+      const before = terminal.output.length;
+      terminal.type("/model");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search models");
+      expect(terminal.output.slice(before)).toContain("0 models");
+      expect(session.model).toBe("openai:test-model");
+    });
+  });
+
+  it("allows cancellation before removing the only saved credential", async () => {
+    await withAuthTui({ environment: { OPENAI_API_KEY: "test-env-key" } }, async ({ terminal, credentialStore }) => {
+      await credentialStore.modify("openai", async () => ({ type: "api_key", key: "test-saved-key" }));
+      terminal.type("/logout");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search saved accounts");
+      terminal.send("\x1b");
+      await expect(credentialStore.read("openai")).resolves.toMatchObject({ type: "api_key" });
+      const before = terminal.output.length;
+      terminal.type("/logout");
+      terminal.send("\r");
+      await waitForCondition(async () => terminal.output.slice(before).includes("Search saved accounts"), "single credential picker reopened");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Any environment credential remains available");
+      await expect(credentialStore.read("openai")).resolves.toBeUndefined();
+    });
+  });
+
+  it("opens the signed-in provider's model list after first login without selecting a model", async () => {
+    await withAuthTui({}, async ({ terminal, session, credentialStore, mainModel }) => {
+      terminal.type("/login");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search providers");
+      terminal.type("openai");
+      terminal.send("\r");
+      await waitForOutput(terminal, "openai API key input is hidden");
+      terminal.send("test-openai-secret\r");
+      await waitForOutput(terminal, "Search models");
+      expect(session.model).toBe(UNCONFIGURED_MODEL);
+      expect(session.snapshot().runId).toBeUndefined();
+      expect(mainModel.callCount).toBe(0);
+      expect(terminal.output).not.toContain("test-openai-secret");
+      await expect(credentialStore.read("openai")).resolves.toMatchObject({ type: "api_key" });
+      terminal.send("\r");
+      await waitForCondition(async () => session.model === "openai:test-model", "OpenAI model selection");
+      expect(session.model).not.toBe("anthropic:openai-lookalike");
+    });
+  });
+
+  it("keeps the current model after signing in to another provider", async () => {
+    await withAuthTui({ model: "anthropic:current-model" }, async ({ terminal, session }) => {
+      terminal.type("/login openai");
+      terminal.send("\r");
+      await waitForOutput(terminal, "openai API key input is hidden");
+      terminal.send("test-openai-secret\r");
+      await waitForOutput(terminal, "Signed in to openai");
+      expect(session.model).toBe("anthropic:current-model");
+      expect(terminal.output).not.toContain("Search models");
+    });
+  });
+
+  it("treats cancelling the auth-method selector as cancellation and restores the editor", async () => {
+    await withAuthTui({}, async ({ terminal, credentialStore }) => {
+      terminal.type("/login anthropic");
+      terminal.send("\r");
+      await waitForOutput(terminal, "supports more than one");
+      terminal.send("\x1b");
+      await waitForOutput(terminal, "Login cancelled.");
+      expect(terminal.output).not.toContain("No supported authentication method");
+      await expect(credentialStore.list()).resolves.toEqual([]);
+      terminal.type("/login openai");
+      terminal.send("\r");
+      await waitForOutput(terminal, "openai API key input is hidden");
+      terminal.send("\x1b");
+    });
+  });
+
+  it("retains a saved login and cached models when catalog refresh fails", async () => {
+    await withAuthTui({ refreshModels: async () => { throw new Error("catalog unavailable"); } }, async ({ terminal, credentialStore }) => {
+      terminal.type("/login openai");
+      terminal.send("\r");
+      await waitForOutput(terminal, "openai API key input is hidden");
+      terminal.send("test-openai-secret\r");
+      await waitForOutput(terminal, "Model catalog refresh failed for openai");
+      await waitForOutput(terminal, "Search models");
+      await expect(credentialStore.read("openai")).resolves.toMatchObject({ type: "api_key" });
+      expect(terminal.output).toContain("Signed in to openai");
+    });
+  });
+
+  it("lets logout choose a saved account independently of the current model", async () => {
+    await withAuthTui({ model: "openai:test-model" }, async ({ terminal, credentialStore, session }) => {
+      await credentialStore.modify("openai", async () => ({ type: "api_key", key: "retain-openai-key" }));
+      await credentialStore.modify("anthropic", async () => ({ type: "api_key", key: "remove-anthropic-key" }));
+      terminal.type("/logout");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search saved accounts");
+      terminal.send("\x1b");
+      await expect(credentialStore.list()).resolves.toHaveLength(2);
+      const before = terminal.output.length;
+      terminal.type("/logout");
+      terminal.send("\r");
+      await waitForCondition(async () => terminal.output.slice(before).includes("Search saved accounts"), "logout picker reopened");
+      terminal.type("anthropic");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Removed the saved anthropic credential");
+      await expect(credentialStore.read("anthropic")).resolves.toBeUndefined();
+      await expect(credentialStore.read("openai")).resolves.toMatchObject({ type: "api_key" });
+      expect(session.model).toBe("openai:test-model");
+      expect(terminal.output).not.toContain("retain-openai-key");
+      expect(terminal.output).not.toContain("remove-anthropic-key");
+    });
+  });
+
+  it("uses models discovered during login refresh instead of the empty startup catalog", async () => {
+    let refreshed = false;
+    await withAuthTui({
+      refreshModels: async (provider) => { refreshed = provider === "openai"; },
+      modelChoices: () => refreshed ? [{ value: "openai:discovered-model", label: "Discovered model" }] : [],
+    }, async ({ terminal, session }) => {
+      terminal.type("/login openai");
+      terminal.send("\r");
+      await waitForOutput(terminal, "openai API key input is hidden");
+      terminal.send("test-openai-secret\r");
+      await waitForOutput(terminal, "Discovered model");
+      terminal.send("\r");
+      await waitForCondition(async () => session.model === "openai:discovered-model", "refreshed model selection");
+    });
+  });
+
+  it("returns to the editor when login succeeds but the provider has no available models", async () => {
+    await withAuthTui({ modelChoices: [] }, async ({ terminal, credentialStore, session }) => {
+      terminal.type("/login openai");
+      terminal.send("\r");
+      await waitForOutput(terminal, "openai API key input is hidden");
+      terminal.send("test-openai-secret\r");
+      await waitForOutput(terminal, "No models are available for openai yet");
+      expect(session.model).toBe(UNCONFIGURED_MODEL);
+      await expect(credentialStore.read("openai")).resolves.toMatchObject({ type: "api_key" });
+      terminal.type("/logout");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Search saved accounts");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Removed the saved openai credential");
+    });
+  });
+
+  it.each([
+    ["/login", "Search providers"],
+    ["/login anthropic", "supports more than one"],
+    ["/logout", "Search saved accounts"],
+  ])("settles the pending %s selector during SIGTERM shutdown", async (command, marker) => {
+    await withAuthTui({}, async ({ terminal, credentialStore, running }) => {
+      await credentialStore.modify("openai", async () => ({ type: "api_key", key: "test-one" }));
+      await credentialStore.modify("anthropic", async () => ({ type: "api_key", key: "test-two" }));
+      terminal.type(command);
+      terminal.send("\r");
+      await waitForOutput(terminal, marker);
+      process.emit("SIGTERM", "SIGTERM");
+      await expect(running).resolves.toBe(0);
+      await expect(credentialStore.list()).resolves.toHaveLength(2);
+    });
+  });
+
   it("supports hidden /login and /logout without entering the Run transcript", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-auth-"));
     const previousExitCode = process.exitCode;
@@ -119,6 +468,8 @@ describe("interactive TUI", () => {
 
       terminal.type("/logout");
       terminal.send("\r");
+      await waitForOutput(terminal, "Search saved accounts");
+      terminal.send("\r");
       await waitForCondition(
         async () => (await credentialStore.read("openrouter")) === undefined,
         "removed TUI credential",
@@ -142,7 +493,7 @@ describe("interactive TUI", () => {
     }
   });
 
-  it("shows provider-owned auth sources in the provider browser", async () => {
+  it("shows provider-owned auth sources in the login picker", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-providers-"));
     const previousExitCode = process.exitCode;
     try {
@@ -176,12 +527,16 @@ describe("interactive TUI", () => {
       });
 
       await terminal.started;
-      terminal.type("/providers");
+      terminal.type("/login");
       terminal.send("\r");
+      await waitForOutput(terminal, "Search providers");
+      terminal.type("openai");
       await waitForOutput(terminal, "OpenAI");
       await waitForOutput(terminal, "ready locally");
       expect(normalizeTerminalOutput(terminal.output)).toContain("OPENAI_API_KEY");
 
+      terminal.send("\x1b");
+      await waitForOutput(terminal, "Login cancelled.");
       terminal.type("/exit");
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
@@ -3306,6 +3661,71 @@ describe("interactive TUI", () => {
     }
   });
 });
+
+async function withAuthTui(
+  options: {
+    model?: string;
+    refreshModels?: InteractiveAuthOptions["refreshModels"];
+    modelChoices?: InteractiveOptions["modelChoices"];
+    environment?: NodeJS.ProcessEnv;
+    checkAuth?: AuthModelPort["checkAuth"];
+  },
+  check: (fixture: {
+    terminal: MemoryTerminal;
+    session: SessionController;
+    credentialStore: FileCredentialStore;
+    mainModel: ScriptedModel;
+    modelPort: ReturnType<typeof createBuiltinModelPort>;
+    running: Promise<number>;
+  }) => Promise<void>,
+): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "nausicaa-multi-provider-tui-"));
+  const previousExitCode = process.exitCode;
+  let running: Promise<number> | undefined;
+  let stopped = false;
+  let session: SessionController | undefined;
+  try {
+    const credentialStore = new FileCredentialStore({ filePath: join(root, "credentials.json") });
+    const modelPort = createBuiltinModelPort({
+      credentials: credentialStore,
+      authContext: { env: async (name) => options.environment?.[name], fileExists: async () => false },
+    });
+    if (options.checkAuth !== undefined) modelPort.checkAuth = options.checkAuth;
+    const mainModel = new ScriptedModel([]);
+    session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: options.model ?? UNCONFIGURED_MODEL,
+      policy: { tetoEnabled: false },
+    }, { mainModel });
+    const terminal = new MemoryTerminal(100, 28);
+    running = runInteractive({
+      session,
+      terminal,
+      forceAltScreen: true,
+      modelChoices: options.modelChoices ?? [
+        { value: "anthropic:openai-lookalike", label: "Other model mentioning openai" },
+        { value: "openai:test-model", label: "OpenAI model" },
+      ],
+      auth: {
+        credentialStore,
+        modelPort,
+        environment: options.environment ?? {},
+        ...(options.refreshModels === undefined ? {} : { refreshModels: options.refreshModels }),
+      },
+    }).finally(() => { stopped = true; });
+    await terminal.started;
+    await check({ terminal, session, credentialStore, mainModel, modelPort, running });
+  } finally {
+    if (running !== undefined && !stopped) process.emit("SIGTERM", "SIGTERM");
+    try { await running; }
+    finally {
+      await session?.close();
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+}
 
 class MemoryTerminal implements Terminal {
   readonly outputChunks: string[] = [];

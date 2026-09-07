@@ -132,18 +132,21 @@ export function modelSelectorOptions(
           value: candidate.value.trim(),
           label: candidate.label.trim() || candidate.value.trim(),
         };
-    if (option.value.length === 0 || candidates.has(option.value)) return;
+    if (option.value.length === 0) return;
+    if (candidates.has(option.value) && typeof candidate === "string") return;
     candidates.set(option.value, option);
   };
   add(current, "Main lane");
   add(tetoModel, "Teto lane");
   for (const candidate of additional) add(candidate, "Configured candidate");
   return [...candidates.values()].map((option) => {
-    const description = option.value === current
+    const lane = option.value === current
       ? "Main lane"
       : option.value === tetoModel
         ? "Teto lane"
-        : option.description ?? "Configured candidate";
+        : undefined;
+    const description = [lane, option.description === lane ? undefined : option.description]
+      .filter(Boolean).join(" · ") || "Configured candidate";
     return { ...option, description };
   });
 }

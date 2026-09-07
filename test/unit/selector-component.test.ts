@@ -10,6 +10,27 @@ describe("SelectorOverlay", () => {
     { value: "scripted", label: "Scripted", description: "Offline test model" },
   ] as const;
 
+  it("updates the result count after facet and search changes", () => {
+    const overlay = new SelectorOverlay({
+      title: "Models",
+      subtitle: (visible) => `${visible.length} models`,
+      options,
+      filters: [{
+        key: "scope", label: "Scope",
+        options: [{ value: "all", label: "All" }, { value: "local", label: "Local" }],
+      }],
+      filterOptions: (items, values) => values.scope === "local" ? items.slice(2) : items,
+      onSelect: () => {},
+      onCancel: () => {},
+    });
+    const rendered = () => stripTerminalSequences(overlay.render(80).join("\n"));
+    expect(rendered()).toContain("3 models");
+    overlay.handleInput("\x1b[C");
+    expect(rendered()).toContain("1 models");
+    overlay.handleInput("missing");
+    expect(rendered()).toContain("0 models");
+  });
+
   it("filters by label/value/description and confirms the selected item", () => {
     const selected: string[] = [];
     const overlay = new SelectorOverlay({
@@ -47,6 +68,21 @@ describe("SelectorOverlay", () => {
     expect(overlay.getSelectedValue()).toBe("openrouter:deepseek/v4");
     overlay.handleInput("\x1b");
     expect(cancelled).toBe(1);
+  });
+
+  it("focuses the best search match instead of retaining a weaker previous selection", () => {
+    const overlay = new SelectorOverlay({
+      title: "Models",
+      options: [
+        { value: "anthropic:openai-lookalike", label: "Other model mentioning openai" },
+        { value: "openai:test-model", label: "OpenAI model" },
+      ],
+      current: "anthropic:openai-lookalike",
+      onSelect: () => {},
+      onCancel: () => {},
+    });
+    overlay.handleInput("OpenAI model");
+    expect(overlay.getSelectedValue()).toBe("openai:test-model");
   });
 
   it("moves through long result sets by page", () => {
@@ -199,5 +235,34 @@ describe("SelectorOverlay", () => {
     expect(overlay.render(80).join("\n")).toContain("Provider: [All] (1/41)");
     overlay.handleInput("\x1b[C");
     expect(overlay.render(80).join("\n")).toContain("Provider: [Provider 0] (2/41)");
+  });
+
+  it.each([44, 80, 120])("keeps both model facets visible at %i columns", (width) => {
+    const overlay = new SelectorOverlay({
+      title: "Models",
+      searchLabel: "Search models",
+      filters: [
+        {
+          key: "scope", label: "Scope",
+          options: [{ value: "configured", label: "Configured" }, { value: "all", label: "All" }],
+        },
+        {
+          key: "provider", label: "Provider", current: "openrouter",
+          options: [
+            { value: "all", label: "All" },
+            { value: "anthropic", label: "Anthropic" },
+            { value: "openai", label: "OpenAI" },
+            { value: "openrouter", label: "OpenRouter" },
+          ],
+        },
+      ],
+      options: [],
+      onSelect: () => {},
+      onCancel: () => {},
+    });
+    const rows = overlay.render(width).map(stripTerminalSequences);
+    expect(rows.join("\n")).toContain("Scope: [Configured] All");
+    expect(rows.join("\n")).toContain("[OpenRouter]");
+    expect(rows.every((row) => visibleWidth(row) <= width)).toBe(true);
   });
 });

@@ -11,6 +11,7 @@ import {
   Spacer,
   Text,
   truncateToWidth,
+  visibleWidth,
 } from "@earendil-works/pi-tui";
 
 import {
@@ -24,7 +25,7 @@ import {
 
 export interface SelectorOverlayOptions {
   title: string;
-  subtitle?: string;
+  subtitle?: string | ((visibleOptions: readonly SelectorOption[]) => string);
   /** Search caption; session history uses Codex-style wording. */
   searchLabel?: string;
   /** Optional Codex-style filter facets rendered beside the search caption. */
@@ -214,7 +215,7 @@ export class SelectorOverlay extends Container implements Focusable {
   private readonly allOptions: readonly SelectorOption[];
   private filteredOptions: readonly SelectorOption[];
   private readonly title: string;
-  private readonly subtitle: string | undefined;
+  private readonly subtitle: SelectorOverlayOptions["subtitle"];
   private readonly searchLabel: string;
   private readonly filters: readonly SelectorFilter[];
   private readonly filterOptions: ((
@@ -229,6 +230,7 @@ export class SelectorOverlay extends Container implements Focusable {
   private readonly multiSelect: boolean;
   private readonly onConfirm: ((values: readonly string[]) => void) | undefined;
   private readonly selectedValues = new Set<string>();
+  private query = "";
   private _focused = false;
 
   constructor(options: SelectorOverlayOptions) {
@@ -260,11 +262,6 @@ export class SelectorOverlay extends Container implements Focusable {
     if (options.initialQuery !== undefined && options.initialQuery.length > 0) {
       this.search.setValue(options.initialQuery);
       this.replaceList(options.initialQuery);
-      if (options.current !== undefined) {
-        const filteredIndex = this.projectOptions(options.initialQuery)
-          .findIndex((option) => option.value === options.current);
-        if (filteredIndex >= 0) this.list.setSelectedIndex(filteredIndex);
-      }
     } else if (currentIndex >= 0) {
       this.list.setSelectedIndex(currentIndex);
     }
@@ -309,7 +306,8 @@ export class SelectorOverlay extends Container implements Focusable {
   }
 
   private replaceList(query: string): void {
-    const previousValue = this.getSelectedValue();
+    const previousValue = query === this.query ? this.getSelectedValue() : undefined;
+    this.query = query;
     const filtered = this.projectOptions(query);
     this.filteredOptions = filtered;
     this.list = this.createList(filtered);
@@ -424,16 +422,19 @@ export class SelectorOverlay extends Container implements Focusable {
     const lines: string[] = [
       truncateToWidth(nausicaaMarkdownTheme.heading(this.title), safeWidth, ""),
     ];
-    if (this.subtitle !== undefined && this.subtitle.trim().length > 0) {
-      lines.push(truncateToWidth(nausicaaMarkdownTheme.linkUrl(this.subtitle), safeWidth, ""));
+    const subtitle = typeof this.subtitle === "function" ? this.subtitle(this.filteredOptions) : this.subtitle;
+    if (subtitle !== undefined && subtitle.trim().length > 0) {
+      lines.push(truncateToWidth(nausicaaMarkdownTheme.linkUrl(subtitle), safeWidth, ""));
     }
-    const filters = this.renderFilters();
+    const filterRows = [this.searchLabel];
+    for (const filter of this.renderFilters(safeWidth)) {
+      const lastIndex = filterRows.length - 1;
+      const joined = `${filterRows[lastIndex]}    ${filter}`;
+      if (visibleWidth(joined) <= safeWidth) filterRows[lastIndex] = joined;
+      else filterRows.push(filter);
+    }
     lines.push(
-      truncateToWidth(
-        filters.length === 0 ? this.searchLabel : `${this.searchLabel}${" ".repeat(4)}${filters}`,
-        safeWidth,
-        "",
-      ),
+      ...filterRows.map((row) => truncateToWidth(row, safeWidth, "")),
       ...this.search.render(safeWidth),
       ...this.list.render(safeWidth),
       truncateToWidth(
@@ -449,14 +450,18 @@ export class SelectorOverlay extends Container implements Focusable {
     return lines.map((line) => truncateToWidth(line, safeWidth, ""));
   }
 
-  private renderFilters(): string {
+  private renderFilters(width: number): readonly string[] {
     return this.filters.map((filter) => {
       const selected = this.filterValues[filter.key];
+      const values = filter.options.map((option) => option.value === selected
+        ? `[${option.label}]`
+        : option.label);
+      const expanded = `${filter.label}: ${values.join(" ")}`;
       // Provider facets can contain dozens of entries. Rendering every option
       // makes the active value disappear on ordinary terminal widths, so keep
       // the compact current-value/count form for long facets while retaining
       // the full toggle strip for small, scannable facets.
-      if (filter.options.length > 6) {
+      if (filter.options.length > 6 || visibleWidth(expanded) > width) {
         const selectedIndex = Math.max(
           0,
           filter.options.findIndex((option) => option.value === selected),
@@ -464,11 +469,8 @@ export class SelectorOverlay extends Container implements Focusable {
         const selectedLabel = filter.options[selectedIndex]?.label ?? selected ?? "-";
         return `${filter.label}: [${selectedLabel}] (${selectedIndex + 1}/${filter.options.length})`;
       }
-      const values = filter.options.map((option) => option.value === selected
-        ? `[${option.label}]`
-        : option.label);
-      return `${filter.label}: ${values.join(" ")}`;
-    }).join("    ");
+      return expanded;
+    });
   }
 
   override invalidate(): void {

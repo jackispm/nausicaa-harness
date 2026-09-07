@@ -43,6 +43,16 @@ describe("Prime-style CLI selectors", () => {
     expect(() => parseThemeChoice("solarized")).toThrow(/auto, light, or dark/);
   });
 
+  it("preserves catalog labels and metadata for Main and Teto candidates", () => {
+    expect(modelSelectorOptions("openai:main", "openai:teto", [
+      { value: "openai:main", label: "Main model name", description: "context 128000" },
+      { value: "openai:teto", label: "Teto model name", description: "context 64000" },
+    ])).toEqual([
+      { value: "openai:main", label: "Main model name", description: "Main lane · context 128000" },
+      { value: "openai:teto", label: "Teto model name", description: "Teto lane · context 64000" },
+    ]);
+  });
+
   it("provides Codex-style permission profiles without conflating Plan mode", () => {
     const available = permissionProfileOptions("workspace", {
       available: true,

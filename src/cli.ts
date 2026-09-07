@@ -491,7 +491,7 @@ const main = async (): Promise<number> => {
           label: `${provider?.name ?? entry.provider} / ${entry.name}`,
           description: `${entry.selector} · ${authHint} · context ${entry.contextWindowTokens} · `
             + `max ${entry.maxOutputTokens} · ${entry.imageInput ? "images" : "text only"} · `
-            + "tools unverified · auth unverified",
+            + "tools unverified",
           contextWindowTokens: entry.contextWindowTokens,
           imageInput: entry.imageInput,
           toolUse: entry.toolUse,

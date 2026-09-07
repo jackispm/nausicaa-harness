@@ -2120,7 +2120,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       // refresh (for example Radius), but they must remain selectable.
       .filter((provider) => provider.authTypes.length > 0)
       .sort((left, right) => left.name.localeCompare(right.name));
-    if (providers.length <= 1) return authProvider("", "login");
+    if (providers.length <= 1) return providers[0]?.id;
     let saved = new Set<string>();
     try {
       saved = new Set((await options.auth!.credentialStore.list()).map((entry) => entry.providerId));
@@ -2131,6 +2131,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     await Promise.all(providers.map(async (provider) => {
       status.set(provider.id, await providerAuthStatus(provider, saved));
     }));
+    if (closing) return undefined;
     return new Promise<string | undefined>((resolve) => {
       let settled = false;
       const settle = (value: string | undefined): void => {
@@ -2148,15 +2149,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           description: `${provider.modelCount} models · ${provider.authTypes.map((type) => authTypeLabel(type, provider.id)).join(" / ")} · ${status.get(provider.id) ?? "status unavailable"}`,
         })),
         onSelect: (value) => {
-          closeSelector(false, selector);
           settle(value);
+          closeSelector(false, selector);
         },
         onCancel: () => {
-          closeSelector(true, selector);
           settle(undefined);
+          closeSelector(true, selector);
         },
       });
-      mountSelector(selector);
+      mountSelector(selector, undefined, () => settle(undefined));
     });
   };
 
@@ -2188,15 +2189,47 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             : "Enter a provider key through a hidden prompt",
         })),
         onSelect: (value) => {
-          closeSelector(false, selector);
           settle(value as AuthType);
+          closeSelector(false, selector);
         },
         onCancel: () => {
-          closeSelector(true, selector);
           settle(undefined);
+          closeSelector(true, selector);
         },
       });
-      mountSelector(selector);
+      mountSelector(selector, undefined, () => settle(undefined));
+    });
+  };
+
+  const selectLogoutProvider = async (): Promise<string | undefined> => {
+    const credentials = await options.auth!.credentialStore.list();
+    if (closing) return undefined;
+    if (credentials.length === 0) {
+      appendNotice("No saved credentials to remove. Environment credentials remain available.", "info");
+      return undefined;
+    }
+    const names = new Map(providerInfos().map((provider) => [provider.id, provider.name]));
+    return new Promise<string | undefined>((resolve) => {
+      const selector = new SelectorOverlay({
+        title: "Sign out",
+        searchLabel: "Search saved accounts",
+        options: credentials
+          .map((credential) => ({
+            value: credential.providerId,
+            label: names.get(credential.providerId) ?? credential.providerId,
+            description: `${credential.providerId} · ${credential.type === "oauth" ? "Saved OAuth credential" : "Saved API key"}`,
+          }))
+          .sort((left, right) => left.label.localeCompare(right.label)),
+        onSelect: (value) => {
+          resolve(value);
+          closeSelector(false, selector);
+        },
+        onCancel: () => {
+          resolve(undefined);
+          closeSelector(true, selector);
+        },
+      });
+      mountSelector(selector, undefined, () => resolve(undefined));
     });
   };
 
@@ -2242,44 +2275,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
   };
 
-  const showProviders = async (argument: string): Promise<void> => {
-    if (argument.length > 0) throw new Error("Usage: /providers");
-    if (options.auth === undefined || providerInfos().length === 0) {
-      appendNotice("Provider catalog is unavailable in this session.", "warning");
-      return;
-    }
-    let saved = new Set<string>();
-    try {
-      saved = new Set((await options.auth.credentialStore.list()).map((entry) => entry.providerId));
-    } catch {
-      // Listing remains useful when the store cannot be read.
-    }
-    const providers = [...providerInfos()]
-      .filter((provider) => provider.authTypes.length > 0)
-      .sort((left, right) => left.name.localeCompare(right.name));
-    const statuses = new Map<string, string>();
-    await Promise.all(providers.map(async (provider) => {
-      statuses.set(provider.id, await providerAuthStatus(provider, saved));
-    }));
-    const lines = [
-      "### Providers",
-      `${providers.length} provider(s) · choose one with /login or filter models with /model`,
-      ...providers.map((provider) => [
-        `- **${terminalSafeText(provider.name)}** (\`${provider.id}\`)`,
-        `${provider.modelCount} model(s)${provider.modelCount === 0 ? " (catalog pending)" : ""} · ${provider.authTypes.map((type) => terminalSafeText(authTypeLabel(type, provider.id))).join(" / ")}`,
-        statuses.get(provider.id) ?? "status unavailable",
-      ].join(" · ")),
-    ];
-    appendBlock(new Markdown(lines.join("\n"), 1, 0, nausicaaMarkdownTheme));
-  };
-
-  const loginInTui = async (argument: string): Promise<void> => {
+  const loginInTui = async (argument: string, openModels = true): Promise<boolean> => {
+    if (closing) return false;
     if (options.auth === undefined) {
       appendNotice(
         "Authentication is unavailable in this session. Use `nausicaa auth login` instead.",
         "warning",
       );
-      return;
+      return false;
     }
     const parts = argument.split(/\s+/u).filter(Boolean);
     if (parts.length > 2) throw new Error("Usage: /login [provider] [api-key|oauth]");
@@ -2292,9 +2295,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       : authProvider(parts[0], "login");
     if (provider === undefined) {
       appendNotice("Login cancelled.", "info");
-      return;
+      return false;
     }
     const authTypes = authTypesForProvider(provider);
+    if (authTypes.length === 0) {
+      appendNotice(`No supported authentication method is available for ${provider}.`, "error");
+      return false;
+    }
     const showAuthTypeChoice = providerWasExplicit || multipleProviders;
     const requestedAuthType = parts[1] === undefined
       ? authTypes.length <= 1 || !showAuthTypeChoice
@@ -2302,9 +2309,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         : await selectLoginAuthType(provider)
       : normalizeAuthType(parts[1]);
     if (requestedAuthType === undefined) {
-      appendNotice(`No supported authentication method is available for ${provider}.`, "error");
-      return;
+      appendNotice("Login cancelled.", "info");
+      return false;
     }
+    if (closing) return false;
     const input = new TuiSecretInput();
     const authPromptView = new TuiAuthPromptView();
     activeAuthPromptView = authPromptView;
@@ -2350,7 +2358,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         message === "Login cancelled" ? "Login cancelled." : `Login failed: ${oneLine(message)}`,
         message === "Login cancelled" ? "info" : "error",
       );
-      return;
+      return false;
     } finally {
       if (activeSecretInput === input) activeSecretInput = undefined;
       if (activeAuthPromptView === authPromptView) activeAuthPromptView = undefined;
@@ -2363,7 +2371,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       await options.auth.refreshModels?.(provider);
     } catch (error: unknown) {
       appendNotice(
-        `Model catalog refresh failed for ${provider}: ${oneLine(error instanceof Error ? error.message : String(error))}. You can retry with /model or --refresh-models.`,
+        `Model catalog refresh failed for ${provider}: ${oneLine(error instanceof Error ? error.message : String(error))}. You can retry with --refresh-models.`,
         "warning",
       );
     }
@@ -2376,6 +2384,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       `Signed in to ${provider}. The credential is saved locally; auth remains unverified until a provider request.`,
       "success",
     );
+    if (!closing && openModels && options.session.snapshot().model === UNCONFIGURED_MODEL) {
+      const hasModels = readModelOptions().some((option) => modelProviderOf(option.value) === provider);
+      if (hasModels) showModelSelector("", provider);
+      else appendNotice(`No models are available for ${provider} yet. Retry with --refresh-models.`, "warning");
+    }
+    return !closing;
   };
 
   const logoutInTui = async (argument: string): Promise<void> => {
@@ -2386,9 +2400,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       );
       return;
     }
-    const provider = authProvider(argument, "logout");
     let hadSavedCredential = false;
+    let provider: string;
     try {
+      const selected = argument.length === 0
+        ? await selectLogoutProvider()
+        : authProvider(argument, "logout");
+      if (selected === undefined || closing) return;
+      provider = selected;
       hadSavedCredential = await options.auth.credentialStore.read(provider) !== undefined;
       await runAuthCommand(
         { action: "logout", provider, json: false },
@@ -2545,51 +2564,94 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     requestTuiRender();
   }
 
-  const showModelSelector = (initialQuery = ""): void => {
+  const showModelSelector = (initialQuery = "", initialProvider = "all"): void => {
     const current = options.session.snapshot().model;
     const modelOptions = readModelOptions();
     const providerNames = new Map(providerInfos().map((provider) => [provider.id, provider.name]));
     const providerIds = [...new Set(modelOptions.map((option) => modelProviderOf(option.value)))]
       .sort((left, right) => left.localeCompare(right));
-    const providerFilterOptions = [
-      { value: "all", label: "All" },
-      ...providerIds.map((provider) => ({
-        value: provider,
-        label: provider === "default" ? "Local" : providerNames.get(provider) ?? provider,
-      })),
-    ];
-    const selector = new SelectorOverlay({
-      title: "Models",
-      searchLabel: "Search models",
-      subtitle: modelOptions.length === 0
-        ? "Local model catalog unavailable/unverified; configure a provider:model selector and retry."
-        : `${modelOptions.length} model candidates · switch Main at the next provider request boundary.`,
-      filters: providerFilterOptions.length <= 2
-        ? []
-        : [{
+    type AuthState = Awaited<ReturnType<AuthModelPort["checkAuth"]>> | null;
+    const show = (authStates?: ReadonlyMap<string, AuthState>, query = initialQuery): void => {
+      if (closing) return;
+      const configured = (value: string): boolean => authStates === undefined
+        || authStates.get(modelProviderOf(value)) != null;
+      const candidates = modelOptions.map((option) => {
+        if (authStates === undefined) return option;
+        const auth = authStates.get(modelProviderOf(option.value));
+        const status = auth === null ? "Auth status unavailable"
+          : auth === undefined ? "Login required"
+          : `Configured locally (${terminalSafeText(auth.source ?? auth.type)})`;
+        return { ...option, description: [status, option.description].filter(Boolean).join(" · ") };
+      }).sort((left, right) => Number(configured(right.value)) - Number(configured(left.value)));
+      const selector = new SelectorOverlay({
+        title: "Models",
+        searchLabel: "Search models",
+        subtitle: (visible) => `${visible.length} model${visible.length === 1 ? "" : "s"}${authStates === undefined ? "" : " · account access unverified"}`,
+        filters: [
+          ...(authStates === undefined ? [] : [{
+            key: "scope",
+            label: "Scope",
+            options: [{ value: "configured", label: "Configured" }, { value: "all", label: "All" }],
+            current: "configured",
+          }]),
+          ...(providerIds.length <= 1 ? [] : [{
             key: "provider",
             label: "Provider",
-            options: providerFilterOptions,
-            current: "all",
-          }],
-      ...(providerFilterOptions.length <= 2 ? {} : {
-        filterOptions: (options: readonly SelectorOption[], values: Readonly<Record<string, string>>) => {
-            const provider = values.provider ?? "all";
-            return provider === "all"
-              ? options
-              : options.filter((option) => modelProviderOf(option.value) === provider);
-          },
-      }),
-      options: modelOptions,
-      ...(current === UNCONFIGURED_MODEL ? {} : { current }),
-      ...(initialQuery.length === 0 ? {} : { initialQuery }),
-      onSelect: (value) => {
-        closeSelector(false, selector);
-        void applyModelSelection(value);
-      },
-      onCancel: () => closeSelector(true, selector),
+            options: [
+              { value: "all", label: "All" },
+              ...providerIds.map((provider) => ({
+                value: provider,
+                label: provider === "default" ? "Local" : providerNames.get(provider) ?? provider,
+              })),
+            ],
+            current: initialProvider,
+          }]),
+        ],
+        filterOptions: (items, values) => items.filter((item) => (
+          (values.scope === "all" || configured(item.value))
+          && ((values.provider ?? initialProvider) === "all"
+            || modelProviderOf(item.value) === (values.provider ?? initialProvider))
+        )),
+        options: candidates,
+        ...(current === UNCONFIGURED_MODEL ? {} : { current }),
+        initialQuery: query,
+        onSelect: (value) => {
+          closeSelector(false, selector);
+          void applyModelSelection(value);
+        },
+        onCancel: () => closeSelector(true, selector),
+      });
+      mountSelector(selector);
+    };
+    if (options.auth === undefined) {
+      show();
+      return;
+    }
+    const authModel = options.auth.modelPort;
+    const loading = new SelectorOverlay({
+      title: "Models",
+      searchLabel: "Checking local credentials...",
+      options: [],
+      initialQuery,
+      onSelect: () => {},
+      onCancel: () => closeSelector(true, loading),
     });
-    mountSelector(selector);
+    mountSelector(loading);
+    // Auth discovery must not hold the submission queue or reopen a dismissed picker.
+    void Promise.all(providerIds.map(async (provider): Promise<[string, AuthState]> => {
+      try {
+        return [provider, await authModel.checkAuth(provider)];
+      } catch {
+        return [provider, null];
+      }
+    })).then((states) => {
+      if (closing || activeSelector?.component !== loading) return;
+      show(new Map(states), loading.getSearchInput().getValue());
+    }).catch(() => {
+      if (closing || activeSelector?.component !== loading) return;
+      closeSelector(true, loading);
+      appendNotice("Model authentication status could not be loaded. Retry /model.", "warning");
+    });
   };
 
   const applyModelSelection = async (value: string): Promise<void> => {
@@ -2597,6 +2659,18 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       if (value === UNCONFIGURED_MODEL) {
         throw new Error("Choose a model from the local catalog before sending a task");
       }
+      if (options.auth !== undefined) {
+        const provider = modelProviderOf(value);
+        if (await options.auth.modelPort.checkAuth(provider) === undefined) {
+          if (closing) return;
+          appendNotice(`Connect ${provider} to select ${value}.`, "info");
+          if (!await loginInTui(provider, false)) return;
+          if (await options.auth.modelPort.checkAuth(provider) === undefined) {
+            throw new Error(`Credentials for ${provider} are still incomplete. Use /login ${provider}.`);
+          }
+        }
+      }
+      if (closing) return;
       const result = await options.session.selectModel(value);
       if (!result.changed) {
         appendNotice(`Already using model ${result.model}.`, "info");
@@ -3053,9 +3127,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "/login":
           await loginInTui(argument);
           break;
-        case "/providers":
-          await showProviders(argument);
-          break;
         case "/logout":
           await logoutInTui(argument);
           break;
@@ -3130,8 +3201,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             showModelSelector();
             break;
           }
-          const selected = normalizeModelSelector(argument);
-          await applyModelSelection(selected);
+          const match = readModelOptions().find((option) => option.value.toLowerCase() === argument.toLowerCase());
+          if (match !== undefined) await applyModelSelection(match.value);
+          else if (argument.includes(":") && !/\s/u.test(argument)) {
+            await applyModelSelection(normalizeModelSelector(argument));
+          } else showModelSelector(argument);
           break;
         }
         case "/permissions": {

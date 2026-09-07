@@ -20,7 +20,6 @@ describe("interactive command registry", () => {
       "setup",
       "status",
       "login",
-      "providers",
       "logout",
       "list-agents",
       "edges",
@@ -72,6 +71,8 @@ describe("interactive command registry", () => {
     expect(help).toContain("/list-agents");
     expect(help).not.toContain("/agents");
     expect(help).not.toContain("/topology");
+    expect(help).not.toContain("/providers");
+    expect(findInteractiveCommand("/providers")).toBeUndefined();
     expect(help).toContain("/edges [refresh]");
     expect(help).toContain("/mode [default|plan]");
     expect(help).toContain("/fork [run-id]");

@@ -46,8 +46,9 @@ nausicaa --help
 模型与 provider：
 
 Nausicaa 默认加载 `pi-ai` 的完整 provider/model 目录，OpenRouter 只是其中一个选项。
-在 TUI 中使用 `/model` 搜索并按 provider 筛选，使用 `/providers` 浏览模型数量和认证方式，
-使用 `/login` 选择 provider，再选择 API key 或浏览器/设备 OAuth。非交互命令可用
+使用 `/login` 查看服务商及认证状态，选择 API key 或浏览器/设备 OAuth。
+`/model` 默认显示已配置服务商的模型，支持搜索、服务商筛选和显式浏览全部目录；
+选择尚未配置的模型会引导登录。非交互命令可用
 `--provider <provider> --model <id>`，也兼容 `provider:model` 选择器。
 
 ```bash
@@ -66,6 +67,7 @@ export NAUSICAA_MODEL="openrouter:openai/gpt-5-mini"
 
 凭据也可以通过 `nausicaa auth login <provider> [api-key|oauth]` 或 TUI 的 `/login` 保存。
 `nausicaa auth status <provider>` 只显示本地配置状态，不会验证或打印密钥。
+尚未选择模型时，登录后会打开该 provider 的模型列表；`/logout` 选择并移除本地保存的凭据，不删除环境变量。
 
 源码开发：
 
@@ -85,7 +87,7 @@ nausicaa "Summarize this workspace"
 
 常用入口：`--print`、`--json`、`--topology`、`--worker`、`--daemon`、
 `--daemon-worker-command <path>`、`--attach <run-id>`；TUI 提供
-`/providers`、`/model`、`/login`、`/list-agents`、`/permissions`、`/plan`、
+`/model`、`/login`、`/logout`、`/list-agents`、`/permissions`、`/plan`、
 `/skills` 和 `/edges`。
 
 开发检查：`npm run typecheck`、`npm test`、`npm run test:smoke`、`npm run build`。
@@ -131,9 +133,10 @@ nausicaa --help
 Model and provider setup:
 
 Nausicaa loads the complete `pi-ai` provider/model catalog by default; OpenRouter is
-one option among many. Use `/model` to search and filter by provider, `/providers`
-to browse model counts and authentication methods, and `/login` to choose a provider
-and then API key or browser/device OAuth. Non-interactive runs accept
+one option among many. Use `/login` to view provider authentication status and
+connect with an API key or browser/device OAuth. `/model` defaults to configured
+providers, with search, provider filtering, and an explicit all-catalog view.
+Selecting an unconfigured model starts login. Non-interactive runs accept
 `--provider <provider> --model <id>` as well as the `provider:model` selector form.
 
 ```bash
@@ -153,6 +156,8 @@ export NAUSICAA_MODEL="openrouter:openai/gpt-5-mini"
 Credentials can also be saved with `nausicaa auth login <provider> [api-key|oauth]`
 or the TUI `/login` command. `nausicaa auth status <provider>` reports local
 configuration only; it never verifies or prints a key.
+When no model is selected, login opens that provider's model list. `/logout`
+lets you choose a saved credential to remove; environment variables are unchanged.
 
 Source checkout:
 
@@ -172,7 +177,7 @@ Project-local `.agents/skills`, `.pi/skills`, and `skills` directories are disco
 
 Common entry points are `--print`, `--json`, `--topology`, `--worker`, `--daemon`,
 `--daemon-worker-command <path>`, and `--attach <run-id>`. The TUI includes
-`/providers`, `/model`, `/login`, `/list-agents`, `/permissions`, `/plan`,
+`/model`, `/login`, `/logout`, `/list-agents`, `/permissions`, `/plan`,
 `/skills`, and `/edges`.
 
 Development checks: `npm run typecheck`, `npm test`, `npm run test:smoke`, and
