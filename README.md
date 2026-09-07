@@ -1,5 +1,12 @@
 # Nausicaa
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/Nausicaa-dark.svg">
+    <img src="assets/Nausicaa.svg" alt="Nausicaa logo" width="160">
+  </picture>
+</p>
+
 > 面向通用任务的多 Lane、多拓扑 Agent 执行运行时。
 > An execution runtime for general-purpose agents that think and act as a topology.
 
