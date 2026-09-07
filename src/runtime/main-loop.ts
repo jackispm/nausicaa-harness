@@ -842,6 +842,7 @@ export class MainLoop {
         });
         let requestEvent: { eventId: string; globalOffset: number } | undefined;
         let response: ModelResponse;
+        let providerDispatched = false;
         const streamProgress: MainModelStreamProgress = { text: "", reasoning: "" };
         let requestDeadlineSignal: AbortSignal | undefined;
         // Start the wall-clock budget at the provider request boundary, before
@@ -914,6 +915,7 @@ export class MainLoop {
             streamProgress,
             deadline.signal,
             modelCapabilities,
+            () => { providerDispatched = true; },
           );
           // A provider promise and the runtime timer can settle in the same
           // turn of the event loop. Once the deadline has fired, the response
@@ -971,7 +973,7 @@ export class MainLoop {
             const reason = persistedErrorText(input.signal?.reason, "Cancelled");
             await this.emit(input, laneId, correlationId, eventState, {
               type: "model.cancelled",
-              payload: { requestId: requestEvent.eventId, reason },
+              payload: { requestId: requestEvent.eventId, reason, dispatched: providerDispatched },
               idempotencyKey: `${eventPrefix}:step:${step}:model:cancelled`,
               causationId: requestEvent.eventId,
             });
@@ -1549,11 +1551,13 @@ export class MainLoop {
     progress: MainModelStreamProgress,
     cancellationSignal: AbortSignal,
     modelCapabilities?: ModelCapabilities,
+    onDispatch?: () => void,
   ): Promise<ModelResponse> {
     // Check before evaluating the provider call expression.  Passing the
     // promise directly to raceAbort would otherwise invoke a ModelPort once
     // even when a slow model.requested append already consumed the deadline.
     throwIfAborted(cancellationSignal);
+    onDispatch?.();
     // `undefined` is intentional here: it records that the capability probe
     // already happened (or that the provider has no usable metadata), so a
     // throwing/expensive capability catalog is never queried twice.

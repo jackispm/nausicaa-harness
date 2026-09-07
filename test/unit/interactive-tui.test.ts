@@ -946,14 +946,27 @@ describe("interactive TUI", () => {
   it("keeps Teto's sibling transcript out of the Main presentation", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-teto-transcript-"));
     const previousExitCode = process.exitCode;
+    let releaseTeto = (): void => {};
+    const tetoReleased = new Promise<void>((resolve) => { releaseTeto = resolve; });
+    let session: SessionController | undefined;
+    let running: Promise<number> | undefined;
+    let stopped = false;
     try {
       const mainModel = new ScriptedModel([response("MAIN_ANSWER_SENTINEL")]);
-      const tetoModel = new ScriptedModel([response("TETO_ANSWER_SENTINEL")]);
-      const session = await SessionController.open({
+      const tetoModel = new ScriptedModel([
+        async () => {
+          await tetoReleased;
+          return response("TETO_ANSWER_SENTINEL");
+        },
+        response("TETO_FOLLOWUP_SENTINEL"),
+      ]);
+      session = await SessionController.open({
         workspace: root,
         dataDir: join(root, "state"),
         model: "scripted/main",
         tetoModel: "scripted/teto",
+        // This presentation test must leave room for both concurrent lanes.
+        maxOutputTokens: 64,
         policy: {
           maxMainStepsPerActivation: 2,
           maxModelTokens: 10_000,
@@ -967,26 +980,39 @@ describe("interactive TUI", () => {
         tetoModel,
         createRunId: () => "interactive-teto-transcript-run",
       });
+      const tetoEvents: AnyEvent[] = [];
+      session.subscribe((event) => {
+        if (event.kind === "event" && event.event.laneId === "teto") tetoEvents.push(event.event);
+      });
       const terminal = new MemoryTerminal(100, 28);
-      const running = runInteractive({ session, terminal, forceAltScreen: true });
+      running = runInteractive({ session, terminal, forceAltScreen: true })
+        .finally(() => { stopped = true; });
 
       await terminal.started;
-      await delay(120);
+      await waitForOutput(terminal, "scripted/main");
       terminal.type("hello");
       terminal.send("\r");
-      await session.waitForIdle();
       await waitForOutput(terminal, "MAIN_ANSWER_SENTINEL");
-      await waitForCondition(
-        () => tetoModel.callCount > 0,
-        "Teto sibling activation",
-      );
-      await delay(40);
+      await session.waitForIdle();
+      const laneDiagnostics = (): string => JSON.stringify(tetoEvents
+        .filter((event) => event.type === "lane.status" || event.type === "model.failed")
+        .map((event) => ({ type: event.type, payload: event.payload })));
+      await vi.waitFor(() => {
+        expect(tetoModel.callCount, laneDiagnostics()).toBeGreaterThan(0);
+      }, { timeout: 5_000, interval: 10 });
+      expect(terminal.output).not.toContain("TETO_ANSWER_SENTINEL");
+
+      releaseTeto();
+      await vi.waitFor(() => {
+        expect(tetoEvents.filter((event) => event.type === "step.completed"), laneDiagnostics())
+          .toHaveLength(2);
+      }, { timeout: 5_000, interval: 10 });
 
       const visible = normalizeTerminalOutput(terminal.output);
       expect(visible).toContain("MAIN_ANSWER_SENTINEL");
       expect(visible).not.toContain("TETO_ANSWER_SENTINEL");
+      expect(visible).not.toContain("TETO_FOLLOWUP_SENTINEL");
       expect(visible).not.toContain("Main output:");
-      await waitForCondition(async () => (await session.transcript()).some((entry) => entry.role === "assistant" && entry.content === "MAIN_ANSWER_SENTINEL"), "committed Main transcript");
       await expect(session.transcript()).resolves.toEqual([
         expect.objectContaining({ role: "user", content: "hello" }),
         expect.objectContaining({ role: "assistant", content: "MAIN_ANSWER_SENTINEL" }),
@@ -996,8 +1022,14 @@ describe("interactive TUI", () => {
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
     } finally {
-      process.exitCode = previousExitCode;
-      await rm(root, { recursive: true, force: true });
+      releaseTeto();
+      if (running !== undefined && !stopped) process.emit("SIGTERM", "SIGTERM");
+      try { await running; }
+      finally {
+        await session?.close();
+        process.exitCode = previousExitCode;
+        await rm(root, { recursive: true, force: true });
+      }
     }
   });
 

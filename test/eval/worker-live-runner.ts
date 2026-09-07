@@ -146,6 +146,13 @@ export interface WorkerLiveRequestInterval {
   usage?: WorkerLiveProviderUsage;
 }
 
+export interface WorkerLivePreDispatchCancellation {
+  requestId: string;
+  laneId: "main";
+  observedNs: string;
+  reason: string;
+}
+
 export interface WorkerLiveGraphEvidence {
   taskCount: number;
   delegated: number;
@@ -173,6 +180,8 @@ export interface WorkerLiveArmRecord {
   taskGraph: TaskGraphProjection;
   graph: WorkerLiveGraphEvidence;
   requestIntervals: readonly WorkerLiveRequestInterval[];
+  /** Recorded at request admission, never inferred from a missing interval. */
+  preDispatchCancellations?: readonly WorkerLivePreDispatchCancellation[];
   toolTrace: readonly WorkerLiveRecordedToolTraceEntry[];
   finalText: string;
   answerArtifact?: WorkerLiveAnswerArtifact;
@@ -488,6 +497,7 @@ export async function executeWorkerLiveArm(
   let runResult: RunExecutionResult | undefined;
   let finalText = "";
   let error: string | undefined;
+  const preDispatchCancellations: WorkerLivePreDispatchCancellation[] = [];
 
   try {
     const physicalModel = options.live
@@ -536,6 +546,18 @@ export async function executeWorkerLiveArm(
         tools,
         workerTools,
         createRunId: () => runId,
+        onEvent: (event: AnyEvent) => {
+          // Main rechecks cancellation after this durable admission callback
+          // and before invoking the model. Observe the signal at that boundary.
+          if (event.type === "model.requested" && event.laneId === "main" && signal.aborted) {
+            preDispatchCancellations.push({
+              requestId: event.eventId,
+              laneId: "main",
+              observedNs: process.hrtime.bigint().toString(),
+              reason: persistedErrorText(signal.reason, "Cancelled"),
+            });
+          }
+        },
       } satisfies RunExecutionDeps;
       let activation = await executeRun({
         ...commonRequest,
@@ -587,7 +609,7 @@ export async function executeWorkerLiveArm(
   if (
     error === undefined
     && !snapshot.budgetBreached
-    && logicalRequests !== ledgerRequests
+    && logicalRequests + preDispatchCancellations.length !== ledgerRequests
   ) {
     error = "Physical request evidence does not match Ledger model requests";
   }
@@ -647,6 +669,7 @@ export async function executeWorkerLiveArm(
     taskGraph,
     graph,
     requestIntervals: intervals,
+    ...(preDispatchCancellations.length === 0 ? {} : { preDispatchCancellations }),
     toolTrace: structuredClone(toolTrace),
     finalText,
     ...(answerArtifact === undefined ? {} : { answerArtifact }),
@@ -1689,8 +1712,14 @@ async function validateWorkerLiveArmRecord(
   const logicalRequestCount = new Set(intervals.map((interval) => (
     interval.logicalRequestId
   ))).size;
+  const preDispatchRequestIds = validatePreDispatchCancellations(
+    value.preDispatchCancellations,
+    typedEvents,
+    startedNs,
+    endedNs,
+  );
   const metrics = projectRunMetrics(typedEvents, value.runId as string);
-  if (logicalRequestCount !== metrics.total.modelRequests) {
+  if (logicalRequestCount + preDispatchRequestIds.size !== metrics.total.modelRequests) {
     throw new WorkerLiveContractError(
       "Worker live physical intervals do not match Ledger logical requests",
     );
@@ -1701,6 +1730,7 @@ async function validateWorkerLiveArmRecord(
     startedNs,
     endedNs,
     manifest,
+    preDispatchRequestIds,
   );
   const toolTrace = validateToolTrace(value.toolTrace);
   validateToolTraceAgainstLedger(toolTrace, typedEvents);
@@ -1871,12 +1901,63 @@ function validateRequestIntervals(
   return intervals;
 }
 
+function validatePreDispatchCancellations(
+  value: unknown,
+  events: readonly AnyEvent[],
+  armStartedNs: bigint,
+  armEndedNs: bigint,
+): ReadonlySet<string> {
+  const requestIds = new Set<string>();
+  if (value === undefined) return requestIds;
+  if (!Array.isArray(value) || value.length > events.length) {
+    throw new WorkerLiveContractError("Worker live pre-dispatch cancellation evidence is malformed");
+  }
+  for (const item of value) {
+    if (!isRecord(item)
+      || Object.keys(item).length !== 4
+      || typeof item.requestId !== "string"
+      || item.laneId !== "main"
+      || typeof item.observedNs !== "string"
+      || typeof item.reason !== "string"
+      || item.reason.length === 0
+      || requestIds.has(item.requestId)) {
+      throw new WorkerLiveContractError("Worker live pre-dispatch cancellation evidence is malformed");
+    }
+    const observedNs = bigintText(item.observedNs, "pre-dispatch.observedNs");
+    if (observedNs < armStartedNs || observedNs > armEndedNs) {
+      throw new WorkerLiveContractError("Worker live pre-dispatch cancellation is outside its arm timing");
+    }
+    const request = events.find((event): event is Extract<AnyEvent, { type: "model.requested" }> => (
+      event.type === "model.requested" && event.laneId === item.laneId && event.eventId === item.requestId
+    ));
+    if (request === undefined) {
+      throw new WorkerLiveContractError("Worker live pre-dispatch cancellation has no matching request");
+    }
+    // Keep the same unique, causally linked terminal checks as physical calls.
+    ledgerRequestTerminal(request, events);
+    const cancellation = events.find((event): event is Extract<AnyEvent, { type: "model.cancelled" }> => (
+      event.type === "model.cancelled" && event.payload.requestId === request.eventId
+    ));
+    const prefix = request.idempotencyKey.slice(0, -":model:requested".length);
+    if (cancellation === undefined || cancellation.payload.reason !== item.reason
+      || cancellation.payload.dispatched !== false
+      || events.some((event) => event.type === "budget.charged" && (
+        event.causationId === request.eventId || event.idempotencyKey === `${prefix}:budget`
+      ))) {
+      throw new WorkerLiveContractError("Worker live pre-dispatch cancellation lacks matching uncharged cancellation evidence");
+    }
+    requestIds.add(request.eventId);
+  }
+  return requestIds;
+}
+
 function validateIntervalsAgainstLedger(
   intervals: readonly WorkerLiveRequestInterval[],
   events: readonly AnyEvent[],
   armStartedNs: bigint,
   armEndedNs: bigint,
   manifest: WorkerLiveManifest,
+  preDispatchRequestIds: ReadonlySet<string>,
 ): void {
   for (const interval of intervals) {
     if (
@@ -1891,7 +1972,7 @@ function validateIntervalsAgainstLedger(
   const requested = events.filter((event): event is Extract<
     AnyEvent,
     { type: "model.requested" }
-  > => event.type === "model.requested");
+  > => event.type === "model.requested" && !preDispatchRequestIds.has(event.eventId));
   for (const laneId of ["main", "worker"] as const) {
     const laneEvents = requested.filter((event) => event.laneId === laneId)
       .sort((left, right) => left.globalOffset - right.globalOffset);
@@ -2002,7 +2083,7 @@ function ledgerRequestTerminal(
       "Worker live Ledger cancellation does not match its request",
     );
   }
-  // A cancelled invocation rejected physically; it is never a successful arm.
+  // A cancelled logical request is never successful, dispatched or not.
   if (terminal.type !== "model.completed") return { terminal: "failed" };
   const usage = providerUsage(terminal.payload.usage);
   const budget = events.find((event): event is Extract<

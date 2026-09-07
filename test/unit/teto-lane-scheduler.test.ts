@@ -44,6 +44,51 @@ const response = (
 });
 
 describe("TetoLaneScheduler", () => {
+  it.each(["release", "settle"] as const)("resumes after Main %ss a temporary shared-budget reservation", async (settlement) => {
+    const shared = new RunTokenBudget(10_000);
+    const tokenBudget = new RunTokenBudget(10_000, 0, { parent: shared, scope: "teto" });
+    shared.reserve("main-in-flight", 10_000);
+    const model = new ScriptedModel([
+      response("Observed Main's first event"),
+      response("Observed Main's next event"),
+    ]);
+    const { scheduler, ledger, mainEvent } = await a2aScenario(model, { tokenBudget });
+    try {
+      scheduler.observeMainEvent(mainEvent);
+      await scheduler.drain();
+      expect(model.callCount).toBe(0);
+      expect(tokenBudget.snapshot().usedTokens).toBe(0);
+      expect((await ledger.read({ runId: "run-a2a" })).some((event) => (
+        event.laneId === "teto" && event.type === "lane.status"
+        && event.payload.status === "waiting"
+      ))).toBe(true);
+
+      if (settlement === "release") shared.cancel("main-in-flight");
+      else shared.settle("main-in-flight", 25);
+      const nextEvent = await ledger.append({
+        runId: "run-a2a", laneId: "main", type: "user.message", payload: mainEvent.payload,
+        correlationId: "run-a2a", idempotencyKey: "main-after-reservation", visibility: "run",
+      });
+      scheduler.observeMainEvent(nextEvent);
+      await scheduler.drain();
+      expect(model.callCount).toBe(2);
+      const observedInputs = (await ledger.read({ runId: "run-a2a" })).filter((event) => (
+        event.laneId === "teto"
+        && event.type === "user.message"
+        && event.payload.sourceEventId !== undefined
+      )) as Array<Extract<AnyEvent, { type: "user.message" }>>;
+      expect(observedInputs.filter((event) => event.payload.sourceEventId === mainEvent.eventId)).toHaveLength(1);
+      expect(observedInputs.filter((event) => event.payload.sourceEventId === nextEvent.eventId)).toHaveLength(1);
+      expect(model.requests[0]?.messages.at(-1)?.content).toContain("Observed lane event");
+      expect(model.requests[1]?.messages.at(-1)?.content).toContain("Observed lane event");
+      expect(scheduler.snapshot().failures).toEqual([]);
+      expect(shared.snapshot().usedTokens).toBe(settlement === "release" ? 50 : 75);
+      expect(shared.snapshot().reservedTokens).toBe(0);
+    } finally {
+      await scheduler.stop();
+    }
+  });
+
   it.each(["lane", "sensitive"] as const)("does not schedule %s owner events live or after recovery", async (visibility) => {
     const model = new ScriptedModel([response("must not observe private data")]);
     const { scheduler, options, mainEvent } = await a2aScenario(model);

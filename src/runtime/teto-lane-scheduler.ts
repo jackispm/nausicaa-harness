@@ -129,6 +129,7 @@ export class TetoLaneScheduler {
   private readonly systemPrompt: string;
   private readonly stopWaitMs: number;
   private readonly seenMainEventIds = new Set<string>();
+  private readonly pendingMainEvents = new Map<string, MainPublicEvent>();
   private readonly completedMainEventIds = new Set<string>();
   private readonly projectedSourceEventIds = new Set<string>();
   private readonly seenToolCallIds = new Set<string>();
@@ -229,7 +230,8 @@ export class TetoLaneScheduler {
       this.completedMainEventIds.add(eventId);
       this.seenMainEventIds.add(eventId);
     }
-    this.budgetExhausted = this.tokenBudget.availableTokens() === 0;
+    const budget = this.tokenBudget.snapshot();
+    this.budgetExhausted = budget.maxTokens !== undefined && budget.usedTokens >= budget.maxTokens;
     this.tail = recoverSeenToolCallIds(
       this.store,
       options.events ?? [],
@@ -284,19 +286,10 @@ export class TetoLaneScheduler {
       || this.seenMainEventIds.has(event.eventId)
     ) return;
     this.seenMainEventIds.add(event.eventId);
-    const operation = this.tail.then(() => this.process(event));
-    this.tail = operation.catch(async (error: unknown) => {
-      if (!(error instanceof MainRunTokenBudgetExhaustedError)) {
-        this.failures.push(asError(error));
-      }
-      const recorder = error instanceof MainRunTokenBudgetExhaustedError
-        ? Promise.resolve()
-        : isAbortError(error)
-        ? this.recordCancelled(event.eventId, error)
-        : this.recordFailure(event.eventId, error);
-      await recorder.catch((recordError: unknown) => {
-        this.failures.push(asError(recordError));
-      });
+    this.pendingMainEvents.set(event.eventId, event);
+    const operation = this.tail.then(() => this.processPendingMainEvents());
+    this.tail = operation.catch((error: unknown) => {
+      this.failures.push(asError(error));
     });
   }
 
@@ -380,6 +373,28 @@ export class TetoLaneScheduler {
     };
   }
 
+  private async processPendingMainEvents(): Promise<void> {
+    for (const [eventId, event] of this.pendingMainEvents) {
+      if (!this.accepting || this.budgetExhausted || this.stopController.signal.aborted || this.signal?.aborted) return;
+      try {
+        await this.process(event);
+      } catch (error: unknown) {
+        // Parent reservations can temporarily refuse admission even when this
+        // lane has allowance. Keep the source ordered; only a new Main event
+        // schedules another attempt, so drain() also settles while blocked.
+        if (error instanceof MainRunTokenBudgetExhaustedError) return;
+        this.failures.push(asError(error));
+        const recorder = isAbortError(error)
+          ? this.recordCancelled(eventId, error)
+          : this.recordFailure(eventId, error);
+        await recorder.catch((recordError: unknown) => {
+          this.failures.push(asError(recordError));
+        });
+      }
+      this.pendingMainEvents.delete(eventId);
+    }
+  }
+
   private async process(event: MainPublicEvent): Promise<void> {
     if (
       !this.accepting
@@ -395,7 +410,8 @@ export class TetoLaneScheduler {
       );
       return;
     }
-    if (projection.toolCallId !== undefined && this.seenToolCallIds.has(projection.toolCallId)) {
+    const alreadyProjected = this.projectedSourceEventIds.has(event.eventId);
+    if (projection.toolCallId !== undefined && this.seenToolCallIds.has(projection.toolCallId) && !alreadyProjected) {
       await this.markEventDormant(event);
       return;
     }
@@ -403,7 +419,6 @@ export class TetoLaneScheduler {
     if (projection.toolCallId !== undefined) this.seenToolCallIds.add(projection.toolCallId);
 
     const sourceCorrelationId = `${this.runId}:${this.laneId}:source:${event.eventId}`;
-    const alreadyProjected = this.projectedSourceEventIds.has(event.eventId);
     await this.eventSink.append({
       runId: this.runId,
       laneId: this.laneId,
@@ -436,9 +451,10 @@ export class TetoLaneScheduler {
     // fails after step.started, the next public event must receive a fresh
     // idempotency namespace rather than replaying that failed step's keys.
     this.nextStep += 1;
+    const activationEvents: AnyEvent[] = [];
     let result: Awaited<ReturnType<MainLoop["run"]>>;
     try {
-      result = await this.loop().run({
+      result = await this.loop((committed) => activationEvents.push(committed)).run({
         runId: this.runId,
         laneId: this.laneId,
         sessionId: `${this.runId}:${this.laneId}:${this.modelName}`,
@@ -472,7 +488,14 @@ export class TetoLaneScheduler {
       });
     } catch (error: unknown) {
       if (error instanceof MainRunTokenBudgetExhaustedError) {
-        this.budgetExhausted = true;
+        // MainLoop persists its observation before admission. Retain those
+        // facts just as restart recovery would, without projecting twice.
+        this.conversationRefs.push(...recoverLaneConversationRefs(activationEvents, this.laneId));
+        for (const eventId of recoverProjectedSourceEventIds(activationEvents, this.runId, this.laneId)) {
+          this.projectedSourceEventIds.add(eventId);
+        }
+        const budget = this.tokenBudget.snapshot();
+        this.budgetExhausted = budget.maxTokens !== undefined && budget.usedTokens >= budget.maxTokens;
         await this.recordBudgetExhausted(event.eventId);
       }
       throw error;
@@ -510,7 +533,7 @@ export class TetoLaneScheduler {
     this.completedMainEventIds.add(event.eventId);
   }
 
-  private loop(): MainLoop {
+  private loop(eventObserver?: (event: AnyEvent) => void): MainLoop {
     const selectCompaction = this.compactionRuntime?.select.bind(this.compactionRuntime);
     const compactForPressure = this.compactionRuntime?.compactIfNeeded?.bind(
       this.compactionRuntime,
@@ -523,6 +546,7 @@ export class TetoLaneScheduler {
       tools: this.tools,
       clock: this.clock,
       runTokenBudget: this.tokenBudget,
+      ...(eventObserver === undefined ? {} : { eventObserver }),
       // Each observed event opens one activation with one natural boundary.
       beforeStep: (context) => this.mailbox.beforeStep({ ...context, step: 1 }),
       afterStepAsync: (context) => this.mailbox.afterStep(context),
@@ -571,7 +595,7 @@ export class TetoLaneScheduler {
         reason: "Teto token budget exhausted",
       },
       correlationId: `${this.runId}:${this.laneId}:source:${sourceEventId}`,
-      idempotencyKey: `${this.runId}:${this.laneId}:status:budget-exhausted`,
+      idempotencyKey: `${this.runId}:${this.laneId}:status:budget-exhausted:${sourceEventId}`,
       visibility: "run",
       occurredAt: this.clock.now().toISOString(),
     });

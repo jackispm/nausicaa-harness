@@ -2,6 +2,16 @@
 
 All notable changes to Nausicaa are documented here.
 
+## [Unreleased]
+
+- Fixed Teto treating temporary shared-budget reservations as permanent
+  exhaustion; later owner events can resume observation without losing
+  already-persisted context.
+- Made cancellation evaluations distinguish admitted requests from dispatched
+  provider calls, with explicit evidence and deterministic boundary tests.
+- Synchronized the TUI transcript-isolation test with durable lane completion
+  and added failure diagnostics and guaranteed session cleanup.
+
 ## [0.1.2] - 2026-09-08
 
 - Added `/settings`, `/system-prompt`, `/logs`, `/changelog`, and `/update`

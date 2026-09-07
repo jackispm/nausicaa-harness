@@ -262,7 +262,7 @@ export interface EventPayloadMap {
     /** Optional for schema-v1 compatibility; absent legacy failures recover conservatively. */
     retryable?: boolean;
   };
-  "model.cancelled": { requestId: EventId; reason: string };
+  "model.cancelled": { requestId: EventId; reason: string; dispatched?: boolean };
   "tool.requested": {
     operationId: string;
     toolCallId: string;
