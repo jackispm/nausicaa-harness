@@ -196,7 +196,7 @@ export class WorkerLaneScheduler {
 
   /** Claim completed Worker replies for the next Main natural boundary. */
   async beforeMainStep(
-    context?: Pick<MainBeforeStepContext, "step">,
+    context?: Pick<MainBeforeStepContext, "step"> & { maxResults?: number },
   ): Promise<readonly MainBoundaryMessage[]> {
     if (!this.accepting || this.stopController.signal.aborted || this.signal?.aborted) {
       return [];
@@ -205,7 +205,7 @@ export class WorkerLaneScheduler {
       await this.acknowledgeCommitted([...this.committedBoundaryMessageIds]);
       const records = await this.inbox.claim(this.mainLaneId, this.mainLaneId, {
         claimId: `${this.runId}:worker:delivery:${this.createId()}`,
-        limit: this.maxResultsPerBoundary,
+        limit: Math.min(this.maxResultsPerBoundary, context?.maxResults ?? this.maxResultsPerBoundary),
         runId: this.runId,
         from: this.workerLaneId,
         types: ["task.accept", "task.result", "task.failed"],

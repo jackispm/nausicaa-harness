@@ -697,7 +697,9 @@ export class WorkerTaskExecutor {
           const availableToolCalls = MAX_WORKER_TOOL_CALLS - totalToolCalls;
           const calls = response.toolCalls.slice(0, Math.max(0, availableToolCalls));
           const omittedToolCalls = response.toolCalls.length - calls.length;
-          const truncatedToolCallError = response.stopReason === "length"
+          const blockedToolCallError = response.stopReason === "aborted"
+            ? "Tool call was not executed because the provider aborted this Worker response."
+            : response.stopReason === "length"
             ? "Tool call was not executed because the Worker response hit its output token limit; re-issue the complete tool call."
             : undefined;
           if (calls.length > 0) {
@@ -710,9 +712,9 @@ export class WorkerTaskExecutor {
                 signal: deadline.signal,
                 correlationId: request.correlationId,
                 visibility: request.visibility,
-                ...(truncatedToolCallError === undefined
+                ...(blockedToolCallError === undefined
                   ? {}
-                  : { executionError: truncatedToolCallError }),
+                  : { executionError: blockedToolCallError }),
               })
             )));
             for (const toolMessage of toolMessages) {
@@ -734,7 +736,7 @@ export class WorkerTaskExecutor {
             || turn >= maxTurns
             || response.stopReason === "length";
           const hasToolCalls = response.toolCalls.length > 0;
-          if (hasToolCalls && calls.length > 0 && !toolLoopTruncated) {
+          if (hasToolCalls && calls.length > 0 && !toolLoopTruncated && response.stopReason !== "aborted") {
             continue;
           }
           return completedExecution(
@@ -1053,6 +1055,9 @@ function completedExecution(
         ? [
             ...(stopReason === "length"
               ? ["Worker response reached its model output limit."]
+              : []),
+            ...(stopReason === "aborted"
+              ? ["The provider aborted the Worker response; its tool calls were not executed."]
               : []),
             ...(toolLoopTruncated && toolCallCount > 0
               ? ["Worker tool loop reached its bounded execution limit."]

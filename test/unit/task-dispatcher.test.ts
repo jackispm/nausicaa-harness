@@ -120,6 +120,63 @@ describe("TaskDispatcher", () => {
     });
   });
 
+  it("restores a Team task from its host admission time without extending the deadline", async () => {
+    const admittedAt = "2026-08-27T12:00:00.000Z";
+    const clock = new MutableClock(new Date("2026-08-27T12:00:05.000Z"));
+    const inbox = new A2AInbox({ clock });
+    const dispatcher = new TaskDispatcher({ inbox, runId: "run-1", clock, admittedAt });
+    const request = {
+      taskId: "restored-task",
+      goal: baseGoal,
+      budget: { ...baseBudget, deadline: "2026-08-27T12:00:30.000Z" },
+    };
+    expect((await dispatcher.dispatch(request)).status).toBe("queued");
+    expect(inbox.snapshot().records[0]?.message).toMatchObject({
+      createdAt: admittedAt,
+      payload: { budget: { deadline: "2026-08-27T12:00:30.000Z" } },
+    });
+    clock.advance(5_000);
+    const restarted = new TaskDispatcher({ inbox, runId: "run-1", clock, admittedAt });
+    expect((await restarted.dispatch(request)).status).toBe("duplicate");
+    expect(inbox.snapshot().records).toHaveLength(1);
+  });
+
+  it("keeps the existing request timestamp authoritative over a later host default", async () => {
+    const clock = new MutableClock(new Date("2026-08-27T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
+    const request = { taskId: "already-sent", goal: baseGoal, budget: baseBudget };
+    await new TaskDispatcher({ inbox, runId: "run-1", clock }).dispatch(request);
+    clock.advance(5_000);
+    const dispatcher = new TaskDispatcher({ inbox, runId: "run-1", clock, admittedAt: clock.now().toISOString() });
+    expect((await dispatcher.dispatch(request)).status).toBe("duplicate");
+    expect(inbox.snapshot().records[0]?.message.createdAt).toBe("2026-08-27T12:00:00.000Z");
+  });
+
+  it("rejects a future host admission timestamp before writing a task", async () => {
+    const clock = new MutableClock(new Date("2026-08-27T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
+    const dispatcher = new TaskDispatcher({
+      inbox, runId: "run-1", clock, admittedAt: "2026-08-27T12:00:01.000Z",
+    });
+    await expect(dispatcher.dispatch({ taskId: "future", goal: baseGoal, budget: baseBudget })).rejects.toThrow(/future/);
+    expect(inbox.snapshot().records).toEqual([]);
+  });
+
+  it("lets the Inbox reject a host admission timestamp ahead of its authoritative clock", async () => {
+    const inboxClock = new MutableClock(new Date("2026-08-27T12:00:00.000Z"));
+    const dispatcherClock = new MutableClock(new Date("2026-08-27T12:00:05.000Z"));
+    const inbox = new A2AInbox({ clock: inboxClock });
+    const dispatcher = new TaskDispatcher({
+      inbox, runId: "run-1", clock: dispatcherClock, admittedAt: "2026-08-27T12:00:01.000Z",
+    });
+    await expect(dispatcher.dispatch({ taskId: "clock-skew", goal: baseGoal, budget: baseBudget })).rejects.toThrow(/future/);
+    expect(inbox.snapshot().records).toEqual([]);
+  });
+
+  it.each(["", "not-a-date"])("rejects malformed host admission time %j", (admittedAt) => {
+    expect(() => new TaskDispatcher({ inbox: new A2AInbox(), runId: "run-1", admittedAt })).toThrow(/admittedAt/);
+  });
+
   it("rejects an explicit deadline that is not derived from task creation", async () => {
     const clock = new MutableClock(new Date("2026-08-27T12:00:00.000Z"));
     const inbox = new A2AInbox({ clock });

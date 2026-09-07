@@ -191,6 +191,10 @@ describe("runtime activation parity", () => {
       "agent_awareness",
       "team_create",
       "team_status",
+      "team_cancel",
+      "team_reduce",
+      "team_present",
+      "agent_message",
       "delegate_task",
     ]);
   });
@@ -282,6 +286,10 @@ describe("runtime activation parity", () => {
       "agent_awareness",
       "team_create",
       "team_status",
+      "team_cancel",
+      "team_reduce",
+      "team_present",
+      "agent_message",
       "delegate_task",
     ]);
   });
@@ -364,6 +372,10 @@ describe("runtime activation parity", () => {
         "teto_status",
         "team_create",
         "team_status",
+        "team_cancel",
+        "team_reduce",
+        "team_present",
+        "agent_message",
         "delegate_task",
       ],
       tetoModels: ["scripted-teto"],

@@ -39,7 +39,7 @@ describe("agent awareness tool", () => {
     const result = await tool.execute({}, context);
     const output = JSON.parse(result.content) as {
       snapshot: typeof snapshot;
-      guidance: { liveOnly: string; taskSummary: string };
+      guidance: { liveOnly: string; taskSummary: string; team: string };
     };
 
     expect(result.isError).toBe(false);
@@ -48,5 +48,7 @@ describe("agent awareness tool", () => {
     expect(output.snapshot.nodes[0]?.activitySummary).toBe("coordinating the request");
     expect(output.guidance.liveOnly).toMatch(/terminal/iu);
     expect(output.guidance.taskSummary).toMatch(/activitySummary/iu);
+    expect(output.guidance.team).toContain("Main is the Team Lead and default synthesizer");
+    expect(output.guidance.team).toContain("Run forks are not Team members");
   });
 });

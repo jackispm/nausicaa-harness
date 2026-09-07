@@ -340,8 +340,9 @@ const hasOperatorResolution = (
   ),
 );
 
-const recoverConversationRefs = (events: readonly AnyEvent[]): FukaiConversationRef[] => {
+export const recoverLaneConversationRefs = (events: readonly AnyEvent[], laneId = "main"): FukaiConversationRef[] => {
   const refs: FukaiConversationRef[] = [];
+  let stepStartedOffset = 0;
   const pendingModelMessages: Array<{
     ref: ArtifactRef;
     offset: number;
@@ -356,8 +357,18 @@ const recoverConversationRefs = (events: readonly AnyEvent[]): FukaiConversation
     // Worker and auxiliary lanes keep their own transcripts. Their findings
     // enter Main only through a Main-owned boundary message, never by replaying
     // lane-local assistant/tool artifacts as if they were Main conversation.
-    if (event.laneId !== "main") continue;
+    if (event.laneId !== laneId) continue;
     switch (event.type) {
+      case "step.started":
+        stepStartedOffset = event.globalOffset;
+        break;
+      case "step.completed": {
+        const boundaries = event.payload.boundaryMessages ?? [];
+        for (const [index, boundary] of boundaries.entries()) {
+          add(boundary.messageRef, stepStartedOffset + (index + 1) / (boundaries.length + 1), `${event.runId}:boundary:${boundary.messageId}`);
+        }
+        break;
+      }
       case "user.message":
         if (event.payload.kind === "continuation") break;
         add(event.payload.messageRef, event.globalOffset, `event:${event.eventId}`);
@@ -429,7 +440,7 @@ export const projectMainExecutionRecovery = (
       ? addUsage(usage, event.payload.usage)
       : usage
   ), emptyUsage());
-  const conversationRefs = recoverConversationRefs(events);
+  const conversationRefs = recoverLaneConversationRefs(events);
   return {
     conversationRefs,
     artifactReadRefs: recoverArtifactReadRefs(events),

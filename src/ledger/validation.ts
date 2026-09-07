@@ -37,6 +37,7 @@ import {
   validateLaneCapabilityManifest,
   validateSpawnContext,
 } from "../runtime/lane-context.js";
+import type { TeamDefinition, TeamMemberDefinition } from "../domain/team.js";
 
 type PayloadValidator = (value: unknown, path: string) => void;
 
@@ -235,6 +236,127 @@ function artifactRefArray(value: unknown, path: string): void {
     invalid(path, "an array of artifact refs");
   }
   value.forEach((ref, index) => artifactRef(ref, `${path}[${index}]`));
+}
+
+function teamId(value: unknown, path: string): asserts value is string {
+  string(value, path, false);
+  if (!/^[A-Za-z0-9._-]{1,96}$/.test(value)) {
+    invalid(path, "1 to 96 letters, digits, dots, underscores, or hyphens");
+  }
+}
+
+function teamMember(value: unknown, path: string): asserts value is TeamMemberDefinition {
+  const member = payloadObject(value, path, ["memberId", "laneId", "task", "dependsOn", "required"]);
+  exactKeys(member, ["memberId", "laneId", "task", "dependsOn", "required"], path);
+  teamId(member.memberId, `${path}.memberId`);
+  string(member.laneId, `${path}.laneId`, false);
+  if ((member.laneId as string).length > 256) invalid(`${path}.laneId`, "at most 256 characters");
+  boolean(member.required, `${path}.required`);
+  if (!Array.isArray(member.dependsOn) || member.dependsOn.length > 16) {
+    invalid(`${path}.dependsOn`, "an array of at most 16 member IDs");
+  }
+  const dependencies = new Set<string>();
+  member.dependsOn.forEach((dependency, index) => {
+    teamId(dependency, `${path}.dependsOn[${index}]`);
+    if (dependency === member.memberId || dependencies.has(dependency)) {
+      invalid(`${path}.dependsOn[${index}]`, "a distinct other member ID");
+    }
+    dependencies.add(dependency);
+  });
+  const task = payloadObject(member.task, `${path}.task`, ["type", "taskId", "goal", "inputRefs", "budget"]);
+  exactKeys(task, ["type", "taskId", "goal", "inputRefs", "budget", "spawnContext"], `${path}.task`);
+  oneOf(task.type, `${path}.task.type`, ["task.request"] as const);
+  taskId(task.taskId, `${path}.task.taskId`);
+  goal(task.goal, `${path}.task.goal`);
+  boundedArtifactRefs(task.inputRefs, `${path}.task.inputRefs`);
+  taskBudget(task.budget, `${path}.task.budget`);
+  if (task.spawnContext !== undefined) {
+    validateSpawnContext(task.spawnContext);
+    if (task.spawnContext.child.laneId !== member.laneId) {
+      invalid(`${path}.task.spawnContext.child.laneId`, "equal to the member laneId");
+    }
+  }
+}
+
+function teamDefinition(value: unknown, path: string): asserts value is TeamDefinition {
+  const item = payloadObject(value, path, [
+    "teamId", "leadLaneId", "joinPolicy", "peerMessaging", "deadline", "fingerprint", "members",
+  ]);
+  exactKeys(item, ["teamId", "leadLaneId", "joinPolicy", "peerMessaging", "deadline", "fingerprint", "members"], path);
+  teamId(item.teamId, `${path}.teamId`);
+  string(item.leadLaneId, `${path}.leadLaneId`, false);
+  oneOf(item.joinPolicy, `${path}.joinPolicy`, ["all-terminal", "deadline-best-effort"] as const);
+  oneOf(item.peerMessaging, `${path}.peerMessaging`, ["team-members", "lead-only"] as const);
+  dateTime(item.deadline, `${path}.deadline`);
+  string(item.fingerprint, `${path}.fingerprint`, false);
+  if ((item.fingerprint as string).length > 256) invalid(`${path}.fingerprint`, "at most 256 characters");
+  if (!Array.isArray(item.members) || item.members.length === 0 || item.members.length > 16) {
+    invalid(`${path}.members`, "an array of 1 to 16 members");
+  }
+  const members = new Map<string, TeamMemberDefinition>();
+  const taskIds = new Set<string>();
+  item.members.forEach((member, index) => {
+    teamMember(member, `${path}.members[${index}]`);
+    if (members.has(member.memberId) || taskIds.has(member.task.taskId)) {
+      invalid(`${path}.members[${index}]`, "a unique member and task identity");
+    }
+    if (member.laneId !== `team:${item.teamId as string}:${member.memberId}` || member.laneId === item.leadLaneId) {
+      invalid(`${path}.members[${index}].laneId`, "the host-issued team:<teamId>:<memberId> lane");
+    }
+    members.set(member.memberId, member);
+    taskIds.add(member.task.taskId);
+  });
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (memberId: string): void => {
+    if (visiting.has(memberId)) invalid(`${path}.members`, "an acyclic dependency graph");
+    if (visited.has(memberId)) return;
+    const member = members.get(memberId);
+    if (member === undefined) invalid(`${path}.members`, "dependencies naming existing members");
+    visiting.add(memberId);
+    member.dependsOn.forEach(visit);
+    visiting.delete(memberId);
+    visited.add(memberId);
+  };
+  for (const memberId of members.keys()) visit(memberId);
+}
+
+function teamOutcome(item: Record<string, unknown>, path: string): void {
+  oneOf(item.outcome, `${path}.outcome`, ["succeeded", "partial", "failed", "cancelled", "abandoned"] as const);
+  if (item.result !== undefined) {
+    const result = payloadObject(item.result, `${path}.result`, [
+      "type", "taskId", "status", "summary", "evidenceRefs", "artifactRefs", "openQuestions", "usage",
+    ]);
+    oneOf(result.type, `${path}.result.type`, ["task.result"] as const);
+    taskId(result.taskId, `${path}.result.taskId`);
+    oneOf(result.status, `${path}.result.status`, ["completed", "partial"] as const);
+    string(result.summary, `${path}.result.summary`, false);
+    stringArray(result.evidenceRefs, `${path}.result.evidenceRefs`);
+    boundedArtifactRefs(result.artifactRefs, `${path}.result.artifactRefs`);
+    stringArray(result.openQuestions, `${path}.result.openQuestions`);
+    usage(result.usage, `${path}.result.usage`);
+    if (item.taskId !== undefined && result.taskId !== item.taskId) {
+      invalid(`${path}.result.taskId`, "equal to the settled taskId");
+    }
+    const expected = result.status === "partial" ? "partial" : "succeeded";
+    if (item.outcome !== expected || item.failure !== undefined) {
+      invalid(path, "a consistent result outcome without a failure");
+    }
+  }
+  if (item.failure !== undefined) {
+    const failure = payloadObject(item.failure, `${path}.failure`, ["type", "taskId", "reason", "retryable", "evidenceRefs"]);
+    oneOf(failure.type, `${path}.failure.type`, ["task.failed"] as const);
+    taskId(failure.taskId, `${path}.failure.taskId`);
+    string(failure.reason, `${path}.failure.reason`, false);
+    boolean(failure.retryable, `${path}.failure.retryable`);
+    stringArray(failure.evidenceRefs, `${path}.failure.evidenceRefs`);
+    if (item.taskId !== undefined && failure.taskId !== item.taskId) {
+      invalid(`${path}.failure.taskId`, "equal to the settled taskId");
+    }
+    if (item.outcome === "succeeded" || item.outcome === "partial") {
+      invalid(path, "a failure without a successful or partial result");
+    }
+  }
 }
 
 function runPolicy(value: unknown, path: string): asserts value is RunPolicy {
@@ -1087,6 +1209,82 @@ const payloadValidators = {
       string(control.requestedBy, `${path}.control.requestedBy`, false);
     }
   },
+  "team.created": teamDefinition,
+  "team.member.settled": (value, path) => {
+    const item = payloadObject(value, path, ["teamId", "memberId", "taskId", "outcome"]);
+    exactKeys(item, ["teamId", "memberId", "taskId", "outcome", "requestMessageId", "result", "failure", "reason", "claimId", "attempt"], path);
+    teamId(item.teamId, `${path}.teamId`);
+    teamId(item.memberId, `${path}.memberId`);
+    taskId(item.taskId, `${path}.taskId`);
+    for (const field of ["requestMessageId", "reason", "claimId"] as const) {
+      if (item[field] !== undefined) string(item[field], `${path}.${field}`, false);
+    }
+    if ((item.claimId === undefined) !== (item.attempt === undefined)) {
+      invalid(path, "claimId and attempt both present or both omitted");
+    }
+    if (item.attempt !== undefined) integer(item.attempt, `${path}.attempt`, 1);
+    teamOutcome(item, path);
+  },
+  "team.joined": (value, path) => {
+    const item = payloadObject(value, path, ["teamId", "reason", "memberOutcomes"]);
+    exactKeys(item, ["teamId", "reason", "memberOutcomes"], path);
+    teamId(item.teamId, `${path}.teamId`);
+    oneOf(item.reason, `${path}.reason`, ["all-terminal", "deadline-best-effort"] as const);
+    if (!Array.isArray(item.memberOutcomes) || item.memberOutcomes.length > 16) {
+      invalid(`${path}.memberOutcomes`, "an array of at most 16 member outcomes");
+    }
+    const ids = new Set<string>();
+    const tasks = new Set<string>();
+    item.memberOutcomes.forEach((value, index) => {
+      const memberPath = `${path}.memberOutcomes[${index}]`;
+      const member = payloadObject(value, memberPath, ["memberId", "taskId", "outcome"]);
+      exactKeys(member, ["memberId", "taskId", "outcome"], memberPath);
+      teamId(member.memberId, `${memberPath}.memberId`);
+      taskId(member.taskId, `${memberPath}.taskId`);
+      teamOutcome(member, memberPath);
+      if (ids.has(member.memberId as string) || tasks.has(member.taskId as string)) {
+        invalid(memberPath, "a unique member and task identity");
+      }
+      ids.add(member.memberId as string);
+      tasks.add(member.taskId as string);
+    });
+  },
+  "team.cancel.requested": (value, path) => {
+    const item = payloadObject(value, path, ["teamId", "reason", "requestedBy"]);
+    exactKeys(item, ["teamId", "reason", "requestedBy"], path);
+    teamId(item.teamId, `${path}.teamId`);
+    string(item.reason, `${path}.reason`, false);
+    string(item.requestedBy, `${path}.requestedBy`, false);
+  },
+  "team.cancelled": (value, path) => {
+    const item = payloadObject(value, path, ["teamId", "reason"]);
+    exactKeys(item, ["teamId", "reason"], path);
+    teamId(item.teamId, `${path}.teamId`);
+    string(item.reason, `${path}.reason`, false);
+  },
+  "team.reduction.requested": (value, path) => {
+    const item = payloadObject(value, path, ["teamId", "reducer"]);
+    exactKeys(item, ["teamId", "reducer"], path);
+    teamId(item.teamId, `${path}.teamId`);
+    teamMember(item.reducer, `${path}.reducer`);
+    if (item.reducer.laneId !== `team-reducer:${item.teamId}`
+      && item.reducer.laneId !== `team:${item.teamId}:${item.reducer.memberId}`) {
+      invalid(`${path}.reducer.laneId`, "a host-issued Team reducer lane");
+    }
+  },
+  "team.reduced": (value, path) => {
+    const item = payloadObject(value, path, ["teamId", "outcome"]);
+    exactKeys(item, ["teamId", "outcome", "result", "failure"], path);
+    teamId(item.teamId, `${path}.teamId`);
+    teamOutcome(item, path);
+  },
+  "team.presented": (value, path) => {
+    const item = payloadObject(value, path, ["teamId", "disposition"]);
+    exactKeys(item, ["teamId", "disposition", "summaryRef"], path);
+    teamId(item.teamId, `${path}.teamId`);
+    oneOf(item.disposition, `${path}.disposition`, ["accepted", "rejected"] as const);
+    if (item.summaryRef !== undefined) artifactRef(item.summaryRef, `${path}.summaryRef`);
+  },
   "step.started": (value, path) => {
     const item = payloadObject(value, path, ["step"]);
     integer(item.step, `${path}.step`, 1);
@@ -1104,6 +1302,23 @@ const payloadValidators = {
           invalid(`${path}.boundaryMessageIds[${index}]`, "unique within the Step");
         }
         unique.add(messageId);
+      });
+    }
+    if (item.boundaryMessages !== undefined) {
+      if (!Array.isArray(item.boundaryMessages) || item.boundaryMessages.length > 256) {
+        invalid(`${path}.boundaryMessages`, "an array of at most 256 boundary messages");
+      }
+      const consumed = new Set(item.boundaryMessageIds as string[] | undefined);
+      const unique = new Set<string>();
+      item.boundaryMessages.forEach((value, index) => {
+        const messagePath = `${path}.boundaryMessages[${index}]`;
+        const message = payloadObject(value, messagePath, ["messageId", "messageRef"]);
+        exactKeys(message, ["messageId", "messageRef"], messagePath);
+        string(message.messageId, `${messagePath}.messageId`, false);
+        artifactRef(message.messageRef, `${messagePath}.messageRef`);
+        if (!consumed.has(message.messageId)) invalid(`${messagePath}.messageId`, "included in boundaryMessageIds");
+        if (unique.has(message.messageId)) invalid(`${messagePath}.messageId`, "unique within the Step");
+        unique.add(message.messageId);
       });
     }
   },

@@ -86,7 +86,7 @@ export interface ClaimOptions {
 
 export type ClaimAvailabilityOptions = Pick<
   ClaimOptions,
-  "now" | "runId" | "from" | "types" | "deliveries"
+  "now" | "runId" | "from" | "types" | "deliveries" | "messageIds"
 >;
 
 export interface AdviceAckResult {
@@ -353,6 +353,8 @@ export class A2AInbox {
           && !options.types.includes(record.message.payload.type))
         || (options.deliveries !== undefined
           && !options.deliveries.includes(record.message.delivery))
+        || (options.messageIds !== undefined
+          && !options.messageIds.includes(record.message.messageId))
       ) {
         continue;
       }

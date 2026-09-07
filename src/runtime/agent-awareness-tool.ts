@@ -24,7 +24,7 @@ export function createAgentAwarenessTool(options: AgentAwarenessToolOptions): Ag
   const tool: AgentTool = {
     definition: {
       name: "agent_awareness",
-      description: "Read the current bounded agent topology: active lanes, their roles and states, Teto activity, and branch relationships. This is a read-only snapshot; use it when deciding whether to open Teto or create a Team.",
+      description: "Read the current bounded agent topology: active lanes, roles, states, Teto activity, and Run lineage. This is a read-only snapshot; use it when deciding whether to open Teto or create a Team.",
       parameters: {
         type: "object",
         properties: {},
@@ -43,7 +43,7 @@ export function createAgentAwarenessTool(options: AgentAwarenessToolOptions): Ag
               liveOnly: "The snapshot excludes offline and terminal lanes. Group nodes by endpoint.sessionId to distinguish sessions.",
               taskSummary: "Use node.activitySummary as the bounded host-provided task/status summary; it is not a private transcript.",
               teto: "Teto is an optional feedback lane. Each parent lane may have at most one active Teto.",
-              team: "Team branches are independent task lanes. A branch may open its own Teto when its task needs a second line of thought.",
+              team: "Team members are independent task lanes; Main is the Team Lead and default synthesizer. A member may open its own Teto. Historical Run forks are not Team members.",
             },
           }),
           isError: false,

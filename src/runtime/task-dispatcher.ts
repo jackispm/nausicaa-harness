@@ -46,6 +46,8 @@ export interface TaskDispatcherOptions {
   /** Maximum unhandled task requests admitted to one destination lane. */
   maxOutstandingTasks?: number;
   clock?: Clock;
+  /** Host admission timestamp used when restoring a Team task request. */
+  admittedAt?: string;
   createId?: () => string;
   /** Host-composed child context used when every dispatch shares one lane. */
   spawnContext?: SpawnContext;
@@ -91,9 +93,10 @@ export class TaskDispatcher {
   private readonly runId: RunId;
   private readonly defaults: Omit<
     Required<TaskDispatcherOptions>,
-    "inbox" | "clock" | "createId" | "maxOutstandingTasks" | "spawnContext" | "spawnContextFactory"
+    "inbox" | "clock" | "admittedAt" | "createId" | "maxOutstandingTasks" | "spawnContext" | "spawnContextFactory"
   >;
   private readonly clock: Clock;
+  private readonly admittedAt: string | undefined;
   private readonly createId: () => string;
   private readonly maxOutstandingTasks: number;
   private readonly spawnContext: SpawnContext | undefined;
@@ -142,6 +145,10 @@ export class TaskDispatcher {
     }
     this.maxOutstandingTasks = maxOutstandingTasks;
     this.clock = options.clock ?? systemClock;
+    if (options.admittedAt !== undefined && !isValidDate(options.admittedAt)) {
+      throw new TypeError("admittedAt must be a valid date-time");
+    }
+    this.admittedAt = options.admittedAt;
     this.createId = options.createId ?? randomUUID;
     this.spawnContext = options.spawnContext === undefined
       ? undefined
@@ -205,7 +212,10 @@ export class TaskDispatcher {
         );
       }
     }
-    const createdAt = existing?.message.createdAt ?? now.toISOString();
+    const createdAt = existing?.message.createdAt ?? this.admittedAt ?? now.toISOString();
+    if (existing === undefined && Date.parse(createdAt) > now.getTime()) {
+      throw new RangeError("admittedAt must not be in the future");
+    }
     const existingBudget = existing?.message.payload.type === "task.request"
       ? existing.message.payload.budget
       : undefined;

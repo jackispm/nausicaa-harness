@@ -1,6 +1,17 @@
 import type { InboxProjection, InboxRecord } from "../a2a/index.js";
-import { projectInbox } from "../a2a/index.js";
+import { InboxProjector, projectInbox } from "../a2a/index.js";
 import type { AnyEvent } from "../domain/events.js";
+import type {
+  TeamDefinition,
+  TeamJoined,
+  TeamJoinPolicy,
+  TeamJoinState,
+  TeamMemberDefinition,
+  TeamMemberExecution,
+  TeamMemberOutcome,
+  TeamMemberSettlement,
+  TeamReduction,
+} from "../domain/team.js";
 import type {
   ArtifactRef,
   Goal,
@@ -11,29 +22,14 @@ import type {
   TaskFailed,
   TaskResult,
 } from "../domain/types.js";
+import { stableJson } from "../ledger/hash.js";
 
-/**
- * Durable Team-board states.  A board is a projection of Ledger/Inbox facts;
- * it is deliberately not another mutable scheduler or persistence store.
- */
+export type { TeamJoinPolicy } from "../domain/team.js";
+
 export type TeamBoardBranchStatus =
-  | "queued"
-  | "claimed"
-  | "running"
-  | "completed"
-  | "failed"
-  | "cancelled"
-  | "unknown";
-
-export type TeamBoardStatus =
-  | "queued"
-  | "running"
-  | "completed"
-  | "failed"
-  | "cancelled"
-  | "unknown";
-
-export type TeamJoinPolicy = "all-terminal" | "deadline-best-effort";
+  | "queued" | "claimed" | "running" | "completed" | "partial"
+  | "failed" | "cancelled" | "abandoned" | "unknown";
+export type TeamBoardStatus = Exclude<TeamBoardBranchStatus, "claimed">;
 
 export interface TeamBoardLease {
   claimId: string;
@@ -42,8 +38,10 @@ export interface TeamBoardLease {
   attempt: number;
 }
 
-export interface TeamBoardBranch {
+export interface TeamBoardMember {
   teamId: string;
+  memberId: string;
+  /** Compatibility alias; this is a live member, not a historical Run branch. */
   branchId: string;
   laneId: LaneId;
   taskId: string;
@@ -52,159 +50,84 @@ export interface TeamBoardBranch {
   goal: Goal;
   inputRefs: ArtifactRef[];
   budget: TaskBudget;
+  dependsOn: string[];
+  required: boolean;
   registered: boolean;
   laneStatus?: LaneStatus;
+  execution: TeamMemberExecution;
+  outcome?: TeamMemberOutcome;
   status: TeamBoardBranchStatus;
+  /** True only for a validated task settlement, never a lane status alone. */
   terminal: boolean;
   attempt: number;
   lease?: TeamBoardLease;
   acceptedMessageId?: string;
   result?: TaskResult;
   failure?: TaskFailed;
+  reason?: string;
   lastOffset: number;
   anomalies: string[];
 }
 
+export type TeamBoardBranch = TeamBoardMember;
+
 export interface TeamBoard {
   runId: RunId;
   teamId: string;
+  leadLaneId: LaneId;
   coordinator: LaneId;
+  definition?: TeamDefinition;
   joinPolicy: TeamJoinPolicy;
   status: TeamBoardStatus;
+  joinReady: boolean;
   joinSatisfied: boolean;
-  branches: TeamBoardBranch[];
+  joinState: TeamJoinState;
+  cancellationRequested: boolean;
+  reductionState: "not-started" | "running" | "completed" | "failed";
+  presentationState: "pending" | "accepted" | "rejected";
+  reducer?: TeamMemberDefinition;
+  reduction?: TeamReduction;
+  members: TeamBoardMember[];
+  /** Compatibility alias of members. */
+  branches: TeamBoardMember[];
   anomalies: string[];
   lastOffset: number;
 }
 
 export interface TeamBoardProjectionOptions {
-  /** Restrict projection to one durable Run when the event stream is shared. */
   runId?: RunId;
-  /** A caller may provide a live Inbox projection; otherwise it is rebuilt. */
   inbox?: InboxProjection | readonly InboxRecord[];
+  /** Legacy only. Modern Teams persist their policy in team.created. */
   joinPolicy?: TeamJoinPolicy;
 }
 
-/** Project every Team represented by durable task requests in one Run. */
+/** A read-only projection: scheduling and lifecycle commits belong to the runtime. */
 export function projectTeamBoards(
   events: readonly AnyEvent[],
   options: TeamBoardProjectionOptions = {},
 ): TeamBoard[] {
-  const scopedEvents = options.runId === undefined
-    ? [...events]
-    : events.filter((event) => event.runId === options.runId);
-  const inboxRecords = normalizeInboxRecords(scopedEvents, options.inbox);
-  const byTeam = new Map<string, Map<string, DraftBranch>>();
-  const teamAnomalies = new Map<string, string[]>();
-
-  const addAnomaly = (teamId: string, message: string): void => {
-    const anomalies = teamAnomalies.get(teamId) ?? [];
-    if (!anomalies.includes(message)) anomalies.push(message);
-    teamAnomalies.set(teamId, anomalies);
-  };
-
-  for (const record of inboxRecords) {
-    const message = record.message;
-    if (message.payload.type !== "task.request") continue;
-    const parsed = parseTeamLane(message.to);
-    if (parsed === undefined) continue;
-    const team = byTeam.get(parsed.teamId) ?? new Map<string, DraftBranch>();
-    byTeam.set(parsed.teamId, team);
-    const previous = team.get(parsed.laneId);
-    if (previous !== undefined) {
-      if (previous.requestMessageId !== message.messageId) {
-        previous.anomalies.push(
-          `multiple task requests target ${parsed.laneId}`,
-        );
-        addAnomaly(parsed.teamId, `branch ${parsed.branchId} has multiple task requests`);
-      }
-      continue;
-    }
-    team.set(parsed.laneId, {
-      teamId: parsed.teamId,
-      branchId: parsed.branchId,
-      laneId: parsed.laneId,
-      taskId: message.payload.taskId,
-      requestMessageId: message.messageId,
-      coordinator: message.from,
-      goal: structuredClone(message.payload.goal),
-      inputRefs: structuredClone(message.payload.inputRefs),
-      budget: structuredClone(message.payload.budget),
-      requestRecord: record,
-      lastOffset: record.sentAtOffset,
-      anomalies: [],
-    });
-  }
-
-  // A registration can survive when the original request record is filtered
-  // out by a caller. Keep the board honest by exposing an anomalous placeholder
-  // rather than silently dropping a live lane.
-  for (const event of scopedEvents) {
-    if (event.type !== "lane.registered" || event.payload.kind !== "team") continue;
-    const parsed = parseTeamLane(event.laneId);
-    if (parsed === undefined) continue;
-    const team = byTeam.get(parsed.teamId) ?? new Map<string, DraftBranch>();
-    byTeam.set(parsed.teamId, team);
-    if (team.has(event.laneId)) continue;
-    const placeholder: DraftBranch = {
-      teamId: parsed.teamId,
-      branchId: parsed.branchId,
-      laneId: event.laneId,
-      taskId: `${parsed.teamId}:${parsed.branchId}`,
-      requestMessageId: "",
-      coordinator: "main",
-      goal: {
-        version: 1,
-        statement: "Unknown task request",
-        successCriteria: [],
-        hardConstraints: [],
-      },
-      inputRefs: [],
-      budget: { maxModelTokens: 1, maxWallClockMs: 1 },
-      lastOffset: event.globalOffset,
-      anomalies: ["lane.registered has no durable task.request"],
-    };
-    team.set(event.laneId, placeholder);
-    addAnomaly(parsed.teamId, `branch ${parsed.branchId} has no durable task request`);
-  }
-
-  const boards: TeamBoard[] = [];
-  for (const [teamId, branches] of [...byTeam.entries()].sort(compareTextEntry)) {
-    const branchViews = [...branches.values()]
-      .sort((left, right) => compareText(left.branchId, right.branchId))
-      .map((draft) => finalizeBranch(draft, scopedEvents, inboxRecords, addAnomaly));
-    const coordinator = selectCoordinator(branchViews);
-    const anomalies = [...(teamAnomalies.get(teamId) ?? [])];
-    for (const branch of branchViews) {
-      for (const anomaly of branch.anomalies) {
-        if (!anomalies.includes(anomaly)) anomalies.push(anomaly);
-      }
-    }
-    const joinPolicy = options.joinPolicy ?? "all-terminal";
-    const joinSatisfied = branchViews.length > 0 && branchViews.every((branch) => branch.terminal);
-    const status = aggregateStatus(branchViews, joinSatisfied, anomalies);
-    boards.push({
-      runId: inferRunId(scopedEvents, inboxRecords),
-      teamId,
-      coordinator,
-      joinPolicy,
-      status,
-      joinSatisfied,
-      branches: branchViews,
-      anomalies,
-      lastOffset: Math.max(
-        ...branchViews.map((branch) => branch.lastOffset),
-        ...scopedEvents
-          .filter((event) => event.runId === inferRunId(scopedEvents, inboxRecords))
-          .map((event) => event.globalOffset),
-        0,
-      ),
-    });
-  }
-  return boards;
+  const suppliedRecords = options.inbox === undefined
+    ? undefined
+    : "records" in options.inbox ? options.inbox.records : options.inbox;
+  const runIds = options.runId === undefined
+    ? new Set([...events.map((event) => event.runId), ...(suppliedRecords ?? []).map((record) => record.message.runId)])
+    : new Set([options.runId]);
+  return [...runIds].sort(compareText).flatMap((runId) => {
+    const seen = new Set<string>();
+    const scopedEvents = events.filter((event) => event.runId === runId)
+      .sort((left, right) => left.globalOffset - right.globalOffset)
+      .filter((event) => {
+        if (seen.has(event.eventId)) return false;
+        seen.add(event.eventId);
+        return true;
+      });
+    const records = suppliedRecords === undefined
+      ? projectInbox(scopedEvents).records.filter((record) => record.message.runId === runId)
+      : suppliedRecords.filter((record) => record.message.runId === runId);
+    return projectRunBoards(runId, scopedEvents, records, options.joinPolicy);
+  });
 }
 
-/** Project one Team, returning undefined when no durable facts identify it. */
 export function projectTeamBoard(
   events: readonly AnyEvent[],
   teamId: string,
@@ -213,177 +136,460 @@ export function projectTeamBoard(
   return projectTeamBoards(events, options).find((board) => board.teamId === teamId);
 }
 
-/** Stable parser shared by restore/status callers; names are host-issued. */
-export function parseTeamLane(laneId: string): { teamId: string; branchId: string; laneId: string } | undefined {
-  const parts = laneId.split(":");
-  if (parts.length !== 3 || parts[0] !== "team" || !parts[1] || !parts[2]) return undefined;
-  return { teamId: parts[1], branchId: parts[2], laneId };
-}
-
-interface DraftBranch {
+export function parseTeamLane(laneId: string): {
   teamId: string;
+  memberId: string;
   branchId: string;
   laneId: string;
-  taskId: string;
-  requestMessageId: string;
-  coordinator: string;
-  goal: Goal;
-  inputRefs: ArtifactRef[];
-  budget: TaskBudget;
-  requestRecord?: InboxRecord;
+} | undefined {
+  const parts = laneId.split(":");
+  if (parts.length !== 3 || parts[0] !== "team" || !parts[1] || !parts[2]) return undefined;
+  return { teamId: parts[1], memberId: parts[2], branchId: parts[2], laneId };
+}
+
+interface DraftMember {
+  definition: TeamMemberDefinition;
+  request?: InboxRecord;
+  registered: boolean;
+  laneStatus?: LaneStatus;
+  acceptedMessageId?: string;
+  settlement?: TeamMemberSettlement;
+  terminalReplies: string[];
   lastOffset: number;
   anomalies: string[];
 }
 
-function finalizeBranch(
-  draft: DraftBranch,
-  events: readonly AnyEvent[],
-  records: readonly InboxRecord[],
-  addTeamAnomaly: (teamId: string, message: string) => void,
-): TeamBoardBranch {
-  const laneEvents = events
-    .filter((event) => event.runId === inferRunId(events, records) && event.laneId === draft.laneId)
-    .sort((left, right) => left.globalOffset - right.globalOffset);
-  const registration = laneEvents.find((event) => event.type === "lane.registered");
-  const statuses = laneEvents.filter((event): event is Extract<AnyEvent, { type: "lane.status" }> => event.type === "lane.status");
-  const latestStatus = statuses.at(-1);
-  const replies = records
-    .filter((record) => (
-      record.message.runId === inferRunId(events, records)
-      && record.message.from === draft.laneId
-      && record.message.to === draft.coordinator
-      && (draft.requestMessageId === "" || record.message.parentId === draft.requestMessageId)
-      && (
-        record.message.payload.type === "task.accept"
-        || record.message.payload.type === "task.result"
-        || record.message.payload.type === "task.failed"
-      )
-    ))
-    .sort((left, right) => left.sentAtOffset - right.sentAtOffset);
-  const accepts = replies.filter((record) => record.message.payload.type === "task.accept");
-  const terminals = replies.filter((record) => (
-    record.message.payload.type === "task.result"
-      || record.message.payload.type === "task.failed"
-  ));
-  const latestTerminal = terminals.at(-1);
-  const terminalPayload = latestTerminal?.message.payload;
-  if (terminals.length > 1) {
-    const terminalIds = terminals.map((record) => record.message.messageId);
-    draft.anomalies.push(`multiple terminal replies: ${terminalIds.join(", ")}`);
-    addTeamAnomaly(draft.teamId, `branch ${draft.branchId} published multiple terminal replies`);
-  }
-  const requestRecord = draft.requestRecord;
-  const latestClaim = requestRecord?.claim;
-  const laneStatus = latestStatus?.payload.status;
-  const terminal = terminalPayload?.type === "task.result"
-    || terminalPayload?.type === "task.failed"
-    || laneStatus === "completed"
-    || laneStatus === "failed"
-    || laneStatus === "cancelled";
-  const status = deriveBranchStatus(
-    terminalPayload?.type === "task.result"
-      ? "completed"
-      : terminalPayload?.type === "task.failed"
-        ? "failed"
-        : undefined,
-    requestRecord?.status,
-    latestClaim !== undefined,
-    terminal,
-    laneStatus,
-  );
-  const lastOffset = Math.max(
-    draft.lastOffset,
-    ...laneEvents.map((event) => event.globalOffset),
-    ...replies.map((record) => record.sentAtOffset),
-    0,
-  );
-  const result = terminalPayload?.type === "task.result" ? structuredClone(terminalPayload) : undefined;
-  const failure = terminalPayload?.type === "task.failed" ? structuredClone(terminalPayload) : undefined;
-  const anomalies = [...draft.anomalies];
-  if (draft.requestMessageId === "") anomalies.push("task request is missing");
-  if (registration === undefined) anomalies.push("branch lane registration is missing");
-  if (latestStatus !== undefined && latestStatus.payload.status === "completed" && result === undefined) {
-    anomalies.push("lane is completed without a task.result reply");
-  }
+interface DraftTeam {
+  teamId: string;
+  coordinator: LaneId;
+  definition?: TeamDefinition;
+  definitionOffset?: number;
+  members: Map<LaneId, DraftMember>;
+  cancellationRequested: boolean;
+  cancelled: boolean;
+  joined?: TeamJoined;
+  reducer?: TeamMemberDefinition;
+  reduction?: TeamReduction;
+  presentationState: TeamBoard["presentationState"];
+  lastOffset: number;
+  anomalies: string[];
+}
+
+function newTeam(teamId: string, coordinator: LaneId): DraftTeam {
   return {
-    teamId: draft.teamId,
-    branchId: draft.branchId,
-    laneId: draft.laneId,
-    taskId: draft.taskId,
-    requestMessageId: draft.requestMessageId,
-    coordinator: draft.coordinator,
-    goal: structuredClone(draft.goal),
-    inputRefs: structuredClone(draft.inputRefs),
-    budget: structuredClone(draft.budget),
-    registered: registration !== undefined,
-    ...(laneStatus === undefined ? {} : { laneStatus }),
-    status,
-    terminal,
-    attempt: latestClaim?.attempt ?? 0,
-    ...(latestClaim === undefined ? {} : { lease: structuredClone(latestClaim) }),
-    ...(accepts.at(-1) === undefined ? {} : { acceptedMessageId: accepts.at(-1)!.message.messageId }),
-    ...(result === undefined ? {} : { result }),
-    ...(failure === undefined ? {} : { failure }),
-    lastOffset,
-    anomalies,
+    teamId, coordinator, members: new Map(), cancellationRequested: false,
+    cancelled: false, presentationState: "pending", lastOffset: 0, anomalies: [],
   };
 }
 
-function deriveBranchStatus(
-  terminalKind: "completed" | "failed" | undefined,
-  requestStatus: InboxRecord["status"] | undefined,
-  hasClaim: boolean,
-  terminal: boolean,
-  laneStatus?: LaneStatus,
-): TeamBoardBranchStatus {
-  if (terminalKind === "completed" || laneStatus === "completed") return "completed";
-  if (terminalKind === "failed" || laneStatus === "failed") return "failed";
-  if (laneStatus === "cancelled") return "cancelled";
-  if (laneStatus === "running") return "running";
-  if (terminal) return "unknown";
-  if (requestStatus === "claimed" || hasClaim) return "claimed";
-  return "queued";
+function newMember(definition: TeamMemberDefinition, offset: number): DraftMember {
+  return {
+    definition: structuredClone(definition), registered: false,
+    terminalReplies: [], lastOffset: offset, anomalies: [],
+  };
 }
 
-function aggregateStatus(
-  branches: readonly TeamBoardBranch[],
-  joinSatisfied: boolean,
-  anomalies: readonly string[],
-): TeamBoardStatus {
-  if (branches.length === 0) return "unknown";
-  if (joinSatisfied) {
-    if (branches.every((branch) => branch.status === "cancelled")) return "cancelled";
-    if (branches.some((branch) => branch.status === "failed")) return "failed";
+function projectRunBoards(
+  runId: RunId,
+  events: readonly AnyEvent[],
+  records: readonly InboxRecord[],
+  legacyPolicy?: TeamJoinPolicy,
+): TeamBoard[] {
+  const teams = new Map<string, DraftTeam>();
+  for (const event of events) {
+    if (event.type !== "team.created" || event.laneId !== event.payload.leadLaneId) continue;
+    const existing = teams.get(event.payload.teamId);
+    if (existing !== undefined) {
+      anomaly(existing, stableJson(existing.definition) === stableJson(event.payload)
+        ? "duplicate team.created" : "conflicting team.created ignored");
+      continue;
+    }
+    const team = newTeam(event.payload.teamId, event.payload.leadLaneId);
+    team.definition = structuredClone(event.payload);
+    team.definitionOffset = event.globalOffset;
+    team.lastOffset = event.globalOffset;
+    for (const member of event.payload.members) {
+      team.members.set(member.laneId, newMember(member, event.globalOffset));
+    }
+    teams.set(team.teamId, team);
+  }
+  const reducerLanes = new Set(events.flatMap((event) => {
+    if (event.type !== "team.reduction.requested") return [];
+    const team = teams.get(event.payload.teamId);
+    return event.laneId === team?.coordinator && !team.members.has(event.payload.reducer.laneId)
+      ? [event.payload.reducer.laneId] : [];
+  }));
+
+  const sentRecords = new Map(records.map((record) => [record.message.messageId, record]));
+  for (const event of events) {
+    if (event.type !== "message.sent" || event.payload.message.runId !== runId) continue;
+    const record = sentRecords.get(event.payload.message.messageId);
+    if (record === undefined || stableJson(record.message) !== stableJson(event.payload.message)) {
+      sentRecords.set(event.payload.message.messageId, recordFromEvent(event));
+    }
+  }
+  for (const record of [...sentRecords.values()].sort((left, right) => left.sentAtOffset - right.sentAtOffset)) {
+    const message = record.message;
+    if (message.payload.type !== "task.request" || reducerLanes.has(message.to)) continue;
+    const parsed = parseTeamLane(message.to);
+    if (parsed === undefined) continue;
+    const team = teams.get(parsed.teamId) ?? newTeam(parsed.teamId, message.from);
+    teams.set(team.teamId, team);
+    const existing = team.members.get(message.to);
+    if (team.definition !== undefined && existing === undefined) {
+      anomaly(team, `task.request targets undeclared member ${parsed.memberId}`);
+      continue;
+    }
+    const member = existing ?? newMember({
+      memberId: parsed.memberId, laneId: message.to, task: message.payload,
+      dependsOn: [], required: true,
+    }, record.sentAtOffset);
+    team.members.set(message.to, member);
+    if (message.from !== team.coordinator || message.payload.taskId !== member.definition.task.taskId) {
+      anomaly(member, "task.request does not match its declared task or lead");
+      continue;
+    }
+    if (member.request !== undefined && member.request.message.messageId !== message.messageId) {
+      anomaly(member, `multiple task requests target ${message.to}`);
+      continue;
+    }
+    member.request = structuredClone(record);
+    member.lastOffset = Math.max(member.lastOffset, record.sentAtOffset);
+  }
+
+  for (const event of events) {
+    if (event.type !== "lane.registered" || event.payload.kind !== "team" || reducerLanes.has(event.laneId)) continue;
+    const parsed = parseTeamLane(event.laneId);
+    if (parsed === undefined) continue;
+    const team = teams.get(parsed.teamId) ?? newTeam(parsed.teamId, "main");
+    teams.set(team.teamId, team);
+    if (team.members.has(event.laneId)) continue;
+    if (team.definition !== undefined) {
+      anomaly(team, `lane.registered targets undeclared member ${parsed.memberId}`);
+      continue;
+    }
+    const member = newMember({
+      memberId: parsed.memberId, laneId: event.laneId, dependsOn: [], required: true,
+      task: {
+        type: "task.request", taskId: `${parsed.teamId}:${parsed.memberId}`,
+        goal: { version: 1, statement: "Unknown task request", successCriteria: [], hardConstraints: [] },
+        inputRefs: [], budget: { maxModelTokens: 1, maxWallClockMs: 1 },
+      },
+    }, event.globalOffset);
+    anomaly(member, "lane.registered has no durable task.request");
+    team.members.set(event.laneId, member);
+  }
+
+  const eventMessageIds = new Set(events.flatMap((event) => (
+    event.type === "message.sent" ? [event.payload.message.messageId] : []
+  )));
+  const timeline = [
+    ...events.map((event) => ({ offset: event.globalOffset, event })),
+    ...[...sentRecords.values()]
+      .filter((record) => !eventMessageIds.has(record.message.messageId))
+      .map((record) => ({ offset: record.sentAtOffset, record })),
+  ].sort((left, right) => left.offset - right.offset);
+  const inbox = new InboxProjector();
+  for (const entry of timeline) {
+    if ("record" in entry) {
+      applyReply(teams, entry.record);
+      continue;
+    }
+    const event = entry.event;
+    const parsed = parseTeamLane(event.laneId);
+    const member = parsed === undefined ? undefined : teams.get(parsed.teamId)?.members.get(event.laneId);
+    if (member !== undefined) member.lastOffset = Math.max(member.lastOffset, event.globalOffset);
+    // A caller may supply a snapshot alongside a partial Ledger read. Unknown
+    // claims cannot authenticate a settlement; their snapshot remains diagnostic.
+    if (event.type === "message.sent" && event.payload.message.runId === runId) {
+      inbox.apply(event);
+      applyReply(teams, recordFromEvent(event));
+    } else if (event.type === "message.claimed" || event.type === "message.handled") {
+      if (inbox.get(event.payload.messageId) !== undefined) inbox.apply(event);
+    }
+    if (event.type === "lane.registered" || event.type === "lane.status") {
+      if (member !== undefined) {
+        if (event.type === "lane.registered") member.registered = true;
+        else member.laneStatus = event.payload.status;
+        member.lastOffset = Math.max(member.lastOffset, event.globalOffset);
+      }
+    }
+    if (isTeamEvent(event)) {
+      const team = teams.get(event.payload.teamId);
+      if (team !== undefined) applyTeamEvent(team, event, inbox);
+    }
+  }
+  return [...teams.values()].sort((left, right) => compareText(left.teamId, right.teamId))
+    .map((team) => finalizeTeam(runId, team, inbox, legacyPolicy));
+}
+
+type TeamEvent = Extract<AnyEvent, { type: `team.${string}` }>;
+
+function isTeamEvent(event: AnyEvent): event is TeamEvent {
+  return event.type.startsWith("team.");
+}
+
+function applyTeamEvent(team: DraftTeam, event: TeamEvent, inbox: InboxProjector): void {
+  team.lastOffset = Math.max(team.lastOffset, event.globalOffset);
+  if (event.type === "team.created") return;
+  if (team.definitionOffset !== undefined && event.globalOffset < team.definitionOffset) {
+    anomaly(team, `${event.type} precedes Team admission`);
+    return;
+  }
+  if (event.type === "team.member.settled") {
+    const member = [...team.members.values()].find((candidate) => candidate.definition.memberId === event.payload.memberId);
+    if (member === undefined) {
+      anomaly(team, `settlement names unknown member ${event.payload.memberId}`);
+      return;
+    }
+    applySettlement(team, member, event, inbox);
+    return;
+  }
+  if (event.laneId !== team.coordinator) {
+    anomaly(team, `${event.type} was not emitted by the Team lead`);
+    return;
+  }
+  switch (event.type) {
+    case "team.cancel.requested":
+      if (event.payload.requestedBy !== team.coordinator) {
+        anomaly(team, "team.cancel.requested has an unauthorized requester");
+      } else team.cancellationRequested = true;
+      break;
+    case "team.cancelled":
+      if (!team.cancellationRequested || [...team.members.values()].some((member) => member.settlement === undefined)) {
+        anomaly(team, "team.cancelled has no cancellation request or unsettled members");
+      } else team.cancelled = true;
+      break;
+    case "team.joined":
+      applyJoin(team, event);
+      break;
+    case "team.reduction.requested":
+      if (team.joined === undefined || team.cancellationRequested
+        || team.members.has(event.payload.reducer.laneId)
+        || [...team.members.values()].some((member) => member.definition.task.taskId === event.payload.reducer.task.taskId)) {
+        anomaly(team, "reduction requires a joined Team and a distinct reducer identity");
+      } else if (team.reducer !== undefined) {
+        anomaly(team, "duplicate reduction request ignored");
+      } else team.reducer = structuredClone(event.payload.reducer);
+      break;
+    case "team.reduced": {
+      const taskId = team.reducer?.task.taskId;
+      if (taskId === undefined || !consistentOutcome(event.payload, taskId)
+        || (team.cancellationRequested && !["cancelled", "abandoned"].includes(event.payload.outcome))) {
+        anomaly(team, "team.reduced has no valid active reducer settlement");
+      } else if (team.reduction !== undefined) {
+        anomaly(team, "duplicate or conflicting reduction settlement ignored");
+      } else {
+        const { teamId: _teamId, ...reduction } = event.payload;
+        team.reduction = structuredClone(reduction);
+      }
+      break;
+    }
+    case "team.presented":
+      if (team.joined === undefined || (team.reducer !== undefined && team.reduction === undefined)) {
+        anomaly(team, "presentation requires a joined Team and a finished requested reduction");
+      } else team.presentationState = event.payload.disposition;
+      break;
+  }
+}
+
+function applySettlement(
+  team: DraftTeam,
+  member: DraftMember,
+  event: Extract<AnyEvent, { type: "team.member.settled" }>,
+  inbox: InboxProjector,
+): void {
+  member.lastOffset = Math.max(member.lastOffset, event.globalOffset);
+  const settlement = event.payload;
+  const requestId = member.request?.message.messageId;
+  const claim = requestId === undefined ? undefined : inbox.get(requestId)?.claim;
+  const host = event.laneId === team.coordinator;
+  const controlOutcome = settlement.outcome === "cancelled" || settlement.outcome === "abandoned" || settlement.outcome === "failed";
+  if ((!host && event.laneId !== member.definition.laneId)
+    || settlement.taskId !== member.definition.task.taskId
+    || (settlement.requestMessageId !== undefined && settlement.requestMessageId !== requestId)
+    || !consistentOutcome(settlement, member.definition.task.taskId)) {
+    anomaly(member, "member settlement has a mismatched sender, task, parent, or outcome");
+    return;
+  }
+  if (team.cancellationRequested && settlement.outcome !== "cancelled" && settlement.outcome !== "abandoned") {
+    anomaly(member, "late member settlement after Team cancellation ignored");
+    return;
+  }
+  if ((settlement.claimId !== undefined && (claim?.claimId !== settlement.claimId
+      || claim.attempt !== settlement.attempt || claim.claimedBy !== member.definition.laneId))
+    || (claim !== undefined && settlement.claimId === undefined && !(host && controlOutcome))
+    || (!controlOutcome && (requestId === undefined || (team.definition !== undefined && claim === undefined)))) {
+    anomaly(member, "member settlement has a stale or missing claim");
+    return;
+  }
+  if (member.settlement !== undefined) {
+    anomaly(member, "duplicate or conflicting member settlement ignored");
+    return;
+  }
+  member.settlement = structuredClone(settlement);
+}
+
+function consistentOutcome(value: TeamReduction, taskId: string): boolean {
+  if (value.result !== undefined) {
+    const expected = value.result.status === "partial" ? "partial" : "succeeded";
+    if (value.result.taskId !== taskId || value.outcome !== expected || value.failure !== undefined) return false;
+  }
+  if (value.failure !== undefined && (value.failure.taskId !== taskId || value.outcome === "succeeded" || value.outcome === "partial")) return false;
+  return true;
+}
+
+function applyReply(teams: Map<string, DraftTeam>, record: InboxRecord): void {
+  const message = record.message;
+  const payload = message.payload;
+  if (payload.type !== "task.accept" && payload.type !== "task.result" && payload.type !== "task.failed") return;
+  for (const team of teams.values()) {
+    for (const member of team.members.values()) {
+      const requestId = member.request?.message.messageId;
+      if (message.from !== member.definition.laneId && payload.taskId !== member.definition.task.taskId) continue;
+      member.lastOffset = Math.max(member.lastOffset, record.sentAtOffset);
+      if (message.from !== member.definition.laneId || message.to !== team.coordinator
+        || payload.taskId !== member.definition.task.taskId || requestId === undefined
+        || message.parentId !== requestId || (message.replyTo !== undefined && message.replyTo !== requestId)) {
+        anomaly(member, `reply ${message.messageId} has a mismatched sender, task, or parent`);
+        continue;
+      }
+      if (payload.type === "task.accept") {
+        member.acceptedMessageId = message.messageId;
+        continue;
+      }
+      if (member.terminalReplies.includes(message.messageId)) continue;
+      member.terminalReplies.push(message.messageId);
+      if (member.terminalReplies.length > 1) anomaly(member, `multiple terminal replies: ${member.terminalReplies.join(", ")}`);
+      if (team.cancellationRequested) {
+        anomaly(member, `late terminal reply ${message.messageId} after Team cancellation ignored`);
+        continue;
+      }
+      // Modern replies carry notifications, not lease tokens. The host settlement
+      // is authoritative; legacy Runs retain their validated transport contract.
+      if (team.definition !== undefined || member.settlement !== undefined) continue;
+      member.settlement = {
+        teamId: team.teamId, memberId: member.definition.memberId,
+        taskId: payload.taskId, requestMessageId: requestId,
+        outcome: payload.type === "task.failed" ? "failed" : payload.status === "partial" ? "partial" : "succeeded",
+        ...(payload.type === "task.result" ? { result: structuredClone(payload) } : { failure: structuredClone(payload) }),
+      };
+    }
+  }
+}
+
+function applyJoin(team: DraftTeam, event: Extract<AnyEvent, { type: "team.joined" }>): void {
+  if (team.joined !== undefined) {
+    anomaly(team, "duplicate or conflicting team.joined ignored");
+    return;
+  }
+  const members = [...team.members.values()];
+  const settled = members.filter((member) => member.settlement !== undefined);
+  const supplied = event.payload.memberOutcomes;
+  const matching = supplied.length === settled.length
+    && new Set(supplied.map((member) => member.memberId)).size === supplied.length
+    && settled.every((member) => supplied.some((outcome) => (
+      outcome.memberId === member.definition.memberId
+      && outcome.taskId === member.definition.task.taskId
+      && outcome.outcome === member.settlement!.outcome
+    )));
+  const requiredReady = members.every((member) => !member.definition.required || member.settlement !== undefined);
+  const deadlineReady = event.payload.reason !== "deadline-best-effort"
+    || (team.definition?.joinPolicy === "deadline-best-effort"
+      && Date.parse(event.occurredAt) >= Date.parse(team.definition.deadline)
+      && settled.length === members.length);
+  if (team.cancellationRequested || !requiredReady || !deadlineReady || !matching) {
+    anomaly(team, "team.joined does not match the durable policy and member settlements");
+    return;
+  }
+  team.joined = structuredClone(event.payload);
+}
+
+function finalizeTeam(runId: RunId, team: DraftTeam, inbox: InboxProjector, legacyPolicy?: TeamJoinPolicy): TeamBoard {
+  const members = [...team.members.values()]
+    .sort((left, right) => compareText(left.definition.memberId, right.definition.memberId))
+    .map((member) => finalizeMember(team, member, inbox));
+  const joinReady = members.length > 0 && !team.cancellationRequested
+    && members.every((member) => !member.required || member.terminal);
+  const joinSatisfied = !team.cancelled && (team.definition === undefined ? joinReady : team.joined !== undefined);
+  const joinState: TeamJoinState = team.cancelled ? "cancelled"
+    : team.joined?.reason === "deadline-best-effort" ? "deadline-settled"
+      : joinSatisfied ? "joined" : "waiting";
+  const reductionState: TeamBoard["reductionState"] = team.reduction === undefined
+    ? team.reducer === undefined ? "not-started" : "running"
+    : team.reduction.outcome === "succeeded" || team.reduction.outcome === "partial" ? "completed" : "failed";
+  return {
+    runId, teamId: team.teamId, coordinator: team.coordinator, leadLaneId: team.coordinator,
+    ...(team.definition === undefined ? {} : { definition: structuredClone(team.definition) }),
+    joinPolicy: team.definition?.joinPolicy ?? legacyPolicy ?? "all-terminal",
+    status: team.cancelled ? "cancelled" : aggregateStatus(members, joinSatisfied),
+    joinReady, joinSatisfied, joinState, cancellationRequested: team.cancellationRequested,
+    reductionState, presentationState: team.presentationState,
+    ...(team.reducer === undefined ? {} : { reducer: structuredClone(team.reducer) }),
+    ...(team.reduction === undefined ? {} : { reduction: structuredClone(team.reduction) }),
+    members, branches: members,
+    anomalies: [...new Set([...team.anomalies, ...members.flatMap((member) => member.anomalies)])],
+    lastOffset: Math.max(team.lastOffset, ...members.map((member) => member.lastOffset), 0),
+  };
+}
+
+function finalizeMember(team: DraftTeam, member: DraftMember, inbox: InboxProjector): TeamBoardMember {
+  const { definition, settlement, laneStatus } = member;
+  const requestId = member.request?.message.messageId;
+  const lease = requestId === undefined ? undefined : inbox.get(requestId)?.claim ?? member.request?.claim;
+  const terminal = settlement !== undefined;
+  const ended = laneStatus === "completed" || laneStatus === "failed" || laneStatus === "cancelled";
+  const execution: TeamMemberExecution = terminal || ended ? "terminal"
+    : laneStatus === "running" ? "running" : lease !== undefined ? "claimed" : "queued";
+  const status: TeamBoardBranchStatus = settlement === undefined
+    ? ended ? "unknown" : execution as "queued" | "claimed" | "running"
+    : settlement.outcome === "succeeded" ? "completed" : settlement.outcome;
+  const anomalies = [...member.anomalies];
+  if (requestId === undefined && team.definition === undefined) anomalies.push("task request is missing");
+  if (!member.registered && member.request !== undefined) anomalies.push("branch lane registration is missing");
+  if (ended && !terminal) anomalies.push("lane is terminal without a valid task settlement");
+  return {
+    teamId: team.teamId, memberId: definition.memberId, branchId: definition.memberId,
+    laneId: definition.laneId, taskId: definition.task.taskId,
+    requestMessageId: requestId ?? "", coordinator: team.coordinator,
+    goal: structuredClone(definition.task.goal), inputRefs: structuredClone(definition.task.inputRefs),
+    budget: structuredClone(definition.task.budget), dependsOn: [...definition.dependsOn], required: definition.required,
+    registered: member.registered,
+    ...(laneStatus === undefined ? {} : { laneStatus }),
+    execution, status, terminal,
+    ...(settlement === undefined ? {} : { outcome: settlement.outcome }),
+    attempt: lease?.attempt ?? 0,
+    ...(lease === undefined ? {} : { lease: structuredClone(lease) }),
+    ...(member.acceptedMessageId === undefined ? {} : { acceptedMessageId: member.acceptedMessageId }),
+    ...(settlement?.result === undefined ? {} : { result: structuredClone(settlement.result) }),
+    ...(settlement?.failure === undefined ? {} : { failure: structuredClone(settlement.failure) }),
+    ...(settlement?.reason === undefined ? {} : { reason: settlement.reason }),
+    lastOffset: member.lastOffset, anomalies,
+  };
+}
+
+function aggregateStatus(members: readonly TeamBoardMember[], joined: boolean): TeamBoardStatus {
+  if (members.length === 0) return "unknown";
+  if (joined) {
+    if (members.every((member) => member.outcome === "cancelled")) return "cancelled";
+    if (members.some((member) => member.outcome === "failed")) return "failed";
+    if (members.some((member) => member.outcome === "abandoned")) return "abandoned";
+    if (members.some((member) => member.outcome === "partial" || member.outcome === "cancelled")) return "partial";
     return "completed";
   }
-  if (branches.every((branch) => branch.status === "queued")) return "queued";
-  if (branches.some((branch) => branch.status === "unknown")) return "unknown";
+  if (members.every((member) => member.status === "queued")) return "queued";
+  if (members.some((member) => member.status === "unknown")) return "unknown";
   return "running";
 }
 
-function selectCoordinator(branches: readonly TeamBoardBranch[]): LaneId {
-  return branches.find((branch) => branch.coordinator.length > 0)?.coordinator ?? "main";
+function recordFromEvent(event: Extract<AnyEvent, { type: "message.sent" }>): InboxRecord {
+  return { message: event.payload.message, sentAtOffset: event.globalOffset, sentAt: event.occurredAt, status: "pending" };
 }
 
-function normalizeInboxRecords(
-  events: readonly AnyEvent[],
-  input: InboxProjection | readonly InboxRecord[] | undefined,
-): InboxRecord[] {
-  if (input === undefined) return projectInbox(events).records;
-  if ("records" in input) {
-    return input.records.map((record) => structuredClone(record));
-  }
-  return [...input].map((record) => structuredClone(record));
-}
-
-function inferRunId(events: readonly AnyEvent[], records: readonly InboxRecord[]): RunId {
-  return events[0]?.runId ?? records[0]?.message.runId ?? "unknown-run";
+function anomaly(target: { anomalies: string[] }, message: string): void {
+  if (!target.anomalies.includes(message)) target.anomalies.push(message);
 }
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function compareTextEntry(left: readonly [string, unknown], right: readonly [string, unknown]): number {
-  return compareText(left[0], right[0]);
 }

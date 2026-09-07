@@ -185,6 +185,10 @@ describe("runtime lane contracts", () => {
         await delay(250);
         return response("done");
       },
+      (request) => {
+        expect(request.messages.map((message) => message.content).join("\n")).toContain("Team demo joined");
+        return response("done after consuming Team results");
+      },
     ]);
     const branchModel = new LaneRecordingModel();
 
@@ -195,7 +199,7 @@ describe("runtime lane contracts", () => {
       workerModel: "branch-model",
       message: "Split this into independent branches",
       policy: {
-        maxMainStepsPerActivation: 2,
+        maxMainStepsPerActivation: 3,
         maxModelTokens: 100_000,
         tetoEnabled: false,
       },
@@ -208,6 +212,17 @@ describe("runtime lane contracts", () => {
 
     expect(result.completed).toBe(true);
     const events = await readEvents(result.stateDir, runId);
+    const joinNotice = events.find((event) => event.type === "message.sent"
+      && event.payload.message.payload.type === "message.inform"
+      && event.payload.message.payload.text.includes("Team demo joined"));
+    expect(joinNotice?.type).toBe("message.sent");
+    if (joinNotice?.type !== "message.sent") throw new Error("Missing durable Team join notification");
+    const consumed = events.find((event) => event.type === "step.completed" && event.laneId === "main"
+      && event.payload.boundaryMessageIds?.includes(joinNotice.payload.message.messageId));
+    const completed = events.find((event) => event.type === "run.completed");
+    expect(consumed).toBeDefined();
+    expect(completed?.globalOffset).toBeGreaterThan(consumed!.globalOffset);
+    expect(main.requests.at(-1)?.messages.map((message) => message.content).join("\n")).toContain("Team demo joined");
     const branchLaneIds = events
       .filter((event): event is Extract<AnyEvent, { type: "lane.registered" }> => (
         event.type === "lane.registered" && event.payload.kind === "team"

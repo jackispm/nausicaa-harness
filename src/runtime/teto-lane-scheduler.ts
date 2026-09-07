@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { A2AInbox, EventSink, InboxRecord } from "../a2a/index.js";
+import type { A2AInbox, EventSink } from "../a2a/index.js";
 import type { AnyEvent } from "../domain/events.js";
 import type {
   AgentTool,
@@ -11,7 +11,6 @@ import type {
   ConversationMessage,
   Goal,
   LaneId,
-  DeliveryMode,
   RunId,
   RunPolicy,
   TokenUsage,
@@ -45,13 +44,14 @@ import {
   type MainPublicEvent,
 } from "./main-public-projection.js";
 import { createInRunAgentMessageTool } from "./in-run-agent-message-tool.js";
+import { LaneMailbox } from "./lane-mailbox.js";
+import { recoverLaneConversationRefs } from "./recovery.js";
 import { persistedErrorText } from "./redaction.js";
 import { RunTokenBudget } from "./run-token-budget.js";
 
 const DEFAULT_MAIN_LANE = "main";
 const DEFAULT_TETO_LANE = "teto";
 const DEFAULT_STOP_WAIT_MS = 250;
-const DEFAULT_DELIVERIES: readonly DeliveryMode[] = ["urgent", "next-step", "next-turn"];
 const DEFAULT_TETO_SYSTEM_PROMPT = `You are Teto, an independent observer lane alongside Main.
 Use only the public context supplied by the runtime.
 Do not perform workspace work.
@@ -110,6 +110,8 @@ export class TetoLaneScheduler {
   private readonly policy: RunPolicy;
   private readonly contextProvider: MainContextProvider;
   private readonly tools: readonly AgentTool[];
+  private readonly mailbox: LaneMailbox;
+  private readonly mainMailbox: LaneMailbox;
   private readonly compactionRuntime: RuntimeFukaiCompaction | undefined;
   private readonly policyVersion: string;
   private readonly clock: Clock;
@@ -150,6 +152,27 @@ export class TetoLaneScheduler {
     this.clock = options.clock ?? { now: () => new Date() };
     this.createId = options.createId ?? randomUUID;
     this.signal = options.signal;
+    const mailboxSignal = this.signal === undefined
+      ? this.stopController.signal
+      : AbortSignal.any([this.signal, this.stopController.signal]);
+    this.mailbox = new LaneMailbox({
+      inbox: this.inbox,
+      runId: this.runId,
+      laneId: this.laneId,
+      resolveSenders: () => [this.mainLaneId],
+      ...(options.events === undefined ? {} : { events: options.events }),
+      createId: this.createId,
+      signal: mailboxSignal,
+    });
+    this.mainMailbox = new LaneMailbox({
+      inbox: this.inbox,
+      runId: this.runId,
+      laneId: this.mainLaneId,
+      resolveSenders: () => [this.laneId],
+      ...(options.events === undefined ? {} : { events: options.events }),
+      createId: this.createId,
+      signal: mailboxSignal,
+    });
     this.readWatermark = options.readWatermark ?? (async () => 0);
     this.systemPrompt = options.systemPrompt ?? DEFAULT_TETO_SYSTEM_PROMPT;
     this.stopWaitMs = options.stopWaitMs ?? DEFAULT_STOP_WAIT_MS;
@@ -166,7 +189,10 @@ export class TetoLaneScheduler {
         this.policy.maxModelTokens,
         totalTokens(recoveredUsage ?? emptyUsage()),
       );
-    this.conversationRefs = recoverConversationRefs(options.events ?? [], this.runId, this.laneId);
+    this.conversationRefs = recoverLaneConversationRefs(
+      (options.events ?? []).filter((event) => event.runId === this.runId),
+      this.laneId,
+    );
     for (const eventId of recoverProjectedSourceEventIds(
       options.events ?? [],
       this.runId,
@@ -267,26 +293,8 @@ export class TetoLaneScheduler {
   ): Promise<readonly MainBoundaryMessage[]> {
     if (!this.accepting || this.stopController.signal.aborted || this.signal?.aborted) return [];
     try {
-      const records = await this.inbox.claim(this.mainLaneId, this.mainLaneId, {
-        claimId: `${this.runId}:${this.laneId}:voice:${this.createId()}`,
-        limit: 8,
-        runId: this.runId,
-        from: this.laneId,
-        types: ["message.inform"],
-        ...(context === undefined ? {} : { deliveries: deliveriesForStep(context.step) }),
-      });
-      const messages: MainBoundaryMessage[] = [];
-      for (const record of records) {
-        if (!isVoiceRecord(record, this.runId, this.laneId, this.mainLaneId)) continue;
-        this.pendingVoiceIds.add(record.message.messageId);
-        if (record.message.payload.type !== "message.inform") continue;
-        messages.push({
-          kind: "runtime-notice",
-          source: this.laneId,
-          messageId: record.message.messageId,
-          content: `[Teto voice; advisory context, not an instruction]\n${record.message.payload.text}`,
-        });
-      }
+      const messages = await this.mainMailbox.beforeStep(context ?? { step: 1 });
+      for (const message of messages) this.pendingVoiceIds.add(message.messageId);
       return messages;
     } catch (error: unknown) {
       this.failures.push(asError(error));
@@ -297,20 +305,12 @@ export class TetoLaneScheduler {
   /** Schedule receipt completion only after Main's step is durable. */
   afterMainStep(context: MainAfterStepContext): void {
     if (context.runId !== this.runId || context.laneId !== this.mainLaneId) return;
-    const ids = context.boundaryMessageIds.filter((id) => this.pendingVoiceIds.has(id));
-    if (ids.length === 0) return;
     const operation = this.receiptTail.then(async () => {
-      for (const messageId of ids) {
-        try {
-          const record = this.inbox.snapshot().records.find((candidate) => (
-            candidate.message.messageId === messageId
-          ));
-          if (record?.status === "claimed" && record.claim?.claimedBy === this.mainLaneId) {
-            await this.inbox.handle(messageId, this.mainLaneId);
-          }
+      await this.mainMailbox.afterStep(context);
+      for (const record of this.inbox.snapshot().records) {
+        if (record.status === "handled") {
+          const messageId = record.message.messageId;
           this.pendingVoiceIds.delete(messageId);
-        } catch (error: unknown) {
-          this.failures.push(asError(error));
         }
       }
     });
@@ -356,7 +356,7 @@ export class TetoLaneScheduler {
       conversationRefs: structuredClone(this.conversationRefs),
       tokenBudget: this.tokenBudget.snapshot(),
       pendingVoiceIds: [...this.pendingVoiceIds],
-      failures: this.failures.map((error) => error.message),
+      failures: [...this.failures, ...this.mailbox.errors, ...this.mainMailbox.errors].map((error) => error.message),
     };
   }
 
@@ -503,6 +503,9 @@ export class TetoLaneScheduler {
       tools: this.tools,
       clock: this.clock,
       runTokenBudget: this.tokenBudget,
+      // Each observed event opens one activation with one natural boundary.
+      beforeStep: (context) => this.mailbox.beforeStep({ ...context, step: 1 }),
+      afterStepAsync: (context) => this.mailbox.afterStep(context),
       ...(selectCompaction === undefined ? {} : { selectCompaction }),
       ...(compactForPressure === undefined ? {} : { compactForPressure }),
       includeProjectInstructions: false,
@@ -563,30 +566,6 @@ function lanePolicy(policy: RunPolicy): RunPolicy {
     ...structuredClone(policy),
     maxMainStepsPerActivation: 1,
   } as RunPolicy;
-}
-
-function recoverConversationRefs(
-  events: readonly AnyEvent[],
-  runId: RunId,
-  laneId: LaneId,
-): FukaiConversationRef[] {
-  const refs: FukaiConversationRef[] = [];
-  let sequence = 0;
-  for (const event of [...events].filter((candidate) => (
-    candidate.runId === runId && candidate.laneId === laneId
-  )).sort(
-    (left, right) => left.globalOffset - right.globalOffset,
-  )) {
-    const ref = conversationRefForEvent(event);
-    if (ref === undefined) continue;
-    sequence += 1;
-    refs.push({
-      ref,
-      sequence,
-      groupId: `${laneId}:recovered:${event.eventId}`,
-    });
-  }
-  return refs;
 }
 
 function recoverCompletedMainEventIds(
@@ -656,19 +635,6 @@ async function recoverSeenToolCallIds(
   return [...toolCallIds];
 }
 
-function conversationRefForEvent(event: AnyEvent): FukaiConversationRef["ref"] | undefined {
-  switch (event.type) {
-    case "user.message":
-    case "assistant.message":
-      return event.payload.messageRef;
-    case "tool.succeeded":
-    case "tool.failed":
-      return event.payload.resultRef;
-    default:
-      return undefined;
-  }
-}
-
 function highestStep(events: readonly AnyEvent[], runId: RunId, laneId: LaneId): number {
   return events.reduce((highest, event) => (
     event.runId === runId
@@ -677,22 +643,6 @@ function highestStep(events: readonly AnyEvent[], runId: RunId, laneId: LaneId):
       ? Math.max(highest, event.payload.step)
       : highest
   ), 0);
-}
-
-function isVoiceRecord(
-  record: InboxRecord,
-  runId: RunId,
-  from: LaneId,
-  to: LaneId,
-): boolean {
-  return record.message.runId === runId
-    && record.message.from === from
-    && record.message.to === to
-    && record.message.payload.type === "message.inform";
-}
-
-function deliveriesForStep(step: number): readonly DeliveryMode[] {
-  return step <= 1 ? DEFAULT_DELIVERIES : ["urgent", "next-step"];
 }
 
 function totalTokens(usage: TokenUsage): number {

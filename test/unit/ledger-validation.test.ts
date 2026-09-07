@@ -132,6 +132,29 @@ const advice: Advice = {
   dedupeKey: "check-engines",
   sourceLane: "teto",
 };
+const teamTask = {
+  type: "task.request" as const,
+  taskId: "team-task-alpha",
+  goal,
+  inputRefs: [],
+  budget: { maxModelTokens: 1_000, maxWallClockMs: 30_000 },
+};
+const teamMember = {
+  memberId: "alpha",
+  laneId: "team:team-1:alpha",
+  task: teamTask,
+  dependsOn: [],
+  required: true,
+};
+const teamDefinition = {
+  teamId: "team-1",
+  leadLaneId: "main",
+  joinPolicy: "all-terminal" as const,
+  peerMessaging: "team-members" as const,
+  deadline: "2026-09-06T00:00:00.000Z",
+  fingerprint: "team-fingerprint-1",
+  members: [teamMember],
+};
 const message: A2AMessage = {
   messageId: "message-1",
   runId: "run-1",
@@ -208,6 +231,20 @@ const crossRunReceipt = {
 };
 
 const validPayloads = {
+  "team.created": teamDefinition,
+  "team.member.settled": {
+    teamId: "team-1", memberId: "alpha", taskId: teamTask.taskId, outcome: "cancelled",
+    requestMessageId: "team-request", claimId: "team-claim", attempt: 1, reason: "Cancelled by lead",
+  },
+  "team.joined": {
+    teamId: "team-1", reason: "all-terminal",
+    memberOutcomes: [{ memberId: "alpha", taskId: teamTask.taskId, outcome: "cancelled" }],
+  },
+  "team.cancel.requested": { teamId: "team-1", reason: "Stopped", requestedBy: "main" },
+  "team.cancelled": { teamId: "team-1", reason: "Stopped" },
+  "team.reduction.requested": { teamId: "team-1", reducer: teamMember },
+  "team.reduced": { teamId: "team-1", outcome: "cancelled" },
+  "team.presented": { teamId: "team-1", disposition: "accepted", summaryRef: artifact },
   "run.created": { goal, workspace: "/workspace", policy },
   "run.forked": {
     parentRunId: "parent-run",
@@ -508,6 +545,18 @@ const validPayloads = {
 } satisfies EventPayloadMap;
 
 const invalidPayloads = {
+  "team.created": { ...teamDefinition, members: [{ ...teamMember, dependsOn: ["missing"] }] },
+  "team.member.settled": {
+    ...validPayloads["team.member.settled"], outcome: "completed",
+  },
+  "team.joined": { ...validPayloads["team.joined"], memberOutcomes: [
+    ...validPayloads["team.joined"].memberOutcomes, ...validPayloads["team.joined"].memberOutcomes,
+  ] },
+  "team.cancel.requested": { teamId: "team-1", reason: "Stopped" },
+  "team.cancelled": { teamId: "team-1", reason: "" },
+  "team.reduction.requested": { teamId: "team-1", reducer: { ...teamMember, laneId: "main" } },
+  "team.reduced": { teamId: "team-1", outcome: "completed" },
+  "team.presented": { teamId: "team-1", disposition: "completed" },
   "run.created": { goal, workspace: "/workspace" },
   "run.forked": {
     parentRunId: "",
@@ -744,6 +793,50 @@ const invalidPayloads = {
 } satisfies Record<EventType, unknown>;
 
 describe("event payload validation", () => {
+  it("rejects cyclic, self-referential, and duplicate Team dependency definitions", () => {
+    const second = {
+      ...teamMember, memberId: "beta", laneId: "team:team-1:beta",
+      task: { ...teamTask, taskId: "team-task-beta" }, dependsOn: ["alpha"],
+    };
+    expect(() => validateEventPayload("team.created", {
+      ...teamDefinition, members: [{ ...teamMember, dependsOn: ["beta"] }, second],
+    })).toThrow(/acyclic/);
+    expect(() => validateEventPayload("team.created", {
+      ...teamDefinition, members: [{ ...teamMember, dependsOn: ["alpha"] }],
+    })).toThrow(/distinct/);
+    expect(() => validateEventPayload("team.created", {
+      ...teamDefinition, members: [teamMember, teamMember],
+    })).toThrow(/unique/);
+    expect(() => validateEventPayload("team.created", {
+      ...teamDefinition, members: Array.from({ length: 17 }, () => teamMember),
+    })).toThrow(/1 to 16/);
+    expect(() => validateEventPayload("team.created", {
+      ...teamDefinition, members: [teamMember, second],
+    })).not.toThrow();
+  });
+
+  it("rejects contradictory Team outcomes and incomplete fencing tokens", () => {
+    const result = {
+      type: "task.result", taskId: teamTask.taskId, status: "partial", summary: "Incomplete",
+      evidenceRefs: [], artifactRefs: [], openQuestions: [], usage: tokenUsage,
+    };
+    const settlement = { ...validPayloads["team.member.settled"], outcome: "partial", result };
+    expect(() => validateEventPayload("team.member.settled", settlement)).not.toThrow();
+    expect(() => validateEventPayload("team.member.settled", { ...settlement, outcome: "succeeded" })).toThrow(/consistent/);
+    expect(() => validateEventPayload("team.member.settled", { ...settlement, taskId: "other-task" })).toThrow(/settled taskId/);
+    expect(() => validateEventPayload("team.member.settled", { ...settlement, claimId: undefined })).toThrow(/both/);
+    expect(() => validateEventPayload("team.member.settled", { ...settlement, attempt: 0 })).toThrow(/integer/);
+  });
+
+  it("accepts a distinct host-issued reducer identity without reusing a member lane", () => {
+    expect(() => validateEventPayload("team.reduction.requested", {
+      teamId: "team-1", reducer: { ...teamMember, laneId: "team-reducer:team-1" },
+    })).not.toThrow();
+    expect(() => validateEventPayload("team.reduction.requested", {
+      teamId: "team-1", reducer: { ...teamMember, laneId: "team-reducer:other-team" },
+    })).toThrow(/host-issued/);
+  });
+
   it("accepts a complete payload for every event type", () => {
     for (const type of Object.keys(validPayloads) as EventType[]) {
       expect(() => validateEventPayload(type, validPayloads[type])).not.toThrow();
@@ -865,6 +958,27 @@ describe("event payload validation", () => {
       hasToolCalls: false,
       boundaryMessageIds: ["worker-result-1", "worker-result-1"],
     })).toThrow(/unique/);
+  });
+
+  it("validates durable runtime notice refs against the committed boundary receipt", () => {
+    const payload = {
+      step: 1, hasToolCalls: false, boundaryMessageIds: ["team-notice", "worker-result"],
+      boundaryMessages: [{ messageId: "team-notice", messageRef: artifact }],
+    };
+    expect(() => validateEventPayload("step.completed", payload)).not.toThrow();
+    expect(() => validateEventPayload("step.completed", { ...payload, boundaryMessageIds: undefined })).toThrow(/included/);
+    expect(() => validateEventPayload("step.completed", {
+      ...payload, boundaryMessages: [{ messageId: "unconsumed", messageRef: artifact }],
+    })).toThrow(/included/);
+    expect(() => validateEventPayload("step.completed", {
+      ...payload, boundaryMessages: [...payload.boundaryMessages, ...payload.boundaryMessages],
+    })).toThrow(/unique/);
+    expect(() => validateEventPayload("step.completed", {
+      ...payload, boundaryMessages: [{ messageId: "team-notice", messageRef: { ...artifact, byteLength: -1 } }],
+    })).toThrow(/integer/);
+    expect(() => validateEventPayload("step.completed", {
+      ...payload, boundaryMessages: Array.from({ length: 257 }, () => payload.boundaryMessages[0]),
+    })).toThrow(/at most 256/);
   });
 
   it("rejects malformed payloads before append", async () => {

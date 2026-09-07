@@ -37,7 +37,7 @@ export interface RemoteAttachOptions {
   readonly session: RemoteAttachSession;
   /** Test/embedding seam; production uses ProcessTerminal. */
   readonly terminal?: Terminal;
-  /** Explicitly opt into Pi's fullscreen/alternate-screen layout. */
+  /** Use Pi's fullscreen/alternate-screen dock; false keeps regular scrollback. */
   readonly forceAltScreen?: boolean;
 }
 
@@ -56,9 +56,9 @@ export interface RemoteAttachSession {
 /** Read-only product surface over one daemon-owned Run attachment. */
 export async function runRemoteAttach(options: RemoteAttachOptions): Promise<number> {
   const terminal = options.terminal ?? new ProcessTerminal();
-  // Match Pi's renderer choice: regular/main-screen is the default and the
-  // alternate-screen viewport is an explicit embedding option.
-  const useAltScreen = options.forceAltScreen === true;
+  // Keep the attached interactive surface on the same fixed Pi dock as the
+  // primary CLI. Regular scrollback remains an explicit embedding option.
+  const useAltScreen = options.forceAltScreen !== false;
   const tui: TUI = useAltScreen
     ? new TuiAltScreen(terminal, undefined, undefined, { mouse: true })
     : new TuiMainScreen(terminal);

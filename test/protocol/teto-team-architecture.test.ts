@@ -265,7 +265,8 @@ describe("Teto and Team lane architecture", () => {
 
     await team.drain();
     const boundary = await team.beforeMainStep({ step: 2 });
-    expect(boundary.filter((message) => message.content.includes("branch done"))).toHaveLength(2);
+    expect(boundary.filter((message) => message.source.startsWith("team:") && message.content.includes("branch done"))).toHaveLength(2);
+    expect(boundary.some((message) => message.content.includes("Team app-build joined"))).toBe(true);
 
     const events = await ledger.read({ runId: "team-run" });
     for (const laneId of ["team:app-build:frontend", "team:app-build:backend"]) {

@@ -468,7 +468,7 @@ function exactKeys(
   optional: readonly string[] = [],
 ): void {
   const accepted = new Set([...required, ...optional]);
-  for (const key of required) if (!(key in value)) throw new TypeError(`${path}.${key} is required`);
+  for (const key of required) if (!optional.includes(key) && !(key in value)) throw new TypeError(`${path}.${key} is required`);
   for (const key of Object.keys(value)) if (!accepted.has(key)) throw new TypeError(`${path}.${key} is not allowed`);
 }
 

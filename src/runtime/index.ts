@@ -32,6 +32,7 @@ export * from "./teto-lane-scheduler.js";
 export * from "./teto-lane-controller.js";
 export * from "./teto-control-tool.js";
 export * from "./in-run-agent-message-tool.js";
+export * from "./lane-mailbox.js";
 export * from "./task-dispatcher.js";
 export * from "./delegate-task-tool.js";
 export * from "./subagent-policy.js";

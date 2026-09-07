@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { A2AInbox } from "../../src/a2a/index.js";
 import type { AnyEvent, Goal, ModelResponse } from "../../src/domain/index.js";
@@ -6,6 +6,9 @@ import type { AgentTool, ModelPort, ModelRequest } from "../../src/domain/ports.
 import { MemoryLedger } from "../../src/ledger/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import { TetoLaneScheduler } from "../../src/runtime/teto-lane-scheduler.js";
+import type { TetoLaneSchedulerOptions } from "../../src/runtime/teto-lane-scheduler.js";
+import { createInRunAgentMessageTool } from "../../src/runtime/in-run-agent-message-tool.js";
+import { RunTokenBudget } from "../../src/runtime/run-token-budget.js";
 import type { MainAfterStepContext } from "../../src/runtime/main-loop.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
 import {
@@ -572,4 +575,132 @@ describe("TetoLaneScheduler", () => {
       .map((event) => event.payload.step);
     expect(steps).toEqual([1, 2]);
   });
+
+  it("receives Main requests and asks Main questions through safe boundaries without widening subscriptions", async () => {
+    const model = new ScriptedModel([response("I have a question for Main", [{
+      id: "teto-question",
+      name: "agent_message",
+      arguments: { kind: "request", text: "Should I also observe the parser?" },
+    }], "toolUse")]);
+    const { scheduler, inbox, ledger, mainEvent, mainTool, clock } = await a2aScenario(model);
+    const sent = await mainTool.execute({ kind: "request", text: "Focus on dependency boundaries" }, {
+      runId: "run-a2a", laneId: "main", workspace: "/workspace", operationId: "main-request",
+    });
+    const peerTool = createInRunAgentMessageTool({
+      inbox, runId: "run-a2a", from: "team:other:peer", to: "teto", now: clock.now,
+    });
+    await peerTool.execute({ text: "Unauthorized peer request" }, {
+      runId: "run-a2a", laneId: "team:other:peer", workspace: "/workspace", operationId: "peer-request",
+    });
+    for (const event of await ledger.read({ runId: "run-a2a" })) {
+      if (event.type === "message.sent") scheduler.observeMainEvent(event);
+    }
+    await scheduler.drain();
+    expect(model.callCount).toBe(0);
+
+    scheduler.observeMainEvent(mainEvent);
+    await scheduler.drain();
+    expect(model.callCount).toBe(1);
+    const content = model.requests[0]?.messages.map((item) => item.content).join("\n") ?? "";
+    expect(content).toContain("Focus on dependency boundaries");
+    expect(content).not.toContain("Unauthorized peer request");
+    const requestId = JSON.parse(sent.content).messageId;
+    expect(inbox.snapshot().records.find((record) => record.message.messageId === requestId)?.status).toBe("handled");
+    const laneInputs = (await ledger.read({ runId: "run-a2a" })).filter((event) => event.type === "user.message" && event.laneId === "teto");
+    expect(laneInputs).toHaveLength(1);
+    expect(laneInputs[0]?.payload).toMatchObject({ sourceEventId: mainEvent.eventId });
+
+    const questions = await scheduler.beforeMainStep({ step: 2 });
+    expect(questions).toHaveLength(1);
+    expect(questions[0]?.content).toContain("Should I also observe the parser?");
+    expect(questions[0]?.content).toContain("question.ask");
+    scheduler.afterMainStep(mainBoundary(questions.map((item) => item.messageId)));
+    await scheduler.drain();
+    expect(inbox.snapshot().records.find((record) => record.message.messageId === questions[0]?.messageId)?.status).toBe("handled");
+    expect(inbox.snapshot().records.find((record) => record.message.from === "team:other:peer")?.status).toBe("pending");
+  });
+
+  it("rebuilds consumed Main message context on restart and repairs its missing receipt", async () => {
+    const { scheduler, inbox, ledger, mainEvent, mainTool, store, options } = await a2aScenario(
+      new ScriptedModel([response("I will watch dependency boundaries")]),
+    );
+    const sent = await mainTool.execute({ text: "Focus on dependency boundaries" }, {
+      runId: "run-a2a", laneId: "main", workspace: "/workspace", operationId: "main-request",
+    });
+    vi.spyOn(inbox, "handle").mockRejectedValueOnce(new Error("receipt write unavailable"));
+    scheduler.observeMainEvent(mainEvent);
+    await scheduler.drain();
+    const requestId = JSON.parse(sent.content).messageId;
+    expect(inbox.snapshot().records.find((record) => record.message.messageId === requestId)?.status).toBe("claimed");
+    const events = await ledger.read({ runId: "run-a2a" });
+    const secondRef = await store.put(JSON.stringify({
+      role: "assistant", content: "Main now checks the package", toolCalls: [], createdAt: options.clock!.now().toISOString(),
+    }), "application/vnd.nausicaa.conversation-message+json");
+    const secondEvent = await ledger.append({
+      runId: "run-a2a", laneId: "main", type: "assistant.message", payload: { messageRef: secondRef },
+      correlationId: "run-a2a", idempotencyKey: "main-second", visibility: "run",
+    });
+    const recoveredModel = new ScriptedModel([response("I remember the request")]);
+    const recovered = new TetoLaneScheduler({ ...options, model: recoveredModel, events });
+    recovered.observeMainEvent(secondEvent);
+    await recovered.drain();
+    const content = recoveredModel.requests[0]?.messages.map((item) => item.content) ?? [];
+    expect(content.filter((item) => item.includes("Focus on dependency boundaries"))).toHaveLength(1);
+    expect(content.findIndex((item) => item.includes("Focus on dependency boundaries")))
+      .toBeLessThan(content.indexOf("I will watch dependency boundaries"));
+    expect(inbox.snapshot().records.find((record) => record.message.messageId === requestId)?.status).toBe("handled");
+    expect((await ledger.read({ runId: "run-a2a" })).filter((event) => (
+      event.type === "step.completed" && event.laneId === "teto" && event.payload.boundaryMessageIds?.includes(requestId)
+    ))).toHaveLength(1);
+  });
+
+  it.each(["stopped", "budget-exhausted"] as const)("keeps incoming messages unread when Teto is %s", async (state) => {
+    const model = new ScriptedModel([response("must not run")]);
+    const { scheduler, inbox, mainEvent, mainTool } = await a2aScenario(model, state === "budget-exhausted"
+      ? { tokenBudget: new RunTokenBudget(1, 1) } : {});
+    await mainTool.execute({ text: "Observe this when active" }, {
+      runId: "run-a2a", laneId: "main", workspace: "/workspace", operationId: "main-request",
+    });
+    if (state === "stopped") await scheduler.stop();
+    scheduler.observeMainEvent(mainEvent);
+    await scheduler.drain();
+    expect(model.callCount).toBe(0);
+    expect(inbox.snapshot().records[0]?.status).toBe("pending");
+  });
 });
+
+async function a2aScenario(model: ModelPort, overrides: Partial<TetoLaneSchedulerOptions> = {}) {
+  const clock = { now: () => new Date("2026-09-07T00:00:00.000Z") };
+  const ledger = new MemoryLedger({ clock });
+  const inbox = new A2AInbox({ sink: ledger, clock });
+  const store = new MemoryContentAddressedStore();
+  const mainRef = await store.put(JSON.stringify({
+    role: "user", content: "Inspect the repository", createdAt: clock.now().toISOString(),
+  }), "application/vnd.nausicaa.conversation-message+json");
+  const mainEvent = await ledger.append({
+    runId: "run-a2a", laneId: "main", type: "user.message", payload: { messageRef: mainRef },
+    correlationId: "run-a2a", idempotencyKey: "main-first", visibility: "run",
+  });
+  const options: TetoLaneSchedulerOptions = {
+    eventSink: ledger, inbox, store, model, modelName: "teto-scripted", runId: "run-a2a",
+    goal, policy, workspace: "/workspace", clock, ...overrides,
+  };
+  return {
+    options, clock, ledger, inbox, store, mainEvent,
+    scheduler: new TetoLaneScheduler(options),
+    mainTool: createInRunAgentMessageTool({ inbox, runId: "run-a2a", from: "main", to: "teto", now: clock.now }),
+  };
+}
+
+function mainBoundary(boundaryMessageIds: readonly string[]): MainAfterStepContext {
+  return {
+    runId: "run-a2a", laneId: "main", step: 2, goal, responseText: "Continuing",
+    toolCalls: [], toolResults: [], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+    boundaryMessageIds,
+    delta: {
+      boundaryId: "main-step-2", triggerKind: "normal", activeObjective: goal.statement,
+      actionOrDecision: "Inspect", expectedOutcome: "Evidence", outcome: "In progress", status: "progress",
+      uncertainties: [], openQuestions: [],
+    },
+  };
+}

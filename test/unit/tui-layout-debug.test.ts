@@ -167,7 +167,7 @@ describe("debug prompt layout", () => {
 
   it("keeps the fullscreen prompt anchored after transient command UI is cancelled", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-layout-debug-autocomplete-"));
-    const terminal = new TerminalStub();
+    const terminal = new TerminalStub(100, 12);
     const session = await SessionController.open({
       workspace: root,
       dataDir: join(root, "state"),
@@ -184,7 +184,6 @@ describe("debug prompt layout", () => {
       const running = runInteractive({
         session,
         terminal,
-        forceAltScreen: true,
         modelChoices: ["openrouter:next-model"],
       });
       await terminal.started;
@@ -287,6 +286,11 @@ describe("debug prompt layout", () => {
       expect(settledFrame().length).toBe(baselineHeight);
       if (process.env.PI_CLEAR_ON_SHRINK === "1") {
         expect(viewportTop()).toBe(baselineViewportTop);
+      } else {
+        // This explicit regular-mode seam preserves Pi's main-screen
+        // differential viewport when clearOnShrink is disabled. Production
+        // uses the fullscreen dock above, so the prompt remains anchored.
+        expect(viewportTop()).toBeGreaterThanOrEqual(baselineViewportTop);
       }
 
       terminal.send("\x7f");
@@ -301,6 +305,8 @@ describe("debug prompt layout", () => {
       expect(settledFrame().length).toBe(baselineHeight);
       if (process.env.PI_CLEAR_ON_SHRINK === "1") {
         expect(viewportTop()).toBe(baselineViewportTop);
+      } else {
+        expect(viewportTop()).toBeGreaterThanOrEqual(baselineViewportTop);
       }
 
       terminal.send("\x03");

@@ -15,6 +15,7 @@ import type {
 } from "../../src/a2a/index.js";
 import { executeRun, SessionController } from "../../src/runtime/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
+import { JsonlLedger } from "../../src/ledger/index.js";
 
 const roots: string[] = [];
 
@@ -118,7 +119,7 @@ describe("executeRun Cross-Run A2A composition", () => {
     expect(model.requests[0]?.tools.map((tool) => tool.name)).toContain("agent_message");
   });
 
-  it("does not advertise cross-Run messaging without host composition", async () => {
+  it("advertises local messaging but rejects cross-Run targets without host composition", async () => {
     const root = await temporaryRoot();
     const model = new ScriptedModel([
       {
@@ -129,13 +130,13 @@ describe("executeRun Cross-Run A2A composition", () => {
           name: "agent_message",
           arguments: {
             target: { relationship: "parent" },
-            payload: { type: "message.inform", text: "hello" },
+            text: "hello",
           },
         }],
       },
       (request) => {
-        expect(request.messages.findLast((message) => message.role === "tool")?.content)
-          .toContain("Unknown tool: agent_message");
+        expect(request.messages.findLast((message) => message.role === "tool"))
+          .toMatchObject({ isError: true, content: expect.stringContaining("target") });
         return response("messaging unavailable");
       },
     ]);
@@ -151,7 +152,16 @@ describe("executeRun Cross-Run A2A composition", () => {
     });
 
     expect(result).toMatchObject({ completed: true, finalText: "messaging unavailable" });
-    expect(model.requests[0]?.tools.map((tool) => tool.name)).not.toContain("agent_message");
+    const messageTool = model.requests[0]?.tools.find((tool) => tool.name === "agent_message");
+    expect(messageTool?.parameters.properties?.target).toMatchObject({ type: "string" });
+    const ledger = await JsonlLedger.open(join(result.stateDir, "ledger.jsonl"));
+    try {
+      const events = await ledger.read({ runId: result.runId });
+      expect(events.some((event) => event.type === "message.sent" || event.type.startsWith("a2a.outbox."))).toBe(false);
+      expect(events.some((event) => event.type === "tool.started" && event.payload.name === "agent_message")).toBe(false);
+    } finally {
+      await ledger.close();
+    }
   });
 
   it("rejects a sender that is not bound to the active Run lane", async () => {

@@ -282,14 +282,14 @@ describe("SessionController", () => {
   it("publishes compaction lifecycle events and includes their usage in snapshots", async () => {
     const root = await temporaryRoot();
     const mainResponses = [
-      response("x".repeat(5_000)),
+      response("x".repeat(10_000)),
       response("second answer"),
       response("third answer"),
     ];
     const model: ModelPort = {
-      // Keep enough response headroom while making the first large answer
-      // cross the model-window pressure threshold on a later Turn.
-      capabilities: () => ({ imageInput: false, contextWindowTokens: 4_000 }),
+      // Fit the standard tool catalog and current objective, while the first
+      // large answer crosses the pressure threshold on a later Turn.
+      capabilities: () => ({ imageInput: false, contextWindowTokens: 8_000 }),
       async complete(request) {
         if (request.sessionId.startsWith("fukai-compaction:")) {
           return response(JSON.stringify({
@@ -310,10 +310,10 @@ describe("SessionController", () => {
       maxOutputTokens: 100,
       fukaiCompaction: {
         ...enabledFukaiPolicy(),
-        maxInputTokens: 12_000,
+        maxInputTokens: 24_000,
         retainRatio: 0.001,
       },
-      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 40_000, tetoEnabled: false },
     }, {
       mainModel: model,
       createRunId: () => "session-fukai-live-events",
@@ -328,7 +328,10 @@ describe("SessionController", () => {
     await session.submit({ inputId: "live-fukai-3", text: "Third task" });
     await session.waitForIdle();
 
-    const types = durableEvents(observed).map((event) => event.type);
+    const events = durableEvents(observed);
+    expect(events.filter((event) => event.type === "turn.failed")).toEqual([]);
+    expect(events.filter((event) => event.type === "fukai.compaction.failed")).toEqual([]);
+    const types = events.map((event) => event.type);
     expect(types).toContain("fukai.compaction.requested");
     expect(types).toContain("fukai.compaction.completed");
     expect(types).toContain("fukai.compaction.committed");

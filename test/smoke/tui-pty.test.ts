@@ -132,11 +132,10 @@ describe("built CLI PTY", () => {
         );
 
         expect(stderr).toBe("");
-        // Pi's default is the regular main-screen renderer. Alternate-screen
-        // mode is an explicit opt-in, so normal CLI sessions remain in
-        // scrollback and restore no alternate buffer on exit.
-        expect(stdout).not.toContain("\x1b[?1049h");
-        expect(stdout).not.toContain("\x1b[?1049l");
+        // The production CLI uses Pi's fullscreen dock so the composer and
+        // footer stay anchored while transient editor content grows/shrinks.
+        expect(stdout).toContain("\x1b[?1049h");
+        expect(stdout).toContain("\x1b[?1049l");
         const plainStdout = stripTerminalSequences(stdout);
         expect(plainStdout).toContain("Nausicaa v0.1.0");
         expect(plainStdout).toContain("escape interrupt");

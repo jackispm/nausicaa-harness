@@ -220,6 +220,8 @@ export interface MainLoopDeps {
   afterStep?: (context: MainAfterStepContext) => void;
   /** Optional awaited host bookkeeping at a committed step boundary. */
   afterStepAsync?: (context: MainAfterStepContext) => Promise<void>;
+  /** True defers a clean completion so pending host work reaches the next step. */
+  beforeCompletion?: () => Promise<boolean>;
   /** Optional, explicit selection of an already-admitted Fukai capsule. */
   selectCompaction?: (
     context: MainCompactionSelectionContext,
@@ -364,6 +366,7 @@ export class MainLoop {
   private readonly navigationHook: MainLoopDeps["navigationHook"];
   private readonly afterStep: MainLoopDeps["afterStep"];
   private readonly afterStepAsync: MainLoopDeps["afterStepAsync"];
+  private readonly beforeCompletion: MainLoopDeps["beforeCompletion"];
   private readonly selectCompaction: MainLoopDeps["selectCompaction"];
   private readonly compactForPressure: MainLoopDeps["compactForPressure"];
   private readonly approve: MainLoopDeps["approve"];
@@ -427,6 +430,7 @@ export class MainLoop {
     this.navigationHook = deps.navigationHook;
     this.afterStep = deps.afterStep;
     this.afterStepAsync = deps.afterStepAsync;
+    this.beforeCompletion = deps.beforeCompletion;
     this.selectCompaction = deps.selectCompaction;
     this.compactForPressure = deps.compactForPressure;
     this.approve = deps.approve;
@@ -568,6 +572,7 @@ export class MainLoop {
         ));
         const goalContextKind = goalBoundary?.goalContextKind ?? pendingGoalContextKind;
         const goalContextGoal = goalBoundary?.goalContextGoal ?? input.threadGoal;
+        const boundaryRefs: { messageId: string; messageRef: ArtifactRef }[] = [];
         for (const boundary of boundaryMessages) {
           // Goal context is rendered by Fukai as an ephemeral, typed dynamic
           // block. Do not persist it as an ordinary user message or expose it
@@ -575,6 +580,7 @@ export class MainLoop {
           if (boundary.goalContextKind !== undefined) continue;
           const message = boundaryConversationMessage(boundary, this.clock.now());
           const ref = await this.writeMessage(message);
+          boundaryRefs.push({ messageId: boundary.messageId, messageRef: ref });
           sequence += 1;
           conversationRefs.push({
             ref,
@@ -1060,7 +1066,9 @@ export class MainLoop {
           requestId: requestEvent.eventId,
           messageRef: assistantRef,
         });
-        const truncatedToolCallError = response.stopReason === "length"
+        const blockedToolCallError = response.stopReason === "aborted"
+          ? "Tool call was not executed because the provider aborted this response."
+          : response.stopReason === "length"
           ? "Tool call was not executed because the model response hit its output token limit; its arguments may be truncated. Re-issue the complete tool call."
           : undefined;
         const toolMessages = response.toolCalls.length === 0
@@ -1074,7 +1082,7 @@ export class MainLoop {
               step,
               response.toolCalls,
               requestToolNames,
-              truncatedToolCallError,
+              blockedToolCallError,
             );
         for (const toolMessage of toolMessages) {
           sequence += 1;
@@ -1127,6 +1135,7 @@ export class MainLoop {
             step,
             hasToolCalls: response.toolCalls.length > 0,
             boundaryMessageIds,
+            ...(boundaryRefs.length === 0 ? {} : { boundaryMessages: boundaryRefs }),
           },
           idempotencyKey: `${eventPrefix}:step:${step}:completed`,
         });
@@ -1144,7 +1153,11 @@ export class MainLoop {
           boundaryMessageIds,
         });
 
+        // Persist rejected tool results for resume, then end this activation.
+        if (response.stopReason === "aborted") break;
+
         if (response.toolCalls.length === 0 && response.stopReason === "stop") {
+          if (await this.beforeCompletion?.()) continue;
           const completionMode = input.completionMode
             ?? (input.turnId !== undefined && input.completeRun !== true ? "turn" : "run");
           if (completionMode === "none") {

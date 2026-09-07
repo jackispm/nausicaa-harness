@@ -151,7 +151,7 @@ export interface InteractiveOptions {
   terminal?: Terminal;
   /** Optional user keybinding file override for embedders/tests. */
   keybindingsPath?: string;
-  /** Explicitly opt into Pi's fullscreen/alternate-screen layout. */
+  /** Use Pi's fullscreen/alternate-screen dock; false keeps regular scrollback. */
   forceAltScreen?: boolean;
   /** Test/embedding seam; production reads the system clipboard lazily. */
   clipboardImageReader?: ClipboardImageReader;
@@ -341,9 +341,11 @@ const MAX_PENDING_BASH_CONTEXTS = 8;
 /** Pi-inspired presentation layer. Runtime state stays in SessionController. */
 export async function runInteractive(options: InteractiveOptions): Promise<number> {
   const terminal = options.terminal ?? new ProcessTerminal();
-  // Pi uses the regular main-screen renderer by default. Fullscreen is an
-  // explicit opt-in for embedders/tests that need a fixed viewport and dock.
-  const useAltScreen = options.forceAltScreen === true;
+  // The working interactive CLI uses Pi's fullscreen dock by default. The
+  // regular renderer remains an explicit test/embedding mode because its
+  // scrollback renderer intentionally preserves a stale viewport when content
+  // shrinks below the terminal height (PI_CLEAR_ON_SHRINK=false).
+  const useAltScreen = options.forceAltScreen !== false;
   const tui: TUI = useAltScreen
     ? new TuiAltScreen(terminal, undefined, undefined, { mouse: true })
     : new TuiMainScreen(terminal);
@@ -364,12 +366,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   // in the alternate screen, where the next frame starts at a known origin,
   // but it leaves stale rows behind on the main screen because the terminal
   // cursor is already below the previous frame. Keep the previous frame for
-  // main-screen updates so shrinking selectors and notices can be erased.
+  // regular-mode updates while matching Pi's immediate fullscreen path.
   const requestTuiRender = (force = false): void => {
-    // Pi invalidates changed components and always keeps the renderer's
-    // differential state. requestRender(true) resets the main-screen viewport
-    // and can replay the welcome stream at the top.
-    if (force) tui.invalidate();
+    tui.invalidate();
+    if (force && tui instanceof TuiAltScreen) {
+      tui.requestRender(true);
+      return;
+    }
     tui.requestRender();
   };
   // Warp and other terminal session browsers use the OSC title as their
@@ -470,12 +473,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   let interruptExitTimer: ReturnType<typeof setTimeout> | undefined;
   let themePreference: ThemeChoice = "auto";
   let detectedColorScheme = getNausicaaColorScheme();
-  let activeSelector: {
-    token: object;
-    component: Component & Focusable & { handleInput(data: string): void };
-    restorePreview: () => void;
-    dispose?: () => void;
-  } | undefined;
+  type InteractiveSelector = Component & Focusable & { handleInput(data: string): void };
+  // Keep the selector lifecycle identical to Pi: the token identifies the
+  // currently mounted selector, while done() owns disposal, editor restoration,
+  // focus restoration, and the render request. A late selector completion can
+  // therefore never restore an older editor slot over a newer selector.
+  let activeSelectorToken: object | undefined;
+  let activeSelectorComponent: InteractiveSelector | undefined;
+  let activeSelectorDispose: (() => void) | undefined;
+  let activeSelectorDone: (() => void) | undefined;
+  let activeSelectorRestorePreview: (() => void) | undefined;
   let pendingPermissionApproval: (() => void) | undefined;
   let permissionApprovalTail: Promise<void> = Promise.resolve();
   let permissionApprovalGranted = false;
@@ -805,31 +812,37 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         };
         const cancelPending = (): void => settle(false);
         pendingPermissionApproval = cancelPending;
-        const selector = new SelectorOverlay({
-          title,
-          subtitle,
-          options: [
-            {
-              value: "approve",
-              label: approveLabel,
-              description: approveDescription,
+        showSelector((done) => {
+          const selector = new SelectorOverlay({
+            title,
+            subtitle,
+            options: [
+              {
+                value: "approve",
+                label: approveLabel,
+                description: approveDescription,
+              },
+              {
+                value: "cancel",
+                label: "Cancel",
+                description: "Leave the command failed and keep the current boundary",
+              },
+            ],
+            onSelect: (value) => {
+              settle(value === "approve");
+              done();
             },
-            {
-              value: "cancel",
-              label: "Cancel",
-              description: "Leave the command failed and keep the current boundary",
+            onCancel: () => {
+              done();
+              settle(false);
             },
-          ],
-          onSelect: (value) => {
-            closeSelector(false, selector);
-            settle(value === "approve");
-          },
-          onCancel: () => {
-            closeSelector(true, selector);
-            settle(false);
-          },
+          });
+          return {
+            component: selector,
+            focus: selector,
+            dispose: () => settle(false),
+          };
         });
-        mountSelector(selector);
       });
     });
     permissionApprovalTail = request.then(() => undefined, () => undefined);
@@ -1960,13 +1973,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
 
   const onSignal = (): void => { void finish(0); };
   const onSigint = (): void => {
-    const selector = activeSelector;
+    const selector = activeSelectorComponent;
     if (selector !== undefined) {
       pendingPermissionApproval?.();
       // Let the mounted selector settle any awaiting Promise (provider/auth
       // selection, permissions, skills, etc.) before restoring editor focus.
-      selector.component.handleInput("\x1b");
-      if (activeSelector === selector) closeSelector(true);
+      selector.handleInput("\x1b");
+      if (activeSelectorComponent === selector) closeSelector(true, selector);
       return;
     }
     if (activeSecretInput !== undefined) {
@@ -2169,25 +2182,31 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         settled = true;
         resolve(value);
       };
-      const selector = new SelectorOverlay({
-        title: "Providers",
-        subtitle: "Choose where to authenticate. Search by provider name or id.",
-        searchLabel: "Search providers",
-        options: providers.map((provider) => ({
-          value: provider.id,
-          label: `${provider.name} (${provider.id})`,
-          description: `${provider.modelCount} models · ${provider.authTypes.map((type) => authTypeLabel(type, provider.id)).join(" / ")} · ${status.get(provider.id) ?? "status unavailable"}`,
-        })),
-        onSelect: (value) => {
-          settle(value);
-          closeSelector(false, selector);
-        },
-        onCancel: () => {
-          settle(undefined);
-          closeSelector(true, selector);
-        },
+      showSelector((done) => {
+        const selector = new SelectorOverlay({
+          title: "Providers",
+          subtitle: "Choose where to authenticate. Search by provider name or id.",
+          searchLabel: "Search providers",
+          options: providers.map((provider) => ({
+            value: provider.id,
+            label: `${provider.name} (${provider.id})`,
+            description: `${provider.modelCount} models · ${provider.authTypes.map((type) => authTypeLabel(type, provider.id)).join(" / ")} · ${status.get(provider.id) ?? "status unavailable"}`,
+          })),
+          onSelect: (value) => {
+            settle(value);
+            done();
+          },
+          onCancel: () => {
+            done();
+            settle(undefined);
+          },
+        });
+        return {
+          component: selector,
+          focus: selector,
+          dispose: () => settle(undefined),
+        };
       });
-      mountSelector(selector, undefined, () => settle(undefined));
     });
   };
 
@@ -2208,26 +2227,32 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         settled = true;
         resolve(value);
       };
-      const selector = new SelectorOverlay({
-        title: "Sign in",
-        subtitle: `${info?.name ?? provider} supports more than one authentication method.`,
-        options: authTypes.map((type) => ({
-          value: type,
-          label: authTypeLabel(type, provider),
-          description: type === "oauth"
-            ? "Open a browser or device flow; no API key is entered"
-            : "Enter a provider key through a hidden prompt",
-        })),
-        onSelect: (value) => {
-          settle(value as AuthType);
-          closeSelector(false, selector);
-        },
-        onCancel: () => {
-          settle(undefined);
-          closeSelector(true, selector);
-        },
+      showSelector((done) => {
+        const selector = new SelectorOverlay({
+          title: "Sign in",
+          subtitle: `${info?.name ?? provider} supports more than one authentication method.`,
+          options: authTypes.map((type) => ({
+            value: type,
+            label: authTypeLabel(type, provider),
+            description: type === "oauth"
+              ? "Open a browser or device flow; no API key is entered"
+              : "Enter a provider key through a hidden prompt",
+          })),
+          onSelect: (value) => {
+            settle(value as AuthType);
+            done();
+          },
+          onCancel: () => {
+            done();
+            settle(undefined);
+          },
+        });
+        return {
+          component: selector,
+          focus: selector,
+          dispose: () => settle(undefined),
+        };
       });
-      mountSelector(selector, undefined, () => settle(undefined));
     });
   };
 
@@ -2240,26 +2265,32 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
     const names = new Map(providerInfos().map((provider) => [provider.id, provider.name]));
     return new Promise<string | undefined>((resolve) => {
-      const selector = new SelectorOverlay({
-        title: "Sign out",
-        searchLabel: "Search saved accounts",
-        options: credentials
-          .map((credential) => ({
-            value: credential.providerId,
-            label: names.get(credential.providerId) ?? credential.providerId,
-            description: `${credential.providerId} · ${credential.type === "oauth" ? "Saved OAuth credential" : "Saved API key"}`,
-          }))
-          .sort((left, right) => left.label.localeCompare(right.label)),
-        onSelect: (value) => {
-          resolve(value);
-          closeSelector(false, selector);
-        },
-        onCancel: () => {
-          resolve(undefined);
-          closeSelector(true, selector);
-        },
+      showSelector((done) => {
+        const selector = new SelectorOverlay({
+          title: "Sign out",
+          searchLabel: "Search saved accounts",
+          options: credentials
+            .map((credential) => ({
+              value: credential.providerId,
+              label: names.get(credential.providerId) ?? credential.providerId,
+              description: `${credential.providerId} · ${credential.type === "oauth" ? "Saved OAuth credential" : "Saved API key"}`,
+            }))
+            .sort((left, right) => left.label.localeCompare(right.label)),
+          onSelect: (value) => {
+            resolve(value);
+            done();
+          },
+          onCancel: () => {
+            done();
+            resolve(undefined);
+          },
+        });
+        return {
+          component: selector,
+          focus: selector,
+          dispose: () => resolve(undefined),
+        };
       });
-      mountSelector(selector, undefined, () => resolve(undefined));
     });
   };
 
@@ -2347,10 +2378,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const authPromptView = new TuiAuthPromptView();
     activeAuthPromptView = authPromptView;
     activeSecretInput = input;
-    editorContainer.clear();
-    editorContainer.addChild(authPromptView);
-    tui.setFocus(authPromptView);
-    requestTuiRender();
+    mountEditorSlot(authPromptView, authPromptView);
     appendNotice(
       requestedAuthType === "oauth"
         ? `${provider} browser/device sign-in started. Follow the authorization instructions below.`
@@ -2392,10 +2420,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     } finally {
       if (activeSecretInput === input) activeSecretInput = undefined;
       if (activeAuthPromptView === authPromptView) activeAuthPromptView = undefined;
-      editorContainer.clear();
-      editorContainer.addChild(editor);
-      tui.setFocus(editor);
-      requestTuiRender();
+      restoreEditorSlot();
     }
     try {
       await options.auth.refreshModels?.(provider);
@@ -2535,63 +2560,106 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     if (message !== undefined) throw new Error(message);
   };
 
+  const mountEditorSlot = (component: Component, focus: Component): void => {
+    editorContainer.clear();
+    editorContainer.addChild(component);
+    tui.setFocus(focus);
+    requestTuiRender();
+  };
+
+  const restoreEditorSlot = (): void => {
+    editorContainer.clear();
+    editorContainer.addChild(editor);
+    tui.setFocus(editor);
+    requestTuiRender();
+  };
+
+  /**
+   * Pi's selector lifecycle. The component factory receives the only callback
+   * allowed to close the selector. The callback is token guarded so an async
+   * result from an old selector cannot replace a newer editor child.
+   */
   function disposeActiveSelector(): void {
-    const selected = activeSelector;
-    activeSelector = undefined;
-    selected?.dispose?.();
+    const dispose = activeSelectorDispose;
+    activeSelectorToken = undefined;
+    activeSelectorComponent = undefined;
+    activeSelectorDispose = undefined;
+    activeSelectorDone = undefined;
+    activeSelectorRestorePreview = undefined;
+    dispose?.();
+  }
+
+  function showSelector(
+    create: (done: () => void) => {
+      component: Component;
+      focus: Component;
+      dispose?: () => void;
+      restorePreview?: () => void;
+    },
+  ): void {
+    const token = {};
+    let dispose: (() => void) | undefined;
+    const done = (): void => {
+      // Match Pi's ordering: dispose first, then ignore stale completions.
+      dispose?.();
+      if (activeSelectorToken !== token) return;
+      activeSelectorToken = undefined;
+      activeSelectorComponent = undefined;
+      activeSelectorDispose = undefined;
+      activeSelectorDone = undefined;
+      activeSelectorRestorePreview = undefined;
+      restoreEditorSlot();
+    };
+    const created = create(done);
+    dispose = created.dispose;
+    // A new selector supersedes the previous one in exactly one place.
+    disposeActiveSelector();
+    activeSelectorToken = token;
+    activeSelectorComponent = created.component as InteractiveSelector;
+    activeSelectorDispose = dispose;
+    activeSelectorDone = done;
+    activeSelectorRestorePreview = created.restorePreview;
+    mountEditorSlot(created.component, created.focus);
   }
 
   function closeSelector(
     restorePreview: boolean,
     expectedComponent?: Component,
   ): void {
-    const selected = activeSelector;
-    if (selected === undefined) return;
-    if (expectedComponent !== undefined && selected.component !== expectedComponent) return;
-    disposeActiveSelector();
-    try {
-      if (restorePreview) selected.restorePreview();
-    } catch (error: unknown) {
-      // A failed preview rollback must not strand focus in an unmounted selector.
+    const component = activeSelectorComponent;
+    if (component === undefined) return;
+    if (expectedComponent !== undefined && component !== expectedComponent) return;
+    if (restorePreview) {
       try {
-        appendNotice(
-          `Selector preview could not be restored: ${error instanceof Error ? error.message : String(error)}`,
-          "warning",
-        );
-      } catch {
-        // Shutdown still owns terminal and focus restoration if rendering is unavailable.
+        activeSelectorRestorePreview?.();
+      } catch (error: unknown) {
+        // A failed preview rollback must not strand focus in an unmounted selector.
+        try {
+          appendNotice(
+            `Selector preview could not be restored: ${error instanceof Error ? error.message : String(error)}`,
+            "warning",
+          );
+        } catch {
+          // Shutdown still owns terminal and focus restoration if rendering is unavailable.
+        }
       }
-    } finally {
-      editorContainer.clear();
-      editorContainer.addChild(editor);
-      tui.setFocus(editor);
-      requestTuiRender();
     }
+    activeSelectorDone?.();
   }
 
+  // Compatibility adapter for the existing option builders. It still routes
+  // every selector through showSelector(), so there is one mount/restore path.
   function mountSelector(
-    component: Component & Focusable & { handleInput(data: string): void },
+    component: InteractiveSelector,
     restorePreview: () => void = () => {},
     dispose?: () => void,
   ): void {
-    closeSelector(true);
-    const token = {};
-    const mountedSelector: {
-      token: object;
-      component: Component & Focusable & { handleInput(data: string): void };
-      restorePreview: () => void;
-      dispose?: () => void;
-    } = {
-      token,
+    showSelector(() => ({
       component,
+      focus: component,
+      ...(dispose === undefined ? {} : { dispose }),
       restorePreview,
-    };
-    if (dispose !== undefined) mountedSelector.dispose = dispose;
-    activeSelector = mountedSelector;
-    editorContainer.clear();
-    editorContainer.addChild(component);
-    tui.setFocus(component);
-    requestTuiRender();
+    }));
   }
 
   const showModelSelector = (initialQuery = "", initialProvider = "all"): void => {
@@ -2675,10 +2743,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         return [provider, null];
       }
     })).then((states) => {
-      if (closing || activeSelector?.component !== loading) return;
+      if (closing || activeSelectorComponent !== loading) return;
       show(new Map(states), loading.getSearchInput().getValue());
     }).catch(() => {
-      if (closing || activeSelector?.component !== loading) return;
+      if (closing || activeSelectorComponent !== loading) return;
       closeSelector(true, loading);
       appendNotice("Model authentication status could not be loaded. Retry /model.", "warning");
     });
@@ -3653,7 +3721,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       }
       return { consume: true };
     }
-    if (activeSelector !== undefined) return undefined;
+    if (activeSelectorComponent !== undefined) return undefined;
     const isInterrupt = keybindings.matches(data, "app.clear");
     if (!isInterrupt) clearInterruptExit();
     if (matchesKey(data, "?") && editor.getText().length === 0) {

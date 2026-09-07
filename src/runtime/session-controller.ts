@@ -122,7 +122,8 @@ import {
 import { createGoalTools } from "./goal-tool.js";
 import { createTetoControlTools } from "./teto-control-tool.js";
 import { TeamRuntime } from "./team-runtime.js";
-import { createTeamStatusTool, createTeamTool } from "./team-tool.js";
+import { createTeamCancelTool, createTeamPresentTool, createTeamReduceTool, createTeamStatusTool, createTeamTool } from "./team-tool.js";
+import { composeAgentMessageTools, createInRunAgentMessageTool } from "./in-run-agent-message-tool.js";
 import { projectRunAwareness } from "./run-awareness.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
 import {
@@ -1610,6 +1611,7 @@ export class SessionController {
         this.publishState();
         active.controller.abort(new Error(reason));
       }
+      await this.attached?.team?.cancelAll(reason);
       if (execution === undefined) {
         const attached = this.attached;
         if (attached === undefined) return;
@@ -2613,7 +2615,7 @@ export class SessionController {
             ownerLaneId: "main",
             relation: "member-of",
           },
-          role: `Team branch ${teamId}/${branchId}`,
+          role: `Team member ${teamId}/${branchId}`,
           state: "ready",
           capabilities: capabilityEntriesFromTools(branchTools),
           targets: [{
@@ -2973,6 +2975,24 @@ export class SessionController {
       if (attached.team !== undefined) {
         pushSessionRuntimeTool(tools, createTeamTool(attached.team));
         pushSessionRuntimeTool(tools, createTeamStatusTool(attached.team));
+        pushSessionRuntimeTool(tools, createTeamCancelTool(attached.team));
+        pushSessionRuntimeTool(tools, createTeamReduceTool(attached.team));
+        pushSessionRuntimeTool(tools, createTeamPresentTool(attached.team));
+        const inRunMessageTool = createInRunAgentMessageTool({
+          inbox, runId: attached.runId, from: "main",
+          resolveTargets: async () => [
+            ...await attached.team!.messageTargets(),
+            ...(attached.teto?.active ? ["teto"] : []),
+          ],
+          now: () => this.clock.now(),
+          onMessage: (message) => {
+            if (message.to === "teto") attached.teto?.enqueue();
+            else attached.team?.enqueue();
+          },
+        });
+        const messageTool = composeAgentMessageTools(inRunMessageTool, crossRunTool);
+        if (crossRunTool === undefined) pushSessionRuntimeTool(tools, messageTool);
+        else tools.splice(tools.indexOf(crossRunTool), 1, messageTool);
       }
       if (attached.worker !== undefined) {
         pushSessionRuntimeTool(tools, createDelegateTaskTool({
@@ -3038,6 +3058,7 @@ export class SessionController {
         return;
       }
       const loop = new MainLoop({
+        beforeCompletion: () => attached.team?.beforeMainCompletion(turn.controller.signal) ?? Promise.resolve(false),
         model,
         resolveModel: () => this.model,
         contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(attached.store)),

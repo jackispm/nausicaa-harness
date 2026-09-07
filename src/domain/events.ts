@@ -29,6 +29,13 @@ import type {
   ContextManifest,
   ContextSourceRef,
 } from "./context.js";
+import type {
+  TeamDefinition,
+  TeamJoined,
+  TeamMemberDefinition,
+  TeamMemberSettlement,
+  TeamReduction,
+} from "./team.js";
 
 export type InputDelivery = "new-turn" | "steering" | "follow-up";
 export type UserMessageKind = "initial" | "steering" | "continuation";
@@ -110,12 +117,22 @@ export interface EventPayloadMap {
     reason?: string;
     control?: { action: "start" | "stop"; requestedBy: LaneId };
   };
+  "team.created": TeamDefinition;
+  "team.member.settled": TeamMemberSettlement;
+  "team.joined": TeamJoined;
+  "team.cancel.requested": { teamId: string; reason: string; requestedBy: LaneId };
+  "team.cancelled": { teamId: string; reason: string };
+  "team.reduction.requested": { teamId: string; reducer: TeamMemberDefinition };
+  "team.reduced": { teamId: string } & TeamReduction;
+  "team.presented": { teamId: string; disposition: "accepted" | "rejected"; summaryRef?: ArtifactRef };
   "step.started": { step: number };
   "step.completed": {
     step: number;
     hasToolCalls: boolean;
     /** Boundary messages durably consumed by this committed Main Step. */
     boundaryMessageIds?: string[];
+    /** Stored runtime notices required to rebuild the committed model context. */
+    boundaryMessages?: { messageId: string; messageRef: ArtifactRef }[];
   };
   "step.failed": { step: number; error: string };
   "input.admitted": {

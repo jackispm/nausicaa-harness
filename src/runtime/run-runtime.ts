@@ -95,7 +95,8 @@ import {
 } from "./agent-awareness-tool.js";
 import { createTetoControlTools } from "./teto-control-tool.js";
 import { TeamRuntime } from "./team-runtime.js";
-import { createTeamStatusTool, createTeamTool } from "./team-tool.js";
+import { createTeamCancelTool, createTeamPresentTool, createTeamReduceTool, createTeamStatusTool, createTeamTool } from "./team-tool.js";
+import { composeAgentMessageTools, createInRunAgentMessageTool } from "./in-run-agent-message-tool.js";
 import { projectRunAwareness } from "./run-awareness.js";
 import { ReflectionScheduler } from "./reflection-scheduler.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
@@ -674,7 +675,7 @@ export const executeRun = async (
         inputRefs,
         budget,
         tools: capabilityEntriesFromTools(teamBranchTools),
-        role: `Team branch ${teamId}/${branchId}`,
+        role: `Team member ${teamId}/${branchId}`,
         targets: [{
           laneId: "main",
           relation: "owns",
@@ -690,6 +691,24 @@ export const executeRun = async (
       }
       pushRuntimeTool(tools, createTeamTool(teamRuntime));
       pushRuntimeTool(tools, createTeamStatusTool(teamRuntime));
+      pushRuntimeTool(tools, createTeamCancelTool(teamRuntime));
+      pushRuntimeTool(tools, createTeamReduceTool(teamRuntime));
+      pushRuntimeTool(tools, createTeamPresentTool(teamRuntime));
+      const inRunMessageTool = createInRunAgentMessageTool({
+        inbox, runId, from: "main",
+        resolveTargets: async () => [
+          ...await teamRuntime!.messageTargets(),
+          ...(scheduler instanceof TetoLaneController && scheduler.active ? ["teto"] : []),
+        ],
+        now: () => clock.now(),
+        onMessage: (message) => {
+          if (message.to === "teto" && scheduler instanceof TetoLaneController) scheduler.enqueue();
+          else teamRuntime?.enqueue();
+        },
+      });
+      const messageTool = composeAgentMessageTools(inRunMessageTool, crossRunTool);
+      if (crossRunTool === undefined) pushRuntimeTool(tools, messageTool);
+      else tools.splice(tools.indexOf(crossRunTool), 1, messageTool);
     } else if (useUnifiedTeto && auxiliaryMode === "teto" && adviceDelivery === "live") {
       // The unified lane still publishes Advice through the same Main-owned
       // acknowledgement tool in frozen live evaluation arms.
@@ -802,6 +821,7 @@ export const executeRun = async (
       : undefined;
 
     const loop = new MainLoop({
+      beforeCompletion: () => teamRuntime?.beforeMainCompletion(request.signal) ?? Promise.resolve(false),
       model: mainModel,
       contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
       conversationStore: store,
@@ -933,11 +953,7 @@ export const executeRun = async (
         await settlesWithin(workerScheduler.drain(), 25);
       }
       if (teamRuntime !== undefined) {
-        // Team branches are task-scoped and their terminal replies are the
-        // useful output of `team_create`. Give already-admitted branches a
-        // bounded grace period to publish those replies before shutting the
-        // one-shot runtime down; Main remains independent of slow observers.
-        await settlesWithin(teamRuntime.drain(), 500);
+        await teamRuntime.waitForJoin(request.signal);
       }
       const blocker: RunExecutionResult["blocker"] = result.completed
         ? undefined
@@ -973,6 +989,7 @@ export const executeRun = async (
         ...(blocker === undefined ? {} : { blocker }),
       };
     } catch (error: unknown) {
+      if (request.signal?.aborted) await teamRuntime?.cancelAll("Run aborted");
       await scheduler?.stop();
       await workerScheduler?.stop();
       await teamRuntime?.stop();
