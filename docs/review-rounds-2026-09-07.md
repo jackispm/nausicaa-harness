@@ -40,4 +40,27 @@ Validation: the five new tests failed before the fix; 86 focused tests across
 10 discovery, registry, activation, status, identity, and build suites passed.
 `npm run typecheck` and `git diff --check` passed.
 
-Rounds 3 through 5 are pending.
+## Round 3: A2A Visibility And Session Isolation
+
+Ordinary public A2A messages now appear in live, resumed, and remotely attached
+transcripts. Both endpoints and envelope identity are checked; sender outbox
+records say submitted, not delivered. Private cross-Run inputs retain private
+visibility through admission, steering, replacement, queue projection, and
+recovery. Legacy public wrappers cannot revive rejected/private source messages.
+Message bodies accept normal whitespace without accepting unsafe controls, and
+an embedded closing marker no longer truncates their display.
+
+Run navigation fences old events and slow history reads, restores current
+history after rejected attachment/fork, and binds explicit resume to its Run
+inside admission. Three new navigation races were reproduced before correction,
+including a command for X incorrectly resuming A and a failed fork blanking
+the still-attached history. The same failure recovery is shared by new/import
+navigation without changing their business semantics.
+
+Validation: an isolated candidate containing only these selected changes passed
+`npm run typecheck` and the complete `npm test`: 188 files, 2,060 tests. This
+includes 93 interactive TUI tests and 58 session protocol tests. Uncommitted
+selector, startup-logo, margin, and TUI-mode changes were excluded from the
+candidate; they were not reverted in the shared workspace.
+
+Rounds 4 and 5 are pending.

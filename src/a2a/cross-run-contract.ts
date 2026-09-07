@@ -976,7 +976,7 @@ function normalizePayload(value: unknown): CrossRunPayload {
       // transport limit below using UTF-8 bytes. ASCII payloads just over the
       // boundary should report the byte-limit error rather than a misleading
       // character-count error.
-      [field]: boundedString(item[field], `payload.${field}`, false, CROSS_RUN_MAX_INLINE_BYTES * 4),
+      [field]: boundedMessageText(item[field], `payload.${field}`),
     } as unknown as CrossRunPayload;
   }
   switch (type) {
@@ -1255,6 +1255,15 @@ function boundedSelector(value: unknown, path: string): string {
     throw new CrossRunProtocolError("wildcard A2A targets are not supported", "selector-invalid");
   }
   return normalized;
+}
+
+function boundedMessageText(value: unknown, path: string): string {
+  // Body whitespace is data; endpoint and identity fields keep their stricter contract.
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > CROSS_RUN_MAX_INLINE_BYTES * 4
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+    throw new CrossRunProtocolError(`${path} must be bounded text without unsafe control characters`);
+  }
+  return value;
 }
 
 function boundedString(value: unknown, path: string, allowEmpty: boolean, max = CROSS_RUN_MAX_STRING_LENGTH): string {

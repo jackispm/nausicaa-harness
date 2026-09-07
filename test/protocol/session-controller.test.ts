@@ -2177,7 +2177,10 @@ describe("SessionController", () => {
       .find((event) => event.type === "turn.waiting")
       ?.payload.reason).toBe("model-output-limit");
 
-    await session.resumeCurrent();
+    await expect(session.resumeCurrent("different-run")).rejects.toThrow("Run attachment changed");
+    expect(model.callCount).toBe(1);
+    expect(durableEvents(events).some((event) => event.type === "turn.resumed")).toBe(false);
+    await session.resumeCurrent("output-limit-run");
     await session.waitForIdle();
 
     const continuation = model.requests[1]?.messages.at(-1);

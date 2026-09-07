@@ -147,6 +147,7 @@ import {
   readToolArgumentsFromStore,
   readUserMessage,
   readUserText,
+  sessionInputVisibility,
   type SessionPendingInput,
   type SessionTranscriptEntry,
 } from "./session-artifacts.js";
@@ -1173,7 +1174,7 @@ export class SessionController {
           causationId: current.eventId,
           correlationId: `input:${inputId}`,
           idempotencyKey: `${attached.runId}:input:${inputId}:replaced:${expectedRevision + 1}`,
-          visibility: "user",
+          visibility: sessionInputVisibility(events, attached.runId, inputId),
           occurredAt: this.clock.now().toISOString(),
         });
       } catch (error: unknown) {
@@ -1219,7 +1220,7 @@ export class SessionController {
           causationId: current.eventId,
           correlationId: `input:${inputId}`,
           idempotencyKey: `${attached.runId}:input:${inputId}:withdrawn:${expectedRevision}`,
-          visibility: "user",
+          visibility: sessionInputVisibility(events, attached.runId, inputId),
           occurredAt: this.clock.now().toISOString(),
         });
       } catch (error: unknown) {
@@ -1575,7 +1576,7 @@ export class SessionController {
         },
         correlationId: `input:${request.inputId}`,
         idempotencyKey: `${attached.runId}:input:${request.inputId}:admitted`,
-        visibility: "user",
+        visibility: sessionInputVisibility(events, attached.runId, request.inputId),
         occurredAt: this.clock.now().toISOString(),
       });
 
@@ -1635,13 +1636,16 @@ export class SessionController {
     });
   }
 
-  async resumeCurrent(): Promise<void> {
+  async resumeCurrent(expectedRunId?: string): Promise<void> {
     await this.runAdmission(async () => {
       this.assertOpen();
       if (this.active !== undefined || this.execution !== undefined) {
         throw new SessionProtocolError("A Turn is already running");
       }
       const attached = this.requireAttached();
+      if (expectedRunId !== undefined && attached.runId !== expectedRunId) {
+        throw new SessionProtocolError(`Run attachment changed before resuming ${expectedRunId}`);
+      }
       const events = await attached.ledger.read({ runId: attached.runId });
       const blocker = blockingReason(events);
       if (blocker?.startsWith("operation-unknown:")) {
@@ -2784,7 +2788,7 @@ export class SessionController {
         causationId: delivered.eventId,
         correlationId: `turn:${turnId}`,
         idempotencyKey: `${attached.runId}:input:${inputId}:user-message`,
-        visibility: "user",
+        visibility: sessionInputVisibility(events, attached.runId, inputId),
         occurredAt: this.clock.now().toISOString(),
       });
       // Session promotion persists the public user message outside MainLoop.
@@ -3416,7 +3420,7 @@ export class SessionController {
         causationId: delivered.eventId,
         correlationId: `turn:${turnId}`,
         idempotencyKey: `${attached.runId}:input:${admission.payload.inputId}:user-message`,
-        visibility: "user",
+        visibility: sessionInputVisibility(events, attached.runId, admission.payload.inputId),
         occurredAt: this.clock.now().toISOString(),
       });
       const userMessage = await readUserMessage(

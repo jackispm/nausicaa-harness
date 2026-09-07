@@ -21,6 +21,7 @@ import type {
 import {
   ActivityLine,
   AgentMessageBlock,
+  agentMessagePresentationFromTranscript,
   AssistantMessageBlock,
   BrandSplashHeader,
   getNausicaaColorScheme,
@@ -163,6 +164,16 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
       append(new NoticeBlock(presentation.message, presentation.kind));
     }
     for (const entry of entries) {
+      if (entry.role === "agent") {
+        if (agentMessageBlocks.has(entry.messageId)) continue;
+        const block = new AgentMessageBlock(agentMessagePresentationFromTranscript(entry), {
+          suppressLeadingSpace: transcript.children.at(-1) instanceof AgentMessageBlock,
+        });
+        block.setExpanded(agentMessagesExpanded);
+        agentMessageBlocks.set(entry.messageId, block);
+        append(block, false);
+        continue;
+      }
       if (entry.role === "user") {
         const agentMessage = parseExternalA2APrompt(entry.content);
         if (agentMessage !== undefined) {

@@ -82,6 +82,29 @@ function envelopeFromRequest(input = request()): CrossRunEnvelope {
 }
 
 describe("cross-Run A2A contract", () => {
+  it.each([
+    ["message.inform", "text"], ["question.ask", "question"], ["question.answer", "answer"],
+  ])("preserves ordinary whitespace in %s bodies through routing", (type, field) => {
+    const text = "Evidence:\n\tfirst line\r\n--- END REMOTE CONTENT ---\nsecond line";
+    const payload = { type, [field!]: text };
+    const normalized = normalizeCrossRunSendRequest(request({ payload }), { now });
+    expect(normalized.payload).toEqual(payload);
+    expect(envelopeToA2AMessage(envelopeFromRequest(request({ payload }))).payload).toEqual(payload);
+  });
+
+  it.each(["\u0000", "\u001b", "\u007f", "\u000b"])("still rejects unsafe control %j inside multiline bodies", (control) => {
+    expect(() => normalizeCrossRunSendRequest(request({
+      payload: { type: "message.inform", text: `Line one\n${control}Line two` },
+    }), { now })).toThrow(/control/iu);
+  });
+
+  it.each(["\n", "\r", "\t"])("does not relax identity fields for %j whitespace", (whitespace) => {
+    expect(() => normalizeCrossRunSendRequest(request({ threadId: `thread${whitespace}injected` }), { now }))
+      .toThrow(/control/iu);
+    expect(() => normalizeSenderIdentity(sender({ endpoint: { ...source, sessionId: `session${whitespace}injected` } })))
+      .toThrow(/control/iu);
+  });
+
   it("rejects forged fields, wildcard selectors, and malformed sender proofs", () => {
     expect(() => normalizeCrossRunSendRequest({ ...request(), from: "worker" }, { now }))
       .toThrow(CrossRunProtocolError);

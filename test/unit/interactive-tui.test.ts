@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { stripTerminalSequences, type Terminal } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 
+import { createCrossRunMessageId, createCrossRunRouteId } from "../../src/a2a/index.js";
 import { FileCredentialStore } from "../../src/auth/index.js";
 import type { AuthModelPort } from "../../src/cli/auth.js";
 import { createBuiltinModelPort, createOpenRouterModelPort } from "../../src/model/index.js";
@@ -823,11 +824,94 @@ describe("interactive TUI", () => {
       const visible = normalizeTerminalOutput(terminal.output);
       expect(visible).not.toContain("Source endpoint:");
       expect(visible).toContain("inform line one inform line two");
-      expect(visible).toContain("Which evidence should be checked first?");
-      expect(visible).toContain("Start with the WindowServer watchdog report.");
-      expect(visible).toContain("Inspect the external task and report the result");
-      expect(visible).toContain("The external evidence points to a stale dependency");
+      expect(visible).toContain("to target-session");
+      expect(visible).toContain("Which evidence should be");
+      expect(visible).toContain("Start with the WindowServer");
+      terminal.send("\x10");
+      await waitForOutput(terminal, "Which evidence should be checked first?");
+      const expanded = normalizeTerminalOutput(terminal.output);
+      expect(expanded).toContain("Start with the WindowServer watchdog report.");
+      expect(expanded).toContain("Inspect the external task and report the result");
+      expect(expanded).toContain("The external evidence points to a stale dependency");
 
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["live", "resume"])("renders public in-Run A2A directions in the %s transcript", async (mode) => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-lane-messages-"));
+    const dataDir = join(root, "state");
+    const runId = "interactive-lane-messages";
+    const previousExitCode = process.exitCode;
+    try {
+      const seed = await SessionController.open({
+        workspace: root, dataDir, model: "scripted",
+        policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      }, { mainModel: new ScriptedModel([response("Main answer")]), createRunId: () => runId });
+      await seed.submit({ inputId: "seed", text: "Seed task" });
+      await seed.waitForIdle();
+      await seed.close();
+
+      const now = new Date().toISOString();
+      const records: Array<{ from: string; to: string; payload: A2AMessage["payload"]; visibility?: "lane" | "sensitive" }> = [
+        { from: "teto", to: "main", payload: { type: "message.inform", text: "TETO_PUBLIC_NOTE" } },
+        { from: "main", to: "teto", payload: { type: "question.ask", question: "MAIN_PUBLIC_QUESTION" } },
+        { from: "team:r:a", to: "team:r:b", payload: { type: "question.answer", answer: "PEER_PUBLIC_ANSWER" } },
+        { from: "teto", to: "main", payload: { type: "message.inform", text: "TETO_PRIVATE_NOTE" }, visibility: "lane" },
+        { from: "main", to: "teto", payload: { type: "message.inform", text: "MAIN_SENSITIVE_NOTE" }, visibility: "sensitive" },
+        { from: "teto", to: "main", payload: { type: "task.accept", taskId: "HIDDEN_TASK_PROTOCOL" } },
+      ];
+      const events: Array<Extract<AnyEvent, { type: "message.sent" }>> = records.map((record, index) => {
+        const id = `lane-message-${index}`;
+        const message: A2AMessage = {
+          messageId: id, runId, from: record.from, to: record.to, payload: record.payload,
+          createdAt: now, visibility: record.visibility ?? "run", priority: 5, delivery: "next-step",
+          conversationId: runId, threadId: id, correlationId: id, idempotencyKey: id,
+        };
+        return {
+          eventId: id, runId, laneId: record.from, globalOffset: 100 + index, laneSeq: 100 + index,
+          type: "message.sent", schemaVersion: 1, occurredAt: now, correlationId: id,
+          idempotencyKey: id, visibility: message.visibility, contentHash: `test:${id}`, payload: { message },
+        };
+      });
+      if (mode === "resume") {
+        const ledger = await JsonlLedger.open(join(dataDir, "runs", runId, "ledger.jsonl"));
+        for (const event of events) await ledger.append({
+          runId, laneId: event.laneId, type: "message.sent", payload: event.payload,
+          correlationId: event.correlationId, idempotencyKey: event.idempotencyKey, visibility: event.visibility,
+        });
+        await ledger.close();
+      }
+      const model = new ScriptedModel([]);
+      const session = await SessionController.open({ workspace: root, dataDir, model: "scripted", runId }, { mainModel: model });
+      const terminal = new MemoryTerminal(140, 44);
+      const running = runInteractive({ session, terminal, forceAltScreen: true });
+      await terminal.started;
+      await waitForOutput(terminal, "Main answer");
+      if (mode === "live") {
+        const publish = (session as unknown as { publish: (event: SessionRuntimeEvent) => void }).publish.bind(session);
+        for (const event of [...events, events[0]!]) publish({ kind: "event", event });
+      }
+      await waitForOutput(terminal, "TETO_PUBLIC_NOTE");
+      await waitForOutput(terminal, "MAIN_PUBLIC_QUESTION");
+      await waitForOutput(terminal, "PEER_PUBLIC_ANSWER");
+      const visible = normalizeTerminalOutput(terminal.output);
+      expect(visible).toContain("from teto to main");
+      expect(visible).toContain("Agent message sent");
+      expect(visible).toContain("from main to teto");
+      expect(visible).toContain("from team:r:a to team:r:b");
+      expect(visible).not.toContain("TETO_PRIVATE_NOTE");
+      expect(visible).not.toContain("MAIN_SENSITIVE_NOTE");
+      expect(visible).not.toContain("HIDDEN_TASK_PROTOCOL");
+      expect(model.callCount).toBe(0);
+      if (mode === "resume") {
+        expect((await session.transcript()).filter((entry) => entry.role === "agent")).toHaveLength(3);
+      }
       terminal.type("/exit");
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
@@ -3077,6 +3161,231 @@ describe("interactive TUI", () => {
     }
   });
 
+  it("discards a slow previous hydration after a newer Run has attached", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-hydration-race-"));
+    const dataDir = join(root, "state");
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let current: SessionController | undefined;
+    let running: Promise<number> | undefined;
+    try {
+      for (const runId of ["slow-hydration-run", "latest-hydration-run"]) {
+        const seed = await SessionController.open({
+          workspace: root, dataDir, model: "scripted", policy: { tetoEnabled: false },
+        }, { mainModel: new ScriptedModel([response(`${runId}_ANSWER`)]), createRunId: () => runId });
+        try {
+          await seed.submit({ inputId: `${runId}-input`, text: `Question for ${runId}` });
+          await seed.waitForIdle();
+        } finally {
+          await seed.close();
+        }
+      }
+      current = await SessionController.open({
+        workspace: root, dataDir, model: "scripted", policy: { tetoEnabled: false },
+      }, { mainModel: new ScriptedModel([]), createRunId: () => "initial-hydration-run" });
+      await current.newRun();
+      const originalTranscript = current.transcript.bind(current);
+      let hydrating = false;
+      current.transcript = async () => {
+        const runId = current!.snapshot().runId;
+        const entries = await originalTranscript();
+        if (runId === "slow-hydration-run") {
+          hydrating = true;
+          await gate;
+          hydrating = false;
+        }
+        return entries;
+      };
+      running = runInteractive({ session: current, terminal, forceAltScreen: true });
+      await terminal.started;
+      terminal.type("/resume");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Resume a previous session");
+      terminal.type("slow-hydration-run");
+      terminal.send("\r");
+      await waitForCondition(() => hydrating, "slow history hydration");
+      terminal.type("/resume latest-hydration-run");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Attached Run latest-hydration-run");
+      const beforeRelease = terminal.output.length;
+      release();
+      await waitForCondition(() => !hydrating, "old history read returning");
+      terminal.type("/status");
+      terminal.send("\r");
+      await waitForCondition(() => terminal.output.slice(beforeRelease).includes("Queue / Tokens"), "post-switch frame");
+      expect(current.snapshot().runId).toBe("latest-hydration-run");
+      expect(terminal.output.slice(beforeRelease)).not.toContain("slow-hydration-run_ANSWER");
+      expect(terminal.output.slice(beforeRelease)).not.toContain("Attached Run slow-hydration-run");
+    } finally {
+      release();
+      if (running !== undefined) {
+        terminal.type("/exit");
+        terminal.send("\r");
+        await running;
+      } else {
+        await current?.close();
+      }
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not resume another Run when an explicit current-Run resume races a picker attachment", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-resume-target-race-"));
+    const dataDir = join(root, "state");
+    const terminal = new MemoryTerminal(120, 32);
+    const previousExitCode = process.exitCode;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let current: SessionController | undefined;
+    let running: Promise<number> | undefined;
+    try {
+      for (const [runId, reason] of [["race-current-run", "stop"], ["race-target-run", "length"]] as const) {
+        const seed = await SessionController.open({
+          workspace: root, dataDir, model: "scripted", policy: { tetoEnabled: false },
+        }, { mainModel: new ScriptedModel([response(`${runId}_ANSWER`, [], reason)]), createRunId: () => runId });
+        try {
+          await seed.submit({ inputId: `${runId}-input`, text: `Question for ${runId}` });
+          await seed.waitForIdle();
+        } finally {
+          await seed.close();
+        }
+      }
+      const model = new ScriptedModel([response("UNEXPECTED_TARGET_RESUME")]);
+      current = await SessionController.open({
+        workspace: root, dataDir, model: "scripted", runId: "race-current-run",
+      }, { mainModel: model });
+      const resumedRuns: string[] = [];
+      current.subscribe((event) => {
+        if (event.kind === "event" && event.event.type === "turn.resumed") resumedRuns.push(event.event.runId);
+      });
+      const attachment = current as unknown as { openAttachment(runId: string): Promise<unknown> };
+      const openAttachment = attachment.openAttachment.bind(current);
+      let attachmentEntered = false;
+      attachment.openAttachment = async (runId) => {
+        if (runId === "race-target-run") {
+          attachmentEntered = true;
+          await gate;
+        }
+        return openAttachment(runId);
+      };
+      running = runInteractive({ session: current, terminal, forceAltScreen: true });
+      await terminal.started;
+      terminal.type("/resume");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Resume a previous session");
+      terminal.type("race-target-run");
+      terminal.send("\r");
+      await waitForCondition(() => attachmentEntered, "picker attachment inside admission");
+      expect(current.snapshot().runId).toBe("race-current-run");
+
+      terminal.type("/resume race-current-run");
+      terminal.send("\r");
+      await delay(30);
+      release();
+      terminal.type("/status");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Queue / Tokens");
+      await current.waitForIdle();
+      expect(resumedRuns).not.toContain("race-target-run");
+      expect(model.callCount).toBe(0);
+    } finally {
+      release();
+      if (running !== undefined) {
+        terminal.type("/exit");
+        terminal.send("\r");
+        await running;
+      } else {
+        await current?.close();
+      }
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps current history after a rejected fork supersedes a slow hydration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-rejected-fork-hydration-"));
+    const dataDir = join(root, "state");
+    const terminal = new MemoryTerminal(120, 32);
+    const previousExitCode = process.exitCode;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let current: SessionController | undefined;
+    let running: Promise<number> | undefined;
+    try {
+      const seed = await SessionController.open({
+        workspace: root, dataDir, model: "scripted", policy: { tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("REJECTED_FORK_HISTORY_ANSWER")]),
+        createRunId: () => "fork-hydration-run",
+      });
+      try {
+        await seed.submit({ inputId: "fork-history-input", text: "History for the attached Run" });
+        await seed.waitForIdle();
+      } finally {
+        await seed.close();
+      }
+      current = await SessionController.open({
+        workspace: root, dataDir, model: "scripted", policy: { tetoEnabled: false },
+      }, { mainModel: new ScriptedModel([]) });
+      const originalTranscript = current.transcript.bind(current);
+      let historyHeld = false;
+      let hydrating = false;
+      current.transcript = async () => {
+        const entries = await originalTranscript();
+        if (!historyHeld && current!.snapshot().runId === "fork-hydration-run") {
+          historyHeld = true;
+          hydrating = true;
+          await gate;
+          hydrating = false;
+        }
+        return entries;
+      };
+      const originalFork = current.forkRun.bind(current);
+      let forkRejected = false;
+      current.forkRun = async (options) => {
+        try {
+          return await originalFork(options);
+        } catch (error: unknown) {
+          forkRejected = true;
+          throw error;
+        }
+      };
+      running = runInteractive({ session: current, terminal, forceAltScreen: true });
+      await terminal.started;
+      terminal.type("/resume");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Resume a previous session");
+      terminal.type("fork-hydration-run");
+      terminal.send("\r");
+      await waitForCondition(() => hydrating, "current history hydration");
+
+      terminal.type("/fork fork-hydration-run");
+      terminal.send("\r");
+      await waitForCondition(() => forkRejected, "self-fork rejection");
+      release();
+      await waitForCondition(() => !hydrating, "current history read returning");
+      terminal.type("/status");
+      terminal.send("\r");
+      await waitForOutput(terminal, "Queue / Tokens");
+      expect(current.snapshot().runId).toBe("fork-hydration-run");
+      expect(normalizeTerminalOutput(terminal.output)).toContain("REJECTED_FORK_HISTORY_ANSWER");
+    } finally {
+      release();
+      if (running !== undefined) {
+        terminal.type("/exit");
+        terminal.send("\r");
+        await running;
+      } else {
+        await current?.close();
+      }
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("clears the previous transcript when an attached Run cannot hydrate its artifacts", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-session-artifact-"));
     const dataDir = join(root, "state");
@@ -3115,9 +3424,27 @@ describe("interactive TUI", () => {
 
       await terminal.started;
       await waitForOutput(terminal, "CURRENT_ARTIFACT_ANSWER");
+      const attachRun = current.attachRun.bind(current);
+      let releaseAttachment!: () => void;
+      let attachmentEntered = false;
+      const attachmentGate = new Promise<void>((resolve) => { releaseAttachment = resolve; });
+      current.attachRun = async (runId) => {
+        attachmentEntered = true;
+        await attachmentGate;
+        return attachRun(runId);
+      };
       terminal.type("/resume damaged-artifact-run");
       const chunkCountBeforeSwitch = terminal.outputChunks.length;
       terminal.send("\r");
+      try {
+        await waitForCondition(() => attachmentEntered, "attachment admission");
+        await delay(40);
+        const whileAttaching = terminal.outputChunks.slice(chunkCountBeforeSwitch).join("");
+        expect(whileAttaching).not.toContain("CURRENT_ARTIFACT_GOAL");
+        expect(whileAttaching).not.toContain("CURRENT_ARTIFACT_ANSWER");
+      } finally {
+        releaseAttachment();
+      }
       await waitForCondition(
         () => current.snapshot().runId === "damaged-artifact-run",
         "damaged Run attachment",
@@ -3132,6 +3459,50 @@ describe("interactive TUI", () => {
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
     } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("restores the previous transcript when Run attachment is rejected", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-session-rejected-"));
+    const terminal = new MemoryTerminal(100, 28);
+    const previousExitCode = process.exitCode;
+    let running: Promise<number> | undefined;
+    let session: SessionController | undefined;
+    try {
+      session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted",
+        policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+      }, {
+        mainModel: new ScriptedModel([response("RESTORED_TRANSCRIPT_ANSWER")]),
+        createRunId: () => "original-attachment-run",
+      });
+      await session.submit({ inputId: "original-input", text: "RESTORED_TRANSCRIPT_GOAL" });
+      await session.waitForIdle();
+      running = runInteractive({ session, terminal, forceAltScreen: true });
+      await terminal.started;
+      await waitForOutput(terminal, "RESTORED_TRANSCRIPT_ANSWER");
+
+      terminal.type("/resume nonexistent-attachment-run");
+      const outputBeforeSwitch = terminal.output.length;
+      terminal.send("\r");
+      await waitForOutput(terminal, "is missing creation facts");
+      expect(session.snapshot().runId).toBe("original-attachment-run");
+      const transition = terminal.output.slice(outputBeforeSwitch);
+      expect(transition).toContain("RESTORED_TRANSCRIPT_GOAL");
+      expect(transition).toContain("RESTORED_TRANSCRIPT_ANSWER");
+      await expect(session.transcript()).resolves.toEqual([
+        expect.objectContaining({ role: "user", content: "RESTORED_TRANSCRIPT_GOAL" }),
+        expect.objectContaining({ role: "assistant", content: "RESTORED_TRANSCRIPT_ANSWER" }),
+      ]);
+    } finally {
+      terminal.type("/exit");
+      terminal.send("\r");
+      await running;
+      await session?.close();
       process.exitCode = previousExitCode;
       await rm(root, { recursive: true, force: true });
     }
@@ -3879,37 +4250,33 @@ function externalA2AMessage(options: {
   expiresAt: string;
   index: number;
 }): A2AMessage {
-  const routeId = `a2a-route:interactive-external-${options.index}`;
+  const sourceEndpoint = {
+    workspaceId: "local-workspace", sessionId: options.sourceSessionId, runId: options.sourceRunId, laneId: "main",
+  };
+  const targetEndpoint = {
+    workspaceId: "local-workspace", sessionId: options.targetSessionId, runId: options.runId, laneId: "main",
+  };
+  const idempotencyKey = `external-send-${options.index}`;
+  const routeId = createCrossRunRouteId(sourceEndpoint, targetEndpoint, idempotencyKey);
+  const fields = {
+    conversationId: "external-conversation", threadId: "external-thread",
+    correlationId: `external-correlation-${options.index}`,
+    visibility: "user" as const, priority: 1, payload: options.payload, expiresAt: options.expiresAt,
+  };
   return {
-    messageId: `external-message-${options.index}`,
+    messageId: createCrossRunMessageId(routeId, fields),
     runId: options.runId,
-    conversationId: "external-conversation",
-    threadId: "external-thread",
+    ...fields,
     from: "main",
     to: "main",
     createdAt: options.createdAt,
-    expiresAt: options.expiresAt,
-    correlationId: `external-correlation-${options.index}`,
-    idempotencyKey: `external-send-${options.index}`,
-    visibility: "user",
-    priority: 1,
+    idempotencyKey,
     delivery: "next-step",
-    payload: options.payload,
     routeId,
     routeRelationship: "direct",
     routeArtifacts: [],
-    sourceEndpoint: {
-      workspaceId: "local-workspace",
-      sessionId: options.sourceSessionId,
-      runId: options.sourceRunId,
-      laneId: "main",
-    },
-    targetEndpoint: {
-      workspaceId: "local-workspace",
-      sessionId: options.targetSessionId,
-      runId: options.runId,
-      laneId: "main",
-    },
+    sourceEndpoint,
+    targetEndpoint,
   };
 }
 

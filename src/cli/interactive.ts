@@ -35,6 +35,7 @@ import {
   type UserImage,
   validateUserImages,
 } from "../domain/images.js";
+import { projectSessionLaneMessage } from "../runtime/session-artifacts.js";
 import type { A2AMessage } from "../domain/types.js";
 import {
   readClipboardImage,
@@ -85,6 +86,7 @@ import {
   ActivityLine,
   AgentMessageBlock,
   agentMessagePresentationFromA2A,
+  agentMessagePresentationFromTranscript,
   type AgentMessagePresentation,
   AdviceBlock,
   AssistantMessageBlock,
@@ -452,6 +454,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   let responseTurnId: string | undefined;
   let presentationTail: Promise<void> = Promise.resolve();
   let transcriptGeneration = 0;
+  let switchingTranscriptRunId: string | null | undefined;
+  let transcriptSwitchGeneration = 0;
   let queueSessionGeneration = 0;
   let queueRefreshTail: Promise<void> = Promise.resolve();
   let queueBrowseTail: Promise<void> = Promise.resolve();
@@ -1569,17 +1573,28 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
   };
 
-  const loadAttachedTranscript = async (reset: boolean): Promise<void> => {
-    if (reset) {
-      transcriptGeneration += 1;
-      resetTranscript();
-      toolBlocks.clear();
-      renderedAssistants.clear();
-      resetResponse();
-      clearShortcutGuide();
-    }
+  const clearAttachedTranscript = (): void => {
+    transcriptGeneration += 1;
+    resetTranscript();
+    toolBlocks.clear();
+    renderedAssistants.clear();
+    resetResponse();
+    clearShortcutGuide();
+  };
+
+  const loadAttachedTranscript = async (reset: boolean): Promise<boolean> => {
+    if (reset) clearAttachedTranscript();
+    const generation = transcriptGeneration;
+    const switchGeneration = transcriptSwitchGeneration;
+    const runId = options.session.snapshot().runId;
     const entries = await options.session.transcript();
+    if (closed || generation !== transcriptGeneration || switchGeneration !== transcriptSwitchGeneration
+      || runId !== options.session.snapshot().runId) return false;
     entries.forEach((entry) => {
+      if (entry.role === "agent") {
+        appendAgentMessage(agentMessagePresentationFromTranscript(entry));
+        return;
+      }
       if (entry.role === "user") {
         const agentMessage = parseExternalA2APrompt(entry.content);
         if (agentMessage !== undefined) {
@@ -1606,6 +1621,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       toolBlocks.set(entry.operationId, block);
       appendBlock(block, false);
     });
+    return true;
   };
 
   const renderRuntimeEvent = async (
@@ -1614,16 +1630,18 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   ): Promise<void> => {
     if (runtimeEvent.kind === "event") {
       const event = runtimeEvent.event;
+      if (event.visibility !== undefined && event.visibility !== "lane"
+        && event.visibility !== "run" && event.visibility !== "user") return;
+      const laneMessage = projectSessionLaneMessage(event, options.session.snapshot().runId ?? event.runId);
       const isTetoAdvice = event.type === "message.sent"
         && event.payload.message.from === "teto"
         && event.payload.message.payload.type === "advice.propose"
         && event.payload.message.sourceEndpoint === undefined;
       const isExternalA2AMessage = event.type === "message.sent"
         && event.payload.message.sourceEndpoint !== undefined;
-      // The transcript renderer owns Main's presentation surface. Teto and
-      // Worker facts stay durable and available to their schedulers, while a
-      // Teto advice message remains an explicit user-facing notice below.
-      if (event.laneId !== "main" && !isTetoAdvice && !isExternalA2AMessage) {
+      // Sibling transcripts stay private; only their explicit public
+      // communication enters the shared presentation.
+      if (event.laneId !== "main" && laneMessage === undefined && !isTetoAdvice && !isExternalA2AMessage) {
         // Worker lifecycle events still change the durable summary mounted in
         // the dock. They are not transcript entries, but skipping the redraw
         // leaves the old "running/ready" label until an unrelated Main event.
@@ -1795,11 +1813,19 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           toolBlocks.get(event.payload.operationId)?.setExpanded(true);
           tui.requestRender();
           break;
+        case "a2a.outbox.pending":
+          if (laneMessage !== undefined) appendAgentMessage(agentMessagePresentationFromTranscript(laneMessage));
+          break;
         case "message.sent": {
           const message = event.payload.message;
           const payload = message.payload;
-          if (message.from === "teto" && payload.type === "advice.propose"
-            && message.sourceEndpoint === undefined) {
+          if ((event.visibility !== "run" && event.visibility !== "user")
+            || (message.visibility !== "run" && message.visibility !== "user")) break;
+          if (laneMessage !== undefined) {
+            appendAgentMessage(agentMessagePresentationFromTranscript(laneMessage));
+            break;
+          }
+          if (isTetoAdvice && payload.type === "advice.propose") {
             appendBlock(new AdviceBlock(
               payload.advice.claim,
               payload.advice.suggestedAction,
@@ -1807,14 +1833,15 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             ));
             break;
           }
-          if (message.sourceEndpoint !== undefined) {
+          if (message.sourceEndpoint !== undefined && payload.type !== "message.inform"
+            && payload.type !== "question.ask" && payload.type !== "question.answer") {
             const agentMessage = agentMessagePresentationFromA2A(message);
             if (agentMessage !== undefined) {
               appendAgentMessage(agentMessage);
               break;
             }
           }
-          const notice = formatA2AMessageNotice(message);
+          const notice = formatLegacyA2AMessageNotice(message);
           if (notice !== undefined) appendNotice(notice);
           break;
         }
@@ -1902,6 +1929,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   };
 
   const unsubscribe = options.session.subscribe((runtimeEvent) => {
+    const eventRunId = runtimeEvent.kind === "event" || runtimeEvent.kind === "stream"
+      ? runtimeEvent.event.runId : undefined;
+    if (switchingTranscriptRunId !== undefined && eventRunId !== undefined
+      && eventRunId !== switchingTranscriptRunId) return;
     if (runtimeEvent.kind === "event") {
       if (runtimeEvent.event.type === "fukai.compaction.committed") {
         compactionCommittedEvents += 1;
@@ -2918,32 +2949,70 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     mountSelector(selector, restorePreview);
   };
 
-  const switchSession = async (runId: string): Promise<void> => {
+  const switchSession = async (runId: string): Promise<boolean> => {
     const current = options.session.snapshot();
     // An explicit `/resume <current-run>` can arrive on the same tick as the
     // durable `turn.waiting` fact, before SessionController has published its
     // final idle state. Wait for that execution to close instead of treating
     // the current attachment as a cross-Run switch.
-    if (current.runId === runId) {
+    if (current.runId === runId && switchingTranscriptRunId === undefined) {
       if (current.status === "running" || current.status === "cancelling") {
         await options.session.waitForIdle();
       }
+      if (options.session.snapshot().runId !== runId) return false;
       appendNotice(`Run ${runId} is already attached.`, "info");
-      return;
+      return true;
     }
     if (current.status === "running" || current.status === "cancelling") {
       throw new Error("/resume is unavailable while Main is working");
     }
-    await options.session.attachRun(runId);
-    resetQueueSelection();
-    clearPendingBashContext();
-    if (promptStashScope.startsWith("<new-run:")) {
-      promptStashes.delete(promptStashScope);
+    // Attachment publishes state asynchronously. Clear the old Run before
+    // those redraws, and fence late messages from its still-closing lanes.
+    const switchGeneration = ++transcriptSwitchGeneration;
+    switchingTranscriptRunId = runId;
+    clearAttachedTranscript();
+    requestTuiRender();
+    try {
+      await options.session.attachRun(runId);
+      if (switchGeneration !== transcriptSwitchGeneration || options.session.snapshot().runId !== runId) return false;
+      resetQueueSelection();
+      clearPendingBashContext();
+      if (promptStashScope.startsWith("<new-run:")) promptStashes.delete(promptStashScope);
+      promptStashScope = runId;
+      if (!await loadAttachedTranscript(true)) return false;
+      await refreshQueue();
+      if (switchGeneration !== transcriptSwitchGeneration || options.session.snapshot().runId !== runId) return false;
+      appendNotice(`Attached Run ${runId}.`, "success");
+      return true;
+    } catch (error: unknown) {
+      if (switchGeneration !== transcriptSwitchGeneration) return false;
+      if (options.session.snapshot().runId === current.runId) {
+        await loadAttachedTranscript(true).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      if (switchGeneration === transcriptSwitchGeneration) switchingTranscriptRunId = undefined;
+      tui.requestRender();
     }
-    promptStashScope = runId;
-    await loadAttachedTranscript(true);
-    await refreshQueue();
-    appendNotice(`Attached Run ${runId}.`, "success");
+  };
+
+  const performRunNavigation = async <T>(
+    operation: () => Promise<T>,
+  ): Promise<{ result: T; generation: number } | undefined> => {
+    const generation = ++transcriptSwitchGeneration;
+    // The destination is host-assigned for new/fork/import; fence all old events.
+    switchingTranscriptRunId = null;
+    try {
+      const result = await operation();
+      return generation === transcriptSwitchGeneration ? { result, generation } : undefined;
+    } catch (error: unknown) {
+      if (generation !== transcriptSwitchGeneration) return undefined;
+      await loadAttachedTranscript(true).catch(() => undefined);
+      if (generation !== transcriptSwitchGeneration) return undefined;
+      throw error;
+    } finally {
+      if (generation === transcriptSwitchGeneration) switchingTranscriptRunId = undefined;
+    }
   };
 
   const forkSession = async (argument: string): Promise<void> => {
@@ -2953,17 +3022,20 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
     const parts = argument.split(/\s+/u).filter(Boolean);
     if (parts.length > 1) throw new Error("Usage: /fork [run-id]");
-    const result = await options.session.forkRun(
+    const navigation = await performRunNavigation(() => options.session.forkRun(
       parts.length === 0 ? {} : { runId: parts[0]! },
-    );
+    ));
+    if (navigation === undefined || options.session.snapshot().runId !== navigation.result.runId) return;
+    const { result, generation: switchGeneration } = navigation;
     resetQueueSelection();
     clearPendingBashContext();
     if (promptStashScope.startsWith("<new-run:")) {
       promptStashes.delete(promptStashScope);
     }
     promptStashScope = result.runId;
-    await loadAttachedTranscript(true);
+    if (!await loadAttachedTranscript(true)) return;
     await refreshQueue();
+    if (switchGeneration !== transcriptSwitchGeneration) return;
     appendNotice(`Forked Run ${result.parentRunId} to ${result.runId}.`, "success");
   };
 
@@ -3012,17 +3084,20 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       throw new Error("/tree is unavailable while Main is working");
     }
     if (snapshot.runId !== selection.runId) {
-      await switchSession(selection.runId);
+      if (!await switchSession(selection.runId)) return;
     }
-    const result = await options.session.forkRun({ checkpoint: selection.checkpoint });
+    const navigation = await performRunNavigation(() => options.session.forkRun({ checkpoint: selection.checkpoint }));
+    if (navigation === undefined || options.session.snapshot().runId !== navigation.result.runId) return;
+    const { result, generation: switchGeneration } = navigation;
     resetQueueSelection();
     clearPendingBashContext();
     if (promptStashScope.startsWith("<new-run:")) {
       promptStashes.delete(promptStashScope);
     }
     promptStashScope = result.runId;
-    await loadAttachedTranscript(true);
+    if (!await loadAttachedTranscript(true)) return;
     await refreshQueue();
+    if (switchGeneration !== transcriptSwitchGeneration) return;
     appendNotice(
       `Forked Run ${result.parentRunId} at checkpoint ${result.parentCheckpoint.watermark} to ${result.runId}.`,
       "success",
@@ -3418,8 +3493,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "/import": {
           if (argument.length === 0) throw new Error("Usage: /import <path.jsonl>");
           const source = await readSessionImportFile({ workspace: options.session.workspace, path: unquoteCommandPath(argument) });
-          const result = await options.session.importRun(source);
-          await loadAttachedTranscript(true);
+          const navigation = await performRunNavigation(() => options.session.importRun(source));
+          if (navigation === undefined || options.session.snapshot().runId !== navigation.result.runId) break;
+          const { result } = navigation;
+          if (!await loadAttachedTranscript(true)) break;
           appendNotice(`Session imported as ${result.runId}. No historical tools were executed.`, "success");
           break;
         }
@@ -3430,8 +3507,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "/fork":
           await forkSession(argument);
           break;
-        case "/new":
-          await options.session.newRun();
+        case "/new": {
+          if (await performRunNavigation(() => options.session.newRun()) === undefined) break;
           resetQueueSelection();
           clearPendingBashContext();
           promptStashes.delete(promptStashKey());
@@ -3446,16 +3523,17 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           clearShortcutGuide();
           appendNotice("New Run ready.", "success");
           break;
+        }
         case "/resume":
           if (argument.length > 0) {
             if (argument.split(/\s+/u).length !== 1) {
               throw new Error("Usage: /resume [run-id]");
             }
-            await switchSession(argument);
+            if (!await switchSession(argument)) break;
             // An explicit Run ID means the caller asked to continue this
             // resumable Turn, while completed Runs simply remain attached.
             assertProviderReady();
-            await options.session.resumeCurrent();
+            await options.session.resumeCurrent(argument);
             appendNotice("Resume requested.", "success");
             break;
           }
@@ -3922,47 +4000,13 @@ function oneLine(value: string, maxWidth = 160): string {
   return value.replace(/\s+/g, " ").trim().slice(0, maxWidth);
 }
 
-const MAX_A2A_NOTICE_CHARS = 160;
-const MAX_A2A_SOURCE_CHARS = 24;
-
-/** Keep cross-Run messages visible without allowing remote text to grow the transcript. */
-function formatA2AMessageNotice(message: A2AMessage): string | undefined {
-  const source = a2aSourceLabel(message);
-  switch (message.payload.type) {
-    case "message.inform":
-      return oneLine(
-        terminalSafeText(`Agent message from ${source}: ${message.payload.text}`),
-        MAX_A2A_NOTICE_CHARS,
-      );
-    case "question.ask":
-      return oneLine(
-        terminalSafeText(`Question from ${source}: ${message.payload.question}`),
-        MAX_A2A_NOTICE_CHARS,
-      );
-    case "question.answer":
-      return oneLine(
-        terminalSafeText(`Answer from ${source}: ${message.payload.answer}`),
-        MAX_A2A_NOTICE_CHARS,
-      );
-    case "task.request":
-      return oneLine(
-        terminalSafeText(`Task request from ${source}: ${message.payload.goal.statement}`),
-        MAX_A2A_NOTICE_CHARS,
-      );
-    case "advice.propose":
-      return oneLine(
-        terminalSafeText(`Advice from ${source}: ${message.payload.advice.claim}`),
-        MAX_A2A_NOTICE_CHARS,
-      );
-    default:
-      return undefined;
-  }
-}
-
-function a2aSourceLabel(message: A2AMessage): string {
-  const source = message.sourceEndpoint?.runId ?? message.from;
-  const label = oneLine(terminalSafeText(source), MAX_A2A_SOURCE_CHARS);
-  return label.length > 0 ? label : "unknown";
+function formatLegacyA2AMessageNotice(message: A2AMessage): string | undefined {
+  const payload = message.payload;
+  const body = payload.type === "task.request" ? payload.goal.statement
+    : payload.type === "advice.propose" ? payload.advice.claim : undefined;
+  if (body === undefined) return undefined;
+  const source = oneLine(terminalSafeText(message.sourceEndpoint?.runId ?? message.from), 24) || "unknown";
+  return oneLine(terminalSafeText(`${payload.type === "task.request" ? "Task request" : "Advice"} from ${source}: ${body}`), 160);
 }
 
 function commandArgumentCompletions(

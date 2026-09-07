@@ -5,9 +5,14 @@ import type {
   InputDelivery,
 } from "../domain/events.js";
 import type {
+  A2AMessage,
   ArtifactRef,
   ConversationMessage,
+  CrossRunEndpoint,
+  CrossRunEnvelope,
+  CrossRunRelationship,
 } from "../domain/types.js";
+import { normalizeEnvelope } from "../a2a/cross-run-contract.js";
 import {
   type UserImage,
   userImageSummary,
@@ -22,7 +27,22 @@ import { SessionProtocolError } from "./session-protocol-error.js";
 export const MESSAGE_MEDIA_TYPE = "application/vnd.nausicaa.conversation-message+json";
 export const TOOL_ARGUMENTS_MEDIA_TYPE = "application/vnd.nausicaa.tool-arguments+json";
 
+export interface SessionLaneMessage {
+  role: "agent";
+  content: string;
+  turnId: string;
+  messageId: string;
+  from: string;
+  to: string;
+  payloadType: "message.inform" | "question.ask" | "question.answer";
+  sourceEndpoint?: CrossRunEndpoint;
+  targetEndpoint?: CrossRunEndpoint;
+  relationship?: CrossRunRelationship;
+  direction?: "incoming" | "outgoing";
+}
+
 export type SessionTranscriptEntry =
+  | SessionLaneMessage
   | {
       role: "user";
       content: string;
@@ -47,6 +67,74 @@ export type SessionTranscriptEntry =
       operationId: string;
       arguments?: Record<string, unknown>;
     };
+
+/** Only explicit public lane communication belongs beside Main's transcript. */
+export function projectSessionLaneMessage(event: AnyEvent, runId: string): SessionLaneMessage | undefined {
+  if (event.runId !== runId || !isTranscriptVisible(event.visibility)) return undefined;
+  if (event.type === "a2a.outbox.pending") {
+    return projectSessionCrossRunMessage(event, runId);
+  }
+  if (event.type !== "message.sent") return undefined;
+  const message = event.payload.message;
+  if (message.routeId !== undefined || message.sourceEndpoint !== undefined || message.targetEndpoint !== undefined) {
+    return projectSessionCrossRunMessage(event, runId);
+  }
+  if (message.runId !== runId || event.laneId !== message.from
+    || !isTranscriptVisible(message.visibility)
+    || message.from === message.to) return undefined;
+  const payload = message.payload;
+  if (payload.type !== "message.inform" && payload.type !== "question.ask" && payload.type !== "question.answer") return undefined;
+  const content = payload.type === "message.inform" ? payload.text
+    : payload.type === "question.ask" ? payload.question
+      : payload.answer;
+  return {
+    role: "agent", content, turnId: event.turnId ?? legacyTurnIdForTranscript(runId),
+    messageId: message.messageId, from: message.from, to: message.to, payloadType: payload.type,
+  };
+}
+
+function projectSessionCrossRunMessage(
+  event: Extract<AnyEvent, { type: "message.sent" | "a2a.outbox.pending" }>,
+  runId: string,
+): SessionLaneMessage | undefined {
+  let envelope: CrossRunEnvelope;
+  try {
+    envelope = event.type === "a2a.outbox.pending"
+      ? normalizeEnvelope(event.payload.envelope)
+      : sessionMessageEnvelope(event.payload.message);
+  } catch {
+    return undefined;
+  }
+  if (!isTranscriptVisible(envelope.visibility) || event.laneId !== envelope.source.laneId) return undefined;
+  const outgoing = event.type === "a2a.outbox.pending";
+  if (outgoing ? envelope.source.runId !== runId : envelope.target.runId !== runId) return undefined;
+  if (event.type === "message.sent" && (event.payload.message.runId !== runId
+    || event.payload.message.from !== envelope.source.laneId
+    || event.payload.message.to !== envelope.target.laneId)) return undefined;
+  const payload = envelope.payload;
+  if (payload.type !== "message.inform" && payload.type !== "question.ask" && payload.type !== "question.answer") return undefined;
+  return {
+    role: "agent", messageId: envelope.messageId,
+    turnId: event.turnId ?? legacyTurnIdForTranscript(runId),
+    from: envelope.source.laneId, to: envelope.target.laneId,
+    payloadType: payload.type,
+    content: payload.type === "message.inform" ? payload.text : payload.type === "question.ask" ? payload.question : payload.answer,
+    sourceEndpoint: { ...envelope.source }, targetEndpoint: { ...envelope.target },
+    relationship: envelope.relationship, direction: outgoing ? "outgoing" : "incoming",
+  };
+}
+
+function sessionMessageEnvelope(message: A2AMessage): CrossRunEnvelope {
+  return normalizeEnvelope({
+    protocolVersion: 1, messageId: message.messageId, routeId: message.routeId,
+    source: message.sourceEndpoint, target: message.targetEndpoint,
+    relationship: message.routeRelationship, artifacts: message.routeArtifacts,
+    conversationId: message.conversationId, threadId: message.threadId,
+    correlationId: message.correlationId, idempotencyKey: message.idempotencyKey,
+    createdAt: message.createdAt, expiresAt: message.expiresAt, causationId: message.causationId,
+    visibility: message.visibility, priority: message.priority, payload: message.payload,
+  });
+}
 
 /**
  * Durable compaction lifecycle facts that are safe to project into a
@@ -90,19 +178,44 @@ export async function projectSessionTranscript(
   const requestedTools = new Map<string, Extract<AnyEvent, {
     type: "tool.requested";
   }>>();
+  const agentMessages = new Map<AnyEvent, SessionLaneMessage>();
+  const wrappedInputs = new Set<string>();
   for (const event of events) {
-    if (event.runId === runId && event.laneId === "main" && event.type === "tool.requested") {
+    if (event.runId === runId && event.type === "message.sent") {
+      const source = event.payload.message;
+      if ((source.routeId !== undefined || source.sourceEndpoint !== undefined || source.targetEndpoint !== undefined)
+        && (source.payload.type === "message.inform" || source.payload.type === "question.ask" || source.payload.type === "question.answer")) {
+        // A host wrapper must not revive an envelope rejected by the public projection.
+        wrappedInputs.add(sessionInputScope(runId, `a2a:${source.messageId}`));
+      }
+    }
+    const message = projectSessionLaneMessage(event, runId);
+    if (message !== undefined) {
+      agentMessages.set(event, message);
+    }
+    if (event.runId === runId && event.laneId === "main" && event.type === "tool.requested"
+      && isMainTranscriptVisible(event.visibility)) {
       requestedTools.set(event.payload.operationId, event);
     }
   }
 
   const transcript: SessionTranscriptEntry[] = [];
   const toolEntryIndexes = new Map<string, number>();
+  const seenLaneMessages = new Set<string>();
+  const privateInputs = privateSessionInputScopes(events);
   for (const event of events) {
+    const laneMessage = agentMessages.get(event);
+    if (laneMessage !== undefined) {
+      if (!seenLaneMessages.has(laneMessage.messageId)) {
+        seenLaneMessages.add(laneMessage.messageId);
+        transcript.push(laneMessage);
+      }
+      continue;
+    }
     // This projection feeds the Main-facing transcript surfaces. Sibling
     // lanes keep their own transcripts for their own context and must not be
     // replayed as if they were another Main answer.
-    if (event.runId !== runId || event.laneId !== "main") continue;
+    if (event.runId !== runId || event.laneId !== "main" || !isMainTranscriptVisible(event.visibility)) continue;
     if (
       event.type !== "user.message"
       && event.type !== "assistant.message"
@@ -110,6 +223,9 @@ export async function projectSessionTranscript(
       && event.type !== "tool.failed"
       && event.type !== "tool.unknown"
     ) continue;
+    if (event.type === "user.message" && event.payload.inputId !== undefined
+      && (privateInputs.has(sessionInputScope(event.runId, event.payload.inputId))
+        || wrappedInputs.has(sessionInputScope(event.runId, event.payload.inputId)))) continue;
     const turnId = event.turnId ?? legacyTurnIdForTranscript(runId);
     if (event.type === "user.message" || event.type === "assistant.message") {
       const message = await readConversationArtifact(store, event.payload.messageRef);
@@ -178,6 +294,49 @@ export async function projectSessionTranscript(
   return transcript;
 }
 
+function isTranscriptVisible(visibility: string): boolean {
+  return visibility === "run" || visibility === "user";
+}
+
+function isMainTranscriptVisible(visibility: string | undefined): boolean {
+  // Legacy Main artifacts were lane-scoped; that does not grant sibling access.
+  return visibility === undefined || visibility === "lane" || isTranscriptVisible(visibility);
+}
+
+/** Main's legacy lane transcript is public, so private derived inputs use sensitive. */
+export function sessionInputVisibility(
+  events: readonly AnyEvent[],
+  runId: string,
+  inputId: string,
+): "user" | "sensitive" {
+  return privateSessionInputScopes(events).has(sessionInputScope(runId, inputId)) ? "sensitive" : "user";
+}
+
+function privateSessionInputScopes(events: readonly AnyEvent[]): Set<string> {
+  const scopes = new Set<string>();
+  for (const event of events) {
+    if ((event.type === "input.admitted" || event.type === "input.replaced")
+      && event.laneId === "main" && event.visibility === "sensitive") {
+      scopes.add(sessionInputScope(event.runId, event.payload.inputId));
+      continue;
+    }
+    if (event.type !== "message.sent") continue;
+    const message = event.payload.message;
+    if (message.runId !== event.runId || event.laneId !== message.from
+      || message.sourceEndpoint?.laneId !== message.from
+      || message.targetEndpoint?.runId !== event.runId
+      || message.targetEndpoint.laneId !== "main" || message.to !== "main") continue;
+    if (!isTranscriptVisible(event.visibility) || !isTranscriptVisible(message.visibility)) {
+      scopes.add(sessionInputScope(event.runId, `a2a:${message.messageId}`));
+    }
+  }
+  return scopes;
+}
+
+function sessionInputScope(runId: string, inputId: string): string {
+  return JSON.stringify([runId, inputId]);
+}
+
 /**
  * Project user-visible compaction lifecycle from replayed Ledger facts.
  *
@@ -226,7 +385,11 @@ export async function projectPendingInputs(
   store: ContentAddressedStore,
   events: readonly AnyEvent[],
 ): Promise<SessionPendingInput[]> {
-  return Promise.all(projectPendingAdmissions(events).map(async (event) => {
+  const privateInputs = privateSessionInputScopes(events);
+  const visible = projectPendingAdmissions(events).filter((event) => (
+    !privateInputs.has(sessionInputScope(event.runId, event.payload.inputId))
+  ));
+  return Promise.all(visible.map(async (event) => {
     const message = await readUserMessage(store, event.payload.messageRef);
     const imageTypes = userImageSummary(message.images);
     return {
