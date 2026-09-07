@@ -41,3 +41,35 @@ Imported conversations do not import model or thinking preferences.
 
 The preference is local to the current Main session/Run. It does not change
 global defaults or implicitly alter Teto, Worker, or Team model requests.
+
+## Selector Descriptions
+
+The descriptions in `src/cli/thinking-options.ts` minimally adapt Pi's
+`packages/coding-agent/src/modes/interactive/components/thinking-selector.ts`.
+This UI reference was checked against `@earendil-works/pi-coding-agent` 0.85.0
+and upstream commit `9767ba275f3e9a5ee0f5c5342249b629ab1b2282`, both MIT,
+Copyright (c) 2025 Mario Zechner. This is a later UI reference than the
+0.84.3 runtime integration recorded above; the runtime dependency and its
+defaults are unchanged.
+
+`thinkingLevelChoices({ levels, current, defaultLevel })` returns only the
+provider-supported concrete levels plus the existing Provider default row.
+The descriptions retain Pi's qualitative scale: no, very brief, light,
+moderate, deep, extra-high, and maximum reasoning. A concrete level receives
+a default marker only when the caller explicitly supplies `defaultLevel`.
+`formatModelThinkingLabel(model, level)` adds the selected explicit level
+beside a display name, including `off`; an unset level leaves the name
+unchanged. It does not normalize or mutate the provider/model selector.
+
+Pi's `core/defaults.ts` uses `medium` as its harness default, and its selector
+marks the configured global default. Nausicaa does not infer that an unset
+preference means medium: its Provider default row remains separate.
+
+Pi's selector also prints approximate token counts, but those are not a
+portable provider contract. The inspected `api/simple-options.ts` maps
+minimal/low/medium/high to 1024/2048/8192/16384 tokens for budget-based
+providers; that helper clamps xhigh/max to high and permits custom budgets
+and model-limit adjustments. Other paths, including OpenAI Responses, use
+effort values and model-specific mappings rather than those fixed budgets.
+Nausicaa therefore omits token estimates from the generic selector instead
+of promising the same token allowance for every model.

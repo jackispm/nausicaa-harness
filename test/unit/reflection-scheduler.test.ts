@@ -133,6 +133,59 @@ describe("ReflectionScheduler", () => {
     });
   });
 
+  it.each(["silent", "revise"])("rejects provider-aborted %s output without losing its usage", async (action) => {
+    const ledger = new MemoryLedger();
+    const usage = { input: 100, output: 10, cacheRead: 20, cacheWrite: 0 };
+    let calls = 0;
+    const modelPort: ModelPort = {
+      complete: async () => {
+        calls += 1;
+        return {
+          content: JSON.stringify(action === "silent" ? { action } : {
+            action, note: "Check the package entry point",
+          }),
+          toolCalls: [],
+          stopReason: "aborted",
+          usage,
+        };
+      },
+    };
+    const runTokenBudget = new RunTokenBudget(10_000);
+    const controller = new AbortController();
+    const scheduler = reflectionScheduler(ledger, modelPort, runTokenBudget, controller.signal);
+    try {
+      scheduler.enqueue(mainStep(1));
+      scheduler.enqueue(mainStep(2));
+      await scheduler.drain();
+
+      expect(calls).toBe(1);
+      expect(controller.signal.aborted).toBe(false);
+      await expect(scheduler.beforeMainStep()).resolves.toEqual([]);
+      const events = await ledger.read({ runId: "run-1" });
+      expect(events.filter((event) => event.type === "reflection.observed"
+        || event.type === "reflection.delivered")).toEqual([]);
+      expect(events.filter((event) => event.type === "lane.status"
+        && event.payload.status === "failed")).toMatchObject([{
+          payload: { reason: "Reflection response was aborted by the provider" },
+        }]);
+      expect(events.filter((event) => event.type === "budget.charged"
+        && event.laneId === "reflection")).toHaveLength(1);
+      expect(runTokenBudget.snapshot()).toMatchObject({
+        usedTokens: 130,
+        reservedTokens: 0,
+        settlements: [{ id: "run-1:lane:reflection:model:2", actualTokens: 130 }],
+      });
+      expect(scheduler.snapshot().tokenGateState).toMatchObject({
+        tetoTokens: 130, reservations: [],
+      });
+      expect(recoverRunTokenUsage(events, "run-1")).toEqual(usage);
+      expect(recoverReflectionSchedulerState(events, { runId: "run-1" }))
+        .toMatchObject({ tokenGateState: { tetoTokens: 130 } });
+    } finally {
+      await scheduler.stop();
+    }
+  });
+
   it("releases the shared reservation when the provider fails", async () => {
     const ledger = new MemoryLedger();
     const model: ModelPort = {

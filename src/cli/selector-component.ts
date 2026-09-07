@@ -218,13 +218,13 @@ const SELECT_LIST_THEME: SelectListTheme = nausicaaEditorTheme.selectList;
 export class SelectorOverlay extends Container implements Focusable {
   private readonly search = new Input();
   private list: SelectList;
-  private readonly allOptions: readonly SelectorOption[];
+  private allOptions: readonly SelectorOption[];
   private filteredOptions: readonly SelectorOption[];
   private readonly title: string;
   private readonly presentation: "inline" | "panel";
   private readonly getRows: (() => number) | undefined;
   private readonly subtitle: SelectorOverlayOptions["subtitle"];
-  private readonly searchLabel: string;
+  private searchLabel: string;
   private readonly filters: readonly SelectorFilter[];
   private readonly filterOptions: ((
     options: readonly SelectorOption[],
@@ -355,6 +355,15 @@ export class SelectorOverlay extends Container implements Focusable {
     return this.search;
   }
 
+  setOptions(options: readonly SelectorOption[]): void {
+    this.allOptions = [...options];
+    this.replaceList(this.search.getValue());
+  }
+
+  setSearchLabel(label: string): void {
+    this.searchLabel = label;
+  }
+
   getSelectedValue(): string | undefined {
     return this.list.getSelectedItem()?.value;
   }
@@ -480,7 +489,7 @@ export class SelectorOverlay extends Container implements Focusable {
     const lines: string[] = [nausicaaPalette.strong(nausicaaPalette.text(plain(this.title)))];
     const subtitle = typeof this.subtitle === "function" ? this.subtitle(this.filteredOptions) : this.subtitle;
     const hasSubtitle = subtitle !== undefined && subtitle.trim().length > 0;
-    if (hasSubtitle) lines.push(nausicaaPalette.muted(plain(subtitle)));
+    if (hasSubtitle) lines.push(nausicaaPalette.menuMuted(plain(subtitle)));
     const filterRows = [plain(this.searchLabel)];
     for (const filter of this.renderFilters(innerWidth)) {
       const index = filterRows.length - 1;
@@ -488,7 +497,7 @@ export class SelectorOverlay extends Container implements Focusable {
       if (visibleWidth(joined) <= innerWidth) filterRows[index] = joined;
       else filterRows.push(plain(filter));
     }
-    lines.push(...filterRows.map((line) => nausicaaPalette.muted(line)));
+    lines.push(...filterRows.map((line) => nausicaaPalette.menuMuted(line)));
     const inputLine = this.search.render(innerWidth + 2)[0] ?? "";
     lines.push(inputLine.startsWith("> ") ? inputLine.slice(2) : inputLine);
     // Keep the active model and both facet controls visible in short terminals.
@@ -511,7 +520,7 @@ export class SelectorOverlay extends Container implements Focusable {
     const visible = this.filteredOptions.slice(start, start + this.pageSize);
     const selectedRows = new Set<number>();
     if (visible.length === 0) {
-      lines.push(nausicaaPalette.muted(this.title === "Models" ? "No matching models" : "No matches"));
+      lines.push(nausicaaPalette.menuMuted(this.title === "Models" ? "No matching models" : "No matches"));
     } else {
       for (const [offset, option] of visible.entries()) {
         const selected = start + offset === currentIndex;
@@ -527,16 +536,16 @@ export class SelectorOverlay extends Container implements Focusable {
           ? `[${this.selectedValues.has(option.value) ? "x" : " "}] ${plain(option.label).replace(/^\[[ x]\]\s*/u, "")}`
           : plain(option.label);
         const primary = option.disabled === true
-          ? nausicaaPalette.muted(label)
+          ? nausicaaPalette.menuMuted(label)
           : selected ? nausicaaPalette.strong(nausicaaPalette.text(label)) : nausicaaPalette.text(label);
-        lines.push(primary, nausicaaPalette.muted(plain(option.description ?? "")));
+        lines.push(primary, nausicaaPalette.menuMuted(plain(option.description ?? "")));
       }
       if (!compact) {
         if (start + visible.length - 1 === currentIndex) selectedRows.add(lines.length);
         lines.push("");
       }
       if (visible.length < this.filteredOptions.length) {
-        lines.push(nausicaaPalette.muted(`(${currentIndex + 1}/${this.filteredOptions.length})`));
+        lines.push(nausicaaPalette.menuMuted(`(${currentIndex + 1}/${this.filteredOptions.length})`));
       }
     }
     return renderAuthPanel(lines, columns, selectedRows).slice(0, budget);

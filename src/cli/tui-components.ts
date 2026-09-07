@@ -19,6 +19,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 import { VERSION } from "../version.js";
+import { formatModelThinkingLabel } from "./thinking-options.js";
 import type {
   SessionContextOverview,
   SessionSnapshot,
@@ -45,6 +46,7 @@ const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 type ColorScheme = "light" | "dark";
 
 interface ThemePalette {
+  brand: (text: string) => string;
   accent: (text: string) => string;
   accentBright: (text: string) => string;
   borderMuted: (text: string) => string;
@@ -57,6 +59,11 @@ interface ThemePalette {
   dim: (text: string) => string;
   thinking: (text: string) => string;
   text: (text: string) => string;
+  menuMuted: (text: string) => string;
+  menuDim: (text: string) => string;
+  menuPageBackground: (text: string) => string;
+  menuBackground: (text: string) => string;
+  menuSelectedBackground: (text: string) => string;
   userBackground: (text: string) => string;
   toolPendingBackground: (text: string) => string;
   toolSuccessBackground: (text: string) => string;
@@ -80,6 +87,7 @@ function bg(code: string, text: string): string {
 }
 
 const lightPalette: ThemePalette = {
+  brand: (text) => fg("38;2;209;149;173", text),
   accent: (text) => fg("38;2;90;128;128", text),
   // Pi has one accent token; keep the brighter role as the same stable teal.
   accentBright: (text) => fg("38;2;90;128;128", text),
@@ -93,6 +101,11 @@ const lightPalette: ThemePalette = {
   dim: (text) => fg("38;2;118;118;118", text),
   thinking: (text) => fg("38;2;108;108;108", text),
   text: (text) => fg("38;2;31;35;40", text),
+  menuMuted: (text) => fg("38;2;98;98;98", text),
+  menuDim: (text) => fg("38;2;100;100;100", text),
+  menuPageBackground: (text) => bg("48;2;249;249;250", text),
+  menuBackground: (text) => bg("48;2;250;239;244", text),
+  menuSelectedBackground: (text) => bg("48;2;242;222;231", text),
   userBackground: (text) => bg("48;2;232;232;232", text),
   toolPendingBackground: (text) => bg("48;2;232;232;240", text),
   toolSuccessBackground: (text) => bg("48;2;232;240;232", text),
@@ -105,6 +118,7 @@ const lightPalette: ThemePalette = {
 };
 
 const darkPalette: ThemePalette = {
+  brand: (text) => fg("38;2;229;174;196", text),
   accent: (text) => fg("38;2;138;190;183", text),
   // Pi's dark theme has a single accent token as well.
   accentBright: (text) => fg("38;2;138;190;183", text),
@@ -118,6 +132,11 @@ const darkPalette: ThemePalette = {
   dim: (text) => fg("38;2;102;102;102", text),
   thinking: (text) => fg("38;2;128;128;128", text),
   text: (text) => fg("38;2;212;212;212", text),
+  menuMuted: (text) => fg("38;2;160;160;160", text),
+  menuDim: (text) => fg("38;2;150;150;150", text),
+  menuPageBackground: (text) => bg("48;2;25;25;27", text),
+  menuBackground: (text) => bg("48;2;41;34;38", text),
+  menuSelectedBackground: (text) => bg("48;2;57;43;50", text),
   userBackground: (text) => bg("48;2;52;53;65", text),
   toolPendingBackground: (text) => bg("48;2;40;40;50", text),
   toolSuccessBackground: (text) => bg("48;2;40;50;40", text),
@@ -142,6 +161,7 @@ export function getNausicaaColorScheme(): ColorScheme {
 }
 
 const palette: ThemePalette = {
+  brand: (text) => activePalette.brand(text),
   accent: (text) => activePalette.accent(text),
   accentBright: (text) => activePalette.accentBright(text),
   borderMuted: (text) => activePalette.borderMuted(text),
@@ -154,6 +174,11 @@ const palette: ThemePalette = {
   dim: (text) => activePalette.dim(text),
   thinking: (text) => activePalette.thinking(text),
   text: (text) => activePalette.text(text),
+  menuMuted: (text) => activePalette.menuMuted(text),
+  menuDim: (text) => activePalette.menuDim(text),
+  menuPageBackground: (text) => activePalette.menuPageBackground(text),
+  menuBackground: (text) => activePalette.menuBackground(text),
+  menuSelectedBackground: (text) => activePalette.menuSelectedBackground(text),
   userBackground: (text) => activePalette.userBackground(text),
   toolPendingBackground: (text) => activePalette.toolPendingBackground(text),
   toolSuccessBackground: (text) => activePalette.toolSuccessBackground(text),
@@ -321,7 +346,7 @@ export class BrandSplashHeader implements Component {
     const lines: string[] = [];
     if (this.options.topPadding !== false) lines.push(" ".repeat(safeWidth));
     for (const [index, rawLine] of this.logoRaw.entries()) {
-      const logoLine = palette.accentBright(rawLine);
+      const logoLine = palette.brand(rawLine);
       const meta = index >= metaStart && index < metaStart + metaLines.length
         ? metaLines[index - metaStart]
         : "";
@@ -469,9 +494,14 @@ export class SessionTray implements Component {
       topology,
       controls,
     ].filter((value): value is string => value !== undefined && value.length > 0).join(" · ");
+    const suffixWidth = snapshot.thinkingLevel === undefined ? 0 : visibleWidth(` • ${snapshot.thinkingLevel}`);
+    const modelLabel = formatModelThinkingLabel(
+      truncateToWidth(shortModel(snapshot.model), Math.max(1, safeWidth - suffixWidth), "..."),
+      snapshot.thinkingLevel,
+    );
     return [
       topLine,
-      alignLine(palette.dim(left), palette.dim(shortModel(snapshot.model)), safeWidth),
+      alignLine(palette.dim(left), palette.dim(modelLabel), safeWidth),
     ];
   }
 
@@ -1739,9 +1769,7 @@ function alignLine(left: string, right: string, width: number): string {
 }
 
 function shortModel(model: string): string {
-  const withoutProvider = model.includes(":") ? model.slice(model.indexOf(":") + 1) : model;
-  const slash = withoutProvider.lastIndexOf("/");
-  return slash < 0 ? withoutProvider : withoutProvider.slice(slash + 1);
+  return model.includes(":") ? model.slice(model.indexOf(":") + 1) : model;
 }
 
 /** Match Pi's footer path treatment while keeping remote paths readable. */

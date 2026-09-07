@@ -8,8 +8,8 @@ import {
 } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { AuthMenu, type AuthMenuChoice, renderAuthPanel } from "../../src/cli/auth-menu.js";
-import { getNausicaaColorScheme, setNausicaaColorScheme } from "../../src/cli/tui-components.js";
+import { AuthMenu, type AuthMenuChoice, FullScreenMenuPage, renderAuthPanel } from "../../src/cli/auth-menu.js";
+import { getNausicaaColorScheme, nausicaaPalette, setNausicaaColorScheme } from "../../src/cli/tui-components.js";
 
 const choices: readonly AuthMenuChoice[] = [
   { value: "openai:oauth", label: "OpenAI", detail: "ChatGPT subscription", status: "Not configured" },
@@ -205,6 +205,20 @@ describe("AuthMenu", () => {
     expect(light).not.toBe(dark);
     expect(stripTerminalSequences(light)).toBe(stripTerminalSequences(dark));
   });
+
+  it.each(["light", "dark"] as const)("uses dedicated readable %s menu metadata and placeholder colors", (scheme) => {
+    setNausicaaColorScheme(scheme);
+    const menu = createMenu({ subtitle: "Connect an account", headerLines: ["Local configuration"] });
+    const rendered = menu.render(78).join("\n");
+    for (const value of ["Connect an account", "Local configuration", "ChatGPT subscription", "Not configured"]) {
+      expect(rendered).toContain(nausicaaPalette.menuMuted(value));
+      expect(rendered).not.toContain(nausicaaPalette.muted(value));
+    }
+    expect(rendered).toContain(nausicaaPalette.menuDim("Search providers"));
+    expect(rendered).not.toContain(nausicaaPalette.dim("Search providers"));
+    menu.handleInput("zzzzzzzz");
+    expect(menu.render(78).join("\n")).toContain(nausicaaPalette.menuMuted("No matching providers"));
+  });
 });
 
 describe("renderAuthPanel", () => {
@@ -217,6 +231,61 @@ describe("renderAuthPanel", () => {
     expect(panel).toHaveLength(content.length + 2);
     expect(panel.join("\n")).toContain(CURSOR_MARKER);
     for (const line of panel) expect(visibleWidth(line)).toBe(width);
+  });
+});
+
+describe("FullScreenMenuPage", () => {
+  it("delegates focus, input and invalidation to its active component", () => {
+    const child = { focused: false, handleInput: vi.fn(), invalidate: vi.fn(), render: () => ["menu"] };
+    const page = new FullScreenMenuPage(child, { getRows: () => 12 });
+    page.focused = true;
+    expect(child.focused).toBe(true);
+    page.handleInput("search");
+    expect(child.handleInput).toHaveBeenCalledWith("search");
+    page.invalidate();
+    expect(child.invalidate).toHaveBeenCalledOnce();
+    page.focused = false;
+    expect(child.focused).toBe(false);
+  });
+
+  it.each([1, 2, 3, 4, 8, 24, 80].flatMap((width) => [1, 2, 4, 8, 12].map((rows) => ({ width, rows }))))(
+    "fully fills and never exceeds a $width by $rows viewport",
+    ({ width, rows }) => {
+      const child = {
+        invalidate: () => {},
+        render: () => ["Menu".repeat(30), "", "one", "two", "three", `${CURSOR_MARKER}query`],
+      };
+      const page = new FullScreenMenuPage(child, { getRows: () => rows });
+      const frame = page.render(width);
+      expect(frame).toHaveLength(rows);
+      for (const line of frame) expect(visibleWidth(line)).toBe(width);
+      expect(frame.join("\n")).toContain(CURSOR_MARKER);
+    },
+  );
+
+  it("safely bounds invalid dimensions and renders empty pages without a focus target", () => {
+    const child = { invalidate: () => {}, render: () => [] };
+    const page = new FullScreenMenuPage(child, {
+      getRows: () => Number.NaN, maxContentWidth: Number.POSITIVE_INFINITY, horizontalMargin: -20,
+    });
+    expect(() => { page.focused = true; page.handleInput("ignored"); }).not.toThrow();
+    expect(page.render(Number.NaN).map(stripTerminalSequences)).toEqual([" "]);
+  });
+
+  it("repaints the page after child resets without changing panel or selection colors", () => {
+    const child = {
+      invalidate: () => {},
+      render: () => [nausicaaPalette.menuBackground("menu"), nausicaaPalette.menuSelectedBackground("pick")],
+    };
+    const page = new FullScreenMenuPage(child, { getRows: () => 4, maxContentWidth: 4 });
+    const frame = page.render(10);
+    expect(frame[0]).toBe(nausicaaPalette.menuPageBackground(" ".repeat(10)));
+    for (const line of frame.slice(1, 3)) {
+      expect(line).toContain(nausicaaPalette.menuPageBackground("   "));
+      expect(stripTerminalSequences(line ?? "")).toMatch(/^ {3}(menu|pick) {3}$/);
+    }
+    expect(frame[1]).toContain(nausicaaPalette.menuBackground("menu"));
+    expect(frame[2]).toContain(nausicaaPalette.menuSelectedBackground("pick"));
   });
 });
 
@@ -274,7 +343,7 @@ describe("AuthMenu fullscreen integration", () => {
     const root = {
       focused: false,
       handleInput: vi.fn(),
-      render: (width: number) => Array.from({ length: terminal.rows }, () => ".".repeat(width)),
+      render: (width: number) => Array.from({ length: terminal.rows }, () => "#".repeat(width)),
       invalidate: () => {},
     };
     tui.setLayoutRoot(root);
@@ -288,7 +357,8 @@ describe("AuthMenu fullscreen integration", () => {
         getRows: () => terminal.rows,
         onCancel: () => handle.hide(),
       });
-      const handle = tui.showOverlay(menu, { anchor: "center", width: 78, maxHeight: "100%", margin: 1 });
+      const page = new FullScreenMenuPage(menu, { getRows: () => terminal.rows });
+      const handle = tui.showOverlay(page, { row: 0, col: 0, width: "100%", maxHeight: "100%" });
       tui.renderNow();
 
       const assertGeometry = (): void => {
@@ -299,12 +369,13 @@ describe("AuthMenu fullscreen integration", () => {
         const frame = tui.frame.map((line) => stripTerminalSequences(line));
         expect(frame).toHaveLength(terminal.rows);
         expect(frame[top + 1]?.indexOf("Providers")).toBe(left + 2);
-        expect(frame[top]).toBe(".".repeat(left) + " ".repeat(overlayWidth)
-          + ".".repeat(terminal.columns - left - overlayWidth));
+        expect(frame[top]).toBe(" ".repeat(terminal.columns));
         expect(frame[top + overlayHeight - 1]).toBe(frame[top]);
+        expect(frame.join("\n")).not.toContain("#");
         expect(tui.frame.some((line) => line.includes(CURSOR_MARKER))).toBe(true);
         for (const line of frame) expect(visibleWidth(line)).toBe(terminal.columns);
-        expect(tui.getFocusedComponent()).toBe(menu);
+        expect(tui.getFocusedComponent()).toBe(page);
+        expect(menu.focused).toBe(true);
       };
       assertGeometry();
       expect(terminal.output.join("")).toContain("Providers");
@@ -326,6 +397,7 @@ describe("AuthMenu fullscreen integration", () => {
       expect(tui.getFocusedComponent()).toBe(root);
       expect(menu.focused).toBe(false);
       expect(tui.frame.map(stripTerminalSequences).join("\n")).not.toContain("Providers");
+      expect(tui.frame.map(stripTerminalSequences).join("\n")).toContain("#".repeat(terminal.columns));
     } finally {
       tui.stop();
     }

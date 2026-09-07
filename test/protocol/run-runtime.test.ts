@@ -603,7 +603,7 @@ describe("executeRun", () => {
     const crashingModel: ModelPort = {
       // Keep this comfortably above the pressure threshold; the exact prompt
       // wording is not part of the compaction contract.
-      capabilities: () => ({ imageInput: false, contextWindowTokens: 2_000 }),
+      capabilities: () => ({ imageInput: false, contextWindowTokens: 3_000 }),
       async complete(request) {
         if (request.sessionId.startsWith("fukai-compaction:")) {
           compactionCalls += 1;

@@ -15,10 +15,22 @@ The thinkingRecap helper in src/cli/tui-components.ts minimally adapts
 packages/coding-agent/src/modes/interactive/components/assistant-message.ts
 from the same Prime Agent commit
 7787f07415d843b9a800f6a4720e0c739bd608e5.
+The thinking-level descriptions in src/cli/thinking-options.ts minimally
+adapt Pi coding-agent 0.85.0's thinking-selector.ts, also audited at upstream
+commit 9767ba275f3e9a5ee0f5c5342249b629ab1b2282 (MIT),
+Copyright (c) 2025 Mario Zechner. Only qualitative descriptions are reused;
+provider-specific token budgets and Nausicaa session defaults are unchanged.
 The centered authentication menu in src/cli/auth-menu.ts minimally adapts
-OAuthSelector, model-selector panel rows, and MenuPanel/MenuRow from Prime Agent 0.7.2 at that same
-commit. Provider authentication and credential storage remain pi-ai and
+OAuthSelector, model-selector panel rows, and MenuPanel/MenuRow from Prime Agent 0.7.2 at
+commit 7787f07415d843b9a800f6a4720e0c739bd608e5. Provider authentication and credential storage remain pi-ai and
 Nausicaa responsibilities; Prime's AuthStorage is not ported.
+FullScreenMenuPage in src/cli/auth-menu.ts minimally adapts centered-overlay.ts
+from Prime Agent v0.9.2, commit 9c54a35dac3a2ad17910074d66664859ea175666 (MIT).
+The retained-tab host in src/cli/configuration-menu.ts adapts configuration-menu.ts
+from Prime Agent 0.7.2 at 7787f07415d843b9a800f6a4720e0c739bd608e5 (MIT).
+These private upstream components cannot be consumed as public package APIs;
+only layout, focus, and retained-page behavior are ported. Authentication, model
+selection, MCP authority, and Skill discovery use the existing Nausicaa owners.
 The queued-input browse/edit state machine in src/cli/queue-selection.ts
 minimally adapts packages/coding-agent/src/modes/interactive/queue-selection.ts
 from that same commit; durable mutation and recovery remain Nausicaa Ledger

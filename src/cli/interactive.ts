@@ -8,6 +8,7 @@ import {
   ScrollView,
   Spacer,
   type Terminal,
+  Text,
   TuiAltScreen,
   TuiMainScreen,
   VStack,
@@ -77,8 +78,10 @@ import {
 } from "./onboarding.js";
 import type { CredentialStatus } from "./onboarding.js";
 import { SelectorOverlay } from "./selector-component.js";
-import { AuthMenu, renderAuthPanel } from "./auth-menu.js";
+import { AuthMenu, FullScreenMenuPage, renderAuthPanel } from "./auth-menu.js";
+import { formatModelThinkingLabel, thinkingLevelChoices } from "./thinking-options.js";
 import { McpMenu } from "./mcp-menu.js";
+import { ConfigurationMenu, type ConfigurationMenuTab } from "./configuration-menu.js";
 import type { McpManagement } from "./mcp-management.js";
 import { authProviderChoices, type AuthProviderChoice, type AuthProviderState } from "./auth-provider-options.js";
 import { CustomEditor } from "./custom-editor.js";
@@ -151,6 +154,13 @@ import type { PermissionDiagnostic } from "../tools/permission-diagnostics.js";
 import { loadProjectInstructions } from "../runtime/project-instructions.js";
 import { exportSessionFile, readSessionImportFile } from "./session-files.js";
 import { displaySkillInvocation } from "./skill-invocation.js";
+import {
+  formatLogLocations,
+  formatSuccessfulUpdate,
+  readPackagedChangelog,
+  updateNausicaa,
+  type SelfUpdateRunner,
+} from "./local-commands.js";
 
 export interface InteractiveOptions {
   session: SessionController;
@@ -197,6 +207,10 @@ export interface InteractiveOptions {
     | AgentAwarenessQuery
     | AgentAwarenessInputSource
     | (() => Promise<AgentAwarenessQuery | AgentAwarenessInputSource>);
+  /** Test/embedding seam; production installs the latest published npm package. */
+  updateRunner?: SelfUpdateRunner;
+  /** Test/embedding seam; production reads the changelog shipped beside dist/. */
+  readChangelog?: () => Promise<string>;
 }
 
 export interface InteractiveAuthOptions {
@@ -485,6 +499,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   // baseline geometry, so selector expansion and collapse use the same
   // editor origin on every frame.
   widgetContainerAbove.addChild(new Spacer(1));
+  const sideQuestionContainer = new Container();
   widgetContainerAbove.addChild(shortcutGuide);
   const workerTaskSummary = new WorkerTaskSummaryLine(
     () => options.session.workerTaskSummary(),
@@ -523,6 +538,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   let activeSubmission: QueuedSubmission | undefined;
   let activeBashAbortController: AbortController | undefined;
   let activeSkillAbortController: AbortController | undefined;
+  let activeUpdateAbortController: AbortController | undefined;
+  let activeSideQuestionAbortController: AbortController | undefined;
+  let sideQuestionTurns: Array<{
+    question: string;
+    answer: string;
+    status: "running" | "complete" | "error";
+    error?: string;
+  }> = [];
   let bashOperationSequence = 0;
   let pendingBashContext: string[] = [];
   let submissionDrainPromise: Promise<void> | undefined;
@@ -576,12 +599,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
 
   const header = new BrandSplashHeader({
     logo: NAUSICAA_LOGO,
-    getModel: () => options.session.snapshot().model,
+    getModel: () => formatModelThinkingLabel(options.session.model, options.session.thinkingLevel),
     getWorkspace: () => options.session.workspace,
   });
   const headerContainer = new Container();
   documentContainer.addChild(headerContainer);
   documentContainer.addChild(transcript);
+  documentContainer.addChild(sideQuestionContainer);
   // Fullscreen keeps a one-cell breathing margin around the scrollable
   // conversation. The ScrollView remains the primary viewport node; only its
   // rendered child is inset so cursor and scroll bookkeeping stay intact.
@@ -802,6 +826,42 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     kind: "info" | "success" | "warning" | "error" = "info",
   ): void => {
     appendBlock(new NoticeBlock(message, kind));
+  };
+
+  const renderSideQuestions = (): void => {
+    sideQuestionContainer.clear();
+    if (sideQuestionTurns.length === 0) {
+      tui.requestRender();
+      return;
+    }
+    sideQuestionContainer.addChild(new Spacer(1));
+    const rows = ["### BTW"];
+    for (const turn of sideQuestionTurns) {
+      rows.push(`**You:** ${terminalSafeText(turn.question)}`);
+      if (turn.status === "running" && turn.answer.length === 0) {
+        rows.push("_Thinking..._");
+      } else if (turn.status === "error") {
+        rows.push(`**Error:** ${terminalSafeText(turn.error ?? "Side question failed")}`);
+      } else {
+        rows.push(terminalSafeText(turn.answer));
+      }
+    }
+    sideQuestionContainer.addChild(new Markdown(
+      rows.join("\n\n"),
+      1,
+      0,
+      nausicaaMarkdownTheme,
+    ));
+    tui.requestRender();
+  };
+
+  const clearSideQuestions = (abort = true): void => {
+    const controller = activeSideQuestionAbortController;
+    activeSideQuestionAbortController = undefined;
+    if (abort) controller?.abort(new Error("Side question cancelled"));
+    sideQuestionTurns = [];
+    sideQuestionContainer.clear();
+    tui.requestRender();
   };
 
   const clearPendingBashContext = (): void => {
@@ -2030,6 +2090,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     clearInterruptExit();
     activeBashAbortController?.abort(new Error("Nausicaa is closing"));
     activeSkillAbortController?.abort(new Error("Nausicaa is closing"));
+    activeUpdateAbortController?.abort(new Error("Nausicaa is closing"));
+    activeSideQuestionAbortController?.abort(new Error("Nausicaa is closing"));
     pendingPermissionApproval?.();
     // A selector may have temporarily previewed a theme. Restore its committed
     // palette before waiting for queued submissions or stopping the renderer.
@@ -2212,72 +2274,77 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     return provider;
   };
 
+  const createProviderMenu = (
+    done: () => void,
+    select: (choice: AuthProviderChoice, menu: AuthMenu) => void,
+    onlyProvider?: string,
+    viewState?: { query: string; current?: string; message?: string },
+    getRows = () => terminal.rows,
+  ): { component: AuthMenu; dispose: () => void } => {
+    const providers = providerInfos().filter((provider) => onlyProvider === undefined || provider.id === onlyProvider);
+    const states = new Map<string, AuthProviderState>();
+    const choices = authProviderChoices(providers, states);
+    let disposed = false;
+    const selector = new AuthMenu({
+      title: "Providers",
+      subtitle: viewState?.message ?? (options.auth === undefined ? "Authentication is unavailable in this session." : "Connect with a subscription or API key."),
+      choices,
+      getRows,
+      ...(viewState === undefined ? {} : { initialQuery: viewState.query, ...(viewState.current === undefined ? {} : { current: viewState.current }) }),
+      onSelect: (value) => {
+        const choice = choices.find((entry) => entry.value === value);
+        if (choice !== undefined) select(choice, selector);
+      },
+      onCancel: done,
+    });
+    // Render immediately; a slow credential helper must not block selection or Escape.
+    void (async () => {
+      try {
+        const saved = await options.auth!.credentialStore.list();
+        for (const credential of saved) states.set(credential.providerId, { savedType: credential.type, checked: false });
+      } catch { /* Status is optional; authentication remains available. */ }
+      if (disposed || closing) return;
+      selector.setChoices(authProviderChoices(providers, states));
+      requestTuiRender();
+      await Promise.all(providers.map(async (provider) => {
+        const state: AuthProviderState = { ...states.get(provider.id), checked: true };
+        try {
+          const auth = await options.auth!.modelPort.checkAuth(provider.id);
+          if (auth !== undefined) state.auth = auth;
+        } catch { state.failed = true; }
+        const environment = inspectEnvironmentCredential(provider.id, options.auth?.environment ?? process.env);
+        if (environment.present) state.environment = "configured";
+        else if (environment.partial) state.environment = "partial";
+        states.set(provider.id, state);
+        if (disposed || closing) return;
+        selector.setChoices(authProviderChoices(providers, states));
+        requestTuiRender();
+      }));
+    })();
+    return { component: selector, dispose: () => { disposed = true; } };
+  };
+
   const selectLoginProvider = async (
     onlyProvider?: string,
     viewState?: { query: string; current?: string; message?: string },
   ): Promise<AuthProviderChoice | undefined> => {
-    const providers = providerInfos().filter((provider) => onlyProvider === undefined || provider.id === onlyProvider);
-    const states = new Map<string, AuthProviderState>();
-    const choices = authProviderChoices(providers, states);
     return new Promise<AuthProviderChoice | undefined>((resolve) => {
-      let settled = false;
-      let selector!: AuthMenu;
-      const settle = (value: AuthProviderChoice | undefined): void => {
-        if (settled) return;
-        settled = true;
-        if (viewState !== undefined) {
-          viewState.query = selector.getQuery();
-          const current = selector.getSelectedValue();
-          if (current !== undefined) viewState.current = current;
-        }
-        resolve(value);
-      };
       showSelector((done) => {
-        selector = new AuthMenu({
-          title: "Providers",
-          subtitle: viewState?.message ?? "Connect with a subscription or API key.",
-          choices,
-          getRows: () => terminal.rows,
-          ...(viewState === undefined ? {} : { initialQuery: viewState.query, ...(viewState.current === undefined ? {} : { current: viewState.current }) }),
-          onSelect: (value) => {
-            settle(choices.find((choice) => choice.value === value));
-            done();
-          },
-          onCancel: () => {
-            settle(undefined);
-            done();
-          },
-        });
+        const page = createProviderMenu(done, (choice) => { resolve(choice); done(); }, onlyProvider, viewState);
         return {
-          component: selector,
-          focus: selector,
-          dispose: () => settle(undefined),
+          component: page.component,
+          focus: page.component,
+          dispose: () => {
+            if (viewState !== undefined) {
+              viewState.query = page.component.getQuery();
+              const current = page.component.getSelectedValue();
+              if (current !== undefined) viewState.current = current;
+            }
+            page.dispose();
+            resolve(undefined);
+          },
         };
       }, true);
-      // Render immediately; a slow credential helper must not block selection or Escape.
-      void (async () => {
-        try {
-          const saved = await options.auth!.credentialStore.list();
-          for (const credential of saved) states.set(credential.providerId, { savedType: credential.type, checked: false });
-        } catch { /* Status is optional; authentication remains available. */ }
-        if (settled || closing) return;
-        selector.setChoices(authProviderChoices(providers, states));
-        requestTuiRender();
-        await Promise.all(providers.map(async (provider) => {
-          const state: AuthProviderState = { ...states.get(provider.id), checked: true };
-          try {
-            const auth = await options.auth!.modelPort.checkAuth(provider.id);
-            if (auth !== undefined) state.auth = auth;
-          } catch { state.failed = true; }
-          const environment = inspectEnvironmentCredential(provider.id, options.auth?.environment ?? process.env);
-          if (environment.present) state.environment = "configured";
-          else if (environment.partial) state.environment = "partial";
-          states.set(provider.id, state);
-          if (settled || closing) return;
-          selector.setChoices(authProviderChoices(providers, states));
-          requestTuiRender();
-        }));
-      })();
     });
   };
 
@@ -2412,7 +2479,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     );
     activeAuthPromptView = authPromptView;
     activeSecretInput = input;
-    const promptOverlay = tui.showOverlay(authPromptView, { anchor: "center", width: 78, maxHeight: "100%", margin: 1 });
+    const promptOverlay = showMenuPage(authPromptView);
     appendNotice(
       requestedAuthType === "oauth"
         ? `${provider} browser/device sign-in started. Follow the authorization instructions below.`
@@ -2629,6 +2696,52 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     if (message !== undefined) throw new Error(message);
   };
 
+  const askSideQuestion = async (question: string): Promise<void> => {
+    assertProviderReady();
+    if (options.session.snapshot().runId === undefined) {
+      throw new Error("Start or resume a Run before asking a side question.");
+    }
+    if (activeSideQuestionAbortController !== undefined) {
+      throw new Error("Wait for the current side question to finish or cancel it first.");
+    }
+    const controller = new AbortController();
+    activeSideQuestionAbortController = controller;
+    const turn: (typeof sideQuestionTurns)[number] = {
+      question,
+      answer: "",
+      status: "running",
+    };
+    sideQuestionTurns.push(turn);
+    renderSideQuestions();
+    try {
+      const previousTurns = sideQuestionTurns.slice(0, -1)
+        .filter((entry) => entry.status === "complete" && entry.answer.length > 0)
+        .map((entry) => ({ question: entry.question, answer: entry.answer }));
+      const answer = await options.session.askSideQuestion(question, {
+        previousTurns,
+        signal: controller.signal,
+        onUpdate: (value) => {
+          if (activeSideQuestionAbortController !== controller) return;
+          turn.answer = value;
+          renderSideQuestions();
+        },
+      });
+      if (activeSideQuestionAbortController !== controller) return;
+      turn.answer = answer;
+      turn.status = "complete";
+      renderSideQuestions();
+    } catch (error: unknown) {
+      if (controller.signal.aborted || activeSideQuestionAbortController !== controller) return;
+      turn.status = "error";
+      turn.error = error instanceof Error ? error.message : String(error);
+      renderSideQuestions();
+    } finally {
+      if (activeSideQuestionAbortController === controller) {
+        activeSideQuestionAbortController = undefined;
+      }
+    }
+  };
+
   const mountEditorSlot = (component: Component, focus: Component): void => {
     editorContainer.clear();
     editorContainer.addChild(component);
@@ -2660,6 +2773,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     activeSelectorOverlay = undefined;
     overlay?.hide();
     dispose?.();
+  }
+
+  function showMenuPage(component: Component): OverlayHandle {
+    return tui.showOverlay(new FullScreenMenuPage(component, {
+      getRows: () => terminal.rows,
+      maxContentWidth: 96,
+    }), { width: "100%", maxHeight: "100%", row: 0, col: 0 });
   }
 
   function showSelector(
@@ -2702,7 +2822,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     activeSelectorDone = done;
     activeSelectorRestorePreview = created.restorePreview;
     if (centered) {
-      activeSelectorOverlay = tui.showOverlay(created.component, { anchor: "center", width: 78, maxHeight: "100%", margin: 1 });
+      activeSelectorOverlay = showMenuPage(created.component);
     } else mountEditorSlot(created.component, created.focus);
   }
 
@@ -2731,106 +2851,91 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     activeSelectorDone?.();
   }
 
-  const showModelSelector = (initialQuery = "", initialProvider = "all", notice?: string): void => {
+  const createModelMenu = (done: () => void, initialQuery = "", initialProvider = "all", notice?: string, getRows = () => terminal.rows) => {
     const current = options.session.snapshot().model;
     const modelOptions = readModelOptions();
     const providerNames = new Map(providerInfos().map((provider) => [provider.id, provider.name]));
     const providerIds = [...new Set(modelOptions.map((option) => modelProviderOf(option.value)))]
       .sort((left, right) => left.localeCompare(right));
     type AuthState = Awaited<ReturnType<AuthModelPort["checkAuth"]>> | null;
-    const show = (authStates?: ReadonlyMap<string, AuthState>, query = initialQuery): void => {
-      if (closing) return;
-      const configured = (value: string): boolean => authStates === undefined
-        || authStates.get(modelProviderOf(value)) != null;
-      const candidates = modelOptions.map((option) => {
-        if (authStates === undefined) return option;
-        const auth = authStates.get(modelProviderOf(option.value));
-        const status = auth === null ? "Auth status unavailable"
-          : auth === undefined ? "Login required"
-          : `Configured locally (${terminalSafeText(auth.source ?? auth.type)})`;
-        return { ...option, description: [status, option.description].filter(Boolean).join(" · ") };
-      }).sort((left, right) => Number(configured(right.value)) - Number(configured(left.value)));
-      showSelector((done) => {
-        const selector = new SelectorOverlay({
-          title: "Models",
-          presentation: "panel",
-          getRows: () => terminal.rows,
-          searchLabel: "Search models",
-          subtitle: (visible) => notice ?? `${visible.length} model${visible.length === 1 ? "" : "s"}${authStates === undefined ? "" : " · account access unverified"}`,
-          filters: [
-            ...(authStates === undefined ? [] : [{
-              key: "scope",
-              label: "Scope",
-              options: [{ value: "configured", label: "Configured" }, { value: "all", label: "All" }],
-              current: "configured",
-            }]),
-            ...(providerIds.length <= 1 ? [] : [{
-              key: "provider",
-              label: "Provider",
-              options: [
-                { value: "all", label: "All" },
-                ...providerIds.map((provider) => ({
-                  value: provider,
-                  label: provider === "default" ? "Local" : providerNames.get(provider) ?? provider,
-                })),
-              ],
-              current: initialProvider,
-            }]),
+    let disposed = false;
+    let authStates: ReadonlyMap<string, AuthState> | undefined;
+    const configured = (value: string): boolean => options.auth === undefined
+      || authStates?.get(modelProviderOf(value)) != null;
+    const candidates = () => modelOptions.map((option) => {
+      if (options.auth === undefined) return option;
+      if (authStates === undefined) return { ...option, disabled: true };
+      const auth = authStates.get(modelProviderOf(option.value));
+      const status = auth === null ? "Auth status unavailable"
+        : auth === undefined ? "Login required"
+        : `Configured locally (${terminalSafeText(auth.source ?? auth.type)})`;
+      return { ...option, description: [status, option.description].filter(Boolean).join(" · ") };
+    }).sort((left, right) => Number(configured(right.value)) - Number(configured(left.value)));
+    const selector = new SelectorOverlay({
+      title: "Models",
+      presentation: "panel",
+      getRows,
+      searchLabel: options.auth === undefined ? "Search models" : "Checking local credentials...",
+      subtitle: (visible) => options.auth !== undefined && authStates === undefined
+        ? "Checking local credentials..."
+        : notice ?? `${visible.length} model${visible.length === 1 ? "" : "s"}${authStates === undefined ? "" : " · account access unverified"}`,
+      filters: [
+        ...(options.auth === undefined ? [] : [{
+          key: "scope",
+          label: "Scope",
+          options: [{ value: "configured", label: "Configured" }, { value: "all", label: "All" }],
+          current: "configured",
+        }]),
+        ...(providerIds.length <= 1 ? [] : [{
+          key: "provider",
+          label: "Provider",
+          options: [
+            { value: "all", label: "All" },
+            ...providerIds.map((provider) => ({
+              value: provider,
+              label: provider === "default" ? "Local" : providerNames.get(provider) ?? provider,
+            })),
           ],
-          filterOptions: (items, values) => items.filter((item) => (
-            (values.scope === "all" || configured(item.value))
-            && ((values.provider ?? initialProvider) === "all"
-              || modelProviderOf(item.value) === (values.provider ?? initialProvider))
-          )),
-          options: candidates,
-          ...(current === UNCONFIGURED_MODEL ? {} : { current }),
-          initialQuery: query,
-          onSelect: (value) => {
-            done();
-            void applyModelSelection(value);
-          },
-          onCancel: () => done(),
-        });
-        return { component: selector, focus: selector };
-      }, true);
-    };
-    if (options.auth === undefined) {
-      show();
-      return;
-    }
-    const authModel = options.auth.modelPort;
-    let loading: SelectorOverlay | undefined;
-    showSelector((done) => {
-      const selector = new SelectorOverlay({
-        title: "Models",
-        presentation: "panel",
-        getRows: () => terminal.rows,
-        searchLabel: "Checking local credentials...",
-        options: [],
-        initialQuery,
-        onSelect: () => {},
-        onCancel: () => done(),
-      });
-      loading = selector;
-      return { component: selector, focus: selector };
-    }, true);
-    if (loading === undefined) return;
-    const mountedLoading = loading;
+          current: initialProvider,
+        }]),
+      ],
+      filterOptions: (items, values) => items.filter((item) => (
+        (values.scope === "all" || configured(item.value))
+        && ((values.provider ?? initialProvider) === "all"
+          || modelProviderOf(item.value) === (values.provider ?? initialProvider))
+      )),
+      options: candidates(),
+      ...(current === UNCONFIGURED_MODEL ? {} : { current }),
+      initialQuery,
+      onSelect: (value) => {
+        done();
+        void applyModelSelection(value);
+      },
+      onCancel: () => done(),
+    });
+    const authModel = options.auth?.modelPort;
     // Auth discovery must not hold the submission queue or reopen a dismissed picker.
-    void Promise.all(providerIds.map(async (provider): Promise<[string, AuthState]> => {
+    if (authModel !== undefined) void Promise.all(providerIds.map(async (provider): Promise<[string, AuthState]> => {
       try {
         return [provider, await authModel.checkAuth(provider)];
       } catch {
         return [provider, null];
       }
     })).then((states) => {
-      if (closing || activeSelectorComponent !== mountedLoading) return;
-      show(new Map(states), mountedLoading.getSearchInput().getValue());
+      if (closing || disposed) return;
+      authStates = new Map(states);
+      selector.setSearchLabel("Search models");
+      selector.setOptions(candidates());
+      requestTuiRender();
     }).catch(() => {
-      if (closing || activeSelectorComponent !== mountedLoading) return;
-      cancelActiveSelector(true, mountedLoading);
+      if (closing || disposed) return;
       appendNotice("Model authentication status could not be loaded. Retry /model.", "warning");
     });
+    return { component: selector, dispose: () => { disposed = true; } };
+  };
+
+  const showModelSelector = (query = "", provider = "all", notice?: string): void => {
+    showConfigurationWorkspace("models", { query, provider, ...(notice === undefined ? {} : { notice }) });
   };
 
   const applyModelSelection = async (value: string): Promise<void> => {
@@ -2925,12 +3030,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         searchable: false,
         getRows: () => terminal.rows,
         current: options.session.thinkingLevel ?? "default",
-        choices: ["default", ...levels].map((value) => ({
-          value,
-          label: value === "default" ? "Provider default" : value,
-          detail: value === "default" && levels.length === 0 ? "No adjustable reasoning levels" : "",
-          status: value === (options.session.thinkingLevel ?? "default") ? "current" : "",
-        })),
+        choices: thinkingLevelChoices({ levels, current: options.session.thinkingLevel }),
         onSelect: (value) => {
           done();
           void applyThinkingLevel(value).catch((error: unknown) => appendNotice(error instanceof Error ? error.message : String(error), "error"));
@@ -3050,6 +3150,54 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     });
   };
 
+  const showSettingsSelector = (): void => {
+    const snapshot = options.session.snapshot();
+    showSelector((done) => {
+      const selector = new SelectorOverlay({
+        title: "Settings",
+        presentation: "panel",
+        getRows: () => terminal.rows,
+        searchLabel: "Search settings",
+        options: [
+          { value: "model", label: "Model", description: snapshot.model },
+          {
+            value: "thinking",
+            label: "Thinking",
+            description: options.session.thinkingLevel ?? "Provider default",
+          },
+          {
+            value: "permissions",
+            label: "Permissions",
+            description: snapshot.permissionProfile,
+          },
+          {
+            value: "mode",
+            label: "Mode",
+            description: snapshot.collaborationMode,
+          },
+          { value: "theme", label: "Theme", description: themePreference },
+          { value: "setup", label: "Provider setup", description: "Authentication and model status" },
+        ],
+        onSelect: (value) => {
+          done();
+          queueMicrotask(() => {
+            if (closing) return;
+            switch (value) {
+              case "model": showModelSelector(); break;
+              case "thinking": showThinkingSelector(); break;
+              case "permissions": showPermissionSelector(); break;
+              case "mode": showCollaborationModeSelector(); break;
+              case "theme": showThemeSelector(); break;
+              case "setup": showSetup(); break;
+            }
+          });
+        },
+        onCancel: done,
+      });
+      return { component: selector, focus: selector };
+    }, true);
+  };
+
   const switchSession = async (runId: string): Promise<boolean> => {
     const current = options.session.snapshot();
     // An explicit `/resume <current-run>` can arrive on the same tick as the
@@ -3100,6 +3248,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   const performRunNavigation = async <T>(
     operation: () => Promise<T>,
   ): Promise<{ result: T; generation: number } | undefined> => {
+    clearSideQuestions();
     const generation = ++transcriptSwitchGeneration;
     // The destination is host-assigned for new/fork/import; fence all old events.
     switchingTranscriptRunId = null;
@@ -3116,12 +3265,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
   };
 
-  const forkSession = async (argument: string): Promise<void> => {
+  const forkSession = async (argument: string, action: "fork" | "clone" = "fork"): Promise<void> => {
     const current = options.session.snapshot();
     if (current.status === "running" || current.status === "cancelling") {
-      throw new Error("/fork is unavailable while Main is working");
+      throw new Error(`/${action} is unavailable while Main is working`);
     }
     const parts = argument.split(/\s+/u).filter(Boolean);
+    if (action === "clone" && parts.length > 0) throw new Error("Usage: /clone");
     if (parts.length > 1) throw new Error("Usage: /fork [run-id]");
     const navigation = await performRunNavigation(() => options.session.forkRun(
       parts.length === 0 ? {} : { runId: parts[0]! },
@@ -3137,7 +3287,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     if (!await loadAttachedTranscript(true)) return;
     await refreshQueue();
     if (switchGeneration !== transcriptSwitchGeneration) return;
-    appendNotice(`Forked Run ${result.parentRunId} to ${result.runId}.`, "success");
+    appendNotice(
+      action === "clone"
+        ? `Cloned Run ${result.parentRunId} to ${result.runId}.`
+        : `Forked Run ${result.parentRunId} to ${result.runId}.`,
+      "success",
+    );
   };
 
   const showSessionTreeSelector = async (): Promise<void> => {
@@ -3318,39 +3473,77 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     requestTuiRender(true);
   };
 
-  const showSkillsSelector = (): void => {
+  const createSkillsMenu = (done: () => void, getRows: () => number) => {
     const controller = options.edgeSelection;
-    if (controller === undefined) {
-      appendBlock(new Markdown(formatEdgeStatus(readEdgeStatus()), 1, 0, nausicaaMarkdownTheme));
-      appendNotice("Skill selection is unavailable: the host did not provide a selection controller.", "warning");
-      return;
-    }
-    const snapshot = controller.snapshot();
-    if (snapshot.skills.length === 0) {
-      appendNotice(snapshot.stale ? "No fresh Skills; the displayed resource snapshot is stale." : "No Skills discovered.", "info");
-      return;
-    }
+    const snapshot = controller?.snapshot();
+    const selector = new SelectorOverlay({
+      title: "Skills",
+      presentation: "panel",
+      getRows,
+      searchLabel: "Search Skills",
+      subtitle: snapshot === undefined ? "Skill selection is unavailable in this session."
+        : snapshot.stale ? "Last available catalog; resource refresh did not complete."
+        : snapshot.skills.length === 0 ? "No Skills discovered." : `${snapshot.skills.length} Skills`,
+      options: skillSelectorOptions(snapshot?.skills ?? []),
+      onSelect: (value) => {
+        const skill = snapshot?.skills.find((entry) => entry.id === value);
+        if (skill === undefined) return;
+        done();
+        const draft = editor.getExpandedText();
+        editor.setText(`/skill:${skill.name} ${draft}`);
+        tui.requestRender();
+      },
+      onCancel: () => done(),
+    });
+    return { component: selector };
+  };
+
+  let configurationGeneration = 0;
+  const showConfigurationWorkspace = (
+    initialTab: ConfigurationMenuTab,
+    modelState: { query?: string; provider?: string; notice?: string } = {},
+    providerState: { query: string; current?: string; message?: string } = { query: "" },
+  ): void => {
+    const generation = ++configurationGeneration;
     showSelector((done) => {
-      const selector = new SelectorOverlay({
-        title: "Skills",
-        presentation: "panel",
-        getRows: () => terminal.rows,
-        searchLabel: "Search Skills",
-        ...(snapshot.stale ? { subtitle: "Last available catalog; resource refresh did not complete." } : {}),
-        options: skillSelectorOptions(snapshot.skills),
-        onSelect: (value) => {
-          const skill = snapshot.skills.find((entry) => entry.id === value);
-          if (skill === undefined) return;
-          done();
-          const draft = editor.getExpandedText();
-          editor.setText(`/skill:${skill.name} ${draft}`);
-          tui.requestRender();
+      const menu: ConfigurationMenu = new ConfigurationMenu({
+        initialTab,
+        requestRender: requestTuiRender,
+        createPage: (tab) => {
+          const getRows = () => menu.getPageRows(terminal.rows);
+          if (tab === "providers") return createProviderMenu(() => {
+            done();
+            if (!closing) appendNotice("Login cancelled.", "info");
+          }, (choice, providerMenu) => {
+            providerState.query = providerMenu.getQuery();
+            const current = providerMenu.getSelectedValue();
+            if (current !== undefined) providerState.current = current;
+            done();
+            void loginInTui(`${choice.provider} ${choice.authType}`, true, providerState).then((success) => {
+              if (!success && !closing && generation === configurationGeneration && activeSelectorComponent === undefined) {
+                showConfigurationWorkspace("providers", modelState, providerState);
+              }
+            }).catch((error: unknown) => {
+              if (!closing) appendNotice(`Login failed: ${oneLine(error instanceof Error ? error.message : String(error))}`, "error");
+            });
+          }, undefined, providerState, getRows);
+          if (tab === "models") return createModelMenu(done, modelState.query, modelState.provider, modelState.notice, getRows);
+          if (tab === "skills") return createSkillsMenu(done, getRows);
+          if (options.mcp === undefined) {
+            return { component: new AuthMenu({
+              title: "MCP Servers", subtitle: "MCP configuration is unavailable in this session.",
+              choices: [], getRows, onSelect: () => {}, onCancel: done,
+            }) };
+          }
+          const mcpMenu = new McpMenu({ controller: options.mcp, getRows, onCancel: done, requestRender: requestTuiRender });
+          return { component: mcpMenu, dispose: () => mcpMenu.dispose() };
         },
-        onCancel: () => done(),
       });
-      return { component: selector, focus: selector };
+      return { component: menu, focus: menu, dispose: () => menu.dispose() };
     }, true);
   };
+
+  const showSkillsSelector = (): void => { showConfigurationWorkspace("skills"); };
 
   const handleCommand = async (
     commandLine: string,
@@ -3405,12 +3598,65 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "/status":
           writeStatus(options.session.snapshot());
           break;
+        case "/settings":
+          if (argument.length > 0) throw new Error("Usage: /settings");
+          showSettingsSelector();
+          break;
+        case "/system-prompt": {
+          if (argument.length > 0) throw new Error("Usage: /system-prompt");
+          const prompt = await options.session.systemPrompt();
+          const block = new Container();
+          block.addChild(new Text(`System Prompt (${prompt.length} chars)`, 1, 0));
+          block.addChild(new Spacer(1));
+          block.addChild(new Text(terminalSafeText(prompt), 1, 0));
+          appendBlock(block);
+          break;
+        }
+        case "/logs":
+          if (argument.length > 0) throw new Error("Usage: /logs");
+          appendBlock(new Text(
+            terminalSafeText(await formatLogLocations(options.session.dataDir, options.session.snapshot().runId)),
+            1,
+            0,
+          ));
+          break;
+        case "/changelog":
+          if (argument.length > 0) throw new Error("Usage: /changelog");
+          appendBlock(new Markdown(
+            `### What's New\n\n${terminalSafeText(await (options.readChangelog ?? readPackagedChangelog)())}`,
+            1,
+            0,
+            nausicaaMarkdownTheme,
+          ));
+          break;
+        case "/update": {
+          if (argument.length > 0) throw new Error("Usage: /update");
+          const status = options.session.snapshot().status;
+          if (status === "running" || status === "cancelling") {
+            throw new Error("Wait for the current Turn to finish before updating.");
+          }
+          appendNotice("Updating Nausicaa from the npm registry...", "info");
+          const abort = new AbortController();
+          activeUpdateAbortController = abort;
+          try {
+            const update = options.updateRunner ?? ((input) => updateNausicaa(undefined, input));
+            await update({ signal: abort.signal });
+            if (!abort.signal.aborted && !closing) appendNotice(formatSuccessfulUpdate(), "success");
+          } catch (error: unknown) {
+            if (!abort.signal.aborted) throw error;
+          } finally {
+            if (activeUpdateAbortController === abort) activeUpdateAbortController = undefined;
+            if (abort.signal.aborted && !closing) appendNotice("Update cancelled. Run /update again to finish installation.", "warning");
+          }
+          break;
+        }
         case "/setup":
           if (argument.length > 0) throw new Error("Usage: /setup");
           showSetup();
           break;
         case "/login":
-          await loginInTui(argument);
+          if (argument.length === 0 && providerInfos().length > 1) showConfigurationWorkspace("providers");
+          else await loginInTui(argument);
           break;
         case "/logout":
           await logoutInTui(argument);
@@ -3429,10 +3675,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             break;
           }
           if (argument.length > 0) throw new Error("Usage: /mcp [status|refresh]");
-          showSelector((done) => {
-            const menu = new McpMenu({ controller: options.mcp!, getRows: () => terminal.rows, onCancel: done, requestRender: requestTuiRender });
-            return { component: menu, focus: menu, dispose: () => menu.dispose() };
-          }, true);
+          showConfigurationWorkspace("mcp");
           break;
         case "/skills": {
           const parts = argument.split(/\s+/u).filter(Boolean);
@@ -3441,7 +3684,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             await refreshEdgeSelection();
             break;
           }
-          if (action === "show" && parts.length === 1) {
+          if (action === "show" && parts.length <= 1) {
             showSkillsSelector();
             break;
           }
@@ -3629,7 +3872,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "/fork":
           await forkSession(argument);
           break;
+        case "/clone":
+          await forkSession(argument, "clone");
+          break;
         case "/new": {
+          if (enteredCommand === "/clear" && argument.length > 0) {
+            throw new Error("Usage: /clear");
+          }
           if (await performRunNavigation(() => options.session.newRun()) === undefined) break;
           resetQueueSelection();
           clearPendingBashContext();
@@ -3692,6 +3941,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           appendNotice("Copied last assistant message to clipboard.", "success");
           break;
         }
+        case "/btw":
+          if (argument.length === 0) throw new Error("Usage: /btw <question>");
+          if ((commandImages?.length ?? 0) > 0) {
+            throw new Error("Images are not supported in side conversations.");
+          }
+          await askSideQuestion(argument);
+          break;
         case "/quit":
           // Finish after this worker drains; awaiting it here would await the
           // worker from inside its own queue item.
@@ -3709,6 +3965,20 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   const processSubmission = async (submission: QueuedSubmission): Promise<void> => {
     clearShortcutGuide();
     const { value } = submission;
+    if (sideQuestionTurns.length > 0) {
+      if (isInteractiveSlashCommand(value) || value.startsWith("!")) {
+        appendNotice("Press Esc to return to the main session before running a command.", "warning");
+        return;
+      }
+      if ((submission.images?.length ?? 0) > 0) {
+        editor.setText(value);
+        appendNotice("Images are not supported in side conversations.", "warning");
+        return;
+      }
+      addPromptToHistory(value);
+      await askSideQuestion(value);
+      return;
+    }
     if (isInteractiveSlashCommand(value)) {
       addPromptToHistory(value);
       await handleCommand(value, submission.images);
@@ -3883,12 +4153,20 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   editor.onPasteImage = queueClipboardImagePaste;
   editor.onCtrlD = () => { void finish(0); };
   editor.onEscape = () => {
+    if (activeUpdateAbortController !== undefined) {
+      activeUpdateAbortController.abort(new Error("Update cancelled"));
+      return;
+    }
     if (activeSkillAbortController !== undefined) {
       activeSkillAbortController.abort(new Error("Skill loading cancelled"));
       return;
     }
     if (activeBashAbortController !== undefined) {
       activeBashAbortController.abort(new Error("Cancelled by user"));
+      return;
+    }
+    if (sideQuestionTurns.length > 0) {
+      clearSideQuestions();
       return;
     }
     if (options.edgeSelection?.snapshot().refreshing === true) {
@@ -3954,12 +4232,20 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       return { consume: true };
     }
     if (isInterrupt) {
+      if (activeUpdateAbortController !== undefined) {
+        activeUpdateAbortController.abort(new Error("Update cancelled"));
+        return { consume: true };
+      }
       if (activeSkillAbortController !== undefined) {
         activeSkillAbortController.abort(new Error("Skill loading cancelled"));
         return { consume: true };
       }
       if (activeBashAbortController !== undefined) {
         activeBashAbortController.abort(new Error("Cancelled by user"));
+        return { consume: true };
+      }
+      if (sideQuestionTurns.length > 0) {
+        clearSideQuestions();
         return { consume: true };
       }
       if (options.edgeSelection?.snapshot().refreshing === true) {

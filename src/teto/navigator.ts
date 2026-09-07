@@ -85,6 +85,9 @@ export class IntentNavigator {
       ...(request.signal === undefined ? {} : { signal: request.signal }),
     });
 
+    if (response.stopReason === "aborted") {
+      throw new TetoOutputError("Teto response was aborted by the provider", response.usage);
+    }
     if (response.stopReason === "length") {
       throw new TetoOutputError(
         `Teto output was truncated at the ${maxOutputTokens}-token limit`,

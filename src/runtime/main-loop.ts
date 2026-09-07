@@ -90,6 +90,8 @@ import {
 const DEFAULT_SYSTEM_PROMPT = `You are Main, the primary execution lane in Nausicaa.
 Handle the current user request with the runtime-provided context and tools.
 The tools attached to this request are the complete tool-call interface; runtime results are authoritative.
+When teto_start is available, proactively open Teto early for multi-step analysis, investigation, debugging, planning, implementation, or review where an independent perspective can help. State the value of that second perspective in the reason, such as checking assumptions, finding missed risks, or evaluating alternatives; reason documents why to open the lane, not a task assignment to Teto.
+Teto is an independent sensing and thinking lane that observes your public work and offers feedback, not a replacement for your own execution or verification. Reuse an active Teto, keep working while it observes, and evaluate its feedback against evidence. You do not need separate user approval to use this available collaboration tool; respect the host's permissions and budgets. Brief factual answers and trivial one-step tasks usually do not need it.
 Return a grounded result when the current request is complete.`;
 
 /** Conservative per-request input ceiling for custom ports without model metadata. */
@@ -1842,8 +1844,15 @@ function boundedToolArguments(arguments_: Record<string, unknown>): string {
   return boundedRedactedText(serialized, 160);
 }
 
-function effectiveSystemPrompt(
-  input: MainLoopInput,
+export interface MainSystemPromptOptions {
+  systemPrompt?: string;
+  collaborationMode?: "default" | "plan";
+  laneCapabilityManifests?: readonly LaneCapabilityManifest[];
+}
+
+/** Build the stable Main prompt prefix shared by model requests and diagnostics. */
+export function effectiveSystemPrompt(
+  input: MainSystemPromptOptions,
 ): string {
   const base = input.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
   const manifests = input.laneCapabilityManifests === undefined

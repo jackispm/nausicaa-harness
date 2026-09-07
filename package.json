@@ -1,6 +1,6 @@
 {
   "name": "nausicaa-harness",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT",
   "author": "Dongjie Gong <jack@gieey.com>",
   "description": "A lightweight, ledger-driven multi-lane agent harness.",
@@ -43,6 +43,7 @@
     "dist",
     "assets",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES"
   ],

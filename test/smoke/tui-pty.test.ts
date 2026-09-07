@@ -39,7 +39,7 @@ if pid == 0:
 
 output = bytearray()
 # Label and value have separate ANSI styles; match the version token itself.
-marker = b'v0.1.1'
+marker = b'v0.1.2'
 awareness_marker = b'Nausicaa awareness'
 deadline = time.monotonic() + 5.0
 sent_agents = False
@@ -138,7 +138,7 @@ describe("built CLI PTY", () => {
         expect(stdout).toContain("\x1b[?1049h");
         expect(stdout).toContain("\x1b[?1049l");
         const plainStdout = stripTerminalSequences(stdout);
-        expect(plainStdout).toContain("version  v0.1.1");
+        expect(plainStdout).toContain("version  v0.1.2");
         expect(plainStdout).toContain("model    deepseek");
         expect(plainStdout).toContain("cwd      ");
         expect(plainStdout).toContain('Try "fix bugs in @<filepath>"');

@@ -21,6 +21,11 @@ describe("interactive command registry", () => {
       "reload",
       "setup",
       "status",
+      "settings",
+      "system-prompt",
+      "logs",
+      "changelog",
+      "update",
       "login",
       "logout",
       "list-agents",
@@ -41,10 +46,12 @@ describe("interactive command registry", () => {
       "import",
       "tree",
       "fork",
+      "clone",
       "new",
       "resume",
       "resolve",
       "copy",
+      "btw",
       "stop",
       "quit",
     ]);
@@ -65,8 +72,12 @@ describe("interactive command registry", () => {
     expect(findInteractiveCommand("/mode")?.name).toBe("mode");
     expect(canonicalInteractiveCommandName("branch")).toBe("fork");
     expect(canonicalInteractiveCommandName("effort")).toBe("thinking");
+    expect(canonicalInteractiveCommandName("clear")).toBe("new");
+    expect(canonicalInteractiveCommandName("side")).toBe("btw");
     expect(findInteractiveCommand("/thinking")?.name).toBe("thinking");
     expect(findInteractiveCommand("/branch")?.name).toBe("fork");
+    expect(findInteractiveCommand("/clear")?.name).toBe("new");
+    expect(findInteractiveCommand("/side")?.name).toBe("btw");
   });
 
   it("keeps the pending extension list empty and includes compatibility help", () => {
@@ -85,6 +96,14 @@ describe("interactive command registry", () => {
     expect(help).toContain("/thinking [level|default]");
     expect(help).toContain("/mode [default|plan]");
     expect(help).toContain("/fork [run-id]");
+    expect(help).toContain("/clone");
+    expect(help).toContain("/system-prompt");
+    expect(help).toContain("/logs");
+    expect(help).toContain("/changelog");
+    expect(help).toContain("/update");
+    expect(help).toContain("/btw <question>");
+    expect(help).not.toContain("/clear");
+    expect(help).not.toContain("/side");
     expect(help).toContain("/tree");
     expect(help).toContain("/compact");
     expect(help).toContain("/resolve <operation-id>");

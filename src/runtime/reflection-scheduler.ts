@@ -300,6 +300,9 @@ export class ReflectionScheduler {
         this.runTokenBudget?.settle(runReservationId, response.usage);
         runReservationSettled = true;
       }
+      if (response.stopReason === "aborted") {
+        throw new Error("Reflection response was aborted by the provider");
+      }
       if (response.stopReason === "length") {
         throw new Error(
           `Reflection output was truncated at the ${this.policy.tetoMaxOutputTokens}-token limit`,

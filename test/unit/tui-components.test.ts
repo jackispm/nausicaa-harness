@@ -17,6 +17,8 @@ import {
   EdgeSkillPickerSummary,
   NoticeBlock,
   NAUSICAA_LOGO_ROWS,
+  getNausicaaColorScheme,
+  nausicaaPalette,
   PromptSurface,
   parseExternalA2APrompt,
   QueuePreview,
@@ -403,6 +405,17 @@ describe("TUI components", () => {
     expect(tray).toContain("main + Teto + Worker/running");
   });
 
+  it("shows the model namespace and selected reasoning level without changing the model", () => {
+    const selected = { ...snapshot, model: "openrouter:moonshotai/kimi-k2.6", thinkingLevel: "medium" as const };
+    const tray = new SessionTray(() => selected);
+    expect(stripTerminalSequences(tray.render(100).join("\n"))).toContain("moonshotai/kimi-k2.6 • medium");
+    expect(selected.model).toBe("openrouter:moonshotai/kimi-k2.6");
+    expect(stripTerminalSequences(tray.render(20)[1]!)).toMatch(/ • medium$/);
+    for (const width of [1, 12, 20, 40, 100]) {
+      expect(tray.render(width).every((line) => visibleWidth(line) <= width)).toBe(true);
+    }
+  });
+
   it("shows current Main context capacity in Pi footer form instead of cumulative usage", () => {
     const tray = stripTerminalSequences(new SessionTray(() => snapshot).render(100).join("\n"));
     expect(tray).toContain("0.7%/1.0m");
@@ -571,6 +584,54 @@ describe("TUI components", () => {
     expect(expanded).toContain("ctrl+o expand or collapse tool output");
     expect(expanded).toContain("Nausicaa can explain its own features");
     expect(expandedLines.length).toBeGreaterThan(compactLines.length);
+  });
+
+  it.each(["light", "dark"] as const)("keeps the %s brand pink independent of semantic colors", (scheme) => {
+    const originalScheme = getNausicaaColorScheme();
+    try {
+      setNausicaaColorScheme(scheme);
+      const header = new BrandSplashHeader();
+      expect(header.render(80).join("\n")).toContain(nausicaaPalette.brand(NAUSICAA_LOGO_ROWS[0]));
+      const brand = nausicaaPalette.brand("mark");
+      expect(brand).not.toBe(nausicaaPalette.accent("mark"));
+      expect(brand).not.toBe(nausicaaPalette.warning("mark"));
+      expect(brand).not.toBe(nausicaaPalette.error("mark"));
+      expect(brand).not.toBe(nausicaaPalette.success("mark"));
+      const surfaces = [
+        nausicaaPalette.menuPageBackground("surface"),
+        nausicaaPalette.menuBackground("surface"),
+        nausicaaPalette.menuSelectedBackground("surface"),
+        nausicaaPalette.userBackground("surface"),
+        nausicaaPalette.toolPendingBackground("surface"),
+      ];
+      expect(new Set(surfaces).size).toBe(surfaces.length);
+    } finally {
+      setNausicaaColorScheme(originalScheme);
+    }
+  });
+
+  it.each(["light", "dark"] as const)("maintains 4.5:1 contrast for %s menu text on every menu surface", (scheme) => {
+    const originalScheme = getNausicaaColorScheme();
+    const luminance = (color: (text: string) => string): number => {
+      const match = color("").match(/\x1b\[(?:38|48);2;(\d+);(\d+);(\d+)m/);
+      if (match === null) throw new Error("Expected a true-color palette token");
+      return match.slice(1).map((channel) => Number(channel) / 255)
+        .map((channel) => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4)
+        .reduce((total, channel, index) => total + channel * ([0.2126, 0.7152, 0.0722][index] ?? 0), 0);
+    };
+    try {
+      setNausicaaColorScheme(scheme);
+      for (const foreground of [nausicaaPalette.text, nausicaaPalette.menuMuted, nausicaaPalette.menuDim]) {
+        for (const background of [nausicaaPalette.menuPageBackground, nausicaaPalette.menuBackground, nausicaaPalette.menuSelectedBackground]) {
+          const values = [luminance(foreground), luminance(background)];
+          expect((Math.max(...values) + 0.05) / (Math.min(...values) + 0.05)).toBeGreaterThanOrEqual(4.5);
+        }
+      }
+      expect(nausicaaPalette.menuMuted("detail")).not.toBe(nausicaaPalette.muted("detail"));
+      expect(nausicaaPalette.menuDim("hint")).not.toBe(nausicaaPalette.dim("hint"));
+    } finally {
+      setNausicaaColorScheme(originalScheme);
+    }
   });
 
   it("expands thinking by default and expands tool details without losing content", () => {

@@ -22,7 +22,8 @@ Nausicaa 的核心不是更复杂的 workflow，而是让更强的模型自己�
 节奏的 Lane 组成动态拓扑，而不再只是一个窗口里的线性循环。
 
 - **Teto**：独立的感知与思考 Lane，默认按需开启，观察 Main 的公开行为并提供
-  第二视角；它不执行工具，也不是隐藏的 chain-of-thought。
+  第二视角，不是隐藏的 chain-of-thought。Main 会被建议在复杂任务中尽早开启；
+  Teto 的观察与反馈权限独立于 Main 的执行权限。
 - **Lane**：每个 Agent 都是可寻址、可恢复、拥有独立上下文和生命周期的执行单位。
 - **多拓扑**：Main、Teto、Worker、Team branch 以及跨 Run A2A 可以按任务自然组合；
   Team branch 也可以拥有自己的 Teto。
@@ -38,7 +39,7 @@ Main
 `- A2A -> another Run
 ```
 
-当前版本：`0.1.1` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
+当前版本：`0.1.2` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
 edge 集成仍在完善。
 
 ### 快速开始
@@ -56,14 +57,19 @@ nausicaa
 
 ### 登录与模型
 
-- `/login` 打开居中的可搜索菜单，直接选择服务商和登录方式。OpenAI API 与
+`/login`、`/model`、`/mcp`、`/skills` 进入同一个淡粉色全屏配置页的对应分页。
+Ctrl+Left/Right 切页时保留搜索、选择和 MCP 草稿；聊天内容暂时隐藏，退出后恢复。
+
+- `/login` 直接选择服务商和登录方式。OpenAI API 与
   ChatGPT 订阅是不同入口；Anthropic、OpenRouter 等只显示各自支持的 API Key 或 OAuth。
 - 完成登录后，凭据保存到 `~/.nausicaa/credentials.json`，下次启动可继续使用。
   浏览菜单或取消不会保存账号；本地“已配置”状态不代表远端访问已验证。
 - `/model [搜索词]` 在同样居中的面板中切换当前会话模型，默认只显示已配置服务商；可筛选服务商或
   切到 All 浏览完整目录。未选择模型时，登录成功会打开对应服务商的模型列表。
 - `/thinking [level|default]`（别名 `/effort`）选择当前模型支持的思考强度。
-  设置随当前会话保存，从下一次 Main 请求生效，不修改 Teto 或 Worker。
+  每档附有说明，选择后模型旁显示 `模型名 • medium` 等标记。
+  设置随当前会话保存，从下一次 Main 请求生效，不修改 Teto 或 Worker；
+  `default` 使用服务商默认值，不把所有模型的默认值假定为 medium。
 - `/logout [provider]` 移除本地保存的凭据，不会删除环境变量中的密钥。
 
 也可在终端指定登录入口；以下是可选示例，不必全部执行：
@@ -85,10 +91,14 @@ nausicaa auth login openrouter api-key
 | `/help`、`/hotkeys` | 命令与当前快捷键 |
 | `/list-agents` | 活跃会话与 Lane 拓扑 |
 | `/new`、`/resume`、`/session` | 创建、恢复、切换会话 |
+| `/clear`、`/clone` | 新会话别名、从当前检查点克隆会话 |
 | `/name`、`/export`、`/import` | 会话命名、HTML/JSONL 导出、JSONL 导入 |
 | `/skills`、`/mcp`、`/reload` | 选择 Skill、管理 MCP、刷新资源 |
 | `/context`、`/compact` | 上下文用量与压缩 |
 | `/permissions`、`/plan`、`/stop` | 权限、规划模式、停止当前任务 |
+| `/settings`、`/system-prompt`、`/logs` | 会话设置、实际系统提示词、日志位置 |
+| `/btw <问题>`（`/side`） | 当前会话的无工具侧问，不写入主对话；用量计入预算 |
+| `/changelog`、`/update` | 版本记录、更新安装包（完成后重启） |
 
 CLI：`--print` 单次回答，`--json` 输出事件，`--continue` 恢复最近会话，
 `--resume <run-id>` 恢复指定会话，`--topology` 查看拓扑；`--daemon` 启动后台控制主机，
@@ -122,8 +132,9 @@ expect future Agents to form dynamic topologies of Lanes with different roles,
 contexts, and cadences instead of one linear loop in one window.
 
 - **Teto**: an independent sensing and thinking Lane, opened on demand. It
-  observes Main's public behavior and offers a second perspective; it does not
-  execute tools or expose hidden chain-of-thought.
+  observes Main's public behavior and offers a second perspective, not hidden
+  chain-of-thought. Main is encouraged to open it early for complex tasks;
+  Teto's observation and feedback permissions are separate from Main's execution authority.
 - **Lane**: an addressable, resumable execution unit with its own context and
   lifecycle.
 - **Multi-topology**: Main, Teto, Worker, Team branches, and cross-Run A2A can be
@@ -140,7 +151,7 @@ Main
 `- A2A -> another Run
 ```
 
-Current version: `0.1.1` beta. Core runtime contracts have offline test coverage;
+Current version: `0.1.2` beta. Core runtime contracts have offline test coverage;
 provider, daemon, RPC, and edge integrations are still evolving.
 
 ### Quick start
@@ -158,7 +169,11 @@ Commands and file writes use your user permissions by default; `/permissions` ca
 
 ### Login and models
 
-- `/login` opens a centered, searchable menu of providers and login methods.
+`/login`, `/model`, `/mcp`, and `/skills` open their tab in one pale-pink,
+full-screen configuration workspace. Ctrl+Left/Right switches tabs without losing
+searches, selections, or MCP drafts. The conversation is hidden until you leave.
+
+- `/login` lists providers and their supported login methods.
   OpenAI API and ChatGPT subscription access are separate entries. Anthropic,
   OpenRouter, and other providers show only their supported API-key or OAuth routes.
 - Successful login saves credentials in `~/.nausicaa/credentials.json` for future
@@ -169,8 +184,10 @@ Commands and file writes use your user permissions by default; `/permissions` ca
   providers, with provider filters and an All catalog view. When no model is
   selected, successful login opens that provider's models.
 - `/thinking [level|default]` (alias `/effort`) selects a level supported by the
-  current model. It persists with this session and applies to the next Main
-  request, without changing Teto or Worker.
+  current model, with descriptions for each level and a `model • medium` label
+  after selection. It persists with this session and applies to the next Main
+  request, without changing Teto or Worker. `default` retains the provider default;
+  it does not assume every model defaults to medium.
 - `/logout [provider]` removes a saved credential without changing environment keys.
 
 You can also select a login route from the shell. These are alternatives:
@@ -193,10 +210,14 @@ Use `nausicaa auth status <provider>` for local authentication status and
 | `/help`, `/hotkeys` | Commands and active keybindings |
 | `/list-agents` | Active sessions and Lane topology |
 | `/new`, `/resume`, `/session` | Create, resume, and switch sessions |
+| `/clear`, `/clone` | New-session alias, clone the current checkpoint |
 | `/name`, `/export`, `/import` | Name sessions, export HTML/JSONL, import JSONL |
 | `/skills`, `/mcp`, `/reload` | Choose a Skill, manage MCP, refresh resources |
 | `/context`, `/compact` | Context usage and compaction |
 | `/permissions`, `/plan`, `/stop` | Permissions, Plan mode, stop the current task |
+| `/settings`, `/system-prompt`, `/logs` | Session settings, effective system prompt, log locations |
+| `/btw <question>` (`/side`) | Tool-free side question on the attached session; separate transcript, shared budget |
+| `/changelog`, `/update` | Release notes, update the installation (then restart) |
 
 CLI: `--print` returns one answer, `--json` emits events, `--continue` resumes the
 latest session, `--resume <run-id>` resumes a specific session, and `--topology`

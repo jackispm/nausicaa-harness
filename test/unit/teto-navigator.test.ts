@@ -203,4 +203,38 @@ describe("IntentNavigator", () => {
     );
     await expect(observation).rejects.toMatchObject({ usage: truncated.usage });
   });
+
+  it.each(["silent", "advise"])("rejects provider-aborted %s output while preserving reported usage", async (action) => {
+    const aborted = response(JSON.stringify(action === "silent" ? { action } : {
+      action,
+      kind: "method-alternative",
+      claim: "The lockfile names the package manager.",
+      risk: "low",
+      suggestedAction: "Check the lockfile.",
+    }));
+    aborted.stopReason = "aborted";
+    const model = new ScriptedModel(aborted);
+    const controller = new AbortController();
+    let adviceIds = 0;
+    const observer = new IntentNavigator({
+      modelPort: model,
+      model: "scripted",
+      createAdviceId: () => `unexpected-advice-${++adviceIds}`,
+    });
+
+    const observation = observer.observe({
+      runId: "run-1",
+      sessionId: "teto-session",
+      frame,
+      signal: controller.signal,
+    });
+    await expect(observation).rejects.toBeInstanceOf(TetoOutputError);
+    await expect(observation).rejects.toMatchObject({
+      message: "Teto response was aborted by the provider",
+      usage: aborted.usage,
+    });
+    expect(model.requests).toHaveLength(1);
+    expect(controller.signal.aborted).toBe(false);
+    expect(adviceIds).toBe(0);
+  });
 });

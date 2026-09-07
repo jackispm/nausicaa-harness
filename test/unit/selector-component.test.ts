@@ -11,6 +11,25 @@ describe("SelectorOverlay", () => {
     { value: "scripted", label: "Scripted", description: "Offline test model" },
   ] as const;
 
+  it("refreshes options without resetting the query, active facet, or selection", () => {
+    const overlay = new SelectorOverlay({
+      title: "Models", options,
+      filters: [{ key: "scope", label: "Scope", options: [
+        { value: "all", label: "All" }, { value: "remote", label: "Remote" },
+      ] }],
+      filterOptions: (items, values) => values.scope === "remote" ? items.filter((item) => item.value.includes(":")) : items,
+      onSelect: () => {}, onCancel: () => {},
+    });
+    overlay.handleInput("\x1b[C");
+    overlay.handleInput("openrouter");
+    overlay.handleInput("\x1b[B");
+    const selected = overlay.getSelectedValue();
+    overlay.setOptions(options.map((option) => ({ ...option, description: "Configured locally" })));
+    expect(overlay.getSearchInput().getValue()).toBe("openrouter");
+    expect(overlay.getSelectedValue()).toBe(selected);
+    expect(stripTerminalSequences(overlay.render(80).join("\n"))).toContain("Remote");
+  });
+
   it("updates the result count after facet and search changes", () => {
     const overlay = new SelectorOverlay({
       title: "Models",

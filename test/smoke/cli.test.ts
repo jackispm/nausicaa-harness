@@ -26,7 +26,7 @@ describe("built CLI", () => {
 
   it("reports a stable version", async () => {
     const { stdout } = await execFileAsync(builtCli, ["--version"]);
-    expect(stdout.trim()).toBe("0.1.1");
+    expect(stdout.trim()).toBe("0.1.2");
   });
 
   it.each([

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { createScopedSpawnContext, validateSpawnContext } from "../../src/runtime/lane-context.js";
+import {
+  createScopedSpawnContext,
+  createTetoCapabilityManifest,
+  renderLaneCapabilityManifest,
+  validateSpawnContext,
+} from "../../src/runtime/lane-context.js";
 
 function context() {
   return createScopedSpawnContext({
@@ -26,5 +31,52 @@ describe("scoped lane context validation", () => {
     const { name: _name, ...missingName } = scoped.tools[0]!;
     expect(() => validateSpawnContext({ ...scoped, tools: [missingName] })).toThrow("name is required");
     expect(() => validateSpawnContext({ ...scoped, privateHistory: [] })).toThrow("privateHistory is not allowed");
+  });
+});
+
+describe("Teto capability guidance", () => {
+  it.each([false, true])("encourages early observation without changing recommended=%s metadata", (recommended) => {
+    const manifest = createTetoCapabilityManifest({
+      workspaceId: "workspace",
+      sessionId: "session",
+      runId: "run",
+      state: "dormant",
+      recommended,
+    });
+    const lifecycle = manifest.capabilities.find((capability) => capability.kind === "lifecycle");
+    expect(lifecycle?.name).toBe(recommended ? "recommended-for-this-run" : "optional-for-this-run");
+    expect(lifecycle?.description).toContain("complex analysis, debugging, planning, or review");
+    expect(lifecycle?.description).toContain("open Teto early through the available control tool");
+    expect(lifecycle?.description).toContain("Reuse an active lane and keep working while it observes");
+    expect(lifecycle?.description).toContain("For simple tasks, weigh the value against the overhead");
+    expect(renderLaneCapabilityManifest([manifest])).toContain(lifecycle!.description);
+    expect(manifest.role).toBe("Main-owned observer lane");
+    expect(manifest.state).toBe("dormant");
+    expect(manifest.targets).toEqual([{
+      laneId: "main",
+      relation: "owns",
+      actions: ["message.inform", "question.ask", "question.answer"],
+    }]);
+    expect(manifest.capabilities.map((capability) => capability.kind)).toEqual(["observation", "a2a", "lifecycle"]);
+  });
+
+  it("preserves the identity and lifecycle of an existing Team-owned observer", () => {
+    const manifest = createTetoCapabilityManifest({
+      workspaceId: "workspace",
+      sessionId: "session",
+      runId: "run",
+      mainLaneId: "team:review:a",
+      tetoLaneId: "team:review:a:teto",
+      state: "running",
+    });
+    expect(manifest.lane).toMatchObject({
+      laneId: "team:review:a:teto",
+      parentLaneId: "team:review:a",
+      ownerLaneId: "team:review:a",
+      relation: "observes",
+    });
+    expect(manifest.state).toBe("running");
+    expect(manifest.targets?.[0]?.laneId).toBe("team:review:a");
+    expect(manifest.capabilities.find((capability) => capability.kind === "lifecycle")?.name).toBe("optional-for-this-run");
   });
 });

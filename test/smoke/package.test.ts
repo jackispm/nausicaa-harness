@@ -30,6 +30,7 @@ interface LockPackage {
 
 const REQUIRED_PACK_FILES = [
   "README.md",
+  "CHANGELOG.md",
   "LICENSE",
   "THIRD_PARTY_NOTICES",
   "dist/cli.js",
@@ -44,6 +45,7 @@ const REQUIRED_PACK_FILES = [
 
 const ALLOWED_PACK_PATHS = new Set<string>([
   "README.md",
+  "CHANGELOG.md",
   "LICENSE",
   "THIRD_PARTY_NOTICES",
   "package.json",
@@ -158,7 +160,7 @@ describe("npm package surface", () => {
     expect(packageJson.bin?.nausicaa).toBe("dist/cli.js");
     expect(packageJson.exports?.["."]).toBeDefined();
     expect(packageJson.files).toEqual(
-      expect.arrayContaining(["dist", "README.md", "THIRD_PARTY_NOTICES"]),
+      expect.arrayContaining(["dist", "README.md", "CHANGELOG.md", "THIRD_PARTY_NOTICES"]),
     );
     for (const scriptName of ["test:live", "eval:worker:live", "eval:live"]) {
       expect(packageJson.scripts?.[scriptName]).toBeDefined();

@@ -12,7 +12,7 @@ import type {
   InputDelivery,
   TurnExecutionBoundary,
 } from "../domain/events.js";
-import type { AgentTool, Clock, ModelPort, ThinkingLevel } from "../domain/ports.js";
+import type { AgentTool, Clock, ModelPort, ModelRequest, ModelResponse, ThinkingLevel } from "../domain/ports.js";
 import { systemClock } from "../domain/ports.js";
 import {
   type UserImage,
@@ -36,10 +36,12 @@ import type {
 } from "../domain/types.js";
 import {
   DEFAULT_MAIN_OUTPUT_TOKENS,
+  DEFAULT_MAIN_REQUEST_TIMEOUT_MS,
   MAX_MAIN_OUTPUT_TOKENS,
   mainStepAllowance,
 } from "../domain/types.js";
 import {
+  composeFukaiSystemPrompt,
   ContentStoreFukaiSource,
   FukaiContextProvider,
 } from "../fukai/index.js";
@@ -52,9 +54,13 @@ import {
 } from "../ledger/index.js";
 import {
   createBuiltinModelPort,
+  DEFAULT_MODEL_RETRY_OPTIONS,
   normalizeModelSelector,
+  prepareModelPort,
   ProviderModelError,
+  RetryingModelPort,
   UNCONFIGURED_MODEL_SELECTOR,
+  withDefaultModelRetries,
   type ModelCatalogEntry,
 } from "../model/index.js";
 import {
@@ -75,12 +81,15 @@ import {
   type ShellExecutionResult,
 } from "../tools/shell-process.js";
 import {
+  effectiveSystemPrompt,
   MainLoop,
   MainRunTokenBudgetExhaustedError,
+  UNKNOWN_MODEL_REQUEST_INPUT_FALLBACK_TOKENS,
   type MainBoundaryMessage,
   type MainLoopDeps,
   type MainStreamEvent,
 } from "./main-loop.js";
+import { loadProjectInstructions } from "./project-instructions.js";
 import {
   commitRunCheckpoint,
   projectMainExecutionRecovery,
@@ -186,6 +195,7 @@ const INTERNAL_INTERACTIVE_TASK = "Handle the current user request";
 const GOAL_CONTINUATION_INPUT = "Continue working toward the active thread Goal.";
 const GOAL_OBJECTIVE_UPDATED_INPUT = "The active thread Goal objective was edited by the user.";
 const GOAL_BUDGET_LIMIT_INPUT = "The active thread Goal has reached its token budget.";
+const SIDE_QUESTION_INSTRUCTION = "Answer this side question using only the conversation context above. Do not use tools. The user may send follow-up side questions; none of this side conversation is added to the main session.";
 const MAX_THREAD_GOAL_OBJECTIVE_CHARS = 4_000;
 const MAX_PENDING_INPUTS = 8;
 const CLOSE_GRACE_MS = 2_000;
@@ -404,6 +414,17 @@ export interface SessionCompactionResult {
     | "verification-failed";
 }
 
+export interface SessionSideQuestionTurn {
+  question: string;
+  answer: string;
+}
+
+export interface SessionSideQuestionOptions {
+  previousTurns?: readonly SessionSideQuestionTurn[];
+  signal?: AbortSignal;
+  onUpdate?: (answer: string) => void;
+}
+
 export interface SessionPendingInputReplacement {
   text: string;
   delivery: "steering" | "follow-up";
@@ -568,6 +589,7 @@ export class SessionController {
   /** Serializes pending-input transitions with delivery/promotion boundaries. */
   private pendingInputTransitionTail: Promise<void> = Promise.resolve();
   private execution: Promise<void> | undefined;
+  private sideQuestion: { controller: AbortController; execution: Promise<string> } | undefined;
   private goalContinuationTimer: ReturnType<typeof setTimeout> | undefined;
   private goalContinuationPending: {
     promise: Promise<void>;
@@ -1147,6 +1169,197 @@ export class SessionController {
     await attached.ledger.flush();
     const events = await attached.ledger.read({ runId: attached.runId });
     return projectSessionTranscript(attached.store, events, attached.runId);
+  }
+
+  /** Return the complete system text the next Main model request will receive. */
+  async systemPrompt(): Promise<string> {
+    this.assertOpen();
+    const instructions = await loadProjectInstructions(this.workspace);
+    return composeFukaiSystemPrompt(
+      effectiveSystemPrompt({ collaborationMode: this.collaborationMode }),
+      this.workspace,
+      instructions.files,
+    );
+  }
+
+  /**
+   * Ask an isolated, tool-free question over the current Main conversation.
+   * Only token charges are persisted; side questions and answers stay ephemeral.
+   */
+  async askSideQuestion(
+    question: string,
+    options: SessionSideQuestionOptions = {},
+  ): Promise<string> {
+    const operation = await this.runAdmission(async () => {
+      this.assertOpen();
+      const normalizedQuestion = question.trim();
+      if (normalizedQuestion.length === 0) {
+        throw new SessionProtocolError("A side question must not be empty");
+      }
+      options.signal?.throwIfAborted();
+      if (this.attached === undefined) {
+        throw new SessionProtocolError("Start or resume a Run before asking a side question");
+      }
+      if (this.sideQuestion !== undefined) {
+        throw new SessionProtocolError("A side question is already running");
+      }
+      const attached = this.attached;
+      const controller = new AbortController();
+      const signal = options.signal === undefined
+        ? controller.signal
+        : AbortSignal.any([controller.signal, options.signal]);
+      const deadlineMs = attached.policy.mainRequestTimeoutMs ?? DEFAULT_MAIN_REQUEST_TIMEOUT_MS;
+      const deadlineAt = new Date(this.clock.now().getTime() + deadlineMs).toISOString();
+      const timer = setTimeout(() => controller.abort(new ProviderModelError({
+        category: "timeout", retryable: true,
+      })), deadlineMs);
+      const execution = this.runSideQuestion(attached, normalizedQuestion, {
+        ...options, signal,
+      }, deadlineMs, deadlineAt).finally(() => {
+        clearTimeout(timer);
+        if (this.sideQuestion?.controller === controller) this.sideQuestion = undefined;
+      });
+      this.sideQuestion = { controller, execution };
+      // Navigation owns admission but must remain able to cancel the model call.
+      return { execution };
+    });
+    return operation.execution;
+  }
+
+  private async runSideQuestion(
+    attached: AttachedRun,
+    question: string,
+    options: SessionSideQuestionOptions & { signal: AbortSignal },
+    deadlineMs: number,
+    deadlineAt: string,
+  ): Promise<string> {
+    const selector = this.model;
+    const contextWindow = this.selectedModelContextWindowTokens();
+    const messages: ConversationMessage[] = [];
+    await attached.ledger.flush();
+    options.signal.throwIfAborted();
+    const events = await attached.ledger.read({ runId: attached.runId });
+    const recovered = projectMainExecutionRecovery(events);
+    for (const { ref } of recovered.conversationRefs) {
+      options.signal.throwIfAborted();
+      messages.push(await readConversationArtifact(attached.store, ref));
+    }
+    const now = this.clock.now().toISOString();
+    const previousTurns = options.previousTurns ?? [];
+    for (const [index, turn] of previousTurns.entries()) {
+      const previousQuestion = turn.question.trim();
+      const previousAnswer = turn.answer.trim();
+      if (previousQuestion.length === 0 || previousAnswer.length === 0) {
+        throw new SessionProtocolError("Completed side-question turns require a question and answer");
+      }
+      messages.push(
+        {
+          role: "user",
+          content: sideQuestionPrompt(previousQuestion, index === 0),
+          createdAt: now,
+        },
+        {
+          role: "assistant",
+          content: previousAnswer,
+          toolCalls: [],
+          createdAt: now,
+        },
+      );
+    }
+    messages.push({
+      role: "user",
+      content: sideQuestionPrompt(question, previousTurns.length === 0),
+      createdAt: now,
+    });
+
+    const request: ModelRequest = {
+      runId: attached.runId,
+      laneId: "main" as const,
+      sessionId: this.sessionId,
+      model: selector,
+      thinkingLevel: "off" as const,
+      systemPrompt: await this.systemPrompt(),
+      messages,
+      tools: [],
+      maxOutputTokens: this.maxOutputTokens,
+      signal: options.signal,
+      deadlineMs,
+      deadlineAt,
+    };
+    options.signal.throwIfAborted();
+    const estimatedInputTokens = sideQuestionInputTokens(request);
+    const inputCapacity = contextWindow === undefined
+      ? UNKNOWN_MODEL_REQUEST_INPUT_FALLBACK_TOKENS
+      : contextWindow - request.maxOutputTokens;
+    if (estimatedInputTokens > inputCapacity) {
+      throw new SessionProtocolError("Side-question context exceeds the model window; use a shorter conversation");
+    }
+    const correlationId = `side-question:${randomUUID()}`;
+    let charges = Promise.resolve();
+    const metered = meterSideQuestionModel(this.deps.mainModel ?? createBuiltinModelPort(), {
+      budget: attached.tokenBudget,
+      correlationId,
+      charge: (idempotencyKey, usage) => {
+        charges = charges.then(async () => {
+          await attached.sink.append({
+            runId: attached.runId,
+            laneId: "main",
+            type: "budget.charged",
+            payload: { laneId: "main", usage },
+            correlationId,
+            idempotencyKey,
+            visibility: "lane",
+            occurredAt: this.clock.now().toISOString(),
+          });
+          if (this.attached === attached) this.publishState();
+        });
+        return charges;
+      },
+    });
+    const prepared = prepareModelPort(withDefaultModelRetries(metered)).prepare(request);
+    let response: ModelResponse | undefined;
+    try {
+      if (prepared.stream !== undefined) {
+        let answer = "";
+        for await (const event of prepared.stream()) {
+          options.signal.throwIfAborted();
+          if (event.type === "text-delta") {
+            answer += event.delta;
+            options.onUpdate?.(answer);
+          } else if (event.type === "done") {
+            response = event.response;
+            break;
+          } else if (event.type === "error") {
+            throw event.error;
+          }
+        }
+        if (response === undefined) {
+          throw new SessionProtocolError("The side-question model stream ended without a response");
+        }
+      } else {
+        response = await prepared.complete();
+      }
+      options.signal.throwIfAborted();
+      if (response.stopReason === "aborted") {
+        throw new SessionProtocolError("The side-question response was aborted by the provider");
+      }
+      if (response.stopReason === "toolUse" || response.toolCalls.length > 0) {
+        throw new SessionProtocolError("Side questions do not support tool calls");
+      }
+      options.onUpdate?.(response.content);
+      return response.content;
+    } finally {
+      // An abort may win the provider race while known usage is being written.
+      // Keep this Run attached until those charges have reached its Ledger.
+      await charges;
+    }
+  }
+
+  private async cancelSideQuestion(): Promise<void> {
+    const active = this.sideQuestion;
+    if (active === undefined) return;
+    active.controller.abort(new Error("Side question cancelled by session navigation or shutdown"));
+    await active.execution.catch(() => undefined);
   }
 
   /**
@@ -1922,6 +2135,7 @@ export class SessionController {
       if (this.active !== undefined || this.execution !== undefined) {
         throw new SessionProtocolError("Wait for or cancel the active Turn before forking a Run");
       }
+      await this.cancelSideQuestion();
       const parent = this.requireAttached();
       const parentEvents = await parent.ledger.read({ runId: parent.runId });
       parent.sink.replaceCache(parentEvents);
@@ -2095,6 +2309,7 @@ export class SessionController {
       this.goalContinuationPending = undefined;
     }
     const closePromise = this.runAdmission(async () => {
+      await this.cancelSideQuestion();
       const execution = this.execution;
       if (this.active !== undefined) {
         this.status = "cancelling";
@@ -2140,6 +2355,7 @@ export class SessionController {
   }
 
   private async attachRunInternal(runId: string): Promise<void> {
+    await this.cancelSideQuestion();
     if (this.attached?.runId === runId) return;
     const candidate = await this.openAttachment(runId);
     try {
@@ -3744,6 +3960,7 @@ export class SessionController {
   }
 
   private async detach(): Promise<void> {
+    await this.cancelSideQuestion();
     const attached = this.attached;
     this.stopExternalObservation();
     this.attached = undefined;
@@ -3758,6 +3975,7 @@ export class SessionController {
   }
 
   private async retireAttachment(): Promise<void> {
+    await this.cancelSideQuestion();
     const attached = this.attached;
     this.stopExternalObservation();
     this.attached = undefined;
@@ -4520,6 +4738,90 @@ function emptyWorkerTaskSummary(): WorkerTaskSummary {
     done: 0,
     failed: 0,
     stale: 0,
+  };
+}
+
+function sideQuestionPrompt(question: string, isFirstTurn: boolean): string {
+  const body = isFirstTurn ? `${SIDE_QUESTION_INSTRUCTION}\n\n${question}` : question;
+  return `<side_question>\n${body}\n</side_question>`;
+}
+
+function sideQuestionInputTokens(request: ModelRequest): number {
+  // Match Fukai's UTF-8 estimate and include per-message framing overhead.
+  return Math.ceil(Buffer.byteLength(JSON.stringify({
+    systemPrompt: request.systemPrompt,
+    messages: request.messages,
+    tools: request.tools,
+  }), "utf8") / 4) + request.messages.length * 4;
+}
+
+function meterSideQuestionModel(
+  delegate: ModelPort,
+  options: {
+    budget: RunTokenBudget;
+    correlationId: string;
+    charge: (idempotencyKey: string, usage: TokenUsage) => Promise<void>;
+  },
+): ModelPort {
+  // This inner boundary makes each attempt cancellable, including custom ports
+  // that ignore signals. The outer retry boundary meters every attempt here.
+  const bounded = prepareModelPort(new RetryingModelPort(delegate, {
+    ...DEFAULT_MODEL_RETRY_OPTIONS, maxAttempts: 1,
+  }), { captureCapabilities: false });
+  let attempt = 0;
+  const reserve = (request: ModelRequest) => {
+    request.signal?.throwIfAborted();
+    const estimatedInput = sideQuestionInputTokens(request);
+    const maxOutputTokens = Math.min(request.maxOutputTokens, options.budget.availableTokens() - estimatedInput);
+    const id = `${options.correlationId}:attempt:${++attempt}:budget`;
+    if (maxOutputTokens < 1 || options.budget.reserve(id, estimatedInput + maxOutputTokens) === undefined) {
+      throw new MainRunTokenBudgetExhaustedError("Run model token budget exhausted before side question");
+    }
+    return { id, request: { ...request, maxOutputTokens } };
+  };
+  const charge = async (id: string, usage: TokenUsage): Promise<void> => {
+    try {
+      await options.charge(id, usage);
+    } finally {
+      options.budget.settle(id, usage);
+    }
+  };
+  const chargeFailure = async (id: string, error: unknown): Promise<void> => {
+    if (error instanceof ProviderModelError && error.providerUsage !== undefined) {
+      await charge(id, error.providerUsage);
+    }
+  };
+  return {
+    async complete(request) {
+      const reservation = reserve(request);
+      try {
+        const response = await bounded.complete(reservation.request);
+        await charge(reservation.id, response.usage);
+        return response;
+      } catch (error: unknown) {
+        await chargeFailure(reservation.id, error);
+        throw error;
+      } finally {
+        options.budget.cancel(reservation.id);
+      }
+    },
+    ...(bounded.stream === undefined ? {} : {
+      async *stream(request: ModelRequest) {
+        const reservation = reserve(request);
+        try {
+          for await (const event of bounded.stream!(reservation.request)) {
+            if (event.type === "error") throw event.error;
+            if (event.type === "done") await charge(reservation.id, event.response.usage);
+            yield event;
+          }
+        } catch (error: unknown) {
+          await chargeFailure(reservation.id, error);
+          throw error;
+        } finally {
+          options.budget.cancel(reservation.id);
+        }
+      },
+    }),
   };
 }
 

@@ -12,6 +12,7 @@ import {
   fuzzyFilter,
   getKeybindings,
   Input,
+  isFocusable,
   stripTerminalSequences,
   truncateToWidth,
   visibleWidth,
@@ -67,7 +68,7 @@ function surfaceLine(text: string, width: number, selected = false): string {
   const innerWidth = innerWidthFor(width);
   const clipped = truncateToWidth(text, innerWidth, "");
   const remaining = " ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)));
-  const background = selected ? palette.userBackground : palette.toolPendingBackground;
+  const background = selected ? palette.menuSelectedBackground : palette.menuBackground;
   // Foreground resets from Input and truncation must not leave holes in the surface.
   return `${padding}${clipped}${remaining}${padding}`
     .split("\x1b[0m").map((segment) => background(segment)).join("\x1b[0m");
@@ -85,6 +86,71 @@ export function renderAuthPanel(
     ...content.map((line, index) => surfaceLine(line, columns, selectedRows?.has(index))),
     surfaceLine("", columns),
   ];
+}
+
+export interface FullScreenMenuPageOptions {
+  getRows: () => number;
+  maxContentWidth?: number;
+  horizontalMargin?: number;
+}
+
+/**
+ * Adapted from Prime Agent's centered-overlay.ts, v0.9.2 @
+ * 9c54a35dac3a2ad17910074d66664859ea175666 (MIT; see THIRD_PARTY_NOTICES).
+ * Mount at row/col 0 with 100% width/height so no underlying chat remains visible.
+ */
+export class FullScreenMenuPage implements Component, Focusable {
+  private _focused = false;
+
+  constructor(
+    private readonly component: Component,
+    private readonly options: FullScreenMenuPageOptions,
+  ) {}
+
+  get focused(): boolean {
+    return this._focused;
+  }
+
+  set focused(value: boolean) {
+    this._focused = value;
+    if (isFocusable(this.component)) this.component.focused = value;
+  }
+
+  handleInput(data: string): void {
+    this.component.handleInput?.(data);
+  }
+
+  invalidate(): void {
+    this.component.invalidate();
+  }
+
+  render(width: number): string[] {
+    const columns = safeWidth(width);
+    const rows = safeWidth(this.options.getRows());
+    const requestedMargin = this.options.horizontalMargin ?? 1;
+    const margin = Number.isFinite(requestedMargin)
+      ? Math.max(0, Math.min(Math.floor(requestedMargin), Math.floor((columns - 1) / 2))) : 0;
+    const contentWidth = Math.min(columns - margin * 2, safeWidth(this.options.maxContentWidth ?? 78));
+    const content = this.component.render(contentWidth);
+    // Components normally adapt to getRows. Keep an oversized prompt's cursor visible.
+    const cursorRow = content.findIndex((line) => line.includes(CURSOR_MARKER));
+    const firstRow = Math.max(0, Math.min(content.length - rows, cursorRow - rows + 1));
+    const visible = content.slice(firstRow, firstRow + rows);
+    const left = Math.floor((columns - contentWidth) / 2);
+    const top = Math.floor((rows - visible.length) / 2);
+    const blank = palette.menuPageBackground(" ".repeat(columns));
+    const frame = Array.from({ length: rows }, () => blank);
+    for (const [index, line] of visible.entries()) {
+      const clipped = truncateToWidth(line, contentWidth, "");
+      const right = Math.max(0, columns - left - visibleWidth(clipped));
+      const placed = " ".repeat(left) + clipped + " ".repeat(right);
+      // Child surfaces may reset their background; repaint the uncovered page spans.
+      frame[top + index] = placed.split(/(\x1b\[(?:0|49)m)/)
+        .map((segment) => /^\x1b\[(?:0|49)m$/.test(segment)
+          ? segment : palette.menuPageBackground(segment)).join("");
+    }
+    return frame;
+  }
 }
 
 /** A provider/credential picker; values identify authentication methods, not labels. */
@@ -163,9 +229,9 @@ export class AuthMenu implements Component, Focusable {
     const compactHeader = budget < 10;
     const header = [palette.strong(palette.text(plainText(this.options.title)))];
     if (!compactHeader && this.options.subtitle) {
-      header.push(palette.muted(plainText(this.options.subtitle)));
+      header.push(palette.menuMuted(plainText(this.options.subtitle)));
     }
-    header.push(...(this.options.headerLines ?? []).map((line) => palette.muted(plainText(line))));
+    header.push(...(this.options.headerLines ?? []).map((line) => palette.menuMuted(plainText(line))));
     if (this.options.searchable !== false) {
       if (!compactHeader) header.push("");
       header.push(this.renderSearch(innerWidthFor(columns)));
@@ -195,7 +261,7 @@ export class AuthMenu implements Component, Focusable {
     const lines = [surfaceLine("", columns), ...header.map((line) => surfaceLine(line, columns))];
 
     if (visible.length === 0) {
-      lines.push(surfaceLine(palette.muted(plainText(this.options.emptyMessage ?? (this.choices.length === 0
+      lines.push(surfaceLine(palette.menuMuted(plainText(this.options.emptyMessage ?? (this.choices.length === 0
         ? "No providers available" : "No matching providers"))), columns));
     } else {
       for (const [offset, choice] of visible.entries()) {
@@ -209,7 +275,7 @@ export class AuthMenu implements Component, Focusable {
         lines.push(surfaceLine("", columns, start + visible.length - 1 === this.selectedIndex));
       }
       if (this.filtered.length > visible.length) {
-        lines.push(surfaceLine(palette.muted(`(${this.selectedIndex + 1}/${this.filtered.length})`), columns));
+        lines.push(surfaceLine(palette.menuMuted(`(${this.selectedIndex + 1}/${this.filtered.length})`), columns));
       }
     }
     lines.push(surfaceLine("", columns));
@@ -218,7 +284,7 @@ export class AuthMenu implements Component, Focusable {
 
   private renderSearch(width: number): string {
     if (this.query === "") {
-      return `${this.focused ? CURSOR_MARKER : ""}${palette.dim(plainText(this.options.searchPlaceholder ?? "Search providers"))}`;
+      return `${this.focused ? CURSOR_MARKER : ""}${palette.menuDim(plainText(this.options.searchPlaceholder ?? "Search providers"))}`;
     }
     const line = this.input.render(width + 2)[0] ?? "";
     return line.startsWith("> ") ? line.slice(2) : line;
@@ -237,8 +303,8 @@ export class AuthMenu implements Component, Focusable {
     const padding = shownStatus ? " ".repeat(Math.max(gap, innerWidth - visibleWidth(shownName) - visibleWidth(shownStatus))) : "";
     const primary = selected ? palette.strong(palette.text(shownName)) : palette.text(shownName);
     return [
-      surfaceLine(primary + padding + palette.muted(shownStatus), width, selected),
-      surfaceLine(palette.muted(plainText(choice.detail ?? "")), width, selected),
+      surfaceLine(primary + padding + palette.menuMuted(shownStatus), width, selected),
+      surfaceLine(palette.menuMuted(plainText(choice.detail ?? "")), width, selected),
     ];
   }
 

@@ -2,6 +2,28 @@
 
 All notable changes to Nausicaa are documented here.
 
+## [0.1.2] - 2026-09-08
+
+- Added `/settings`, `/system-prompt`, `/logs`, `/changelog`, and `/update`
+  as local interactive commands.
+- Added isolated `/btw` (`/side`) questions with follow-ups and cancellation;
+  their text stays outside the main transcript, but usage counts against the
+  attached Run budget and remains accounted across recovery. Closing or changing
+  sessions cancels outstanding side requests.
+- Added `/clone`, plus `/clear` as the compatibility alias for starting a new
+  session while preserving the previous Run.
+- Unified Providers, Models, MCP, and Skills in one full-screen configuration
+  workspace with retained tab state, centered pale-pink menus, and a pink logo.
+- Improved light/dark menu contrast, narrow-terminal layout, thinking-level
+  descriptions, and `model • medium` labels without assuming a universal default.
+- Made updates cancellable with bounded process lifetime and output; sanitized
+  terminal control sequences in displayed diagnostics.
+- Encouraged Main to start Teto early for complex work, reuse an active observer,
+  and continue working while independently evaluating its feedback.
+- Rejected provider-aborted Teto and reflection responses while preserving
+  their reported usage. Documented the production loop baseline without a
+  wholesale migration to the standalone L0 kernel.
+
 ## [0.1.1] - 2026-09-08
 
 - Added a centered, searchable Prime-style `/login` menu with provider and
