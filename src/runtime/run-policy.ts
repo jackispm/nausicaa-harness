@@ -16,7 +16,7 @@ export const DEFAULT_RUN_POLICY: RunPolicy = {
   maxMainStepsPerActivation: 24,
   mainRequestTimeoutMs: DEFAULT_MAIN_REQUEST_TIMEOUT_MS,
   tetoEnabled: true,
-  tetoMaxOutputTokens: 64,
+  tetoMaxOutputTokens: 1_024,
   // New lanes expose Teto as a capability; the owning model opens it when
   // the task warrants a second line of thought.
   tetoActivation: "manual",

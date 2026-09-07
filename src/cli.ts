@@ -541,7 +541,6 @@ const main = async (): Promise<number> => {
               ? {}
               : { maxModelTokens: resolvedSettings.maxModelTokens }),
             tetoEnabled: resolvedSettings.tetoEnabled,
-            tetoMaxOutputTokens: 64,
           },
           allowWrite: resolvedSettings.allowWrite,
           allowShell: resolvedSettings.allowShell,
@@ -702,7 +701,6 @@ const main = async (): Promise<number> => {
             ? {}
             : { maxModelTokens: resolvedSettings.maxModelTokens }),
           tetoEnabled: resolvedSettings.tetoEnabled,
-          tetoMaxOutputTokens: 64,
         },
         allowWrite: resolvedSettings.allowWrite,
         allowShell: resolvedSettings.allowShell,
@@ -877,7 +875,6 @@ const runDaemonMode = async (options: DaemonModeOptions): Promise<number> => {
           ? {}
           : { maxModelTokens: options.settings.maxModelTokens }),
         tetoEnabled: options.settings.tetoEnabled,
-        tetoMaxOutputTokens: 64,
       },
       ...(options.fukaiCompaction === undefined
         ? {}

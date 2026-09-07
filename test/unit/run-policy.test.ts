@@ -16,6 +16,11 @@ describe("run policy", () => {
       .toMatchObject({ workerEnabled: false, tetoEnabled: false });
   });
 
+  it("gives tool-using Teto room for complete messages and preserves explicit output caps", () => {
+    expect(resolveRunPolicy().tetoMaxOutputTokens).toBe(1_024);
+    expect(resolveRunPolicy({ tetoMaxOutputTokens: 64 }).tetoMaxOutputTokens).toBe(64);
+  });
+
   it("leaves compaction composition to CLI settings or the embedding API caller", () => {
     expect(resolveRunPolicy().fukaiCompaction).toBeUndefined();
   });
