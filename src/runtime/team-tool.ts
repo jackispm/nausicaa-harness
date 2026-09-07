@@ -66,6 +66,7 @@ export interface TeamReduceRequest {
   statement?: string;
   maxModelTokens?: number;
   maxWallClockMs?: number;
+  maxAttempts?: number;
 }
 
 export interface TeamPresentRequest {
@@ -92,7 +93,7 @@ export function createTeamStatusTool(control: TeamControl): AgentTool {
   const tool: AgentTool = {
     definition: {
       name: "team_status",
-      description: "Read durable Team members, outcomes, join, reduction, and Main acceptance in this Run. Join follows the declared policy automatically; it collects terminal outcomes, including partial or failed work, without proving success or completing Main's synthesis.",
+      description: "Read a compact snapshot of durable Team members, outcomes, join, reduction, and Main acceptance in this Run. Join follows the declared policy automatically; it collects terminal outcomes, including partial or failed work, without proving success or completing Main's synthesis. This is a snapshot, not a wait operation.",
       parameters: {
         type: "object",
         properties: {},
@@ -103,7 +104,7 @@ export function createTeamStatusTool(control: TeamControl): AgentTool {
       try {
         exactKeys(object(arguments_, "arguments"), [], "arguments");
         return {
-          content: JSON.stringify(await control.status!(context)),
+          content: JSON.stringify(modelTeamStatus(await control.status!(context))),
           isError: false,
         };
       } catch (error: unknown) {
@@ -125,6 +126,66 @@ export function createTeamStatusTool(control: TeamControl): AgentTool {
     inputKinds: ["json"],
     outputKinds: ["json"],
   });
+}
+
+// Keep the host board intact; model status excludes admission context and compatibility duplicates.
+function modelTeamStatus(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(modelTeamBoard);
+  if (isStatusRecord(value) && Array.isArray(value.teams)) {
+    return { ...value, teams: value.teams.map(modelTeamBoard) };
+  }
+  return value;
+}
+
+function modelTeamBoard(value: unknown): unknown {
+  if (!isStatusRecord(value) || typeof value.teamId !== "string") return value;
+  const members = Array.isArray(value.members) ? value.members
+    : Array.isArray(value.branches) ? value.branches : undefined;
+  // Older hosts may expose an opaque status payload instead of Team boards.
+  if (members === undefined) return value;
+  const definition = isStatusRecord(value.definition) ? value.definition : undefined;
+  return {
+    ...statusFields(value, [
+      "runId", "teamId", "status", "joinPolicy", "joinReady", "joinSatisfied", "joinState",
+      "cancellationRequested", "reductionState", "reduction", "presentationState", "anomalies", "lastOffset",
+    ]),
+    leadLaneId: value.leadLaneId ?? value.coordinator,
+    ...(definition === undefined ? {} : statusFields(definition, ["deadline", "peerMessaging"])),
+    members: members.map(modelTeamMember),
+    ...(value.reducer === undefined ? {} : { reducer: modelTeamReducer(value.reducer) }),
+  };
+}
+
+function modelTeamMember(value: unknown): unknown {
+  if (!isStatusRecord(value)) return value;
+  const goal = isStatusRecord(value.goal) ? value.goal : undefined;
+  return {
+    ...statusFields(value, [
+      "laneId", "taskId", "registered", "status", "laneStatus", "execution", "terminal", "outcome",
+      "dependsOn", "required", "attempt", "result", "failure", "reason", "anomalies", "lastOffset",
+    ]),
+    memberId: value.memberId ?? value.branchId,
+    ...(goal === undefined ? {} : { statement: goal.statement }),
+  };
+}
+
+function modelTeamReducer(value: unknown): unknown {
+  if (!isStatusRecord(value)) return value;
+  const task = isStatusRecord(value.task) ? value.task : undefined;
+  const goal = task !== undefined && isStatusRecord(task.goal) ? task.goal : undefined;
+  return {
+    ...statusFields(value, ["memberId", "laneId", "dependsOn", "required"]),
+    ...(task === undefined ? {} : { taskId: task.taskId }),
+    ...(goal === undefined ? {} : { statement: goal.statement }),
+  };
+}
+
+function statusFields(value: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> {
+  return Object.fromEntries(keys.filter((key) => Object.hasOwn(value, key)).map((key) => [key, value[key]]));
+}
+
+function isStatusRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 const MAX_MEMBERS = 16;
@@ -246,16 +307,18 @@ export function createTeamReduceTool(control: TeamControl): AgentTool {
   return createTeamCommand(
     "team_reduce",
     "Explicitly schedule an optional, bounded read-only Reducer lane after the Team joins. Use it when synthesis benefits from another lane; Main is the default synthesizer and must accept or reject the reduction before presenting the final answer.",
-    { teamId: teamIdSchema, statement: boundedText, maxModelTokens: modelTokenSchema, maxWallClockMs: wallClockSchema },
+    { teamId: teamIdSchema, statement: boundedText, maxModelTokens: modelTokenSchema, maxWallClockMs: wallClockSchema,
+      maxAttempts: { type: "integer", minimum: 1, maximum: MAX_TASK_ATTEMPTS, description: "Maximum model calls, including tool steps; defaults to 2" } },
     ["teamId"],
     (arguments_, context) => {
-      exactKeys(arguments_, ["teamId", "statement", "maxModelTokens", "maxWallClockMs"], "arguments");
+      exactKeys(arguments_, ["teamId", "statement", "maxModelTokens", "maxWallClockMs", "maxAttempts"], "arguments");
       const statement = optionalString(arguments_.statement, "statement");
       return control.reduce!({
         teamId: normalizeTeamId(arguments_.teamId),
         ...(statement === undefined ? {} : { statement }),
         ...(arguments_.maxModelTokens === undefined ? {} : { maxModelTokens: positiveInteger(arguments_.maxModelTokens, "maxModelTokens", MAX_TASK_MODEL_TOKENS) }),
         ...(arguments_.maxWallClockMs === undefined ? {} : { maxWallClockMs: positiveInteger(arguments_.maxWallClockMs, "maxWallClockMs", MAX_TASK_WALL_CLOCK_MS) }),
+        ...(arguments_.maxAttempts === undefined ? {} : { maxAttempts: positiveInteger(arguments_.maxAttempts, "maxAttempts", MAX_TASK_ATTEMPTS) }),
       }, context);
     },
   );

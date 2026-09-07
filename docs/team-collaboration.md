@@ -56,7 +56,7 @@ still pass through identical strict normalization before host side effects.
 | Tool | Meaning |
 |---|---|
 | `team_create` | Admit members and their task definitions; return stable identities, not completed work |
-| `team_status` | Read the durable board, outcomes, join, reduction, and presentation state |
+| `team_status` | Read a compact snapshot of durable member outcomes, join, reduction, and presentation state; not a wait operation |
 | `team_cancel` | Cancel unfinished Team work, preserve settled results, and fence later work |
 | `team_reduce` | Explicitly queue a bounded read-only synthesis lane after join |
 | `team_present` | Record Main's `accepted` or `rejected` decision; Main still writes the answer |
@@ -180,6 +180,10 @@ task, join a Team, or complete reduction.
 - Reducer default model allowance: 12,000 tokens; the shared protocol ceiling
   is 1,000,000 model tokens and 30 minutes of wall-clock time. The effective
   allowance also respects the remaining Run budget and host policy.
+- Reducer `maxAttempts` is configurable from 1 to 8, defaulting to 2. The
+  allowance covers model requests, not just final reports. Recovery deducts
+  durable prior requests, including failed or unfinished calls, for members
+  and reducers; reopening a lane cannot reset its allowance.
 - Default one-shot ownership: bounded wait for active admitted Team work and
   declared settlement boundaries. Expiry or shutdown must persist an explicit
   outcome; a short silent drain-and-stop is not Team completion.
@@ -208,6 +212,19 @@ messages do not force empty steps, and a recovered uncommitted claim is allowed
 to become deliverable before another model step is spent. The hook does not
 silently raise that allowance or create another model loop. Exhaustion leaves
 Main incomplete rather than claiming the Team evidence was incorporated.
+
+Members also check their mailbox before accepting a no-tool final response.
+An authorized message that arrived during that response gets another ordinary
+step when it is already claimable. This uses the existing completion hook,
+does not wait for future mail, and never raises the model budget. Expired,
+deferred, next-turn, and still-leased messages do not force extra requests.
+Messages arriving after settlement do not reopen a task. A lane that stops
+without any report produces an explicit failure, not an invalid empty result.
+
+The `team_status` tool omits admission context, leases, and the duplicate
+legacy `branches` representation. It retains canonical members, their result
+and failure evidence, and join/reduction/Lead acceptance. The host's durable
+TeamBoard and legacy input aliases are unchanged.
 
 Interactive members can still outlive a budget-stopped or interrupted Main
 activation. Notifications remain durable until the next normal or explicitly

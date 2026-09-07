@@ -78,4 +78,48 @@ passed in the root gate, with 54 additional related tests passed independently.
 `npm run typecheck` and `git diff --check` passed. The optional dispatch signal
 preserves existing callers and does not cancel already-admitted work.
 
-Round 5 is pending.
+## Round 5: Team Completion, Recovery, And Evidence
+
+Restored members now deduct every durable model request from their attempt
+allowance, including failed and unfinished calls. Available final responses
+are still reused without another paid call, unless ready collaboration mail
+requires a new boundary. Unknown tool effects remain fail-closed.
+
+The live probes exposed further issues and informed focused regressions:
+
+- `team_status` repeated admission/spawn context and legacy branch aliases.
+  A model-facing projection reduced the same real snapshot from 20,771 to
+  1,914 bytes (90.8%) without changing the durable board or dropping outcome
+  evidence, errors, join, reduction, and Lead acceptance.
+- A peer message arriving during a final response was missed before member
+  settlement. The existing completion hook now checks already-claimable mail,
+  in both active and recovery paths, without waiting for future messages or
+  exceeding the task allowance. Budget-exhausted mail is not marked consumed.
+- A reducer exhausting its allowance on tools could produce an illegal empty
+  partial summary. Empty/whitespace reports now fail with an explicit reason.
+  `team_reduce` accepts a bounded optional `maxAttempts`; its default stays 2.
+- The live evaluator could mistake a consumed greeting for consumed evidence.
+  It now requires correctly scoped numeric JSON, a prior successful read,
+  and the exact evidence ID in a later committed recipient step. Cancellation
+  facts are checked even if the final provider response fails. Meter deadlines
+  clear their timers and uncertain provider cost stops further paid calls.
+
+Validation: 177 tests passed in the root focused gate and 212 related tests
+passed independently. The final isolated candidate passed typecheck, the
+complete 190-file / 2,140-test suite, and build. A new Node process loaded
+build ID `bd2ba351c449`. The source/test tree in the final commit is checked
+against this validated candidate; subsequent edits only record these results.
+
+Live validation remains deliberately separate from those offline gates:
+
+| Report suffix | Result |
+| --- | --- |
+| `15-22-36-490Z-mLM9AX` | Main repeatedly read the large Team board and exhausted Run tokens; cleanup aborted member calls. Known cost $0.04943 is incomplete. |
+| `15-43-02-396Z-6UVMCP` | Teto passed all 12 communication/presentation checks. Team exposed the completion-mail and empty-summary issues fixed above. 34 calls, $0.07310, complete reported cost. |
+| `16-01-07-163Z-3jMKE5` | Reducer, Lead acceptance, and the correct answer succeeded. The strict Team case still failed: items used `grand_total` instead of required `subtotal`, and invalid `agent_message` kinds consumed its six-step allowance, leaving it partial. 23 calls, $0.05155, complete reported cost. |
+
+Reports are retained under `.local/live-topology/2026-09-07T<suffix>/` and are
+not committed. The last Team failure is not a lost-message diagnosis or a
+successful all-member run. Its remaining model choices are not hidden by
+loosening the evaluator or reclassifying partial results. One Teto pass does
+not prove consistent adoption of its advice; see the smoke contract for limits.

@@ -11,6 +11,7 @@ import type {
   TaskFailed,
 } from "../domain/index.js";
 import type { AgentTool, Clock, ModelPort } from "../domain/ports.js";
+import { DEFAULT_TASK_MAX_ATTEMPTS } from "../domain/types.js";
 import {
   ContentStoreFukaiSource,
   FukaiContextProvider,
@@ -367,22 +368,39 @@ export class TeamBranchExecutor {
         if (event.type === "tool.succeeded" || event.type === "tool.failed") pendingTools.delete(event.payload.operationId);
       }
       if (pendingTools.size > 0) return { kind: "failed", payload: failed(task, `Prior tool outcomes require reconciliation: ${[...pendingTools].join(", ")}`) };
-      const completedModel = laneEvents.findLast((event) => event.type === "model.completed");
-      if (completedModel?.type === "model.completed" && completedModel.payload.stopReason === "stop") {
-        const message = await readConversationMessage(this.options.store, completedModel.payload.responseRef);
-        if (message?.role === "assistant" && message.toolCalls.length === 0) {
-          return { kind: "result", payload: {
-            type: "task.result", taskId: task.taskId, status: "completed", summary: message.content.slice(0, 8_192),
-            evidenceRefs: task.inputRefs.map((ref) => ref.contentHash), artifactRefs: [completedModel.payload.responseRef], openQuestions: [],
-            usage: laneUsage(events, this.options.runId, this.options.branchLaneId),
-          } };
-        }
-      }
+      const startStep = highestLaneStep(events, this.options.runId, this.options.branchLaneId) + 1;
       const mailbox = new LaneMailbox({
         inbox: this.options.inbox, runId: this.options.runId, laneId: this.options.branchLaneId,
         resolveSenders: this.options.resolveMessageSenders ?? (() => [this.options.parentLaneId]),
         events, signal,
       });
+      const completedModel = laneEvents.findLast((event) => event.type === "model.completed");
+      if (completedModel?.type === "model.completed" && completedModel.payload.stopReason === "stop") {
+        const message = await readConversationMessage(this.options.store, completedModel.payload.responseRef);
+        if (message?.role === "assistant" && message.toolCalls.length === 0) {
+          const summary = message.content.slice(0, 8_192);
+          if (summary.trim().length === 0) {
+            return { kind: "failed", payload: failed(task, "Recovered Team member model completed without a non-empty report") };
+          }
+          if (!await mailbox.hasReadyMessages({ step: startStep })) {
+            return { kind: "result", payload: {
+              type: "task.result", taskId: task.taskId, status: "completed", summary,
+              evidenceRefs: task.inputRefs.map((ref) => ref.contentHash), artifactRefs: [completedModel.payload.responseRef], openQuestions: [],
+              usage: laneUsage(events, this.options.runId, this.options.branchLaneId),
+            } };
+          }
+        }
+      }
+      // One member owns one task; every durable request consumes an attempt, even without a response.
+      const maxAttempts = budget.maxAttempts ?? DEFAULT_TASK_MAX_ATTEMPTS;
+      const usedAttempts = laneEvents.filter((event) => event.type === "model.requested").length;
+      if (usedAttempts >= maxAttempts) {
+        return { kind: "failed", payload: failed(task, `Team member model attempt budget exhausted (${usedAttempts}/${maxAttempts})`) };
+      }
+      const remainingAttempts = maxAttempts - usedAttempts;
+      const executionPolicy = this.policy.maxMainStepsPerActivation === undefined
+        ? { ...this.policy, maxMainSteps: Math.min(this.policy.maxMainSteps, startStep + remainingAttempts - 1) }
+        : { ...this.policy, maxMainStepsPerActivation: Math.min(this.policy.maxMainStepsPerActivation, remainingAttempts) };
       const conversationRefs = recoverLaneConversationRefs(laneEvents, this.options.branchLaneId);
       const upperWatermark = await this.options.readWatermark();
       if (this.compactionRuntime !== undefined && !this.compactionPrepared) {
@@ -400,6 +418,7 @@ export class TeamBranchExecutor {
       }
       const selectCompaction = this.compactionRuntime?.select.bind(this.compactionRuntime);
       const compactForPressure = this.compactionRuntime?.compactIfNeeded?.bind(this.compactionRuntime);
+      let currentStep = startStep - 1;
       const loop = new MainLoop({
         model: this.options.model,
         contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(this.options.store)),
@@ -409,8 +428,12 @@ export class TeamBranchExecutor {
         clock: this.clock,
         runTokenBudget: this.options.runTokenBudget,
         eventObserver: (event) => this.teto.observeMainEvent(event),
-        beforeStep: async ({ step }) => [...await this.teto.beforeMainStep({ step }), ...await mailbox.beforeStep({ step })],
+        beforeStep: async ({ step }) => {
+          currentStep = step;
+          return [...await this.teto.beforeMainStep({ step }), ...await mailbox.beforeStep({ step })];
+        },
         afterStep: (context) => { this.teto.afterMainStep(context); void mailbox.afterStep(context); },
+        beforeCompletion: () => mailbox.hasReadyMessages({ step: currentStep + 1 }),
         ...(selectCompaction === undefined ? {} : { selectCompaction }),
         ...(compactForPressure === undefined ? {} : { compactForPressure }),
         includeProjectInstructions: false,
@@ -422,7 +445,7 @@ export class TeamBranchExecutor {
         model: this.options.modelName,
         workspace: this.options.workspace,
         goal,
-        policy: this.policy,
+        policy: executionPolicy,
         systemPrompt: branchSystemPrompt(this.options.branchLaneId, this.options.reducer === true),
         laneKind: this.options.reducer ? "worker" : "team",
         includeProjectInstructions: false,
@@ -430,7 +453,7 @@ export class TeamBranchExecutor {
         correlationId: request.correlationId,
         ...(conversationRefs.length === 0 ? { initialMessage } : {}),
         conversationRefs,
-        startStep: highestLaneStep(events, this.options.runId, this.options.branchLaneId) + 1,
+        startStep,
         upperWatermark,
         policyVersion: this.options.policyVersion ?? "team-branch-v1",
         pressureEligibleConversationCount: conversationRefs.length,
@@ -440,13 +463,24 @@ export class TeamBranchExecutor {
       // The branch result is the task lane's terminal boundary. Teto is an
       // advisory sibling, so a slow observer must not hold that result open.
       await settlesWithin(this.teto.drain(), DEFAULT_STOP_WAIT_MS);
+      const summary = result.finalText.slice(0, 8_192);
+      if (summary.trim().length === 0) {
+        const stepAllowance = executionPolicy.maxMainStepsPerActivation === undefined
+          ? Math.max(0, executionPolicy.maxMainSteps - startStep + 1)
+          : executionPolicy.maxMainStepsPerActivation;
+        const reason = result.completed ? "model completed"
+          : result.stopReason === "length" ? "model output limit reached"
+            : executionPolicy.maxModelTokens !== undefined && totalTokens(result.usage) >= executionPolicy.maxModelTokens ? "model token budget exhausted"
+              : result.steps >= stepAllowance ? "step budget exhausted" : "model stopped";
+        return { kind: "failed", payload: failed(task, `Team member ${reason} without a non-empty report`) };
+      }
       return {
         kind: "result",
         payload: {
           type: "task.result",
           taskId: task.taskId,
           status: result.completed ? "completed" : "partial",
-          summary: result.finalText.slice(0, 8_192),
+          summary,
           evidenceRefs: task.inputRefs.map((ref) => ref.contentHash),
           artifactRefs: result.finalMessageRef === undefined ? [] : [result.finalMessageRef],
           openQuestions: [],

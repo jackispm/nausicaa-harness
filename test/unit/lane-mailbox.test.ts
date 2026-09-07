@@ -359,6 +359,70 @@ describe("composed agent_message", () => {
 });
 
 describe("LaneMailbox", () => {
+  it("checks ready messages without claiming or consuming them", async () => {
+    const { inbox, ledger } = setup();
+    const lane = mailbox(inbox);
+    expect(await lane.hasReadyMessages({ step: 2 })).toBe(false);
+    await inbox.send(message("arrived-before-completion"));
+    const before = await ledger.read();
+    expect(await lane.hasReadyMessages({ step: 2 })).toBe(true);
+    expect(await ledger.read()).toEqual(before);
+    expect(inbox.snapshot().records[0]?.status).toBe("pending");
+    const notices = await lane.beforeStep({ step: 2 });
+    expect(notices.map((item) => item.messageId)).toEqual(["arrived-before-completion"]);
+    await lane.afterStep({ runId, laneId: memberB, boundaryMessageIds: notices.map((item) => item.messageId) });
+    expect(await lane.hasReadyMessages({ step: 3 })).toBe(false);
+  });
+
+  it("uses Inbox expiry, lease, delivery and local identity rules for completion readiness", async () => {
+    const { inbox, advance } = setup();
+    await inbox.send(message("leased"));
+    await inbox.claim(memberB, memberB, { runId });
+    await inbox.send(message("expired", { expiresAt: "2026-09-07T00:00:00.001Z" }));
+    await inbox.send(message("next-turn", { delivery: "next-turn" }));
+    await inbox.send(message("deferred", { delivery: "deferred" }));
+    await inbox.send(message("foreign-run", { runId: "foreign-run" }));
+    await inbox.send(message("foreign-lane", { to: "main" }));
+    await inbox.send(message("unauthorized", { from: "not-a-peer" }));
+    await inbox.send(message("protocol", {
+      payload: { type: "task.failed", taskId: "task", reason: "not an ordinary message", retryable: false, evidenceRefs: [] },
+    }));
+    advance(2);
+    const lane = mailbox(inbox);
+    expect(await lane.hasReadyMessages({ step: 2 })).toBe(false);
+    expect(await lane.hasReadyMessages({ step: 1 })).toBe(true);
+    advance(100);
+    expect(await lane.hasReadyMessages({ step: 2 })).toBe(true);
+    expect(inbox.snapshot().records.find((record) => record.message.messageId === "leased")?.claim?.attempt).toBe(1);
+  });
+
+  it("excludes committed messages and rechecks sender grants and cancellation before completion", async () => {
+    const { inbox } = setup();
+    await inbox.send(message("already-committed"));
+    const controller = new AbortController();
+    let senders: string[] = [];
+    const lane = mailbox(inbox, {
+      committedBoundaryMessageIds: ["already-committed"], signal: controller.signal,
+      resolveSenders: () => senders,
+    });
+    senders = [memberA];
+    expect(await lane.hasReadyMessages({ step: 2 })).toBe(false);
+    await inbox.send(message("ready"));
+    expect(await lane.hasReadyMessages({ step: 2 })).toBe(true);
+    senders = [];
+    expect(await lane.hasReadyMessages({ step: 2 })).toBe(false);
+    senders = [memberA];
+    controller.abort();
+    expect(await lane.hasReadyMessages({ step: 2 })).toBe(false);
+    await expect(lane.hasReadyMessages({ step: 0 })).rejects.toThrow(/step/);
+    await expect(lane.hasReadyMessages({ step: 2, runId: "wrong" })).rejects.toThrow(/another Run or lane/);
+    const abort = new AbortController();
+    const cancelledDuringResolution = mailbox(inbox, {
+      signal: abort.signal, resolveSenders: async () => { abort.abort(); return [memberA]; },
+    });
+    expect(await cancelledDuringResolution.hasReadyMessages({ step: 2 })).toBe(false);
+  });
+
   it("delivers directed peer messages as runtime notices and handles only committed IDs", async () => {
     const { inbox, ledger } = setup();
     await inbox.send(message("inform"));

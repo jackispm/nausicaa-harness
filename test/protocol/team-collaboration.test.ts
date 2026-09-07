@@ -4,6 +4,7 @@ import { A2AInbox } from "../../src/a2a/inbox.js";
 import type { AppendEvent, EventType } from "../../src/domain/events.js";
 import type { AgentTool, ModelPort, ModelRequest, ModelResponse, ToolExecutionContext } from "../../src/domain/ports.js";
 import type { RunPolicy } from "../../src/domain/types.js";
+import { MAX_TASK_ATTEMPTS } from "../../src/domain/types.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
 import { annotateTool } from "../../src/mowe/catalog.js";
 import { createScopedSpawnContext } from "../../src/runtime/lane-context.js";
@@ -486,6 +487,96 @@ describe("durable Team collaboration", () => {
       reductionState: "completed", reduction: { outcome: "succeeded", result: { taskId: "team:review:reduction", summary: "Reducer synthesis from both reports" } },
     });
     expect((await board(team, "team-reducer")).members[0]?.taskId).toBe("team-reducer:review");
+  });
+
+  it.each([
+    { maxAttempts: undefined, content: "", expectedCalls: 2 },
+    { maxAttempts: undefined, content: " \n\t", expectedCalls: 2 },
+    { maxAttempts: 3, content: "", expectedCalls: 3 },
+  ])("preserves the reducer default and durably applies an explicit attempt allowance: %j", async ({ maxAttempts, content, expectedCalls }) => {
+    const tool = annotateTool({
+      definition: { name: "read_evidence", description: "Read evidence", parameters: { type: "object", properties: {}, additionalProperties: false } },
+      execute: vi.fn(async () => ({ content: "Verified subtotal 44, shipping 6, discount 4", isError: false })),
+    }, { effect: "read" });
+    const model = new RecordingModel((request, call) => {
+      if (!request.laneId.startsWith("team-reducer:")) return response("Member evidence for synthesis");
+      if (call <= 2) return { ...response(content, "toolUse"), toolCalls: [{ id: `read-${call}`, name: "read_evidence", arguments: {} }] };
+      return response("Evidence checked: checkout total is 46");
+    });
+    const { team, ledger, inbox } = fixture({ model, tools: [tool] });
+    await team.create({ teamId: "review", members: [member("source")] }, context);
+    await team.drain();
+    await team.reduce({ teamId: "review", ...(maxAttempts === undefined ? {} : { maxAttempts }) }, context);
+    await team.drain();
+
+    const state = await board(team);
+    expect(state.reducer?.task.budget.maxAttempts).toBe(maxAttempts ?? 2);
+    expect(state.reducer?.task.spawnContext?.budget.maxAttempts).toBe(maxAttempts ?? 2);
+    expect(model.requests.filter((request) => request.laneId.startsWith("team-reducer:"))).toHaveLength(expectedCalls);
+    if (maxAttempts === undefined) {
+      expect(state.reduction).toMatchObject({ outcome: "failed", failure: {
+        reason: expect.stringContaining("step budget exhausted without a non-empty report"), retryable: false,
+        evidenceRefs: state.reducer!.task.inputRefs.map((ref) => ref.contentHash),
+      } });
+      expect(state.reduction).not.toHaveProperty("result");
+      expect(inbox.snapshot().records.some((record) => record.message.from === state.reducer?.laneId && record.message.payload.type === "task.result")).toBe(false);
+    } else {
+      expect(state.reduction).toMatchObject({ outcome: "succeeded", result: { status: "completed", summary: "Evidence checked: checkout total is 46" } });
+    }
+    const events = await ledger.read({ runId: RUN_ID });
+    expect(events.filter((event) => event.type === "team.reduced")).toHaveLength(1);
+    expect(events.find((event) => event.type === "team.reduction.requested")?.payload.reducer.task.budget.maxAttempts).toBe(maxAttempts ?? 2);
+  });
+
+  it.each([0, 1.5, MAX_TASK_ATTEMPTS + 1])("rejects an invalid direct reducer attempt allowance before admission: %j", async (maxAttempts) => {
+    const { team, ledger } = fixture();
+    await team.create({ teamId: "review", members: [member("source")] }, context);
+    await team.drain();
+    const watermark = await ledger.watermark();
+    await expect(team.reduce({ teamId: "review", maxAttempts }, context)).rejects.toThrow("maxAttempts");
+    expect(await ledger.watermark()).toBe(watermark);
+    expect((await board(team)).reducer).toBeUndefined();
+  });
+
+  it.each([1, 2])("checks peer messages arriving during a final model request within a %i-attempt allowance", async (maxAttempts) => {
+    const aEntered = deferred<void>();
+    const finalA = deferred<ModelResponse>();
+    const model = new RecordingModel(async (request, call) => {
+      if (request.laneId.endsWith(":a")) {
+        if (call === 1) { aEntered.resolve(); return finalA.promise; }
+        return response("A incorporated B's late evidence");
+      }
+      if (call === 1) {
+        await aEntered.promise;
+        return { ...response("Send evidence while A is generating", "toolUse"), toolCalls: [
+          { id: "late-peer-evidence", name: "agent_message", arguments: { target: "team:review:a", kind: "inform", text: "Late peer evidence: shipping is 6" } },
+        ] };
+      }
+      finalA.resolve(response("A's initial report was generated before peer evidence"));
+      return response("B sent its evidence");
+    });
+    const { team, ledger, inbox } = fixture({ model });
+    await team.create({ teamId: "review", members: [member("a", { maxAttempts }), member("b", { maxAttempts: 2 })] }, context);
+    await team.drain();
+
+    const aRequests = model.requests.filter((request) => request.laneId === "team:review:a");
+    expect(aRequests).toHaveLength(maxAttempts);
+    const message = inbox.snapshot().records.find((record) => record.message.payload.type === "message.inform"
+      && record.message.from === "team:review:b" && record.message.to === "team:review:a")!;
+    const events = await ledger.read({ runId: RUN_ID });
+    const consumed = events.filter((event) => event.type === "step.completed" && event.laneId === "team:review:a"
+      && event.payload.boundaryMessageIds?.includes(message.message.messageId));
+    if (maxAttempts === 2) {
+      expect(aRequests[1]?.messages.map((item) => item.content).join("\n")).toContain("Late peer evidence: shipping is 6");
+      expect(consumed).toHaveLength(1);
+      expect(message.status).toBe("handled");
+      expect((await board(team)).members.find((item) => item.memberId === "a")?.outcome).toBe("succeeded");
+    } else {
+      expect(consumed).toHaveLength(0);
+      expect(message.status).toBe("pending");
+      expect((await board(team)).members.find((item) => item.memberId === "a")?.outcome).toBe("partial");
+    }
+    expect(await team.messageTargets("main")).not.toContain("team:review:a");
   });
 
   it("delivers direct bidirectional peer A2A at member boundaries while both members are working", async () => {

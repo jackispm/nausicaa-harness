@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { ToolExecutionContext } from "../../src/domain/ports.js";
+import type { TaskRequest } from "../../src/domain/types.js";
 import { MAX_TASK_ATTEMPTS, MAX_TASK_MODEL_TOKENS, MAX_TASK_WALL_CLOCK_MS } from "../../src/domain/types.js";
 import { assertSupportedSchema, validateArguments } from "../../src/mowe/admission.js";
+import type { TeamBoard } from "../../src/runtime/team-board.js";
 import {
   createTeamCancelTool,
   createTeamPresentTool,
@@ -29,6 +31,37 @@ function setup(overrides: Partial<TeamControl> = {}) {
   }));
   const control: TeamControl = { create, ...overrides };
   return { control, create, tool: createTeamTool(control) };
+}
+
+function statusBoard(): TeamBoard {
+  const goal = { version: 1, statement: "Inspect auth", successCriteria: ["Report evidence"], hardConstraints: [] };
+  const budget = { maxModelTokens: 30_000, maxWallClockMs: 120_000, maxAttempts: 6, deadline: "2026-09-07T12:00:00Z" };
+  const parent = { workspaceId: "workspace", sessionId: "session", runId: "run-1", laneId: "main", laneKind: "main" as const };
+  const child = { ...parent, laneId: "team:review:security", laneKind: "team" as const };
+  const tools = [{ kind: "tool" as const, name: "read_file", description: "spawn-only-marker".repeat(2_000) }];
+  const task: TaskRequest = {
+    type: "task.request", taskId: "review:security", goal, inputRefs: [], budget,
+    spawnContext: {
+      schemaVersion: 1, parent, child, goal, inputRefs: [], projectInstructionRefs: [], parentSummaryRefs: [],
+      tools, skills: [], laneManifest: { schemaVersion: 1, lane: child, role: "security", state: "running", capabilities: tools }, budget,
+    },
+  };
+  const definition = { memberId: "security", laneId: child.laneId, task, dependsOn: [], required: true };
+  const member: TeamBoard["members"][number] = {
+    teamId: "review", memberId: "security", branchId: "security", laneId: child.laneId, taskId: task.taskId,
+    requestMessageId: "request-security", coordinator: "main", goal, inputRefs: [], budget, dependsOn: [], required: true,
+    registered: true, laneStatus: "running", execution: "running", status: "running", terminal: false,
+    attempt: 1, lease: { claimId: "claim-security", claimedBy: child.laneId, claimedAt: "2026-09-07T11:59:00Z", attempt: 1 },
+    acceptedMessageId: "accept-security", lastOffset: 42, anomalies: [],
+  };
+  return {
+    runId: "run-1", teamId: "review", leadLaneId: "main", coordinator: "main",
+    definition: { teamId: "review", leadLaneId: "main", joinPolicy: "all-terminal", peerMessaging: "team-members",
+      deadline: budget.deadline, fingerprint: "fingerprint-review", members: [definition] },
+    joinPolicy: "all-terminal", status: "running", joinReady: false, joinSatisfied: false, joinState: "waiting",
+    cancellationRequested: false, reductionState: "not-started", presentationState: "pending",
+    members: [member], branches: [member], anomalies: [], lastOffset: 42,
+  };
 }
 
 describe("Team tool creation contract", () => {
@@ -207,7 +240,7 @@ describe("Team lifecycle tools", () => {
     const { control } = setup({ reduce, present });
     const reduceTool = createTeamReduceTool(control);
     const presentTool = createTeamPresentTool(control);
-    const request = { teamId: "review", statement: "Resolve conflicting findings", maxModelTokens: 2_000, maxWallClockMs: 10_000 };
+    const request = { teamId: "review", statement: "Resolve conflicting findings", maxModelTokens: 2_000, maxWallClockMs: 10_000, maxAttempts: 4 };
     expect(() => assertSupportedSchema(reduceTool.definition.parameters)).not.toThrow();
     expect(() => assertSupportedSchema(presentTool.definition.parameters)).not.toThrow();
     expect(validateArguments(reduceTool, request).ok).toBe(true);
@@ -216,6 +249,15 @@ describe("Team lifecycle tools", () => {
     expect(reduce).toHaveBeenCalledWith(request, context);
     expect((await presentTool.execute({ teamId: "review", disposition: "rejected" }, context)).isError).toBe(false);
     expect(present).toHaveBeenCalledWith({ teamId: "review", disposition: "rejected" }, context);
+  });
+
+  it.each([0, -1, 1.5, MAX_TASK_ATTEMPTS + 1, "3", null])("rejects an invalid reducer attempt allowance before dispatch: %j", async (maxAttempts) => {
+    const reduce = vi.fn();
+    const { control } = setup({ reduce });
+    const tool = createTeamReduceTool(control);
+    expect(validateArguments(tool, { teamId: "review", maxAttempts }).ok).toBe(false);
+    expect((await tool.execute({ teamId: "review", maxAttempts }, context)).isError).toBe(true);
+    expect(reduce).not.toHaveBeenCalled();
   });
 
   it("rejects spoofed identities and malformed lifecycle arguments before dispatch", async () => {
@@ -241,14 +283,113 @@ describe("Team lifecycle tools", () => {
   });
 
   it("returns board facts without allowing status calls to carry commands", async () => {
-    const status = vi.fn(async () => [{ teamId: "review", join: "joined", reduction: "not-started", presentation: "pending" }]);
+    const legacy = [{ teamId: "review", join: "joined", reduction: "not-started", presentation: "pending" }];
+    const status = vi.fn(async () => legacy);
     const { control } = setup({ status });
     const tool = createTeamStatusTool(control);
     expect(() => assertSupportedSchema(tool.definition.parameters)).not.toThrow();
-    expect((await tool.execute({}, context)).isError).toBe(false);
+    const result = await tool.execute({}, context);
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content)).toEqual(legacy);
     expect(status).toHaveBeenCalledWith(context);
     expect(tool.definition.description).toMatch(/without proving success/);
     expect((await tool.execute({ disposition: "accepted" }, context)).isError).toBe(true);
     expect(status).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["envelope", "array"] as const)("projects a compact status from a host %s without changing its board", async (shape) => {
+    const board = statusBoard();
+    board.reducer = { ...board.definition!.members[0]!, memberId: "reducer", laneId: "team:review:reducer",
+      task: { ...board.definition!.members[0]!.task, taskId: "review:reducer" } };
+    board.reductionState = "running";
+    const original = structuredClone(board);
+    const payload = shape === "envelope" ? { teams: [board] } : [board];
+    const { control } = setup();
+    control.status = async function (executionContext) {
+      expect(this).toBe(control);
+      expect(executionContext).toBe(context);
+      return payload;
+    };
+
+    const response = await createTeamStatusTool(control).execute({}, context);
+    expect(response.isError).toBe(false);
+    expect(response.content.includes("spawn-only-marker")).toBe(false);
+    expect(Buffer.byteLength(response.content)).toBeLessThan(2_000);
+    const parsed = JSON.parse(response.content);
+    const status = shape === "envelope" ? parsed.teams[0] : parsed[0];
+    expect(status).toMatchObject({
+      runId: "run-1", teamId: "review", leadLaneId: "main", joinPolicy: "all-terminal",
+      deadline: board.definition!.deadline, peerMessaging: "team-members",
+      status: "running", joinReady: false, joinSatisfied: false, joinState: "waiting",
+      cancellationRequested: false, reductionState: "running", presentationState: "pending", lastOffset: 42,
+      members: [{ memberId: "security", laneId: "team:review:security", taskId: "review:security",
+        statement: "Inspect auth", status: "running", execution: "running", laneStatus: "running", terminal: false,
+        registered: true, attempt: 1, dependsOn: [], required: true, anomalies: [] }],
+      reducer: { memberId: "reducer", laneId: "team:review:reducer", taskId: "review:reducer", statement: "Inspect auth" },
+    });
+    for (const field of ["definition", "branches"]) expect(status).not.toHaveProperty(field);
+    for (const field of ["branchId", "lease", "requestMessageId", "acceptedMessageId"]) {
+      expect(status.members[0]).not.toHaveProperty(field);
+    }
+    expect(status.reducer).not.toHaveProperty("task");
+    expect(board).toEqual(original);
+  });
+
+  it.each(["joined", "deadline-settled", "cancelled"] as const)("retains result evidence, failures and lead decisions for %s Teams", async (joinState) => {
+    const board = statusBoard();
+    const result = {
+      type: "task.result" as const, taskId: "review:security", status: "partial" as const, summary: "Auth reviewed; policy remains unresolved",
+      evidenceRefs: ["sha256:evidence"], artifactRefs: [{ id: "report", contentHash: "sha256:report", mediaType: "text/plain", byteLength: 10 }],
+      openQuestions: ["Confirm the access policy"], usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0 },
+    };
+    const failure = { type: "task.failed" as const, taskId: "review:policy", reason: "Policy input missing", retryable: false, evidenceRefs: ["sha256:missing"] };
+    board.members = [
+      { ...board.members[0]!, laneStatus: "completed", execution: "terminal", status: "partial", outcome: "partial", terminal: true, result },
+      { ...board.members[0]!, memberId: "policy", branchId: "policy", laneId: "team:review:policy", taskId: "review:policy",
+        dependsOn: ["security"], required: false, laneStatus: "failed", execution: "terminal", status: "failed", outcome: "failed", terminal: true,
+        failure, reason: "Policy input missing", anomalies: ["Policy evidence unavailable"] },
+    ];
+    board.branches = board.members;
+    board.joinPolicy = joinState === "deadline-settled" ? "deadline-best-effort" : "all-terminal";
+    board.joinState = joinState;
+    board.joinReady = joinState !== "cancelled";
+    board.joinSatisfied = joinState !== "cancelled";
+    board.cancellationRequested = joinState === "cancelled";
+    board.status = joinState === "cancelled" ? "cancelled" : "failed";
+    board.reductionState = "failed";
+    board.reduction = { outcome: "failed", failure: { ...failure, taskId: "review:reducer" } };
+    board.presentationState = "rejected";
+    board.anomalies = ["Some required evidence is unavailable"];
+    const { control } = setup({ status: async () => ({ teams: [board] }) });
+
+    const response = await createTeamStatusTool(control).execute({}, context);
+    expect(response.isError).toBe(false);
+    const status = JSON.parse(response.content).teams[0];
+    expect(status).toMatchObject({
+      status: board.status, joinPolicy: board.joinPolicy, joinState, joinReady: board.joinReady, joinSatisfied: board.joinSatisfied,
+      cancellationRequested: board.cancellationRequested, reductionState: "failed", reduction: board.reduction,
+      presentationState: "rejected", anomalies: board.anomalies,
+    });
+    expect(status.members[0].result).toEqual(result);
+    expect(status.members[0]).toMatchObject({ status: "partial", outcome: "partial", terminal: true });
+    expect(status.members[1]).toMatchObject({
+      status: "failed", outcome: "failed", failure, reason: "Policy input missing", dependsOn: ["security"], required: false,
+      anomalies: ["Policy evidence unavailable"],
+    });
+  });
+
+  it("projects older branch-only boards to canonical member identities", async () => {
+    const legacy = { teamId: "legacy", coordinator: "main", status: "queued", branches: [
+      { branchId: "reader", laneId: "team:legacy:reader", taskId: "legacy:reader", status: "queued", terminal: false },
+    ] };
+    const { control } = setup({ status: async () => ({ teams: [legacy] }) });
+    const response = await createTeamStatusTool(control).execute({}, context);
+    expect(response.isError).toBe(false);
+    const status = JSON.parse(response.content).teams[0];
+    expect(status).toMatchObject({ teamId: "legacy", leadLaneId: "main", status: "queued", members: [
+      { memberId: "reader", laneId: "team:legacy:reader", taskId: "legacy:reader", status: "queued", terminal: false },
+    ] });
+    expect(status).not.toHaveProperty("branches");
+    expect(legacy).not.toHaveProperty("members");
   });
 });

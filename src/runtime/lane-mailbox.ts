@@ -76,24 +76,10 @@ export class LaneMailbox {
 
   beforeStep(context: BeforeStepContext): Promise<readonly MainBoundaryMessage[]> {
     return this.exclusive(async () => {
-      this.assertScope(context);
-      if (!Number.isSafeInteger(context.step) || context.step < 1) {
-        throw new RangeError("step must be a positive integer");
-      }
+      this.assertBoundary(context);
       await this.repairCommitted();
-      if (this.signal?.aborted) return [];
-      const senders = await this.resolveSenders();
-      if (!Array.isArray(senders)) throw new TypeError("resolveSenders must return lane IDs");
-      const authorized = new Set(senders.map((sender) => boundedIdentity(sender, "sender")));
-      if (this.signal?.aborted || authorized.size === 0) return [];
       const deliveries = boundaryDeliveries(context.step);
-      const messageIds = this.inbox.snapshot().records
-        .filter((record) => record.status !== "handled"
-          && this.isLocalRecord(record)
-          && authorized.has(record.message.from)
-          && deliveries.includes(record.message.delivery)
-          && !this.committed.has(record.message.messageId))
-        .map((record) => record.message.messageId);
+      const messageIds = await this.boundaryCandidates(deliveries);
       if (messageIds.length === 0) return [];
       const records: InboxRecord[] = [];
       const claimId = `${this.runId}:${this.laneId}:mailbox:${this.createId()}`;
@@ -110,7 +96,7 @@ export class LaneMailbox {
       return records
         .filter((record) => record.status !== "handled"
           && this.isLocalRecord(record)
-          && authorized.has(record.message.from)
+          && messageIds.includes(record.message.messageId)
           && !this.committed.has(record.message.messageId))
         .map((record) => ({
           kind: "runtime-notice" as const,
@@ -119,6 +105,31 @@ export class LaneMailbox {
           content: formatMessage(record.message, this.maxMessageChars),
         }));
     });
+  }
+
+  /** Completion may continue for ready messages, without claiming or waiting for future mail. */
+  hasReadyMessages(context: BeforeStepContext): Promise<boolean> {
+    return this.exclusive(async () => {
+      this.assertBoundary(context);
+      const deliveries = boundaryDeliveries(context.step);
+      const messageIds = await this.boundaryCandidates(deliveries);
+      return messageIds.length > 0 && this.inbox.nextClaimableDelayMs(this.laneId, {
+        runId: this.runId, types: MESSAGE_TYPES, deliveries, messageIds,
+      }) === 0;
+    });
+  }
+
+  private async boundaryCandidates(deliveries: readonly DeliveryMode[]): Promise<string[]> {
+    if (this.signal?.aborted) return [];
+    const senders = await this.resolveSenders();
+    if (!Array.isArray(senders)) throw new TypeError("resolveSenders must return lane IDs");
+    const authorized = new Set(senders.map((sender) => boundedIdentity(sender, "sender")));
+    if (this.signal?.aborted || authorized.size === 0) return [];
+    return this.inbox.snapshot().records
+      .filter((record) => record.status !== "handled" && this.isLocalRecord(record)
+        && authorized.has(record.message.from) && deliveries.includes(record.message.delivery)
+        && !this.committed.has(record.message.messageId))
+      .map((record) => record.message.messageId);
   }
 
   /** The host calls this only after step.completed durably includes these IDs. */
@@ -174,6 +185,13 @@ export class LaneMailbox {
     if ((context.runId !== undefined && context.runId !== this.runId)
       || (context.laneId !== undefined && context.laneId !== this.laneId)) {
       throw new Error("Lane mailbox boundary belongs to another Run or lane");
+    }
+  }
+
+  private assertBoundary(context: BeforeStepContext): void {
+    this.assertScope(context);
+    if (!Number.isSafeInteger(context.step) || context.step < 1) {
+      throw new RangeError("step must be a positive integer");
     }
   }
 

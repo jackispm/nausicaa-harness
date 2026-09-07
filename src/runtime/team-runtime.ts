@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { A2AInbox } from "../a2a/index.js";
 import type { AnyEvent } from "../domain/events.js";
 import type { TeamDefinition, TeamMemberDefinition } from "../domain/team.js";
-import { MAX_TASK_MODEL_TOKENS, MAX_TASK_WALL_CLOCK_MS } from "../domain/types.js";
+import { MAX_TASK_ATTEMPTS, MAX_TASK_MODEL_TOKENS, MAX_TASK_WALL_CLOCK_MS } from "../domain/types.js";
 import type { AgentTool, Clock, ModelPort, ToolExecutionContext } from "../domain/ports.js";
 import type {
   ArtifactRef,
@@ -28,7 +28,7 @@ import {
 import { recoverRunTokenUsageByLane } from "./run-token-budget-recovery.js";
 import { createTeamBranchPolicy, TeamBranchExecutor } from "./team-branch-executor.js";
 import type { AgentTopologySnapshot } from "./agent-awareness.js";
-import type { TeamControl, TeamCreateRequest, TeamCreateResult, TeamBranchRequest } from "./team-tool.js";
+import type { TeamControl, TeamCreateRequest, TeamCreateResult, TeamBranchRequest, TeamReduceRequest } from "./team-tool.js";
 import { normalizeTeamCreateRequest, teamGoal } from "./team-tool.js";
 import type { TeamBoard } from "./team-board.js";
 import { capabilityEntriesFromTools, createScopedSpawnContext } from "./lane-context.js";
@@ -655,7 +655,7 @@ export class TeamRuntime implements TeamControl {
     });
   }
 
-  async reduce(request: { teamId: string; statement?: string; maxModelTokens?: number; maxWallClockMs?: number }, context: ToolExecutionContext): Promise<unknown> {
+  async reduce(request: TeamReduceRequest, context: ToolExecutionContext): Promise<unknown> {
     return this.enqueueLifecycle(async () => {
       assertOwner(context, this.runId, this.parentLaneId);
       this.assertAdmissionActive(context.signal);
@@ -668,7 +668,8 @@ export class TeamRuntime implements TeamControl {
       }
       const maxModelTokens = request.maxModelTokens ?? DEFAULT_BRANCH_MODEL_TOKENS;
       const maxWallClockMs = request.maxWallClockMs ?? DEFAULT_BRANCH_WALL_CLOCK_MS;
-      validateBudget({ maxModelTokens, maxWallClockMs, maxAttempts: DEFAULT_BRANCH_ATTEMPTS });
+      const maxAttempts = request.maxAttempts ?? DEFAULT_BRANCH_ATTEMPTS;
+      validateBudget({ maxModelTokens, maxWallClockMs, maxAttempts });
       const inputRef = await this.store.put(JSON.stringify(board.members.map((member) => ({
         memberId: member.memberId, outcome: member.outcome, result: member.result, failure: member.failure,
       }))), "application/json");
@@ -678,7 +679,7 @@ export class TeamRuntime implements TeamControl {
         task: {
           type: "task.request", taskId: `team:${board.teamId}:reduction`,
           goal: { version: 1, statement: request.statement ?? "Synthesize the Team results for Main. Preserve disagreements, partial results and missing evidence.", successCriteria: [], hardConstraints: ["Do not merge workspace changes; Main accepts or rejects this report."] },
-          inputRefs: [inputRef], budget: { maxModelTokens, maxWallClockMs, maxAttempts: DEFAULT_BRANCH_ATTEMPTS, deadline: new Date(this.clock.now().getTime() + maxWallClockMs).toISOString() },
+          inputRefs: [inputRef], budget: { maxModelTokens, maxWallClockMs, maxAttempts, deadline: new Date(this.clock.now().getTime() + maxWallClockMs).toISOString() },
         },
       };
       reducer.task.spawnContext = this.memberSpawnContext(board.teamId, reducer.memberId, reducer.laneId, reducer.task, [], true);
@@ -1060,7 +1061,7 @@ function laneFamilyTokens(events: readonly AnyEvent[], runId: string, laneId: st
 function validateBudget(value: { maxModelTokens: number; maxWallClockMs: number; maxAttempts: number }): void {
   if (!Number.isSafeInteger(value.maxModelTokens) || value.maxModelTokens < 1 || value.maxModelTokens > MAX_TASK_MODEL_TOKENS) throw new RangeError("maxModelTokens must be within the task protocol bounds");
   if (!Number.isSafeInteger(value.maxWallClockMs) || value.maxWallClockMs < 1 || value.maxWallClockMs > MAX_TASK_WALL_CLOCK_MS) throw new RangeError("maxWallClockMs must be within the task protocol bounds");
-  if (!Number.isSafeInteger(value.maxAttempts) || value.maxAttempts < 1) throw new RangeError("maxAttempts must be a positive integer");
+  if (!Number.isSafeInteger(value.maxAttempts) || value.maxAttempts < 1 || value.maxAttempts > MAX_TASK_ATTEMPTS) throw new RangeError("maxAttempts must be within the task protocol bounds");
 }
 
 export { TeamRuntime as TeamCoordinator };

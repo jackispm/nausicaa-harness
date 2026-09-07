@@ -25,7 +25,7 @@ afterEach(async () => {
   for (const close of cleanup.splice(0).reverse()) await close();
 });
 
-async function fixture() {
+async function fixture(options: { maxAttempts?: number; maxModelTokens?: number; messageSenders?: readonly string[] } = {}) {
   let now = Date.parse("2026-09-07T00:00:00.000Z");
   let sequence = 0;
   const clock = { now: () => new Date(now) };
@@ -44,7 +44,7 @@ async function fixture() {
       task: {
         type: "task.request", taskId: "review:inspection",
         goal: { version: 1, statement: "Inspect recovery evidence", successCriteria: ["Preserve verified results"], hardConstraints: [] },
-        inputRefs: [], budget: { maxModelTokens: 1_000, maxWallClockMs: 60_000, maxAttempts: 3, deadline: new Date(now + 60_000).toISOString() },
+        inputRefs: [], budget: { maxModelTokens: options.maxModelTokens ?? 1_000, maxWallClockMs: 60_000, maxAttempts: options.maxAttempts ?? 3, deadline: new Date(now + 60_000).toISOString() },
       },
     }],
   };
@@ -69,11 +69,11 @@ async function fixture() {
   });
   async function restoreExecutor(tools: readonly AgentTool[] = []) {
     now += 51;
-    const events = await ledger.read({ runId });
+    const events = await ledger.read();
     const restoredInbox = A2AInbox.rehydrate(events, { sink: ledger, clock, claimLeaseMs: 50 });
     const lifecycle = new TeamLifecycle({
       runId, leadLaneId: "main", ledger, inbox: restoredInbox, clock,
-      readEvents: () => ledger.read({ runId }), stopMember: async () => undefined,
+      readEvents: () => ledger.read(), stopMember: async () => undefined,
     });
     cleanup.push(() => lifecycle.close());
     const executor = new TeamBranchExecutor({
@@ -81,7 +81,8 @@ async function fixture() {
       parentLaneId: "main", branchLaneId: member.laneId, goal: member.task.goal, taskDefinition: member.task,
       policy, tools, workspace: process.cwd(), runTokenBudget: new RunTokenBudget(10_000),
       clock, events, createId: () => `recovered-${++sequence}`,
-      readEvents: () => ledger.read({ runId }), readWatermark: () => ledger.watermark(), readAwareness: awareness,
+      readEvents: () => ledger.read(), readWatermark: () => ledger.watermark(), readAwareness: awareness,
+      resolveMessageSenders: () => options.messageSenders ?? ["main"],
       settleTask: (input) => lifecycle.settle("review", member, input.request, input.claim, input.payload),
       readTaskTerminal: async () => {
         const state = (await lifecycle.boards())[0]?.members.find((item) => item.memberId === member.memberId);
@@ -94,9 +95,109 @@ async function fixture() {
   return { ledger, store, inbox, clock, definition, member, request, model, complete, append, awareness, restoreExecutor };
 }
 
+async function seedAttempt(
+  s: Awaited<ReturnType<typeof fixture>>,
+  outcome: "length" | "failed" | "unfinished" = "length",
+) {
+  await s.append("step.started", { step: 1 });
+  await s.append("model.requested", {
+    model: modelName, requestHash: "prior-call", contextWatermark: await s.ledger.watermark(),
+  });
+  if (outcome === "failed") {
+    await s.append("model.failed", { model: modelName, error: "Interrupted provider attempt", retryable: true });
+  } else if (outcome === "length") {
+    const responseRef = await s.store.put(JSON.stringify({
+      role: "assistant", content: "Prior truncated evidence", toolCalls: [], createdAt: s.clock.now().toISOString(),
+    }), MESSAGE_MEDIA_TYPE);
+    await s.append("model.completed", { model: modelName, responseRef, stopReason: "length", usage });
+  }
+}
+
 describe("Team member recovery", () => {
+  it.each([1, 2])("checks pending peer evidence before reusing a final response with a %i-attempt allowance", async (maxAttempts) => {
+    const peer = "team:review:peer";
+    const s = await fixture({ maxAttempts, maxModelTokens: 10_000, messageSenders: ["main", peer] });
+    const responseRef = await s.store.put(JSON.stringify({
+      role: "assistant", content: "Initial report before peer evidence arrived", toolCalls: [], createdAt: s.clock.now().toISOString(),
+    }), MESSAGE_MEDIA_TYPE);
+    await s.append("step.started", { step: 1 });
+    await s.append("model.requested", { model: modelName, requestHash: "final-before-crash", contextWatermark: await s.ledger.watermark() });
+    await s.append("model.completed", { model: modelName, responseRef, stopReason: "stop", usage });
+    const messageId = "pending-peer-after-final-model";
+    await s.inbox.send({
+      ...s.request, messageId, idempotencyKey: messageId, from: peer, to: s.member.laneId,
+      payload: { type: "message.inform", text: "Recovered peer evidence: shipping is 6" },
+    });
+    s.complete.mockResolvedValue({ content: "Revised report using the peer evidence", toolCalls: [], stopReason: "stop", usage });
+    const restored = await s.restoreExecutor();
+    await restored.executor.runOnce();
+
+    expect(s.complete).toHaveBeenCalledTimes(maxAttempts - 1);
+    const events = await s.ledger.read({ runId });
+    const consumed = events.filter((event) => event.type === "step.completed" && event.laneId === s.member.laneId
+      && event.payload.boundaryMessageIds?.includes(messageId));
+    const state = (await restored.lifecycle.boards())[0]!.members[0]!;
+    const message = restored.inbox.snapshot().records.find((record) => record.message.messageId === messageId)!;
+    if (maxAttempts === 2) {
+      expect(s.complete.mock.calls[0]?.[0].messages.map((item) => item.content).join("\n")).toContain("Recovered peer evidence: shipping is 6");
+      expect(state).toMatchObject({ outcome: "succeeded", result: { summary: "Revised report using the peer evidence" } });
+      expect(consumed).toHaveLength(1);
+      expect(message.status).toBe("handled");
+    } else {
+      expect(state).toMatchObject({ outcome: "failed", failure: { reason: expect.stringContaining("model attempt budget exhausted (1/1)") } });
+      expect(state.result).toBeUndefined();
+      expect(consumed).toHaveLength(0);
+      expect(message.status).toBe("pending");
+    }
+    expect(events.filter((event) => event.type === "model.requested" && event.laneId === s.member.laneId)).toHaveLength(maxAttempts);
+  });
+
+  it.each(["", " \n\t"])("fails a recovered empty final report without another model call: %j", async (content) => {
+    const s = await fixture({ maxAttempts: 1 });
+    const responseRef = await s.store.put(JSON.stringify({
+      role: "assistant", content, toolCalls: [], createdAt: s.clock.now().toISOString(),
+    }), MESSAGE_MEDIA_TYPE);
+    await s.append("step.started", { step: 1 });
+    await s.append("model.requested", { model: modelName, requestHash: "empty-final", contextWatermark: await s.ledger.watermark() });
+    await s.append("model.completed", { model: modelName, responseRef, stopReason: "stop", usage });
+    const restored = await s.restoreExecutor();
+
+    await expect(restored.executor.runOnce()).resolves.toMatchObject({
+      status: "failed", reason: expect.stringContaining("model completed without a non-empty report"),
+    });
+    expect(s.complete).not.toHaveBeenCalled();
+    expect((await restored.lifecycle.boards())[0]?.members[0]).toMatchObject({
+      outcome: "failed", failure: { evidenceRefs: [], retryable: false },
+    });
+    expect(restored.inbox.snapshot().records.some((record) => record.message.payload.type === "task.result")).toBe(false);
+  });
+
+  it.each(["", " \n\t"])("fails a fresh empty final report without inventing a summary: %j", async (content) => {
+    const s = await fixture({ maxAttempts: 2, maxModelTokens: 10_000 });
+    s.complete.mockResolvedValue({ content, toolCalls: [], stopReason: "stop", usage });
+    const restored = await s.restoreExecutor();
+    await expect(restored.executor.runOnce()).resolves.toMatchObject({
+      status: "failed", reason: expect.stringContaining("model completed without a non-empty report"),
+    });
+    expect(s.complete).toHaveBeenCalledTimes(1);
+    expect((await restored.lifecycle.boards())[0]?.members[0]).toMatchObject({
+      outcome: "failed", failure: { evidenceRefs: [], retryable: false },
+    });
+    expect(restored.inbox.snapshot().records.some((record) => record.message.payload.type === "task.result")).toBe(false);
+  });
+
+  it("identifies an empty model output-limit response without a serialization error", async () => {
+    const s = await fixture({ maxAttempts: 2, maxModelTokens: 10_000 });
+    s.complete.mockResolvedValue({ content: "", toolCalls: [], stopReason: "length", usage });
+    const restored = await s.restoreExecutor();
+    await expect(restored.executor.runOnce()).resolves.toMatchObject({
+      status: "failed", reason: expect.stringContaining("model output limit reached without a non-empty report"),
+    });
+    expect(s.complete).toHaveBeenCalledTimes(1);
+  });
+
   it("reuses a committed final model response after a crash before task settlement", async () => {
-    const s = await fixture();
+    const s = await fixture({ maxAttempts: 1 });
     const answerRef = await s.store.put(JSON.stringify({
       role: "assistant", content: "Previously verified recovery evidence", toolCalls: [], createdAt: s.clock.now().toISOString(),
     }), MESSAGE_MEDIA_TYPE);
@@ -127,8 +228,84 @@ describe("Team member recovery", () => {
       .toBeLessThan(events.find((event) => event.type === "message.sent" && event.payload.message.payload.type === "task.result")!.globalOffset);
   });
 
+  it.each(["length", "failed", "unfinished"] as const)(
+    "does not reset exhausted attempts after a %s provider request",
+    async (outcome) => {
+      const s = await fixture({ maxAttempts: 1, maxModelTokens: 10_000 });
+      await seedAttempt(s, outcome);
+      const restored = await s.restoreExecutor();
+
+      await expect(restored.executor.runOnce()).resolves.toMatchObject({
+        status: "failed", taskId: s.member.task.taskId,
+        reason: expect.stringContaining("model attempt budget exhausted (1/1)"),
+      });
+      expect(s.complete).not.toHaveBeenCalled();
+      expect((await restored.lifecycle.boards())[0]?.members[0]).toMatchObject({
+        outcome: "failed", failure: { retryable: false, reason: expect.stringContaining("model attempt budget exhausted") },
+      });
+      expect((await s.ledger.read({ runId })).filter((event) => event.type === "model.requested")).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    { maxAttempts: 3, remainingCalls: 2 },
+    { maxAttempts: 8, remainingCalls: 3 },
+  ])("bounds resumed work by remaining attempts and host allowance: %j", async ({ maxAttempts, remainingCalls }) => {
+    const s = await fixture({ maxAttempts, maxModelTokens: 10_000 });
+    await seedAttempt(s);
+    const execute = vi.fn(async () => ({ content: "Verified read-only evidence", isError: false }));
+    const tool: AgentTool = {
+      definition: {
+        name: "read_file", description: "Read evidence",
+        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false },
+      },
+      execute,
+    };
+    s.complete.mockImplementation(async () => ({
+      content: "Continue inspecting evidence", stopReason: "toolUse", usage,
+      toolCalls: [{ id: `read-${s.complete.mock.calls.length}`, name: "read_file", arguments: { path: "evidence.txt" } }],
+    }));
+    const restored = await s.restoreExecutor([tool]);
+    await restored.executor.runOnce();
+
+    expect(s.complete).toHaveBeenCalledTimes(remainingCalls);
+    expect(execute).toHaveBeenCalledTimes(remainingCalls);
+    expect((await restored.lifecycle.boards())[0]?.members[0]).toMatchObject({
+      terminal: true, outcome: "partial", result: { status: "partial" },
+    });
+    const events = await s.ledger.read({ runId });
+    expect(events.filter((event) => event.type === "model.requested")).toHaveLength(1 + remainingCalls);
+    expect(events.filter((event) => event.type === "step.started").map((event) => event.payload.step))
+      .toEqual(Array.from({ length: 1 + remainingCalls }, (_value, index) => index + 1));
+  });
+
+  it("does not charge other lanes or Runs against the recovered task's attempts", async () => {
+    const s = await fixture({ maxAttempts: 2, maxModelTokens: 10_000 });
+    await seedAttempt(s);
+    for (const laneId of ["main", "team:review:other", `${s.member.laneId}:teto`]) {
+      await s.append("model.requested", {
+        model: modelName, requestHash: "other-lane-call", contextWatermark: await s.ledger.watermark(),
+      }, laneId);
+    }
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await s.ledger.append({
+        runId: "different-run", laneId: s.member.laneId, type: "model.requested",
+        payload: { model: modelName, requestHash: "other-run-call", contextWatermark: await s.ledger.watermark() },
+        correlationId: "other-run", idempotencyKey: `other-run-attempt-${attempt}`,
+      });
+    }
+    s.complete.mockResolvedValue({ content: "Verified final evidence", toolCalls: [], stopReason: "stop", usage });
+    const restored = await s.restoreExecutor();
+    await expect(restored.executor.runOnce()).resolves.toMatchObject({ status: "completed" });
+
+    expect(s.complete).toHaveBeenCalledTimes(1);
+    expect((await restored.lifecycle.boards())[0]?.members[0]).toMatchObject({ outcome: "succeeded" });
+    expect((await s.ledger.read({ runId }))
+      .filter((event) => event.laneId === s.member.laneId && event.type === "model.requested")).toHaveLength(2);
+  });
+
   it("fails closed without replaying an operation whose side effect outcome is unknown", async () => {
-    const s = await fixture();
+    const s = await fixture({ maxAttempts: 1 });
     const execute = vi.fn(async () => ({ content: "Side effect must not be replayed", isError: false }));
     const tool: AgentTool = {
       definition: { name: "publish_change", description: "Publish a change once", parameters: { type: "object", properties: {}, additionalProperties: false } },
@@ -136,6 +313,7 @@ describe("Team member recovery", () => {
     };
     const argumentsRef = await s.store.put("{}", TOOL_ARGUMENTS_MEDIA_TYPE);
     await s.append("step.started", { step: 1 });
+    await s.append("model.requested", { model: modelName, requestHash: "prior-tool-call", contextWatermark: await s.ledger.watermark() });
     await s.append("tool.requested", { operationId: "op-publish", toolCallId: "call-publish", name: tool.definition.name, argumentsRef });
     await s.append("tool.admitted", { operationId: "op-publish", toolCallId: "call-publish", name: tool.definition.name, argumentsHash: argumentsRef.contentHash });
     await s.append("tool.started", { operationId: "op-publish", toolCallId: "call-publish", name: tool.definition.name, argumentsHash: argumentsRef.contentHash });
