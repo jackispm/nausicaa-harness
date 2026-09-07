@@ -123,3 +123,46 @@ not committed. The last Team failure is not a lost-message diagnosis or a
 successful all-member run. Its remaining model choices are not hidden by
 loosening the evaluator or reclassifying partial results. One Teto pass does
 not prove consistent adoption of its advice; see the smoke contract for limits.
+
+## Publication CI Follow-Up
+
+The first pushed revision, `22728b4`, did not pass GitHub CI. Local unit and
+protocol tests alone were not the complete publication gate. Inspection of
+runs `34124458557`, `34135759765`, and `34142151765` identified these causes:
+
+- The Goal TUI fixture used an empty scripted model even though creating a
+  Goal starts autonomous execution. Its model failure added progress/blocked
+  revisions before the edit assertion. Failed assertions then skipped normal
+  shutdown, so recursive cleanup raced a still-open Session and could obscure
+  the original failure with `ENOTEMPTY`. The fixture now waits for a controlled
+  model request, preserves the exact create/edit assertions, and closes the
+  TUI and Session even on failure. Deliberate assertion failure was checked
+  separately to verify this cleanup path.
+- The compaction benefit fixture required an entire 10,000-character filler
+  message to survive a 4,096-token input allowance. Host tool schemas and
+  stable context legitimately left less room than that. The fixture now
+  checks the same explicit fact in raw history and the actual capsule;
+  filler-only and header-only inputs must fail. The 8,192-token model window,
+  output reservation, request counts, token/byte savings, and no-fallback
+  assertions are unchanged. The fake summarizer cannot invent the fact when
+  it is absent from its input.
+- The offline Worker overlap probe depended on fixed 25/250 ms sleeps. Its
+  scripted model now waits for both real provider calls to start, with abort
+  handling and a bounded failure deadline. Overlap is still measured from
+  actual request intervals; neither timestamps nor successful outcomes are
+  fabricated. Ready, cancelled, and timed-out waits all release their timer
+  and listener.
+- A later local parallel evaluation run hit widespread wall-clock failures
+  under concurrent host load. The unchanged 104 evaluations passed when run
+  by file serially. The `eval` script now follows the existing unit/smoke
+  file-isolation policy; Main/Worker overlap inside each test remains real.
+
+The older Run-switch transcript failure already has the controlled attachment
+and stale-event regressions recorded in Round 3. No production behavior,
+workflow step, or supported Node version is removed by these CI fixture fixes.
+
+Publication requires typecheck, the full test suite, deterministic evaluations,
+CLI/PTY/package smoke tests, and package inspection from the selected revision.
+Both GitHub CI matrix jobs (`22.19.0` and `24.x`) must report success for that
+same pushed SHA before publication is described as complete. Other agents'
+uncommitted UI changes remain outside this validation and these commits.

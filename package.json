@@ -64,7 +64,7 @@
     "test:smoke": "npm run build && vitest run test/smoke --no-file-parallelism",
     "test:live": "node ./node_modules/vitest/vitest.mjs run test/live --passWithNoTests --no-file-parallelism",
     "test:beta:live": "node ./node_modules/vitest/vitest.mjs run test/live/openrouter-beta-suite.test.ts --passWithNoTests --no-file-parallelism",
-    "eval": "vitest run test/eval",
+    "eval": "vitest run test/eval --no-file-parallelism",
     "eval:worker": "vitest run test/eval/worker-contract.test.ts test/eval/worker-runner.test.ts",
     "eval:worker:live": "node --import tsx test/eval/worker-live-cli.ts",
     "eval:worker:verify": "node --import tsx test/eval/verify-worker-live.ts",

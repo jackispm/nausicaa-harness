@@ -2029,25 +2029,36 @@ describe("interactive TUI", () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-goal-"));
     const terminal = new MemoryTerminal(100, 28);
     const previousExitCode = process.exitCode;
+    let session: SessionController | undefined;
+    let running: Promise<number> | undefined;
+    let stopped = false;
+    let modelStarted = false;
+    let releaseModel!: (value: ModelResponse) => void;
+    const modelResponse = new Promise<ModelResponse>((resolve) => { releaseModel = resolve; });
     try {
-      const session = await SessionController.open({
+      session = await SessionController.open({
         workspace: root,
         dataDir: join(root, "state"),
         model: "scripted",
         policy: { maxMainStepsPerActivation: 4, tetoEnabled: false },
       }, {
-        mainModel: new ScriptedModel([]),
+        // Hold the autonomous Goal turn until shutdown cancels it.
+        mainModel: new ScriptedModel([() => {
+          modelStarted = true;
+          return modelResponse;
+        }]),
         createRunId: () => "interactive-goal-run",
       });
       const events: SessionRuntimeEvent[] = [];
       session.subscribe((event) => events.push(event));
-      const running = runInteractive({ session, terminal, forceAltScreen: true });
+      running = runInteractive({ session, terminal, forceAltScreen: true })
+        .finally(() => { stopped = true; });
 
       await terminal.started;
-      await delay(120);
       terminal.type("/goal Understand this repository");
       terminal.send("\r");
       await waitForOutput(terminal, "Goal created.");
+      await waitForCondition(() => modelStarted, "the autonomous Goal model request");
       terminal.type("/goal edit Explain installation precisely");
       terminal.send("\r");
       await waitForOutput(terminal, "Goal updated.");
@@ -2064,8 +2075,14 @@ describe("interactive TUI", () => {
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
     } finally {
-      process.exitCode = previousExitCode;
-      await rm(root, { recursive: true, force: true });
+      if (running !== undefined && !stopped) process.emit("SIGTERM", "SIGTERM");
+      try { await running; }
+      finally {
+        await session?.close();
+        releaseModel(response("cleanup"));
+        process.exitCode = previousExitCode;
+        await rm(root, { recursive: true, force: true });
+      }
     }
   });
 

@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
   ModelPort,
@@ -175,6 +175,36 @@ describe("Worker live runner", () => {
     expect(treatment.outcome.overlapMs).toBeGreaterThan(0);
     await evaluation.cleanup();
   });
+
+  it.each(["ready", "abort", "timeout"] as const)(
+    "cleans up the overlap barrier after %s",
+    async (outcome) => {
+      vi.useFakeTimers();
+      try {
+        const peer = deferred();
+        const controller = new AbortController();
+        const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+        const pending = waitForPeer(peer.promise, controller.signal);
+        if (outcome === "ready") {
+          peer.resolve();
+          await expect(pending).resolves.toBeUndefined();
+        } else if (outcome === "abort") {
+          controller.abort(new Error("overlap cancelled"));
+          await expect(pending).rejects.toThrow("overlap cancelled");
+        } else {
+          const rejection = expect(pending).rejects.toThrow(
+            "The overlap fixture did not start both provider requests",
+          );
+          await vi.advanceTimersByTimeAsync(2_000);
+          await rejection;
+        }
+        expect(vi.getTimerCount()).toBe(0);
+        expect(removeListener).toHaveBeenCalledWith("abort", expect.any(Function));
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("writes one paired partial probe without a report or decision", async () => {
     const root = await temporaryRoot();
@@ -486,11 +516,14 @@ function retryOnceFactory(): WorkerLiveModelFactory {
 
 const naturalWorkerFactory: WorkerLiveModelFactory = ({ fixture, arm }) => {
   let callId = 0;
+  const workerStarted = deferred();
+  const mainContinued = deferred();
   return {
     async complete(request) {
       callId += 1;
       if (request.laneId === "worker") {
-        await abortableDelay(25, request.signal);
+        workerStarted.resolve();
+        await waitForPeer(mainContinued.promise, request.signal);
         return response("Worker evidence synthesis complete.");
       }
       const canDelegate = request.tools.some((tool) => tool.name === "delegate_task");
@@ -512,12 +545,10 @@ const naturalWorkerFactory: WorkerLiveModelFactory = ({ fixture, arm }) => {
           })]);
         }
         if (!terminalNotice) {
-          // Worker startup crosses a committed Main-step boundary and may
-          // spend time rebuilding Inbox/Ledger state before its provider
-          // request begins. Keep a generous observation window so this
-          // deterministic fixture proves overlap rather than scheduler
-          // startup latency.
-          await abortableDelay(250, request.signal);
+          // Keep both real provider intervals open until the peer starts;
+          // overlap must not depend on host speed or a fixed sleep window.
+          mainContinued.resolve();
+          await waitForPeer(workerStarted.promise, request.signal);
           return response("", [toolCall(`read-${callId}`, "read_file", {
             path: firstEvidencePath(fixture.task.taskId),
           })]);
@@ -582,13 +613,35 @@ function firstEvidencePath(taskId: string): string {
   }
 }
 
-async function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<void> {
-  await new Promise<void>((resolveDelay, rejectDelay) => {
-    const timer = setTimeout(resolveDelay, milliseconds);
-    signal?.addEventListener("abort", () => {
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
+async function waitForPeer(peer: Promise<void>, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("The overlap fixture did not start both provider requests"));
+    }, 2_000);
+    const cleanup = (): void => {
       clearTimeout(timer);
-      rejectDelay(signal.reason);
-    }, { once: true });
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = (): void => {
+      cleanup();
+      reject(signal?.reason);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    peer.then(() => {
+      cleanup();
+      resolve();
+    }, (error: unknown) => {
+      cleanup();
+      reject(error);
+    });
   });
 }
 

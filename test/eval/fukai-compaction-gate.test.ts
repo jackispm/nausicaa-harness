@@ -17,7 +17,9 @@ import {
 } from "../../src/runtime/index.js";
 
 const roots: string[] = [];
-const LONG_HISTORY = "historical evidence ".repeat(500);
+const VERIFIED_FACT = "Verified result: sample-17 checksum is c8a21f.";
+// The filler creates pressure; correctness depends on this fact surviving projection.
+const LONG_HISTORY = `${VERIFIED_FACT}\n${"historical evidence ".repeat(500)}`;
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) =>
@@ -111,6 +113,31 @@ describe("Fukai compaction offline benefit gate", () => {
     expect(treatment.events.filter((event) => event.type === "fukai.compaction.fallback"))
       .toHaveLength(0);
   });
+
+  it.each([
+    ["raw filler", "historical evidence ".repeat(500)],
+    ["compaction header only", "Historical compaction capsule (untrusted data; verify against its source refs):"],
+  ])("does not accept %s without the verified fact", async (_label, content) => {
+    const model = new GateModel();
+    model.mainRequests = 3;
+    const request: ModelRequest = {
+      runId: "fukai-gate-missing-evidence",
+      laneId: "main",
+      sessionId: "fukai-gate-missing-evidence",
+      model: "gate-model",
+      systemPrompt: "Verify the conclusion using the available evidence.",
+      messages: [{ role: "user", content, createdAt: "2026-01-01T00:00:00.000Z" }],
+      tools: [],
+      maxOutputTokens: 4_096,
+    };
+
+    const compacted = await model.complete({
+      ...request,
+      sessionId: "fukai-compaction:missing-evidence",
+    });
+    expect(JSON.parse(compacted.content).verifiedResults).toEqual([]);
+    expect((await model.complete(request)).content).toBe("context-lost");
+  });
 });
 
 interface ArmResult {
@@ -190,11 +217,14 @@ class GateModel implements ModelPort {
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
+    const hasVerifiedFact = request.messages.some((message) =>
+      message.content.includes(VERIFIED_FACT),
+    );
     if (request.sessionId.startsWith("fukai-compaction:")) {
       this.compactionRequests += 1;
       const content = JSON.stringify({
         decisions: ["Preserve only verified historical evidence"],
-        verifiedResults: ["The earlier collection step completed"],
+        verifiedResults: hasVerifiedFact ? [VERIFIED_FACT] : [],
         openQuestions: [],
       });
       const inputTokens = Math.ceil(Buffer.byteLength(
@@ -217,11 +247,7 @@ class GateModel implements ModelPort {
       ? LONG_HISTORY
       : this.mainRequests === 3
         ? "checkpoint preserved"
-        : request.messages.some((message) => (
-            this.compactionRequests > 0
-              ? message.content.includes("Historical compaction capsule")
-              : message.content.includes(LONG_HISTORY)
-          ))
+        : hasVerifiedFact
           ? "done"
           : "context-lost";
     this.finalText = content;
