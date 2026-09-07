@@ -63,4 +63,19 @@ includes 93 interactive TUI tests and 58 session protocol tests. Uncommitted
 selector, startup-logo, margin, and TUI-mode changes were excluded from the
 candidate; they were not reverted in the shared workspace.
 
-Rounds 4 and 5 are pending.
+## Round 4: Cancellation Before Task Admission
+
+A cancelled delegate call could still persist optional input and enqueue work,
+including while waiting behind another admission. Cancellation is now checked
+before input persistence, after it, inside the shared admission queue, and
+immediately before Inbox send. Once send persistence has started, the caller
+receives the actual queued outcome rather than a false claim of rollback.
+Task fields are validated before optional input storage. Cancellation during a
+store write may leave a bounded orphan artifact, but cannot admit a new task.
+
+Validation: regressions failed before the fix; 42 delegate/dispatcher tests
+passed in the root gate, with 54 additional related tests passed independently.
+`npm run typecheck` and `git diff --check` passed. The optional dispatch signal
+preserves existing callers and does not cancel already-admitted work.
+
+Round 5 is pending.

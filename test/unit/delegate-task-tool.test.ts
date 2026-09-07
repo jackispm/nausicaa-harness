@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { A2AInbox } from "../../src/a2a/index.js";
 import type { ToolExecutionContext } from "../../src/domain/index.js";
+import { MAX_TASK_MODEL_TOKENS, MAX_TASK_WALL_CLOCK_MS } from "../../src/domain/index.js";
 import { TaskDispatcher } from "../../src/runtime/index.js";
 import {
   createDelegateTaskTool,
@@ -28,6 +29,12 @@ function setup(maxInputBytes?: number, policy?: { depth?: number; maxDepth?: num
     ...(policy ?? {}),
   });
   return { inbox, store, tool };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => { resolve = complete; });
+  return { promise, resolve };
 }
 
 describe("delegate_task tool", () => {
@@ -73,6 +80,115 @@ describe("delegate_task tool", () => {
     await expect(store.get(refs[0]!)).resolves.toEqual(
       new TextEncoder().encode("package metadata"),
     );
+  });
+
+  it("rejects an already cancelled delegation before storing input", async () => {
+    const { inbox, store, tool } = setup();
+    const abort = new AbortController();
+    abort.abort(new Error("Cancelled before delegation"));
+
+    const result = await tool.execute({ statement: "Inspect input", input: "private input" }, {
+      ...context, signal: abort.signal,
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("Cancelled before delegation");
+    expect(await store.listObjects()).toEqual([]);
+    expect(inbox.snapshot().records).toEqual([]);
+  });
+
+  it("does not dispatch when cancelled during input persistence", async () => {
+    const { inbox, store, tool } = setup();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const put = store.put.bind(store);
+    vi.spyOn(store, "put").mockImplementationOnce(async (...arguments_) => {
+      entered.resolve();
+      await release.promise;
+      return put(...arguments_);
+    });
+    const abort = new AbortController();
+    const execution = tool.execute({ statement: "Inspect input", input: "saved input" }, {
+      ...context, signal: abort.signal,
+    });
+    await entered.promise;
+    abort.abort(new Error("Cancelled while storing input"));
+    release.resolve();
+
+    const result = await execution;
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("Cancelled while storing input");
+    expect(inbox.snapshot().records).toEqual([]);
+    expect(await store.listObjects()).toHaveLength(1);
+  });
+
+  it("propagates cancellation while waiting for serialized task admission", async () => {
+    const { inbox, tool } = setup();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const send = inbox.send.bind(inbox);
+    vi.spyOn(inbox, "send").mockImplementationOnce(async (message) => {
+      entered.resolve();
+      await release.promise;
+      return send(message);
+    });
+    const first = tool.execute({ taskId: "first", statement: "First task" }, context);
+    await entered.promise;
+    const abort = new AbortController();
+    const second = tool.execute({ taskId: "cancelled", statement: "Must not start" }, {
+      ...context, operationId: "second-operation", signal: abort.signal,
+    });
+    abort.abort(new Error("Cancelled while queued for admission"));
+    release.resolve();
+
+    const [admitted, cancelled] = await Promise.all([first, second]);
+    expect(admitted.isError).toBe(false);
+    expect(cancelled.isError).toBe(true);
+    expect(cancelled.content).toContain("Cancelled while queued for admission");
+    expect(inbox.snapshot().records.map((record) => record.message.messageId))
+      .toEqual(["run-1:task:first:request"]);
+  });
+
+  it("returns an admitted task truthfully when cancelled after persistence", async () => {
+    const { inbox, tool } = setup();
+    const persisted = deferred<void>();
+    const release = deferred<void>();
+    const send = inbox.send.bind(inbox);
+    vi.spyOn(inbox, "send").mockImplementationOnce(async (message) => {
+      const result = await send(message);
+      persisted.resolve();
+      await release.promise;
+      return result;
+    });
+    const abort = new AbortController();
+    const execution = tool.execute({ taskId: "admitted", statement: "Already admitted" }, {
+      ...context, signal: abort.signal,
+    });
+    await persisted.promise;
+    abort.abort(new Error("Cancelled after persistence"));
+    release.resolve();
+
+    const result = await execution;
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content)).toMatchObject({ status: "queued", taskId: "admitted" });
+    expect(inbox.snapshot().records).toHaveLength(1);
+  });
+
+  it.each([
+    { taskId: "" },
+    { taskId: "invalid\0task" },
+    { taskId: "x".repeat(129) },
+    { statement: "invalid\0goal" },
+    { maxAttempts: 9 },
+    { maxModelTokens: MAX_TASK_MODEL_TOKENS + 1 },
+    { maxWallClockMs: MAX_TASK_WALL_CLOCK_MS + 1 },
+  ])("validates task fields before input persistence: %j", async (invalid) => {
+    const { inbox, store, tool } = setup();
+    const result = await tool.execute({ statement: "Inspect input", input: "Do not persist", ...invalid }, context);
+
+    expect(result.isError).toBe(true);
+    expect(await store.listObjects()).toEqual([]);
+    expect(inbox.snapshot().records).toEqual([]);
   });
 
   it("uses conservative runtime defaults when budget fields are omitted", async () => {

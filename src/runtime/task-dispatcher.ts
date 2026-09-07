@@ -156,14 +156,19 @@ export class TaskDispatcher {
     this.spawnContextFactory = options.spawnContextFactory;
   }
 
-  async dispatch(request: TaskDispatchRequest): Promise<TaskDispatchResult> {
+  async dispatch(
+    request: TaskDispatchRequest,
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<TaskDispatchResult> {
+    const signal = options.signal;
+    signal?.throwIfAborted();
     const input = structuredClone(request);
-    return runInboxAdmission(this.inbox, () => this.dispatchCommand(input));
+    return runInboxAdmission(this.inbox, () => this.dispatchCommand(input, signal));
   }
 
-  private async dispatchCommand(request: TaskDispatchRequest): Promise<TaskDispatchResult> {
-    validateGoal(request.goal);
-    validateTaskBudget(request.budget);
+  private async dispatchCommand(request: TaskDispatchRequest, signal?: AbortSignal): Promise<TaskDispatchResult> {
+    signal?.throwIfAborted();
+    validateTaskDispatchRequest(request);
     const taskId = request.taskId ?? this.createId();
     validateTaskId(taskId);
 
@@ -248,6 +253,8 @@ export class TaskDispatcher {
           inputRefs: request.inputRefs ?? [],
           budget,
         });
+    // Cancellation before admission prevents new work; an admitted send keeps its actual receipt.
+    signal?.throwIfAborted();
     const result = await this.inbox.send({
       messageId,
       runId: this.runId,
@@ -279,6 +286,15 @@ function runInboxAdmission<T>(inbox: A2AInbox, operation: () => Promise<T>): Pro
   const result = tail.then(operation);
   admissionTails.set(inbox, result.then(() => undefined, () => undefined));
   return result;
+}
+
+/** Validate caller-owned task fields before an adapter persists optional input. */
+export function validateTaskDispatchRequest(
+  request: Pick<TaskDispatchRequest, "taskId" | "goal" | "budget">,
+): void {
+  validateGoal(request.goal);
+  validateTaskBudget(request.budget);
+  if (request.taskId !== undefined) validateTaskId(request.taskId);
 }
 
 function nonEmpty(value: unknown, field: string): asserts value is string {

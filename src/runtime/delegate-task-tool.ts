@@ -5,7 +5,7 @@ import {
 } from "../domain/types.js";
 import type { Goal, TaskBudget } from "../domain/types.js";
 import type { ContentAddressedStore } from "../store/index.js";
-import { TaskDispatcher } from "./task-dispatcher.js";
+import { TaskDispatcher, validateTaskDispatchRequest } from "./task-dispatcher.js";
 import {
   DEFAULT_SUBAGENT_MAX_DEPTH,
   assertSubagentSpawnAllowed,
@@ -63,8 +63,9 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
       },
     },
 
-    async execute(arguments_) {
+    async execute(arguments_, context) {
       try {
+        context.signal?.throwIfAborted();
         // Admission happens before input persistence or Inbox mutation. A
         // denied recursive spawn therefore leaves no orphaned artifacts.
         assertSubagentSpawnAllowed(depth, maxDepth);
@@ -85,9 +86,6 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
           throw new RangeError(`input exceeds ${maxInputBytes} bytes`);
         }
 
-        const inputRefs = input === undefined
-          ? []
-          : [await options.store.put(input, "text/plain")];
         const taskId = arguments_.taskId === undefined
           ? undefined
           : requiredString(arguments_.taskId, "taskId");
@@ -102,12 +100,16 @@ export function createDelegateTaskTool(options: DelegateTaskToolOptions): AgentT
           maxWallClockMs,
           ...(maxAttempts === undefined ? {} : { maxAttempts }),
         } satisfies TaskBudget;
+        const request = { ...(taskId === undefined ? {} : { taskId }), goal, budget };
+        validateTaskDispatchRequest(request);
+        const inputRefs = input === undefined
+          ? []
+          : [await options.store.put(input, "text/plain")];
+        context.signal?.throwIfAborted();
         const result = await options.dispatcher.dispatch({
-          ...(taskId === undefined ? {} : { taskId }),
-          goal,
+          ...request,
           inputRefs,
-          budget,
-        });
+        }, context.signal === undefined ? undefined : { signal: context.signal });
         return {
           content: JSON.stringify({
             status: result.status,

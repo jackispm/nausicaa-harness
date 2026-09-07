@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { A2AInbox, A2AProtocolError } from "../../src/a2a/index.js";
 import type { ArtifactRef, Clock, Goal } from "../../src/domain/index.js";
@@ -38,6 +38,12 @@ const baseArtifact: ArtifactRef = {
 };
 
 const baseBudget = { maxModelTokens: 1_000, maxWallClockMs: 30_000 };
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => { resolve = complete; });
+  return { promise, resolve };
+}
 
 describe("TaskDispatcher", () => {
   it("sends a bounded task request with stable defaults and cloned inputs", async () => {
@@ -354,6 +360,72 @@ describe("TaskDispatcher", () => {
     ]);
 
     expect(settled.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"]);
+    expect(inbox.snapshot().records).toHaveLength(1);
+  });
+
+  it("rejects an already aborted dispatch without publishing a request", async () => {
+    const inbox = new A2AInbox();
+    const dispatcher = new TaskDispatcher({ inbox, runId: "run-1" });
+    const abort = new AbortController();
+    abort.abort(new Error("Cancelled before admission"));
+
+    await expect(dispatcher.dispatch({ goal: baseGoal, budget: baseBudget }, { signal: abort.signal }))
+      .rejects.toThrow("Cancelled before admission");
+    expect(inbox.snapshot().records).toEqual([]);
+  });
+
+  it("rechecks cancellation after waiting for another dispatcher's admission", async () => {
+    const inbox = new A2AInbox();
+    const first = new TaskDispatcher({ inbox, runId: "run-1" });
+    const second = new TaskDispatcher({ inbox, runId: "run-1" });
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const send = inbox.send.bind(inbox);
+    vi.spyOn(inbox, "send").mockImplementationOnce(async (message) => {
+      entered.resolve();
+      await release.promise;
+      return send(message);
+    });
+    const admitted = first.dispatch({ taskId: "first", goal: baseGoal, budget: baseBudget });
+    await entered.promise;
+    const abort = new AbortController();
+    const cancelled = second.dispatch({ taskId: "cancelled", goal: baseGoal, budget: baseBudget }, {
+      signal: abort.signal,
+    });
+    abort.abort(new Error("Cancelled while awaiting admission"));
+    release.resolve();
+
+    await Promise.all([
+      expect(admitted).resolves.toMatchObject({ status: "queued", taskId: "first" }),
+      expect(cancelled).rejects.toThrow("Cancelled while awaiting admission"),
+    ]);
+    expect(inbox.snapshot().records.map((record) => record.message.messageId))
+      .toEqual(["run-1:task:first:request"]);
+    await expect(second.dispatch({ taskId: "later", goal: baseGoal, budget: baseBudget }))
+      .resolves.toMatchObject({ status: "queued", taskId: "later" });
+  });
+
+  it("preserves the admission result if cancellation follows persistence", async () => {
+    const inbox = new A2AInbox();
+    const dispatcher = new TaskDispatcher({ inbox, runId: "run-1" });
+    const persisted = deferred<void>();
+    const release = deferred<void>();
+    const send = inbox.send.bind(inbox);
+    vi.spyOn(inbox, "send").mockImplementationOnce(async (message) => {
+      const result = await send(message);
+      persisted.resolve();
+      await release.promise;
+      return result;
+    });
+    const abort = new AbortController();
+    const execution = dispatcher.dispatch({ taskId: "admitted", goal: baseGoal, budget: baseBudget }, {
+      signal: abort.signal,
+    });
+    await persisted.promise;
+    abort.abort(new Error("Cancelled after persistence"));
+    release.resolve();
+
+    await expect(execution).resolves.toMatchObject({ status: "queued", taskId: "admitted" });
     expect(inbox.snapshot().records).toHaveLength(1);
   });
 
