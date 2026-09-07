@@ -174,4 +174,30 @@ describe("SelectorOverlay", () => {
     expect(overlay.getSelectedValue()).toBe("openai:gpt-5.4");
     expect(overlay.render(120).join("\n")).toContain("Provider: All [OpenAI] Anthropic");
   });
+
+  it("keeps long provider facets readable by showing the active value and count", () => {
+    const overlay = new SelectorOverlay({
+      title: "Models",
+      searchLabel: "Search models",
+      filters: [{
+        key: "provider",
+        label: "Provider",
+        current: "all",
+        options: [
+          { value: "all", label: "All" },
+          ...Array.from({ length: 40 }, (_, index) => ({
+            value: `provider-${index}`,
+            label: `Provider ${index}`,
+          })),
+        ],
+      }],
+      options: [{ value: "provider-0:model", label: "Provider 0 / model" }],
+      onSelect: () => {},
+      onCancel: () => {},
+    });
+
+    expect(overlay.render(80).join("\n")).toContain("Provider: [All] (1/41)");
+    overlay.handleInput("\x1b[C");
+    expect(overlay.render(80).join("\n")).toContain("Provider: [Provider 0] (2/41)");
+  });
 });

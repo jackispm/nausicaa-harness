@@ -452,6 +452,18 @@ export class SelectorOverlay extends Container implements Focusable {
   private renderFilters(): string {
     return this.filters.map((filter) => {
       const selected = this.filterValues[filter.key];
+      // Provider facets can contain dozens of entries. Rendering every option
+      // makes the active value disappear on ordinary terminal widths, so keep
+      // the compact current-value/count form for long facets while retaining
+      // the full toggle strip for small, scannable facets.
+      if (filter.options.length > 6) {
+        const selectedIndex = Math.max(
+          0,
+          filter.options.findIndex((option) => option.value === selected),
+        );
+        const selectedLabel = filter.options[selectedIndex]?.label ?? selected ?? "-";
+        return `${filter.label}: [${selectedLabel}] (${selectedIndex + 1}/${filter.options.length})`;
+      }
       const values = filter.options.map((option) => option.value === selected
         ? `[${option.label}]`
         : option.label);
