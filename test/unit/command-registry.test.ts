@@ -17,12 +17,14 @@ describe("interactive command registry", () => {
     ))).toBe(true);
     expect(PUBLIC_INTERACTIVE_COMMANDS.map((spec) => spec.name)).toEqual([
       "help",
+      "hotkeys",
+      "reload",
       "setup",
       "status",
       "login",
       "logout",
       "list-agents",
-      "edges",
+      "mcp",
       "skills",
       "context",
       "compact",
@@ -33,6 +35,9 @@ describe("interactive command registry", () => {
       "theme",
       "goal",
       "session",
+      "name",
+      "export",
+      "import",
       "tree",
       "fork",
       "new",
@@ -73,7 +78,7 @@ describe("interactive command registry", () => {
     expect(help).not.toContain("/topology");
     expect(help).not.toContain("/providers");
     expect(findInteractiveCommand("/providers")).toBeUndefined();
-    expect(help).toContain("/edges [refresh]");
+    expect(help).toContain("/mcp [refresh]");
     expect(help).toContain("/mode [default|plan]");
     expect(help).toContain("/fork [run-id]");
     expect(help).toContain("/tree");

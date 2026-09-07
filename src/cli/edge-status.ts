@@ -181,6 +181,20 @@ export function formatEdgeStatus(status: EdgeStatusProjection): string {
   return lines.join("\n");
 }
 
+/** MCP inspection does not mix Skill metadata into the server list. */
+export function formatMcpStatus(status: EdgeStatusProjection): string {
+  const servers = status.sources.filter((source) => source.type === "mcp");
+  const lines = ["### MCP", `${servers.length} configured server(s)`];
+  if (servers.length === 0) lines.push("No MCP servers configured.");
+  if (status.refreshing) lines.push("Discovery in progress.");
+  if (status.stale) lines.push("Showing the last snapshot; the latest refresh did not complete.");
+  for (const server of servers) {
+    lines.push(`- **${safeText(server.sourceId)}:** ${safeText(server.health ?? server.status)}; ${server.toolCount ?? 0} tool(s)`);
+    for (const diagnostic of server.diagnostics ?? []) lines.push(`  ${safeText(diagnostic)}`);
+  }
+  return lines.join("\n");
+}
+
 function safeText(value: string): string {
   return stripTerminalSequences(value)
     .replace(/[\u0000-\u001f\u007f]/g, "");

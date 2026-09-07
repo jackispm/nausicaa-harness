@@ -136,8 +136,8 @@ describe("settings", () => {
       allowWrite: true,
       allowNetwork: true,
       fukaiCompaction: {
-        enabled: false,
-        provider: "none",
+        enabled: true,
+        provider: "pi-ai",
         maxInputTokens: 32_000,
         maxOutputTokens: 4_096,
         maxWallClockMs: 60_000,
@@ -170,7 +170,7 @@ describe("settings", () => {
     ).model).toBe("openrouter:environment");
   });
 
-  it("keeps Fukai compaction disabled by default without selecting a provider", () => {
+  it("enables Fukai compaction by default with the existing model provider", () => {
     const resolved = resolveSettings(
       "/work",
       { model: "openrouter:base" },
@@ -179,8 +179,8 @@ describe("settings", () => {
     );
 
     expect(resolved.fukaiCompaction).toEqual({
-      enabled: false,
-      provider: "none",
+      enabled: true,
+      provider: "pi-ai",
       maxInputTokens: 32_000,
       maxOutputTokens: 4_096,
       maxWallClockMs: 60_000,
@@ -188,6 +188,27 @@ describe("settings", () => {
       retainRatio: 0.16,
       minimumGainTokens: 1,
     });
+  });
+
+  it("preserves explicit compaction opt-outs in settings and overrides", () => {
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base", fukaiCompaction: { enabled: false } },
+      {},
+      {},
+    ).fukaiCompaction).toMatchObject({ enabled: false, provider: "none" });
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base", fukaiCompaction: { enabled: true, provider: "pi-ai" } },
+      { fukaiCompaction: { enabled: false } },
+      {},
+    ).fukaiCompaction).toMatchObject({ enabled: false, provider: "pi-ai" });
+    expect(resolveSettings(
+      "/work",
+      { model: "openrouter:base", fukaiCompaction: { provider: "none" } },
+      {},
+      {},
+    ).fukaiCompaction).toMatchObject({ enabled: false, provider: "none" });
   });
 
   it("merges and bounds explicit Fukai compaction settings", () => {
@@ -318,7 +339,25 @@ describe("settings", () => {
     ).allowNetwork).toBe(true);
   });
 
-  it("loads and resolves opt-in edge source declarations without starting adapters", async () => {
+  it("enables configured sources and startup refresh without adding servers or grants", () => {
+    const defaults = resolveSettings("/work", { model: "m" }, {}, {});
+    expect(defaults.edges).toMatchObject({
+      enabled: true,
+      refreshOnStart: true,
+      sources: [],
+      grants: [],
+    });
+    const disabled = resolveSettings("/work", {
+      model: "m",
+      edges: { enabled: false, refreshOnStart: false },
+    }, {}, {});
+    expect(disabled.edges).toMatchObject({ enabled: false, refreshOnStart: false });
+    expect(resolveSettings("/work", { model: "m" }, {
+      edges: { enabled: false, refreshOnStart: false },
+    }, {}).edges).toMatchObject({ enabled: false, refreshOnStart: false });
+  });
+
+  it("loads and resolves configured edge declarations without starting adapters", async () => {
     const root = await makeRoot();
     const home = join(root, "home");
     const workspace = join(root, "workspace");

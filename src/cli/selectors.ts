@@ -186,21 +186,21 @@ export interface SkillSelectorInput {
   readonly sourceId?: string;
   readonly selected: boolean;
   readonly disabled: boolean;
+  readonly userInvocable?: boolean;
 }
 
-/** Add compact selection/disabled state without exposing Skill bodies. */
+/** Keep the invocation picker focused on names and descriptions, not registry state. */
 export function skillSelectorOptions(
   skills: readonly SkillSelectorInput[],
 ): SelectorOption[] {
   return skills.map((skill) => ({
     value: skill.id,
-    label: `${skill.selected ? "[x]" : "[ ]"} ${terminalSafeSelectorText(skill.name)}`,
+    label: terminalSafeSelectorText(skill.name),
     description: [
-      skill.disabled ? "disabled" : skill.selected ? "selected for next Turn" : "available",
-      skill.sourceId,
+      skill.disabled ? skill.userInvocable === true ? "manual only" : "unavailable" : undefined,
       skill.description === undefined ? undefined : terminalSafeSelectorText(skill.description),
     ].filter((value): value is string => value !== undefined && value.length > 0).join(" · "),
-    disabled: skill.disabled,
+    disabled: skill.disabled && skill.userInvocable !== true,
   }));
 }
 

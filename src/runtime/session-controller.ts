@@ -150,6 +150,7 @@ import {
   type SessionTranscriptEntry,
 } from "./session-artifacts.js";
 import { SessionProtocolError } from "./session-protocol-error.js";
+import { readSessionName, writeSessionName } from "./session-metadata.js";
 import {
   freezeWorkspaceEdgeToolSnapshot,
   type WorkspaceEdgeToolSnapshot,
@@ -370,6 +371,12 @@ export interface SessionForkResult {
   runId: string;
   parentRunId: string;
   parentCheckpoint: { watermark: number; checksum: string };
+}
+
+export interface SessionHistorySource {
+  runId: string;
+  events: readonly AnyEvent[];
+  store: ContentAddressedStore;
 }
 
 export type SessionCompactionStatus = "committed" | "skipped" | "unavailable";
@@ -1889,6 +1896,72 @@ export class SessionController {
     return this.forkRun(options);
   }
 
+  async sessionName(): Promise<string | undefined> {
+    const runId = this.attached?.runId;
+    return runId === undefined ? undefined : readSessionName(this.dataDir, runId);
+  }
+
+  async setSessionName(name: string): Promise<void> {
+    return this.runAdmission(async () => {
+      this.assertOpen();
+      if (this.attached === undefined) await this.createRun();
+      await writeSessionName(this.dataDir, this.requireAttached().runId, name);
+      this.publishState();
+    });
+  }
+
+  async portableSessionSource(): Promise<SessionHistorySource> {
+    return this.runAdmission(async () => {
+      this.assertOpen();
+      if (this.active !== undefined || this.execution !== undefined) {
+        throw new SessionProtocolError("Wait for or cancel the active Turn before exporting a session");
+      }
+      const attached = this.requireAttached();
+      return {
+        runId: attached.runId,
+        events: await attached.ledger.read({ runId: attached.runId }),
+        store: attached.store,
+      };
+    });
+  }
+
+  /** Import history through the existing fork copier, never through tool execution/recovery. */
+  async importRun(source: SessionHistorySource & { title?: string }): Promise<SessionForkResult> {
+    return this.runAdmission(async () => {
+      this.assertOpen();
+      if (this.active !== undefined || this.execution !== undefined) {
+        throw new SessionProtocolError("Wait for or cancel the active Turn before importing a session");
+      }
+      validateRunId(source.runId);
+      for (const event of source.events) {
+        validateEvent(event);
+        if (event.runId !== source.runId) throw new SessionProtocolError("Imported history contains another Run");
+      }
+      const checkpoint = latestForkCheckpoint(source.events, source.runId);
+      const projection = projectRun(source.events, source.runId);
+      if (projection.activeTurnId !== undefined || Object.values(projection.turns).some((turn) => (
+        turn.status === "waiting" || turn.status === "interrupted"
+      )) || pendingToolOperations(source.events, source.runId).length > 0) {
+        throw new SessionProtocolError("Imported history contains unfinished work");
+      }
+      const events = source.events
+        .filter((event) => event.type !== "model.selected" && event.type !== "goal.revised"
+          && !event.type.startsWith("thread.goal."))
+        .map((event): AnyEvent => event.type === "run.created" ? {
+          ...event,
+          payload: { workspace: this.workspace, policy: structuredClone(this.policy), mainModel: this.model },
+        } : event);
+      const runId = (this.deps.createRunId ?? randomUUID)();
+      validateRunId(runId);
+      if (runId === source.runId) throw new SessionProtocolError("Imported session needs a fresh Run ID");
+      await this.assertRunPathAbsent(runId);
+      await this.createForkRun({ runId: source.runId, store: source.store }, events, checkpoint, runId);
+      if (source.title !== undefined) await writeSessionName(this.dataDir, runId, source.title);
+      await this.attachRunInternal(runId);
+      return { runId, parentRunId: source.runId, parentCheckpoint: checkpoint };
+    });
+  }
+
   async attachRun(runId: string): Promise<void> {
     await this.runAdmission(async () => {
       this.assertOpen();
@@ -2026,7 +2099,7 @@ export class SessionController {
   }
 
   private async createForkRun(
-    parent: AttachedRun,
+    parent: Pick<AttachedRun, "runId" | "store">,
     parentEvents: readonly AnyEvent[],
     parentCheckpoint: { watermark: number; checksum: string },
     childRunId: string,
@@ -4447,7 +4520,7 @@ export async function listWorkspaceRuns(
         ?? projection.goal?.statement
         ?? created.payload.goal?.statement
         ?? INTERNAL_INTERACTIVE_TASK;
-      const title = await readWorkspaceRunTitle(
+      const title = await readSessionName(dataDir, entry.name).catch(() => undefined) ?? await readWorkspaceRunTitle(
         runsDir,
         entry.name,
         events,

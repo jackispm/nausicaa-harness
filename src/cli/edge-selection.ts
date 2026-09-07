@@ -1,4 +1,6 @@
 import type { EdgeProvenance } from "../mowe/edge-types.js";
+import type { EdgeRuntimeRegistryLike } from "../runtime/edge-runtime.js";
+import { expandSkillInvocation } from "./skill-invocation.js";
 
 /** A metadata-only Skill row suitable for a user-facing picker. */
 export interface EdgeSkillSummary {
@@ -8,6 +10,7 @@ export interface EdgeSkillSummary {
   readonly name: string;
   readonly description: string;
   readonly disabled: boolean;
+  readonly userInvocable?: boolean;
   readonly selected: boolean;
   readonly contentHash?: string;
   readonly provenance?: EdgeProvenance;
@@ -47,6 +50,7 @@ export interface EdgeSelectionProvider {
   readonly registry?: {
     snapshot?: () => unknown;
     refresh?: (options?: { readonly signal?: AbortSignal }) => unknown | Promise<unknown>;
+    loadContribution?: EdgeRuntimeRegistryLike["loadContribution"];
   };
 }
 
@@ -55,6 +59,8 @@ export interface EdgeSelectionController {
   selectSkill(id: string): void | Promise<void>;
   deselectSkill(id: string): void | Promise<void>;
   toggleSkill(id: string): void | Promise<void>;
+  /** Explicit request-local invocation, independent of persistent preloading. */
+  expandSkillInvocation?(text: string, signal?: AbortSignal): Promise<string>;
   /** Stable identities to feed a host's per-Turn context selector. */
   selectedContributions(): readonly { readonly sourceId: string; readonly contributionId: string }[];
   selectionPredicate(summary: unknown): boolean;
@@ -145,6 +151,13 @@ export function createEdgeSelectionController(
       const skill = findSkill(id);
       setSelected(skill.id, !selectedIds.has(skill.id));
     },
+    expandSkillInvocation: (text, signal) => {
+      const registry = typeof provider === "function" ? undefined : provider.registry;
+      return expandSkillInvocation(text, registry?.loadContribution === undefined ? undefined : {
+        snapshot: () => registry.snapshot?.() ?? readSnapshot(),
+        loadContribution: registry.loadContribution.bind(registry),
+      }, signal);
+    },
     selectedContributions: () => Object.freeze(current.skills
       .filter((skill) => selectedIds.has(skill.id))
       .map((skill) => Object.freeze({
@@ -234,6 +247,7 @@ export function projectEdgeSelectionSnapshot(
       name: value.name,
       description: typeof value.description === "string" ? value.description : "",
       disabled: value.disabled === true,
+      ...(typeof value.userInvocable === "boolean" ? { userInvocable: value.userInvocable } : {}),
       selected: selected.has(id),
       ...(typeof value.contentHash === "string" ? { contentHash: value.contentHash } : {}),
       ...(isRecord(value.provenance) ? { provenance: freezeProvenance(value.provenance) } : {}),

@@ -75,7 +75,7 @@ import type { CredentialStatus } from "./onboarding.js";
 import { SelectorOverlay } from "./selector-component.js";
 import { CustomEditor } from "./custom-editor.js";
 import type { SelectorFilter } from "./selector-component.js";
-import { createKeybindings } from "./keybindings.js";
+import { createKeybindings, formatHotkeys, reloadKeybindings } from "./keybindings.js";
 import type { EdgeSelectionController, EdgeSelectionSnapshot } from "./edge-selection.js";
 import {
   QueueSelection,
@@ -90,7 +90,6 @@ import {
   AssistantMessageBlock,
   BrandSplashHeader,
   ContextUsageBlock,
-  EdgeSkillPickerSummary,
   getNausicaaColorScheme,
   nausicaaEditorTheme,
   nausicaaMarkdownTheme,
@@ -107,6 +106,7 @@ import {
 } from "./tui-components.js";
 import {
   formatEdgeStatus,
+  formatMcpStatus,
   type EdgeStatusProjection,
 } from "./edge-status.js";
 import { AgentTopologyBlock } from "./agent-topology.js";
@@ -137,6 +137,9 @@ import type {
 import type { ModelProviderInfo } from "../model/index.js";
 import { diagnosePermissionFailure } from "../tools/permission-diagnostics.js";
 import type { PermissionDiagnostic } from "../tools/permission-diagnostics.js";
+import { loadProjectInstructions } from "../runtime/project-instructions.js";
+import { exportSessionFile, readSessionImportFile } from "./session-files.js";
+import { displaySkillInvocation } from "./skill-invocation.js";
 
 export interface InteractiveOptions {
   session: SessionController;
@@ -146,6 +149,8 @@ export interface InteractiveOptions {
   resumeOnStart?: boolean;
   /** Test/embedding seam; production uses ProcessTerminal. */
   terminal?: Terminal;
+  /** Optional user keybinding file override for embedders/tests. */
+  keybindingsPath?: string;
   /** Explicitly opt into Pi's fullscreen/alternate-screen layout. */
   forceAltScreen?: boolean;
   /** Test/embedding seam; production reads the system clipboard lazily. */
@@ -199,6 +204,17 @@ interface QueuedSubmission {
   images?: UserImage[];
   delivery: "new-turn" | "steering" | "follow-up";
   resolve: () => void;
+}
+
+function isInteractiveSlashCommand(value: string): boolean {
+  return value.startsWith("/") && !value.startsWith("/skill:");
+}
+
+function unquoteCommandPath(value: string): string {
+  const first = value[0];
+  return (first === '"' || first === "'") && value.at(-1) === first
+    ? value.slice(1, -1)
+    : value;
 }
 
 interface PromptStash {
@@ -335,6 +351,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   // Register it before constructing any focusable component so pi-tui's
   // global Editor/Input/SelectList bindings resolve the same definitions.
   const keybindings = createKeybindings();
+  let keybindingsWarning: string | undefined;
+  try {
+    await reloadKeybindings(keybindings, options.keybindingsPath);
+  } catch (error: unknown) {
+    keybindingsWarning = `Keyboard shortcuts were not loaded: ${error instanceof Error ? error.message : String(error)}`;
+  }
   // Pi leaves clearOnShrink under the TUI/settings/environment default. Do not
   // force it here: forcing a main-screen full redraw clears scrollback and
   // moves the regular welcome stream back to the top of the terminal.
@@ -438,6 +460,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   let activeAuthPromptView: TuiAuthPromptView | undefined;
   let activeSubmission: QueuedSubmission | undefined;
   let activeBashAbortController: AbortController | undefined;
+  let activeSkillAbortController: AbortController | undefined;
   let bashOperationSequence = 0;
   let pendingBashContext: string[] = [];
   let submissionDrainPromise: Promise<void> | undefined;
@@ -565,10 +588,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
     return completion;
   });
-  editor.setAutocompleteProvider(new CombinedAutocompleteProvider(
-    autocompleteCommands,
-    options.session.workspace,
-  ));
+  const refreshAutocomplete = (): void => {
+    const skillCommands = (options.edgeSelection?.snapshot().skills ?? [])
+      .filter((skill) => !skill.disabled || skill.userInvocable === true)
+      .map((skill) => ({ name: `skill:${skill.name}`, description: skill.description }));
+    editor.setAutocompleteProvider(new CombinedAutocompleteProvider(
+      [...autocompleteCommands, ...skillCommands],
+      options.session.workspace,
+    ));
+  };
+  refreshAutocomplete();
   // Keep the initial command menu useful while compatibility aliases remain
   // accepted by dispatch but are intentionally hidden from the public list.
   // Pi's default editor exposes five completion rows. Larger menus make the
@@ -1545,7 +1574,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           return;
         }
         addPromptToHistory(entry.content);
-        appendBlock(new UserMessageBlock(entry.content, entry.imageTypes));
+        appendBlock(new UserMessageBlock(displaySkillInvocation(entry.content) ?? entry.content, entry.imageTypes));
         return;
       }
       if (entry.role === "assistant") {
@@ -1669,7 +1698,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
                 break;
               }
               appendBlock(new UserMessageBlock(
-                message.content,
+                displaySkillInvocation(message.content) ?? message.content,
                 message.images?.map((image) => image.mimeType),
               ));
             }
@@ -1888,6 +1917,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     closing = true;
     clearInterruptExit();
     activeBashAbortController?.abort(new Error("Nausicaa is closing"));
+    activeSkillAbortController?.abort(new Error("Nausicaa is closing"));
     pendingPermissionApproval?.();
     // A selector may have temporarily previewed a theme. Restore its committed
     // palette before waiting for queued submissions or stopping the renderer.
@@ -3006,7 +3036,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   const refreshEdgeSelection = async (): Promise<void> => {
     const controller = options.edgeSelection;
     if (controller === undefined) {
-      appendNotice("Edge refresh is unavailable: the host did not provide a selection controller.", "warning");
+      appendNotice("Resource refresh is unavailable: the host did not provide a resource controller.", "warning");
       return;
     }
     const before = controller.snapshot();
@@ -3015,7 +3045,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const refreshed = await pending;
     if (refreshed.stale) {
       appendNotice(
-        `Edge refresh was cancelled or failed; showing stale generation ${before.generation}.`,
+        `Resource refresh was cancelled or failed; showing stale generation ${before.generation}.`,
         "warning",
       );
     } else if (
@@ -3030,36 +3060,14 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       // source failure. Do not report that as an unqualified success; keep
       // the notice short and point users to `/edges` for the bounded details.
       appendNotice(
-        `Edges refreshed at generation ${refreshed.generation} with diagnostics; inspect /edges.`,
+        `Resources refreshed at generation ${refreshed.generation} with diagnostics; inspect /mcp or /skills.`,
         "warning",
       );
     } else {
-      appendNotice(`Edges refreshed at generation ${refreshed.generation}.`, "success");
+      appendNotice(`Resources refreshed at generation ${refreshed.generation}.`, "success");
     }
+    refreshAutocomplete();
     requestTuiRender(true);
-  };
-
-  const applySkillSelection = async (values: readonly string[]): Promise<void> => {
-    const controller = options.edgeSelection;
-    if (controller === undefined) return;
-    const wanted = new Set(values);
-    const snapshot = controller.snapshot();
-    try {
-      for (const skill of snapshot.skills) {
-        if (skill.disabled) continue;
-        const selected = wanted.has(skill.id);
-        if (selected && !skill.selected) await controller.selectSkill(skill.id);
-        if (!selected && skill.selected) await controller.deselectSkill(skill.id);
-      }
-      const count = controller.snapshot().selectedSkillIds.length;
-      appendNotice(`${count} Skill(s) selected for the next Turn.`, "success");
-      requestTuiRender(true);
-    } catch (error: unknown) {
-      appendNotice(
-        `Skills were not changed: ${error instanceof Error ? error.message : String(error)}`,
-        "error",
-      );
-    }
   };
 
   const showSkillsSelector = (): void => {
@@ -3070,23 +3078,22 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       return;
     }
     const snapshot = controller.snapshot();
-    appendBlock(new EdgeSkillPickerSummary(() => controller.snapshot()));
     if (snapshot.skills.length === 0) {
-      appendNotice(snapshot.stale ? "No fresh Skills; the displayed edge snapshot is stale." : "No Skills discovered.", "info");
+      appendNotice(snapshot.stale ? "No fresh Skills; the displayed resource snapshot is stale." : "No Skills discovered.", "info");
       return;
     }
     const selector = new SelectorOverlay({
       title: "Skills",
-      subtitle: snapshot.stale
-        ? "Stale snapshot. Space toggles metadata-only Skills; Enter applies to the next Turn."
-        : "Space toggles metadata-only Skills; Enter applies to the next Turn.",
+      searchLabel: "Search Skills",
+      ...(snapshot.stale ? { subtitle: "Last available catalog; resource refresh did not complete." } : {}),
       options: skillSelectorOptions(snapshot.skills),
-      multiSelect: true,
-      selectedValues: snapshot.selectedSkillIds,
-      onSelect: () => {},
-      onConfirm: (values) => {
+      onSelect: (value) => {
+        const skill = snapshot.skills.find((entry) => entry.id === value);
+        if (skill === undefined) return;
         closeSelector(false, selector);
-        void applySkillSelection(values);
+        const draft = editor.getExpandedText();
+        editor.setText(`/skill:${skill.name} ${draft}`);
+        requestTuiRender();
       },
       onCancel: () => closeSelector(true, selector),
     });
@@ -3105,6 +3112,32 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const command = `/${canonicalInteractiveCommandName(enteredCommand)}`;
     try {
       switch (command) {
+        case "/hotkeys":
+          if (argument.length > 0) throw new Error("Usage: /hotkeys");
+          appendBlock(new Markdown(formatHotkeys(keybindings, useAltScreen), 1, 0, nausicaaMarkdownTheme));
+          break;
+        case "/reload": {
+          if (argument.length > 0) throw new Error("Usage: /reload");
+          const failures: string[] = [];
+          const reload = async (name: string, action: () => Promise<unknown>): Promise<void> => {
+            try { await action(); }
+            catch (error: unknown) { failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`); }
+          };
+          await reload("Keyboard shortcuts", () => reloadKeybindings(keybindings, options.keybindingsPath));
+          await reload("Project instructions", () => loadProjectInstructions(options.session.workspace));
+          if (options.edgeSelection !== undefined) await refreshEdgeSelection();
+          if (options.auth?.refreshModels !== undefined) {
+            await reload("Model catalog", () => options.auth!.refreshModels!(modelProviderOf(options.session.snapshot().model)));
+          }
+          if (options.auth?.onChanged !== undefined) await reload("Model status", async () => options.auth!.onChanged!());
+          refreshAutocomplete();
+          if (options.edgeSelection?.snapshot().stale) failures.push("Skill/MCP discovery did not complete");
+          appendNotice(failures.length > 0
+            ? `Reload finished with errors: ${failures.join("; ")}`
+            : "Resources reloaded. Project instructions are read again at the next model step.",
+          failures.length > 0 ? "warning" : "success");
+          break;
+        }
         case "/help":
           appendBlock(new Markdown([
             "### Commands",
@@ -3133,13 +3166,13 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         case "/list-agents":
           await showAgentTopology(argument);
           break;
-        case "/edges":
+        case "/mcp":
           if (argument === "refresh") {
             await refreshEdgeSelection();
             break;
           }
-          if (argument.length > 0) throw new Error("Usage: /edges [refresh]");
-          appendBlock(new Markdown(formatEdgeStatus(readEdgeStatus()), 1, 0, nausicaaMarkdownTheme));
+          if (argument.length > 0) throw new Error("Usage: /mcp [refresh]");
+          appendBlock(new Markdown(formatMcpStatus(readEdgeStatus()), 1, 0, nausicaaMarkdownTheme));
           break;
         case "/skills": {
           const parts = argument.split(/\s+/u).filter(Boolean);
@@ -3156,7 +3189,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           if ((action === "select" || action === "deselect") && parts.length === 2 && controller !== undefined) {
             if (action === "select") await controller.selectSkill(parts[1]!);
             else await controller.deselectSkill(parts[1]!);
-            appendNotice(`Skill ${parts[1]} ${action === "select" ? "selected" : "deselected"} for the next Turn.`, "success");
+            appendNotice(`Skill ${parts[1]} ${action === "select" ? "preloaded until deselected" : "removed from preloading"}.`, "success");
             break;
           }
           throw new Error("Usage: /skills [refresh|select <id>|deselect <id>]");
@@ -3293,6 +3326,35 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             await switchSession(argument);
           }
           break;
+        case "/name": {
+          if (argument.length === 0) {
+            appendNotice(await options.session.sessionName() ?? "This session has no name.", "info");
+          } else {
+            await options.session.setSessionName(argument);
+            appendNotice(`Session named ${argument}.`, "success");
+          }
+          break;
+        }
+        case "/export": {
+          const source = await options.session.portableSessionSource();
+          const title = await options.session.sessionName();
+          const result = await exportSessionFile({
+            ...source,
+            workspace: options.session.workspace,
+            ...(title === undefined ? {} : { title }),
+            ...(argument.length === 0 ? {} : { path: unquoteCommandPath(argument) }),
+          });
+          appendNotice(`Session exported to ${result.path}.`, "success");
+          break;
+        }
+        case "/import": {
+          if (argument.length === 0) throw new Error("Usage: /import <path.jsonl>");
+          const source = await readSessionImportFile({ workspace: options.session.workspace, path: unquoteCommandPath(argument) });
+          const result = await options.session.importRun(source);
+          await loadAttachedTranscript(true);
+          appendNotice(`Session imported as ${result.runId}. No historical tools were executed.`, "success");
+          break;
+        }
         case "/tree":
           if (argument.length > 0) throw new Error("Usage: /tree");
           await showSessionTreeSelector();
@@ -3379,7 +3441,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   const processSubmission = async (submission: QueuedSubmission): Promise<void> => {
     clearShortcutGuide();
     const { value } = submission;
-    if (value.startsWith("/")) {
+    if (isInteractiveSlashCommand(value)) {
       addPromptToHistory(value);
       await handleCommand(value, submission.images);
       return;
@@ -3404,10 +3466,25 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     const shellContext = pendingBashContext.length === 0
       ? undefined
       : pendingBashContext.join("\n\n");
-    const promptText = shellContext === undefined
-      ? value
-      : `${shellContext}\n\nUser request:\n${value}`;
     try {
+      let expanded = value;
+      if (value.startsWith("/skill:")) {
+        const controller = options.edgeSelection;
+        if (controller?.expandSkillInvocation === undefined) throw new Error("Skill invocation is unavailable in this session.");
+        const abort = new AbortController();
+        activeSkillAbortController = abort;
+        const timeout = setTimeout(() => abort.abort(new Error("Skill loading timed out")), 10_000);
+        try {
+          expanded = await controller.expandSkillInvocation(value, abort.signal);
+          abort.signal.throwIfAborted();
+        } finally {
+          clearTimeout(timeout);
+          if (activeSkillAbortController === abort) activeSkillAbortController = undefined;
+        }
+      }
+      const promptText = shellContext === undefined
+        ? expanded
+        : `${shellContext}\n\nUser request:\n${expanded}`;
       await options.session.submit({
         inputId,
         text: promptText,
@@ -3479,7 +3556,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
     const unresolvedMarkers = [...new Set(imageMarkerIds(value)
       .filter((markerId) => !pastedImages.has(markerId)))];
-    if (!value.startsWith("/") && unresolvedMarkers.length > 0) {
+    if (!isInteractiveSlashCommand(value) && unresolvedMarkers.length > 0) {
       editor.setText(value);
       const references = unresolvedMarkers
         .slice(0, 3)
@@ -3497,7 +3574,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     ];
     if ((value.length === 0 && submittedImages.length === 0) || closing) return Promise.resolve();
     const isBashCommand = value.startsWith("!");
-    if (!value.startsWith("/") && !isBashCommand && options.session.snapshot().model === UNCONFIGURED_MODEL) {
+    if (!isInteractiveSlashCommand(value) && !isBashCommand && options.session.snapshot().model === UNCONFIGURED_MODEL) {
       editor.setText(value);
       appendNotice("Choose a model with /model before sending a task. Local setup status is shown at startup.", "warning");
       return Promise.resolve();
@@ -3512,8 +3589,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     }
     editor.setText("");
     const hasPriorConversationSubmission = (
-      activeSubmission !== undefined && !activeSubmission.value.startsWith("/")
-    ) || submissionQueue.some((submission) => !submission.value.startsWith("/"));
+      activeSubmission !== undefined && !isInteractiveSlashCommand(activeSubmission.value)
+    ) || submissionQueue.some((submission) => !isInteractiveSlashCommand(submission.value));
     const delivery = requestedDelivery
       ?? (
         options.session.snapshot().status === "running" || hasPriorConversationSubmission
@@ -3538,6 +3615,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   editor.onPasteImage = queueClipboardImagePaste;
   editor.onCtrlD = () => { void finish(0); };
   editor.onEscape = () => {
+    if (activeSkillAbortController !== undefined) {
+      activeSkillAbortController.abort(new Error("Skill loading cancelled"));
+      return;
+    }
     if (activeBashAbortController !== undefined) {
       activeBashAbortController.abort(new Error("Cancelled by user"));
       return;
@@ -3573,29 +3654,29 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       return { consume: true };
     }
     if (activeSelector !== undefined) return undefined;
-    const isInterrupt = matchesKey(data, "ctrl+c");
+    const isInterrupt = keybindings.matches(data, "app.clear");
     if (!isInterrupt) clearInterruptExit();
     if (matchesKey(data, "?") && editor.getText().length === 0) {
       showShortcutGuide();
       return { consume: true };
     }
-    if (matchesKey(data, pasteImageKey)) {
+    if (keybindings.matches(data, "app.clipboard.pasteImage")) {
       queueClipboardImagePaste();
       return { consume: true };
     }
-    if (matchesKey(data, "ctrl+s")) {
+    if (keybindings.matches(data, "app.prompt.stash")) {
       handlePromptStash();
       return { consume: true };
     }
-    if (matchesKey(data, "alt+up")) {
+    if (keybindings.matches(data, "app.message.dequeue")) {
       browseQueueSelection(-1);
       return { consume: true };
     }
-    if (matchesKey(data, "alt+down")) {
+    if (keybindings.matches(data, "app.message.queueNext")) {
       browseQueueSelection(1);
       return { consume: true };
     }
-    if (matchesKey(data, "alt+enter")) {
+    if (keybindings.matches(data, "app.message.followUp")) {
       if (!closing) {
         const text = editor.getExpandedText();
         void submitText(text, "follow-up");
@@ -3603,6 +3684,10 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       return { consume: true };
     }
     if (isInterrupt) {
+      if (activeSkillAbortController !== undefined) {
+        activeSkillAbortController.abort(new Error("Skill loading cancelled"));
+        return { consume: true };
+      }
       if (activeBashAbortController !== undefined) {
         activeBashAbortController.abort(new Error("Cancelled by user"));
         return { consume: true };
@@ -3629,24 +3714,24 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       }
       return { consume: true };
     }
-    if (matchesKey(data, "ctrl+d") && editor.getText().length === 0) {
+    if (keybindings.matches(data, "app.exit") && editor.getText().length === 0) {
       void finish(0);
       return { consume: true };
     }
-    if (matchesKey(data, "ctrl+t")) {
+    if (keybindings.matches(data, "app.thinking.toggle")) {
       thinkingExpanded = !thinkingExpanded;
       for (const block of assistantBlocks) block.setThinkingExpanded(thinkingExpanded);
       tui.requestRender();
       return { consume: true };
     }
-    if (matchesKey(data, "ctrl+o")) {
+    if (keybindings.matches(data, "app.tools.expand")) {
       toolsExpanded = !toolsExpanded;
       for (const block of toolBlocks.values()) block.setExpanded(toolsExpanded);
       header.setExpanded(toolsExpanded);
       tui.requestRender();
       return { consume: true };
     }
-    if (matchesKey(data, "ctrl+p")) {
+    if (keybindings.matches(data, "app.agentMessages.toggle")) {
       agentMessagesExpanded = !agentMessagesExpanded;
       for (const block of agentMessageBlocks.values()) {
         block.setExpanded(agentMessagesExpanded);
@@ -3680,6 +3765,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   headerContainer.addChild(new Spacer(1));
   requestTuiRender();
   await refreshQueue();
+  if (keybindingsWarning !== undefined) appendNotice(keybindingsWarning, "warning");
   if (options.showStartupSetup === true || options.startupModelMissing === true) {
     // Setup status is a startup diagnostic, not a public slash command.
     showSetup();

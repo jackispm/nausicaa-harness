@@ -1042,9 +1042,18 @@ const openCliEdgeRuntime = async (
       return {
         ...runtime,
         enabled: skillPlan.edges.enabled,
-        ...(runtime.sources.length === 0 && configured.sources.length > 0
-          ? { sources: configured.sources }
-          : {}),
+        sources: configured.sources.map((source) => {
+          const discovered = runtime.sources.find((item) => item.sourceId === source.sourceId);
+          if (discovered !== undefined) return discovered;
+          const plan = composition.sourcePlan.find((item) => item.sourceId === source.sourceId);
+          return {
+            ...source,
+            ...(plan === undefined ? {} : {
+              health: plan.status,
+              diagnostics: plan.reason === undefined ? [] : [plan.reason],
+            }),
+          };
+        }),
         refreshRequested: externalStartupRefresh,
         diagnostics: Object.freeze([
           ...(runtime.diagnostics ?? []),

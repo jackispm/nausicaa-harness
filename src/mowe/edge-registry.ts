@@ -326,6 +326,8 @@ export class MoweEdgeRegistry {
     context: {
       readonly workspace?: string;
       readonly signal?: AbortSignal;
+      /** Only an explicit host-side user action may request manual invocation. */
+      readonly invocation?: "model" | "user";
       /** Optional Turn snapshot so a refresh cannot invalidate selection. */
       readonly snapshot?: MoweEdgeRegistrySnapshot;
       /** Optional bounded Skill resource selection forwarded to adapters. */
@@ -361,7 +363,11 @@ export class MoweEdgeRegistry {
     if (current === undefined) {
       throw new MoweEdgeRegistryError("Context contribution is not present in the active snapshot");
     }
-    if (validated.disabled) {
+    const manualSkill = context.invocation === "user" && validated.sourceType === "skill";
+    if (manualSkill && validated.userInvocable === false) {
+      throw new MoweEdgeRegistryError("Context contribution cannot be invoked by the user");
+    }
+    if (validated.disabled && !(manualSkill && validated.userInvocable === true)) {
       throw new MoweEdgeRegistryError("Disabled context contributions cannot be loaded");
     }
     const signal = context.signal ?? new AbortController().signal;
@@ -370,6 +376,7 @@ export class MoweEdgeRegistry {
         validated,
         {
           ...edgeContext(context.workspace ?? this.#workspace, signal),
+          ...(context.invocation === undefined ? {} : { invocation: context.invocation }),
           ...(context.resourcePaths === undefined ? {} : { resourcePaths: context.resourcePaths }),
           ...(context.maxBodyBytes === undefined ? {} : { maxBodyBytes: context.maxBodyBytes }),
           ...(context.maxResourceBytes === undefined ? {} : { maxResourceBytes: context.maxResourceBytes }),
@@ -383,21 +390,42 @@ export class MoweEdgeRegistry {
     );
     const contribution = validateEdgeContextContribution(loaded);
     assertContextIdentity(current, contribution);
-    // Skills may carry bounded, adapter-owned resource results as a
-    // non-enumerable extension. Preserve that extension across the shared
+    // Skills may carry bounded, adapter-owned resources and reference paths
+    // as non-enumerable extensions. Preserve these across the shared
     // contribution validator without widening the model-facing contract or
     // allowing it to participate in identity hashing.
     const resources = isRecord(loaded)
       ? Object.getOwnPropertyDescriptor(loaded, "resources")
       : undefined;
-    if (resources !== undefined && !resources.enumerable && Array.isArray(resources.value)) {
+    const skillLocation = isRecord(loaded) && validated.sourceType === "skill"
+      ? Object.getOwnPropertyDescriptor(loaded, "skillLocation")
+      : undefined;
+    const hasResources = resources !== undefined && !resources.enumerable && Array.isArray(resources.value);
+    const hasSkillLocation = skillLocation !== undefined && !skillLocation.enumerable
+      && isRecord(skillLocation.value)
+      && typeof skillLocation.value.filePath === "string"
+      && typeof skillLocation.value.baseDirectory === "string";
+    if (hasResources || hasSkillLocation) {
       const enriched = { ...contribution };
-      Object.defineProperty(enriched, "resources", {
-        configurable: false,
-        enumerable: false,
-        value: Object.freeze([...resources.value]),
-        writable: false,
-      });
+      if (hasResources) {
+        Object.defineProperty(enriched, "resources", {
+          configurable: false,
+          enumerable: false,
+          value: Object.freeze([...resources.value]),
+          writable: false,
+        });
+      }
+      if (hasSkillLocation) {
+        Object.defineProperty(enriched, "skillLocation", {
+          configurable: false,
+          enumerable: false,
+          value: Object.freeze({
+            filePath: skillLocation.value.filePath,
+            baseDirectory: skillLocation.value.baseDirectory,
+          }),
+          writable: false,
+        });
+      }
       return Object.freeze(enriched) as EdgeContextContribution;
     }
     return contribution;
@@ -800,6 +828,7 @@ export class MoweEdgeRegistry {
           name: contribution.name,
           description: contribution.description,
           disabled: contribution.disabled,
+          ...(contribution.userInvocable === undefined ? {} : { userInvocable: contribution.userInvocable }),
           contentHash: contribution.contentHash ?? null,
           provenance: contribution.provenance ?? null,
         })),
@@ -1028,6 +1057,7 @@ function assertContextIdentity(
     || loaded.name !== summary.name
     || loaded.description !== summary.description
     || loaded.disabled !== summary.disabled
+    || loaded.userInvocable !== summary.userInvocable
     || stableJson(loaded.provenance ?? null) !== stableJson(summary.provenance ?? null)
     || (summary.contentHash !== undefined && loaded.contentHash !== summary.contentHash)) {
     throw new MoweEdgeRegistryError("Loaded context contribution does not match discovered summary");

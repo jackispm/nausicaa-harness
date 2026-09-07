@@ -58,6 +58,7 @@ export interface EdgeSourcePlan {
 
 export type EdgeFactoryDiagnosticCode =
   | "edge-disabled"
+  | "missing-host-grant"
   | "missing-constructor"
   | "plugin-unsupported"
   | "constructor-failed"
@@ -82,7 +83,7 @@ export interface ConfiguredEdgeComposition {
 
 /**
  * Build an explicitly configured edge composition. No constructor is invoked
- * for disabled/default settings, and no adapter module is imported here.
+ * for absent or disabled sources, and no adapter module is imported here.
  */
 export async function createConfiguredEdgeComposition(
   options: ConfiguredEdgeCompositionOptions,
@@ -115,6 +116,23 @@ export async function createConfiguredEdgeComposition(
         reason: "plugin constructors are not enabled by the configuration factory",
       }));
       diagnostics.push(factoryDiagnostic("plugin-unsupported", source.sourceId, "Plugin source was rejected; native plugin loading is disabled"));
+      continue;
+    }
+    // MCP discovery can execute a process or contact a server before tool admission.
+    if (source.type === "mcp"
+      && !edgeSettings.grants.some((grant) => grant.sourceId === source.sourceId)) {
+      plans.push(Object.freeze({
+        sourceId: source.sourceId,
+        type: source.type,
+        enabled: true,
+        status: "rejected",
+        reason: "MCP connection requires a host grant for this source",
+      }));
+      diagnostics.push(factoryDiagnostic(
+        "missing-host-grant",
+        source.sourceId,
+        "MCP source was not connected; configure a matching host grant",
+      ));
       continue;
     }
     const constructor = constructors[source.type];
@@ -209,7 +227,7 @@ export async function createConfiguredEdgeComposition(
 }
 
 function resolveInputEdgeSettings(input: ResolvedSettings | ResolvedEdgeSettings | EdgeSettings): ResolvedEdgeSettings {
-  if (isResolvedSettings(input)) return input.edges;
+  if (isResolvedSettings(input)) return resolveEdgeSettings(input.edges, undefined);
   return resolveEdgeSettings(input, undefined);
 }
 

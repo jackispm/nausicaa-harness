@@ -668,6 +668,14 @@ describe("SessionController", () => {
     expect(overview.lanes).toEqual([{
       laneId: "main",
       usage: overview.usage,
+    }, {
+      laneId: "worker",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+      },
     }]);
     expect(overview.currentContext.tokens).not.toBe(overview.usage.input);
     await session.selectModel("openrouter:other");

@@ -114,6 +114,8 @@ describe("parseCliArgs", () => {
       .toThrow(/only accepts/u);
     expect(() => parseCliArgs(["--attach", "run-7", "--worker"], "/work"))
       .toThrow(/only accepts/u);
+    expect(() => parseCliArgs(["--attach", "run-7", "--no-worker"], "/work"))
+      .toThrow(/only accepts/u);
     expect(usage).toContain("--attach <run-id>");
   });
 
@@ -222,13 +224,25 @@ describe("parseCliArgs", () => {
     });
   });
 
-  it("keeps the complete provider catalog opt-in", () => {
+  it("keeps the legacy provider flag and explicit model refresh compatible", () => {
     expect(parseCliArgs(["--all-providers", "--refresh-models", "--model", "anthropic:claude-sonnet-4", "task"], "/work"))
       .toMatchObject({ allProviders: true, refreshModels: true, model: "anthropic:claude-sonnet-4", message: "task" });
     expect(() => parseCliArgs(["--topology", "--all-providers"], "/work"))
       .toThrow(/cannot be combined/u);
     expect(() => parseCliArgs(["--attach", "run-1", "--all-providers"], "/work"))
       .toThrow(/only accepts/u);
+  });
+
+  it("preserves settings defaults unless Worker enablement is explicitly overridden", () => {
+    expect(parseCliArgs(["task"], "/work").workerEnabled).toBeUndefined();
+    expect(parseCliArgs(["--no-worker", "task"], "/work"))
+      .toMatchObject({ workerEnabled: false, message: "task" });
+    expect(parseCliArgs(["--worker", "--no-worker", "task"], "/work").workerEnabled)
+      .toBe(false);
+    expect(parseCliArgs(["--no-worker", "--worker", "task"], "/work").workerEnabled)
+      .toBe(true);
+    expect(() => parseCliArgs(["--topology", "--no-worker"], "/work"))
+      .toThrow(/cannot be combined/u);
   });
 
   it("leaves write access unset unless explicitly requested", () => {
@@ -354,11 +368,16 @@ describe("parseCliArgs", () => {
     expect(usage).toContain("--continue");
     expect(usage).toContain("--max-output-tokens");
     expect(usage).toContain("--fukai-compaction");
+    expect(usage).toMatch(/--fukai-compaction.*default.*pi-ai/u);
+    expect(usage).toMatch(/--worker.*default/u);
+    expect(usage).toContain("--no-worker");
     expect(usage).toContain("--fukai-provider <none|pi-ai>");
     expect(usage).toMatch(/--allow-shell.*host-level shell access.*default/i);
     expect(usage).toContain("--allow-network");
     expect(usage).toContain("--edges");
     expect(usage).toContain("--refresh-edges");
+    expect(usage).toMatch(/--edges.*authorized MCP sources.*default/u);
+    expect(usage).toContain("native plugins are unsupported");
     expect(usage).toContain("--daemon");
     expect(usage).toContain("--daemon-socket");
     expect(usage).toContain("--topology");

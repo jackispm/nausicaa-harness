@@ -426,6 +426,7 @@ function assertLoadedIdentity(
     || loaded.name !== summary.name
     || loaded.description !== summary.description
     || loaded.disabled !== summary.disabled
+    || loaded.userInvocable !== summary.userInvocable
     || stableJson(loaded.provenance ?? null) !== stableJson(summary.provenance ?? null)
     || (summary.contentHash !== undefined && loaded.contentHash !== summary.contentHash)) {
     throw new TypeError("Loaded Skill does not match its selected summary");

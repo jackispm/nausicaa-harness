@@ -374,11 +374,13 @@ function normalizeContextContribution(
     "name",
     "description",
     "disabled",
+    "userInvocable",
     "contentHash",
     "provenance",
     ...(requireBody ? ["body"] : []),
   ];
   assertExactKeys(record, keys, "context contribution", [
+    "userInvocable",
     "contentHash",
     "provenance",
     ...(requireBody ? ["body"] : []),
@@ -406,6 +408,9 @@ function normalizeContextContribution(
     name: requiredIdentity(record.name, "context contribution.name"),
     description: requiredString(record.description, "context contribution.description"),
     disabled: requiredBoolean(record.disabled, "context contribution.disabled"),
+    ...(record.userInvocable === undefined ? {} : {
+      userInvocable: requiredBoolean(record.userInvocable, "context contribution.userInvocable"),
+    }),
     ...(body === undefined ? {} : { body }),
     ...(contentHash === undefined
       ? (body === undefined ? {} : { contentHash: sha256(body) })

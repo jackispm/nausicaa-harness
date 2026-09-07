@@ -224,6 +224,9 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
       case "--worker":
         options.workerEnabled = true;
         break;
+      case "--no-worker":
+        options.workerEnabled = false;
+        break;
       case "--fukai-compaction":
         options.fukaiCompaction = {
           ...(options.fukaiCompaction ?? {}),
@@ -545,8 +548,9 @@ Options:
   --continue              Resume the latest Run for this workspace
   --resolve-operation <id> Resolve one unknown tool operation as failed (requires --resume)
   --main-only             Disable the Teto lane for this run
-  --worker                Enable the bounded Worker sub-agent lane
-  --fukai-compaction      Enable activation-scoped Fukai compaction (defaults to pi-ai)
+  --worker                Allow bounded Worker delegation (default; starts only when requested)
+  --no-worker             Disable Worker delegation for this run
+  --fukai-compaction      Enable automatic context compaction (default; provider: pi-ai)
   --no-fukai-compaction   Disable Fukai compaction for this run
   --fukai-provider <none|pi-ai>
                           Select the Fukai provider capability; does not invoke it
@@ -559,10 +563,10 @@ Options:
   --allow-write           Allow workspace writes (default; use settings/profile to restrict)
   --allow-shell           Allow host-level shell access (default; use /permissions to restrict)
   --allow-network         Allow public web fetch/search tools (default)
-  --edges                 Enable configured external Skills/MCP/plugin edge sources
-                          (project-local Skills are discovered by default)
+  --edges                 Enable configured Skills and authorized MCP sources (default)
+                          Project-local Skills are discovered by default; native plugins are unsupported
   --no-edges              Disable configured edge sources and project-local Skill discovery
-  --refresh-edges         Refresh edge sources (including project-local Skills) before the host/Turn
+  --refresh-edges         Refresh Skills and authorized MCP sources at startup (default)
   --workspace <path>      Bound tools to this workspace
   --data-dir <path>       Runtime state directory (default: .nausicaa)
   --max-steps <number>    Maximum Main model steps (default: 24)

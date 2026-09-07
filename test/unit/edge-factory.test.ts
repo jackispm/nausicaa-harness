@@ -71,12 +71,10 @@ describe("configured edge factory", () => {
     await composition.close();
   });
 
-  it("constructs only enabled injected sources and passes host grants to admission", async () => {
+  it("starts configured authorized sources by default and preserves per-source opt-outs", async () => {
     const release = vi.fn();
     const constructor = vi.fn(async (source) => makeAdapter(source.sourceId, "mcp", "factory_tool", release));
     const settings: EdgeSettings = {
-      enabled: true,
-      refreshOnStart: true,
       sources: [
         { sourceId: "docs", type: "mcp", command: "fake", enabled: true },
         { sourceId: "off", type: "mcp", command: "fake", enabled: false },
@@ -100,6 +98,98 @@ describe("configured edge factory", () => {
     expect(release).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    { name: "no grant", grants: [] },
+    { name: "a different source grant", grants: [{ sourceId: "other", effects: ["read"] as const, scopes: ["workspace"] as const }] },
+  ])("does not start MCP transports with $name", async ({ grants }) => {
+    const constructor = vi.fn<EdgeAdapterConstructor>();
+    const composition = await createConfiguredEdgeComposition({
+      workspace: "/workspace",
+      settings: {
+        sources: [
+          { sourceId: "stdio", type: "mcp", command: "fake" },
+          { sourceId: "remote", type: "mcp", endpoint: "https://example.test/mcp" },
+        ],
+        grants,
+      },
+      constructors: { mcp: constructor },
+    });
+    expect(constructor).not.toHaveBeenCalled();
+    expect(composition.sourcePlan).toEqual([
+      expect.objectContaining({ sourceId: "remote", status: "rejected" }),
+      expect.objectContaining({ sourceId: "stdio", status: "rejected" }),
+    ]);
+    expect(composition.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceId: "stdio", code: "missing-host-grant" }),
+      expect.objectContaining({ sourceId: "remote", code: "missing-host-grant" }),
+    ]));
+    await composition.refresh();
+    expect(constructor).not.toHaveBeenCalled();
+    expect(composition.snapshot().tools).toEqual([]);
+    await composition.close();
+  });
+
+  it("keeps the explicit global opt-out effective even for an authorized source", async () => {
+    const constructor = vi.fn<EdgeAdapterConstructor>();
+    const composition = await createConfiguredEdgeComposition({
+      workspace: "/workspace",
+      settings: {
+        enabled: false,
+        sources: [{ sourceId: "docs", type: "mcp", command: "fake" }],
+        grants: [{ sourceId: "docs", effects: ["read"], scopes: ["workspace"] }],
+      },
+      constructors: { mcp: constructor },
+    });
+    expect(constructor).not.toHaveBeenCalled();
+    expect(composition.sourcePlan).toEqual([
+      expect.objectContaining({ sourceId: "docs", status: "disabled" }),
+    ]);
+    await composition.close();
+  });
+
+  it("keeps startup discovery explicitly suppressible for configured authorized sources", async () => {
+    const discover = vi.fn(async () => []);
+    const composition = await createConfiguredEdgeComposition({
+      workspace: "/workspace",
+      settings: {
+        refreshOnStart: false,
+        sources: [{ sourceId: "docs", type: "mcp", command: "fake" }],
+        grants: [{ sourceId: "docs", effects: ["read"], scopes: ["workspace"] }],
+      },
+      constructors: {
+        mcp: (source) => ({ ...makeAdapter(source.sourceId, "mcp", "factory_tool"), discover }),
+      },
+    });
+    expect(discover).not.toHaveBeenCalled();
+    await composition.refresh();
+    expect(discover).toHaveBeenCalledOnce();
+    await composition.close();
+  });
+
+  it("preserves approval requirements and refuses capabilities outside their grant", async () => {
+    const composition = await createConfiguredEdgeComposition({
+      workspace: "/workspace",
+      settings: {
+        sources: [
+          { sourceId: "docs", type: "mcp", command: "fake" },
+          { sourceId: "restricted", type: "mcp", command: "fake" },
+        ],
+        grants: [
+          { sourceId: "docs", effects: ["read"], scopes: ["workspace"] },
+          { sourceId: "restricted", effects: ["compute"], scopes: ["workspace"] },
+        ],
+      },
+      constructors: { mcp: (source) => makeAdapter(source.sourceId, "mcp", `${source.sourceId}_tool`) },
+    });
+    expect(composition.snapshot().tools).toHaveLength(1);
+    expect(composition.snapshot().tools[0]).toMatchObject({
+      name: "docs_tool",
+      metadata: { effect: "read", scope: "workspace", requiresApproval: true },
+    });
+    expect(composition.snapshot().catalog.has("restricted_tool")).toBe(false);
+    await composition.close();
+  });
+
   it("rejects plugins, records missing constructors, and redacts constructor failures", async () => {
     const failing = vi.fn(async () => { throw new Error("secret command and token"); });
     const composition = await createConfiguredEdgeComposition({
@@ -111,6 +201,7 @@ describe("configured edge factory", () => {
           { sourceId: "skill", type: "skill", location: "./skills" },
           { sourceId: "broken", type: "mcp", command: "secret-command" },
         ],
+        grants: [{ sourceId: "broken", effects: ["read"], scopes: ["workspace"] }],
       },
       constructors: { mcp: failing },
     });

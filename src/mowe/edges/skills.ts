@@ -175,6 +175,7 @@ export interface SkillEdgeContextContributionSummary {
   readonly name: string;
   readonly description: string;
   readonly disabled: boolean;
+  readonly userInvocable?: boolean;
   readonly contentHash?: string;
   readonly provenance?: EdgeProvenance;
 }
@@ -182,6 +183,11 @@ export interface SkillEdgeContextContributionSummary {
 export interface SkillEdgeContextContribution extends SkillEdgeContextContributionSummary {
   readonly body?: string;
   readonly resources?: readonly SkillResource[];
+  /** Adapter-owned reference location, retained as non-enumerable metadata. */
+  readonly skillLocation?: {
+    readonly filePath: string;
+    readonly baseDirectory: string;
+  };
 }
 
 export interface SkillContextLoadContext extends EdgeLoadContext {
@@ -742,6 +748,9 @@ class SkillsEdgeAdapterImpl implements SkillsEdgeAdapter {
       : undefined;
     if (selected === undefined) throw new SkillLoaderError("Skill contribution was not discovered by this adapter");
     validateSelectedContribution(this.sourceId, summary, selected, this.#options.provenance);
+    if (selected.disableModelInvocation && context.invocation !== "user") {
+      throw new SkillLoaderError("Skill disables model invocation; explicit user invocation is required");
+    }
     const workspace = await awaitWithSignal(canonicalWorkspace(context.workspace), context.signal);
     if (workspace !== selected.workspace) throw new SkillPathError("Skill contribution workspace does not match discovery");
     const resourcePaths = selectedResourcePaths(context);
@@ -816,6 +825,12 @@ class SkillsEdgeAdapterImpl implements SkillsEdgeAdapter {
       configurable: false,
       enumerable: false,
       value: Object.freeze(resources),
+      writable: false,
+    });
+    Object.defineProperty(contribution, "skillLocation", {
+      configurable: false,
+      enumerable: false,
+      value: Object.freeze({ filePath: selected.path, baseDirectory: selected.directory }),
       writable: false,
     });
     return Object.freeze(contribution) as SkillEdgeContextContribution;
@@ -901,6 +916,7 @@ function skillContributionSummary(
     name: summary.name,
     description: summary.description,
     disabled: summary.disableModelInvocation,
+    userInvocable: true,
     ...(normalizedProvenance === undefined ? {} : { provenance: normalizedProvenance }),
   };
   return Object.freeze(value);
@@ -935,6 +951,7 @@ function validateSelectedContribution(
     || contribution.name !== selected.name
     || contribution.description !== selected.description
     || contribution.disabled !== selected.disableModelInvocation
+    || contribution.userInvocable !== true
     || contribution.contributionId !== skillContributionId(selected)) {
     throw new SkillLoaderError("Skill contribution summary is forged or stale");
   }

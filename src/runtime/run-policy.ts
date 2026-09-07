@@ -20,7 +20,7 @@ export const DEFAULT_RUN_POLICY: RunPolicy = {
   // New lanes expose Teto as a capability; the owning model opens it when
   // the task warrants a second line of thought.
   tetoActivation: "manual",
-  workerEnabled: false,
+  workerEnabled: true,
 };
 
 export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {

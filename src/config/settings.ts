@@ -16,7 +16,7 @@ import type { MoweEffect, MoweToolScope } from "../mowe/types.js";
 export type FukaiCompactionProviderCapability = FukaiCompactionPolicy["provider"];
 
 /**
- * Explicit, opt-in compaction settings. These values describe a capability;
+ * Compaction settings. These values describe a default-on capability;
  * they do not construct a provider or trigger a model request by themselves.
  */
 export interface FukaiCompactionSettings {
@@ -60,7 +60,7 @@ export interface EdgeHostGrantSettings {
 }
 
 export interface EdgeSettings {
-  /** Edge loading is opt-in; disabled sources never enter a Turn snapshot. */
+  /** Configured sources load by default; explicit opt-outs remain effective. */
   enabled?: boolean;
   /** Refresh at host startup; explicit refresh remains a runtime concern. */
   refreshOnStart?: boolean;
@@ -305,8 +305,8 @@ export const resolveEdgeSettings = (
       : { headers: Object.freeze({ ...source.headers }) }),
   }));
   return {
-    enabled: merged.enabled ?? false,
-    refreshOnStart: merged.refreshOnStart ?? false,
+    enabled: merged.enabled ?? true,
+    refreshOnStart: merged.refreshOnStart ?? true,
     refreshTimeoutMs,
     sources: Object.freeze(sources.map((source) => Object.freeze(source))),
     grants: Object.freeze((merged.grants ?? []).map((grant) => Object.freeze({
@@ -549,7 +549,8 @@ const resolveFukaiCompactionSettings = (
   overrides: FukaiCompactionSettings | undefined,
 ): ResolvedFukaiCompactionSettings => {
   const merged = { ...settings, ...overrides };
-  const enabled = merged.enabled ?? false;
+  // Preserve the legacy explicit provider opt-out while enabling new sessions.
+  const enabled = merged.enabled ?? merged.provider !== "none";
   const provider = merged.provider ?? (enabled ? "pi-ai" : "none");
   if (enabled && provider === "none") {
     throw new SettingsError(

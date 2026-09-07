@@ -31,8 +31,8 @@ function settings(
     allowWrite: false,
     allowNetwork: false,
     edges: {
-      enabled: false,
-      refreshOnStart: false,
+      enabled: true,
+      refreshOnStart: true,
       refreshTimeoutMs: 60_000,
       sources: [],
       grants: [],
@@ -52,8 +52,9 @@ function settings(
 }
 
 describe("CLI Skill discovery policy", () => {
-  it("adds project Skill discovery without enabling configured external sources", () => {
+  it("keeps local Skill discovery available when external sources are explicitly disabled", () => {
     const plan = planCliSkillDiscovery(settings({
+      enabled: false,
       sources: [{ sourceId: "docs", type: "mcp", command: "docs-server" }],
     }));
 
@@ -71,13 +72,13 @@ describe("CLI Skill discovery policy", () => {
     ]);
   });
 
-  it("keeps configured external sources enabled when the edge gate is on", () => {
+  it("keeps configured external sources and refresh enabled with the new defaults", () => {
     const plan = planCliSkillDiscovery(settings({
-      enabled: true,
       sources: [{ sourceId: "docs", type: "mcp", command: "docs-server" }],
     }));
 
     expect(plan.edges.enabled).toBe(true);
+    expect(plan.edges.refreshOnStart).toBe(true);
     expect(plan.edges.sources).toEqual(expect.arrayContaining([
       expect.objectContaining({ sourceId: DEFAULT_LOCAL_SKILL_SOURCE_ID, enabled: true }),
       expect.objectContaining({ sourceId: "docs", type: "mcp", command: "docs-server" }),

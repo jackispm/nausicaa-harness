@@ -62,7 +62,10 @@ export interface EdgeDiscoveryContext {
   readonly signal?: AbortSignal;
 }
 
-export interface EdgeLoadContext extends EdgeDiscoveryContext {}
+export interface EdgeLoadContext extends EdgeDiscoveryContext {
+  /** Host-only intent; model-facing tools must not accept or forward this flag. */
+  readonly invocation?: "model" | "user";
+}
 
 /** Adapter-owned refresh hook. It must preserve already published capabilities. */
 export interface EdgeRefreshContext extends EdgeDiscoveryContext {}
@@ -109,6 +112,8 @@ export interface EdgeContextContributionSummary {
   readonly name: string;
   readonly description: string;
   readonly disabled: boolean;
+  /** Allows explicit user invocation even when model invocation is disabled. */
+  readonly userInvocable?: boolean;
   readonly contentHash?: string;
   readonly provenance?: EdgeProvenance;
 }

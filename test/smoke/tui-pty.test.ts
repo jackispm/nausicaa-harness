@@ -154,7 +154,7 @@ describe("built CLI PTY", () => {
         expect(plainStdout).not.toContain('Try "inspect this project"');
         expect(plainStdout).toContain("Nausicaa awareness");
         expect(plainStdout).not.toContain("Agent awareness is unavailable");
-        expect(plainStdout).toContain("main/new");
+        expect(plainStdout).toContain("main + Worker/new");
       } finally {
         await rm(root, { recursive: true, force: true });
       }

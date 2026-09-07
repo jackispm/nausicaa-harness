@@ -191,6 +191,7 @@ describe("runtime activation parity", () => {
       "agent_awareness",
       "team_create",
       "team_status",
+      "delegate_task",
     ]);
   });
 
@@ -281,6 +282,7 @@ describe("runtime activation parity", () => {
       "agent_awareness",
       "team_create",
       "team_status",
+      "delegate_task",
     ]);
   });
 
@@ -362,6 +364,7 @@ describe("runtime activation parity", () => {
         "teto_status",
         "team_create",
         "team_status",
+        "delegate_task",
       ],
       tetoModels: ["scripted-teto"],
       tetoSessionIds: [`${runId}:teto:scripted-teto`],

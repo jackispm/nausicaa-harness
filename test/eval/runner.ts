@@ -438,6 +438,10 @@ export async function executeEvaluationArm(
           maxMainStepsPerActivation: 8,
           maxModelTokens: arm.budget.maxInputTokens + arm.budget.maxOutputTokens,
           tetoEnabled: config.auxiliaryMode === "teto",
+          // Phase 2.4 evaluates the frozen workspace-tool contract. Keep the
+          // production Worker capability out of this arm so the request
+          // surface remains comparable across treatments.
+          workerEnabled: false,
           // Keep the evaluation aligned with the production Teto budget. The
           // parser tolerates provider wrappers without spending extra tokens.
           tetoMaxOutputTokens: 64,

@@ -182,10 +182,13 @@ describe("Mowe Skills contribution adapter", () => {
 
     const summary = (await adapter.discoverContributions({ workspace }))[0]!;
     expect(summary.disabled).toBe(true);
+    expect(summary.userInvocable).toBe(true);
     expect(adapter.diagnostics()).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "disabled", name: "manual-only" }),
     ]));
-    const loaded = await adapter.loadContribution(summary, { workspace });
+    await expect(adapter.loadContribution(summary, { workspace })).rejects.toThrow(/explicit user invocation/u);
+    const loaded = await adapter.loadContribution(summary, { workspace, invocation: "user" });
+    expect(loaded.body).toBe("manual body\n");
     expect(projectSkillContext(loaded)).toBeUndefined();
     expect(await adapter.health?.()).toMatchObject({ status: "healthy" });
   });
