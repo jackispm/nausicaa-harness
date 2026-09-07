@@ -156,6 +156,13 @@ runs `34124458557`, `34135759765`, and `34142151765` identified these causes:
   under concurrent host load. The unchanged 104 evaluations passed when run
   by file serially. The `eval` script now follows the existing unit/smoke
   file-isolation policy; Main/Worker overlap inside each test remains real.
+- Revision `70af941` passed all 2,140 tests in both remote environments but
+  exposed one more evaluator gap. A 20 ms deadline could expire after the
+  provider started on CI, while slower local startup often ended before any
+  request. Main correctly recorded `model.cancelled`, which the old verifier
+  did not recognize. Verification now requires exactly one matching terminal,
+  checks the cancellation's request identity and ordering, and treats the
+  cancelled physical invocation as failed, never as a successful arm.
 
 The older Run-switch transcript failure already has the controlled attachment
 and stale-event regressions recorded in Round 3. No production behavior,

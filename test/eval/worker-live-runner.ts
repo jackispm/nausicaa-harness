@@ -1965,30 +1965,46 @@ function ledgerRequestTerminal(
   terminal: WorkerLiveRequestInterval["terminal"];
   usage?: WorkerLiveProviderUsage;
 } {
+  if (!request.idempotencyKey.endsWith(":model:requested")) {
+    throw new WorkerLiveContractError("Worker live Ledger request identity is malformed");
+  }
   const prefix = request.idempotencyKey.slice(
     0,
     -":model:requested".length,
   );
-  const completed = events.find((event): event is Extract<
-    AnyEvent,
-    { type: "model.completed" }
-  > => (
-    event.type === "model.completed"
-    && event.laneId === request.laneId
-    && event.idempotencyKey === `${prefix}:model:completed`
+  const terminals = events.filter((event) => (
+    event.laneId === request.laneId
+    && (
+      (event.type === "model.completed"
+        && event.idempotencyKey === `${prefix}:model:completed`)
+      || (event.type === "model.failed"
+        && event.idempotencyKey === `${prefix}:model:failed`)
+      || (event.type === "model.cancelled"
+        && event.idempotencyKey === `${prefix}:model:cancelled`)
+    )
   ));
-  const failed = events.some((event) => (
-    event.type === "model.failed"
-    && event.laneId === request.laneId
-    && event.idempotencyKey === `${prefix}:model:failed`
-  ));
-  if ((completed !== undefined) === failed) {
+  const terminal = terminals[0];
+  if (terminals.length !== 1 || terminal === undefined) {
     throw new WorkerLiveContractError(
       "Worker live Ledger request has missing or conflicting terminal evidence",
     );
   }
-  if (completed === undefined) return { terminal: "failed" };
-  const usage = providerUsage(completed.payload.usage);
+  if (terminal.runId !== request.runId || terminal.globalOffset <= request.globalOffset) {
+    throw new WorkerLiveContractError(
+      "Worker live Ledger terminal does not follow its request",
+    );
+  }
+  if (terminal.type === "model.cancelled" && (
+    terminal.payload.requestId !== request.eventId
+    || terminal.causationId !== request.eventId
+  )) {
+    throw new WorkerLiveContractError(
+      "Worker live Ledger cancellation does not match its request",
+    );
+  }
+  // A cancelled invocation rejected physically; it is never a successful arm.
+  if (terminal.type !== "model.completed") return { terminal: "failed" };
+  const usage = providerUsage(terminal.payload.usage);
   const budget = events.find((event): event is Extract<
     AnyEvent,
     { type: "budget.charged" }

@@ -1,10 +1,12 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { clearTimeout as clearStartupTimeout, setTimeout as setStartupTimeout } from "node:timers";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
+  AnyEvent,
   ModelPort,
   ModelRequest,
   ModelResponse,
@@ -12,6 +14,8 @@ import type {
   TokenUsage,
 } from "../../src/domain/index.js";
 import { ProviderModelError } from "../../src/model/index.js";
+import { computeEventContentHash } from "../../src/ledger/ledger.js";
+import { projectTaskGraph } from "../../src/ledger/index.js";
 import {
   WORKER_LIVE_MANIFEST,
   WORKER_LIVE_TREATMENT_ARM,
@@ -281,6 +285,82 @@ describe("Worker live runner", () => {
     await evaluation.cleanup();
   });
 
+  it("verifies deadline cancellation after the provider request has started", async () => {
+    const root = await temporaryRoot();
+    const evaluation = await cancelledProviderEvaluation(root);
+    try {
+      expect(evaluation.records).toHaveLength(1);
+      const record = evaluation.records[0]!;
+      const requested = record.events.filter((event) => event.type === "model.requested");
+      const cancelled = record.events.filter((event) => event.type === "model.cancelled");
+      expect(requested).toHaveLength(1);
+      expect(cancelled).toHaveLength(1);
+      expect(cancelled[0]).toMatchObject({
+        runId: requested[0]!.runId,
+        laneId: requested[0]!.laneId,
+        causationId: requested[0]!.eventId,
+        payload: { requestId: requested[0]!.eventId },
+      });
+      expect(cancelled[0]!.globalOffset).toBeGreaterThan(requested[0]!.globalOffset);
+      expect(record.requestIntervals).toEqual([
+        expect.objectContaining({ laneId: "main", terminal: "failed" }),
+      ]);
+      expect(record.outcome.completed).toBe(false);
+      await expect(verifyWorkerLiveArtifacts(join(root, "artifacts"))).resolves.toMatchObject({
+        complete: false,
+        recordCount: 1,
+        failureCount: 1,
+      });
+    } finally {
+      await evaluation.cleanup();
+    }
+  });
+
+  it.each(["missing", "wrong-request", "conflicting"] as const)(
+    "rejects %s cancellation evidence after the checkpoint is re-signed",
+    async (mutation) => {
+      const root = await temporaryRoot();
+      const evaluation = await cancelledProviderEvaluation(root);
+      try {
+        const artifactDirectory = join(root, "artifacts");
+        await expect(verifyWorkerLiveArtifacts(artifactDirectory)).resolves.toMatchObject({ complete: false });
+        const checkpointPath = join(artifactDirectory, "raw", "records.json");
+        const checkpoint = await readCheckpoint(checkpointPath);
+        const record = checkpoint.records[0]!;
+        const cancelled = record.events.find((event) => event.type === "model.cancelled")!;
+        const requested = record.events.find((event) => event.type === "model.requested")!;
+        if (mutation === "missing") {
+          record.events = record.events.filter((event) => event.eventId !== cancelled.eventId);
+        } else if (mutation === "wrong-request") {
+          cancelled.payload.requestId = "unrelated-model-request";
+        } else {
+          record.events.push({
+            ...cancelled,
+            eventId: `${cancelled.eventId}:conflicting-failure`,
+            type: "model.failed",
+            idempotencyKey: `${requested.idempotencyKey.slice(0, -":model:requested".length)}:model:failed`,
+            payload: { model: requested.payload.model, error: "conflicting failure" },
+          });
+        }
+        const laneSequences = new Map<string, number>();
+        record.events.forEach((event, index) => {
+          event.globalOffset = index + 1;
+          event.laneSeq = (laneSequences.get(event.laneId) ?? 0) + 1;
+          laneSequences.set(event.laneId, event.laneSeq);
+          event.contentHash = computeEventContentHash(event);
+        });
+        record.ledgerDigest = hashJson(record.events);
+        record.taskGraph = projectTaskGraph(record.events, record.events[0]!.runId);
+        await writeResignedCheckpoint(checkpointPath, checkpoint);
+        await expect(verifyWorkerLiveArtifacts(artifactDirectory)).rejects.toThrow(
+          /terminal evidence|cancellation.*request/u,
+        );
+      } finally {
+        await evaluation.cleanup();
+      }
+    },
+  );
+
   it("rejects TaskGraph tampering even when the outer digest is recomputed", async () => {
     const root = await temporaryRoot();
     const artifactDirectory = join(root, "artifacts");
@@ -493,6 +573,50 @@ class AbortOnlyModel implements ModelPort {
   }
 }
 
+async function cancelledProviderEvaluation(root: string) {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const providerStarted = deferred();
+  let startupTimer!: NodeJS.Timeout;
+  const startupDeadline = new Promise<never>((_resolve, reject) => {
+    startupTimer = setStartupTimeout(() => reject(new Error("The cancellation fixture provider did not start")), 2_000);
+  });
+  const running = runWorkerLiveEvaluation({
+    maxPairs: 1,
+    deadlineMs: 20,
+    rootDirectory: join(root, "state"),
+    artifactDirectory: join(root, "artifacts"),
+    repositoryStateForTests: cleanRepository,
+    modelFactory: () => ({
+      complete(request) {
+        const pending = new AbortOnlyModel().complete(request);
+        providerStarted.resolve();
+        return pending;
+      },
+    }),
+  });
+  let settled = false;
+  void running.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    await Promise.race([
+      providerStarted.promise,
+      startupDeadline,
+      running.then(() => { throw new Error("The cancellation fixture ended before its provider started"); }),
+    ]);
+    await vi.advanceTimersByTimeAsync(20);
+    return await running;
+  } finally {
+    clearStartupTimeout(startupTimer);
+    try {
+      if (!settled) {
+        await vi.advanceTimersByTimeAsync(20);
+        await running.catch(() => undefined);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+}
+
 function retryOnceFactory(): WorkerLiveModelFactory {
   return () => {
     let attempts = 0;
@@ -659,6 +783,9 @@ interface MutableWorkerLiveCheckpoint {
     baselineIsAncestor: boolean;
   };
   records: Array<{
+    events: AnyEvent[];
+    ledgerDigest: string;
+    taskGraph: ReturnType<typeof projectTaskGraph>;
     finalText: string;
     graph: { anomalyCount: number };
     requestIntervals: Array<{ sessionId: string; maxOutputTokens: number }>;
