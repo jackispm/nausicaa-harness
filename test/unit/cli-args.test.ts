@@ -6,6 +6,27 @@ describe("parseCliArgs", () => {
   it("parses auth and config utility commands without a TTY", () => {
     expect(parseCliArgs(["auth", "status", "--json"], "/work").command).toEqual({ kind: "auth", action: "status", provider: "openrouter", json: true });
     expect(parseCliArgs(["config", "set-model", "openrouter:demo"], "/work").command).toEqual({ kind: "config", action: "set-model", model: "openrouter:demo", json: false });
+    expect(parseCliArgs(["auth", "login", "anthropic", "oauth"], "/work").command).toEqual({
+      kind: "auth",
+      action: "login",
+      provider: "anthropic",
+      authType: "oauth",
+      json: false,
+    });
+    expect(parseCliArgs(["auth", "status", "OpenAI"], "/work").command).toEqual({
+      kind: "auth",
+      action: "status",
+      provider: "openai",
+      json: false,
+    });
+  });
+
+  it("canonicalizes an unqualified model with --provider", () => {
+    expect(parseCliArgs(["--provider", "openai", "--model", "gpt-5.4", "task"], "/work"))
+      .toMatchObject({ provider: "openai", model: "openai:gpt-5.4", message: "task" });
+    expect(() => parseCliArgs(["--provider", "openai"], "/work")).toThrow(/requires --model/u);
+    expect(() => parseCliArgs(["--provider", "openai", "--model", "anthropic:claude"], "/work"))
+      .toThrow(/cannot be combined/u);
   });
 
   it("does not accept a key-bearing command-line option", () => {

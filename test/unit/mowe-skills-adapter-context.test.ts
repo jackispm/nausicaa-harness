@@ -224,6 +224,15 @@ describe("Mowe Skills contribution adapter", () => {
     expect(await adapter.health?.()).toMatchObject({ status: "degraded" });
     expect(adapter.diagnostics()).toEqual(expect.arrayContaining([expect.objectContaining({ kind: "invalid" })]));
 
+    // Fix the file and refresh. The prior discovery error must not remain
+    // sticky once a clean generation is published.
+    await writeSkill(malformed, "Malformed fixed", "fixed\n");
+    await adapter.refresh?.({ workspace });
+    expect(await adapter.health?.()).toMatchObject({ status: "unavailable" });
+    await adapter.discoverContributions({ workspace });
+    expect(await adapter.health?.()).toMatchObject({ status: "healthy" });
+    expect(adapter.diagnostics()).toEqual([]);
+
     await adapter.release?.({ reason: "shutdown" });
     await adapter.release?.({ reason: "shutdown" });
     expect(await adapter.health?.()).toMatchObject({ status: "closed" });

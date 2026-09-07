@@ -1,4 +1,8 @@
+import {
+  defaultProviderAuthContext,
+} from "@earendil-works/pi-ai";
 import type {
+  AuthCheck,
   AuthContext,
   AuthEvent,
   AuthPrompt,
@@ -20,13 +24,56 @@ import {
   userSettingsPath,
   type UserSettingsOptions,
 } from "../config/index.js";
-import { maskSecret } from "./onboarding.js";
+import {
+  maskSecret,
+  inspectEnvironmentCredential,
+} from "./onboarding.js";
 
 const MAX_SECRET_INPUT_CHARS = 64 * 1024;
+
+/** Decode terminal bracketed-paste markers even when escape bytes are split across chunks. */
+export class BracketedPasteDecoder {
+  private static readonly START = "\x1b[200~";
+  private static readonly END = "\x1b[201~";
+  private buffer = "";
+  private inPaste = false;
+
+  push(value: string, emit: (text: string) => void): void {
+    this.buffer += value;
+    while (this.buffer.length > 0) {
+      const marker = this.inPaste ? BracketedPasteDecoder.END : BracketedPasteDecoder.START;
+      // A lone ESC is the terminal's cancel key, not a useful partial marker.
+      // Treat it immediately so an Escape press can never leave auth pending.
+      if (!this.inPaste && this.buffer === "\x1b") {
+        emit(this.buffer);
+        this.buffer = "";
+        break;
+      }
+      const markerIndex = this.buffer.indexOf(marker);
+      if (markerIndex >= 0) {
+        if (markerIndex > 0) emit(this.buffer.slice(0, markerIndex));
+        this.buffer = this.buffer.slice(markerIndex + marker.length);
+        this.inPaste = !this.inPaste;
+        continue;
+      }
+      let preserved = 0;
+      for (let length = 1; length < marker.length; length += 1) {
+        if (this.buffer.endsWith(marker.slice(0, length))) preserved = length;
+      }
+      const emitLength = this.buffer.length - preserved;
+      if (emitLength > 0) {
+        emit(this.buffer.slice(0, emitLength));
+        this.buffer = this.buffer.slice(emitLength);
+      }
+      break;
+    }
+  }
+}
 
 export interface AuthCommandInput {
   readonly action: "login" | "status" | "logout";
   readonly provider: string;
+  readonly authType?: AuthType;
   readonly json: boolean;
 }
 
@@ -45,10 +92,19 @@ export interface UtilityCommandDependencies {
   readonly environment?: NodeJS.ProcessEnv;
   /** Optional Pi auth context for deterministic host/tests. */
   readonly authContext?: AuthContext;
+  /** Render provider-owned OAuth/info events without exposing secrets. */
+  readonly onAuthEvent?: (event: AuthEvent) => void;
+  /** Render provider-owned prompt metadata before reading the input stream. */
+  readonly onAuthPrompt?: (prompt: AuthPrompt) => void;
+  /** Render non-secret prompt input without ever receiving a secret value. */
+  readonly onAuthInput?: (value: string, prompt: AuthPrompt) => void;
+  /** Render secret input progress without receiving the secret itself. */
+  readonly onAuthSecretInput?: (length: number, prompt: AuthPrompt) => void;
 }
 
 export interface SecretInput {
   readonly isTTY?: boolean;
+  readonly signal?: AbortSignal;
   readonly setRawMode?: (mode: boolean) => SecretInput;
   resume(): void;
   pause(): void;
@@ -62,7 +118,7 @@ export interface Output {
 
 /** The small provider-auth surface needed by both top-level CLI and TUI. */
 export type AuthModelPort = Pick<PiAiModelPort, "checkAuth" | "login" | "logout">
-  & Partial<Pick<PiAiModelPort, "hasProvider" | "providerAuthTypes">>;
+  & Partial<Pick<PiAiModelPort, "hasProvider" | "providerAuthTypes" | "providers">>;
 
 /** Execute a non-Run command without opening a Ledger or touching the network. */
 export async function runUtilityCommand(
@@ -79,13 +135,21 @@ export async function runUtilityCommand(
     : { userHome: dependencies.userHome };
   const store = dependencies.credentialStore
     ?? createNausicaaCredentialStore(credentialOptions);
+  const authContext = dependencies.authContext
+    ?? (dependencies.environment === undefined
+      ? undefined
+      : {
+          ...defaultProviderAuthContext(),
+          env: async (name: string): Promise<string | undefined> => (
+            dependencies.environment?.[name]
+          ),
+        });
   const model = dependencies.modelPort
-    // Auth commands are provider-scoped and do not open a Run. Use Pi's
-    // complete built-in registry here even though the beta execution path
-    // remains OpenRouter-only unless `--all-providers` is selected.
+    // Auth commands are provider-scoped and do not open a Run. Use the same
+    // complete built-in registry as normal execution.
     ?? createBuiltinModelPort({
       credentials: store,
-      ...(dependencies.authContext === undefined ? {} : { authContext: dependencies.authContext }),
+      ...(authContext === undefined ? {} : { authContext }),
     });
   return runAuthCommand(command, {
     ...dependencies,
@@ -103,7 +167,7 @@ export async function runAuthCommand(
   },
 ): Promise<number> {
   const output = dependencies.output ?? process.stdout;
-  const provider = command.provider;
+  const provider = normalizeProviderId(command.provider);
   if (dependencies.modelPort.hasProvider !== undefined
     && !dependencies.modelPort.hasProvider(provider)) {
     throw new Error(`Unknown provider ${provider}; use a provider from the built-in Pi catalog`);
@@ -111,11 +175,19 @@ export async function runAuthCommand(
 
   if (command.action === "login") {
     const authTypes = dependencies.modelPort.providerAuthTypes?.(provider) ?? ["api_key"];
-    const loginType: AuthType | undefined = authTypes.includes("api_key")
-      ? "api_key"
-      : authTypes.includes("oauth")
-        ? "oauth"
-        : undefined;
+    const requestedType = command.authType;
+    if (requestedType !== undefined && !authTypes.includes(requestedType)) {
+      throw new Error(
+        `Provider ${provider} does not support ${requestedType === "oauth" ? "OAuth" : "API key"}; `
+        + `available methods: ${authTypes.join(", ") || "none"}`,
+      );
+    }
+    const loginType: AuthType | undefined = requestedType
+      ?? (authTypes.includes("api_key")
+        ? "api_key"
+        : authTypes.includes("oauth")
+          ? "oauth"
+          : undefined);
     if (loginType === undefined) {
       throw new Error(
         `Provider ${provider} does not expose a supported login type; supported login type: ${authTypes.join(
@@ -129,7 +201,7 @@ export async function runAuthCommand(
     }
     const credential = await dependencies.modelPort.login(
       loginType,
-      createSecretInteraction(input, output),
+      createSecretInteraction(input, output, dependencies, provider),
       provider,
     );
     const result = {
@@ -172,17 +244,33 @@ export async function runAuthCommand(
   const stored = await dependencies.credentialStore.read(provider);
   const environment = dependencies.environment ?? process.env;
   const environmentPresent = environmentCredentialPresent(provider, environment);
-  const auth = await dependencies.modelPort.checkAuth(provider);
+  let auth: AuthCheck | undefined;
+  let authCheckFailed = false;
+  try {
+    auth = await dependencies.modelPort.checkAuth(provider);
+  } catch {
+    // Status is a local diagnostic surface. A broken credential helper or
+    // unreadable ADC/AWS file should be reported as unknown, not as a command
+    // failure that prevents the user from choosing another auth method.
+    authCheckFailed = true;
+  }
+  const authTypes = dependencies.modelPort.providerAuthTypes?.(provider) ?? ["api_key" as const];
+  const authIsStored = isStoredAuth(auth);
+  const configured = auth !== undefined || stored !== undefined || environmentPresent;
   const result = {
     provider,
-    configured: auth !== undefined,
+    configured,
     auth: "unverified" as const,
-    source: stored === undefined
-      ? environmentPresent || auth !== undefined ? "environment" as const : "none" as const
-      : "saved" as const,
+    authCheck: authCheckFailed ? "unavailable" as const : "available" as const,
+    authMethods: authTypes,
+    ...(authCheckFailed ? { authCheckFailed: true } : {}),
+    ...(auth?.source === undefined ? {} : { authSource: auth.source }),
+    source: stored !== undefined || authIsStored
+      ? "saved" as const
+      : environmentPresent || auth !== undefined ? "environment" as const : "none" as const,
     ...(stored === undefined ? {} : { storedCredential: credentialSummary(stored) }),
     environmentCredential: environmentPresent || (
-      stored === undefined && auth !== undefined
+      stored === undefined && auth !== undefined && !authIsStored
     ),
     path: credentialStorePath(dependencies.credentialStore),
   };
@@ -224,11 +312,34 @@ async function runConfigCommand(
   return 0;
 }
 
-function createSecretInteraction(input: SecretInput, output: Output) {
+function createSecretInteraction(
+  input: SecretInput,
+  output: Output,
+  callbacks: Pick<UtilityCommandDependencies, "onAuthEvent" | "onAuthPrompt" | "onAuthInput" | "onAuthSecretInput"> = {},
+  provider?: string,
+) {
   return {
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
     prompt: async (prompt: AuthPrompt): Promise<string> => {
-      if (prompt.type === "select") {
-        const options = prompt.options
+      const displayPrompt = prompt.type === "select" && provider === "amazon-bedrock"
+        ? {
+            ...prompt,
+            options: prompt.options.filter((option) => option.id !== "credential-chain"),
+          }
+        : prompt;
+      if (prompt.type === "select"
+        && displayPrompt.type === "select"
+        && displayPrompt.options.length !== prompt.options.length) {
+        const event: AuthEvent = {
+          type: "info",
+          message: "AWS credential chains are detected automatically; configure AWS credentials in the environment or use an AWS profile.",
+        };
+        callbacks.onAuthEvent?.(event);
+        if (callbacks.onAuthEvent === undefined) output.write(`${event.message}\n`);
+      }
+      callbacks.onAuthPrompt?.(displayPrompt);
+      if (displayPrompt.type === "select") {
+        const options = displayPrompt.options
           .map((option, index) => `${index + 1}. ${option.label}${option.description === undefined ? "" : ` - ${option.description}`}`)
           .join("\n");
         const answer = await readPromptValue(
@@ -237,12 +348,13 @@ function createSecretInteraction(input: SecretInput, output: Output) {
           output,
           prompt.signal,
           "Selection cannot be empty",
+          { hidden: false, onValueChange: (value) => callbacks.onAuthInput?.(value, prompt) },
         );
         const numeric = Number.parseInt(answer, 10);
-        if (Number.isSafeInteger(numeric) && numeric >= 1 && numeric <= prompt.options.length) {
-          return prompt.options[numeric - 1]!.id;
+        if (Number.isSafeInteger(numeric) && numeric >= 1 && numeric <= displayPrompt.options.length) {
+          return displayPrompt.options[numeric - 1]!.id;
         }
-        const matching = prompt.options.find((option) => option.id === answer);
+        const matching = displayPrompt.options.find((option) => option.id === answer);
         if (matching !== undefined) return matching.id;
         throw new Error("Invalid authentication selection");
       }
@@ -251,10 +363,30 @@ function createSecretInteraction(input: SecretInput, output: Output) {
         input,
         output,
         prompt.signal,
-        prompt.type === "secret" ? "API key cannot be empty" : "Input cannot be empty",
+        prompt.type === "secret"
+          ? "API key cannot be empty"
+          : prompt.type === "manual_code"
+            ? "Authorization code cannot be empty"
+            : "Input cannot be empty",
+        {
+          // Manual OAuth codes are credentials too; keep them out of terminal
+          // echo and callbacks just like API keys.
+          hidden: prompt.type === "secret" || prompt.type === "manual_code",
+          onLengthChange: (length) => {
+            if (prompt.type === "secret" || prompt.type === "manual_code") {
+              callbacks.onAuthSecretInput?.(length, prompt);
+            }
+          },
+          onValueChange: (value) => {
+            if (prompt.type !== "secret" && prompt.type !== "manual_code") {
+              callbacks.onAuthInput?.(value, prompt);
+            }
+          },
+        },
       );
     },
     notify: (event: AuthEvent): void => {
+      callbacks.onAuthEvent?.(event);
       switch (event.type) {
         case "auth_url":
           output.write(`${event.instructions ?? "Open this URL to authenticate"}: ${event.url}\n`);
@@ -267,7 +399,11 @@ function createSecretInteraction(input: SecretInput, output: Output) {
           break;
         case "info":
         case "progress":
-          output.write(`${event.message}\n`);
+          output.write(
+            `${event.message}${event.type === "info" && event.links !== undefined
+              ? `\n${event.links.map((link) => `${link.label ?? "Open"}: ${link.url}`).join("\n")}`
+              : ""}\n`,
+          );
           break;
       }
     },
@@ -292,6 +428,11 @@ async function readPromptValue(
   output: Output,
   signal: AbortSignal | undefined,
   emptyMessage: string,
+  options: {
+    hidden: boolean;
+    onValueChange?: (value: string) => void;
+    onLengthChange?: (length: number) => void;
+  },
 ): Promise<string> {
   if (input.isTTY !== true || input.setRawMode === undefined) {
     throw new Error("Secret input requires a TTY");
@@ -300,6 +441,7 @@ async function readPromptValue(
   return new Promise<string>((resolve, reject) => {
     let value = "";
     let settled = false;
+    const pasteDecoder = new BracketedPasteDecoder();
     const finish = (error?: Error): void => {
       if (settled) return;
       settled = true;
@@ -311,8 +453,7 @@ async function readPromptValue(
       if (error !== undefined) reject(error);
       else resolve(value.trim());
     };
-    const onData = (chunk: Buffer | string): void => {
-      const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    const processText = (text: string): void => {
       for (const character of text) {
         if (character === "\u0003" || character === "\u0004" || character === "\u001b") {
           finish(new Error("Login cancelled"));
@@ -328,6 +469,9 @@ async function readPromptValue(
         }
         if (character === "\u007f" || character === "\b") {
           value = value.slice(0, -1);
+          options.onLengthChange?.(value.length);
+          options.onValueChange?.(value);
+          if (!options.hidden) output.write("\b \b");
           continue;
         }
         if (character >= " " && character !== "\u007f") {
@@ -336,8 +480,17 @@ async function readPromptValue(
             return;
           }
           value += character;
+          options.onLengthChange?.(value.length);
+          options.onValueChange?.(value);
+          if (!options.hidden) output.write(character);
         }
       }
+    };
+    const onData = (chunk: Buffer | string): void => {
+      pasteDecoder.push(
+        typeof chunk === "string" ? chunk : chunk.toString("utf8"),
+        processText,
+      );
     };
     const onAbort = (): void => finish(new Error("Login cancelled"));
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -359,13 +512,29 @@ function credentialSummary(credential: Credential): { type: Credential["type"]; 
   };
 }
 
+/** `checkAuth` can succeed from a saved credential even when the caller did
+ * not pass the credential-store metadata separately. Keep status/source labels
+ * honest in that race and in injected hosts. */
+function isStoredAuth(auth: AuthCheck | undefined): boolean {
+  if (auth === undefined) return false;
+  if (auth.type === "oauth") return true;
+  const source = auth.source?.trim().toLocaleLowerCase();
+  return source === "stored credential" || source === "oauth";
+}
+
 export function environmentCredentialPresent(
   provider: string,
   environment: NodeJS.ProcessEnv,
 ): boolean {
-  const name = provider === "openrouter" ? "OPENROUTER_API_KEY" : undefined;
-  const value = name === undefined ? undefined : environment[name];
-  return typeof value === "string" && value.trim().length > 0;
+  return inspectEnvironmentCredential(provider, environment).present;
+}
+
+function normalizeProviderId(value: string): string {
+  const normalized = value.trim().toLocaleLowerCase();
+  if (normalized.length === 0 || !/^[a-z0-9][a-z0-9._-]*$/u.test(normalized)) {
+    throw new Error("Provider id must contain only letters, numbers, dots, underscores, or hyphens");
+  }
+  return normalized;
 }
 
 async function ambientCredentialConfigured(
@@ -393,16 +562,26 @@ function credentialStorePath(store: CredentialStore): string {
 function formatAuthStatus(result: {
   provider: string;
   configured: boolean;
+  authCheck: "available" | "unavailable";
+  authMethods: readonly AuthType[];
   source: "saved" | "environment" | "none";
   storedCredential?: { type: Credential["type"]; mask?: string };
   environmentCredential: boolean;
+  authCheckFailed?: boolean;
+  authSource?: string;
 }): string {
   const source = result.source === "none"
     ? "no credential detected"
     : result.source === "saved"
       ? `saved credential${result.storedCredential?.mask === undefined ? "" : ` (${result.storedCredential.mask})`}`
-      : "environment credential";
-  return `${result.provider}: ${result.configured ? "configured" : "not configured"} (auth unverified; ${source})\n`;
+      : `environment credential${result.authSource === undefined ? "" : ` (${result.authSource})`}`;
+  const methods = result.authMethods.length === 0
+    ? "no interactive auth"
+    : result.authMethods.map((type) => type === "oauth" ? "OAuth" : "API key").join(" / ");
+  const check = result.authCheck === "unavailable"
+    ? "auth check unavailable"
+    : "auth unverified";
+  return `${result.provider}: ${result.configured ? "configured" : "not configured"} (${check}; ${methods}; ${source})\n`;
 }
 
 function writeResult(output: Output, json: boolean, value: unknown, text: string): void {

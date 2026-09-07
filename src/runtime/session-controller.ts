@@ -51,7 +51,7 @@ import {
   validateEvent,
 } from "../ledger/index.js";
 import {
-  createOpenRouterModelPort,
+  createBuiltinModelPort,
   normalizeModelSelector,
   ProviderModelError,
   UNCONFIGURED_MODEL_SELECTOR,
@@ -433,8 +433,10 @@ export interface SessionControllerOptions {
 
 export interface SessionControllerDeps {
   mainModel?: ModelPort;
-  /** Optional last-known local catalog used only to validate interactive selection. */
-  modelCatalog?: readonly ModelCatalogEntry[];
+  /** Optional local catalog used only to validate interactive selection. */
+  modelCatalog?:
+    | readonly ModelCatalogEntry[]
+    | (() => readonly ModelCatalogEntry[]);
   tetoModel?: ModelPort;
   workerModel?: ModelPort;
   tools?: readonly AgentTool[];
@@ -761,7 +763,7 @@ export class SessionController {
     this.assertOpen();
     try {
       const capabilities = (
-        this.deps.mainModel ?? createOpenRouterModelPort()
+        this.deps.mainModel ?? createBuiltinModelPort()
       ).capabilities?.(this.model);
       if (capabilities === undefined) return { imageInput: "unknown" };
       return {
@@ -795,8 +797,11 @@ export class SessionController {
       }
       const previousModel = this.selectedMainModel;
       const activeRequestUnaffected = this.active !== undefined;
-      if (this.deps.modelCatalog !== undefined) {
-        const entry = this.deps.modelCatalog.find((candidate) => (
+      const modelCatalog = typeof this.deps.modelCatalog === "function"
+        ? this.deps.modelCatalog()
+        : this.deps.modelCatalog;
+      if (modelCatalog !== undefined) {
+        const entry = modelCatalog.find((candidate) => (
           candidate.selector === model
           || (model.indexOf(":") < 0 && candidate.selector === `openrouter:${model}`)
         ));
@@ -999,7 +1004,7 @@ export class SessionController {
     if (cached !== undefined) return cached ?? undefined;
     try {
       const value = (
-        this.deps.mainModel ?? createOpenRouterModelPort()
+        this.deps.mainModel ?? createBuiltinModelPort()
       ).capabilities?.(this.model)?.contextWindowTokens;
       const normalized = Number.isSafeInteger(value) && (value ?? 0) > 0
         ? value
@@ -1763,7 +1768,7 @@ export class SessionController {
       if (policy?.enabled !== true || policy.provider !== "pi-ai") {
         return { status: "unavailable", reason: "disabled" };
       }
-      const modelPort = this.deps.mainModel ?? createOpenRouterModelPort();
+      const modelPort = this.deps.mainModel ?? createBuiltinModelPort();
       const runtime = instantiateRuntimeFukaiCompaction(
         attached.policy,
         this.deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
@@ -2304,7 +2309,7 @@ export class SessionController {
     });
     const workerModel = this.deps.workerModel
       ?? this.deps.mainModel
-      ?? createOpenRouterModelPort();
+      ?? createBuiltinModelPort();
     const workerTools = this.deps.workerTools ?? createWorkspaceTools({
       allowWrite: false,
       allowShell: false,
@@ -2401,7 +2406,7 @@ export class SessionController {
     attached.inbox = inbox;
     const tetoModel = this.deps.tetoModel
       ?? this.deps.mainModel
-      ?? createOpenRouterModelPort();
+      ?? createBuiltinModelPort();
     const tetoBudget = new RunTokenBudget(
       attached.policy.maxModelTokens,
       totalTokens(laneUsage(events, attached.runId, "teto")),
@@ -2462,7 +2467,7 @@ export class SessionController {
 
     const branchModel = this.deps.workerModel
       ?? this.deps.mainModel
-      ?? createOpenRouterModelPort();
+      ?? createBuiltinModelPort();
     const branchTools = this.deps.workerTools ?? createWorkspaceTools({
       allowWrite: false,
       allowShell: false,
@@ -2798,7 +2803,7 @@ export class SessionController {
         `turn:${turn.turnId}:running:${startStep}`,
         turn.turnId,
       );
-      const model = this.deps.mainModel ?? createOpenRouterModelPort();
+      const model = this.deps.mainModel ?? createBuiltinModelPort();
       const inbox = attached.inbox ?? new A2AInbox({
         sink: attached.sink,
         events,

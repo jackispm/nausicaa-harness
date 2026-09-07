@@ -142,4 +142,36 @@ describe("SelectorOverlay", () => {
     expect(overlay.getSelectedValue()).toBe("archived-run");
     expect(overlay.render(120).join("\n")).toContain("Status: Active [Archived]");
   });
+
+  it("filters model rows by provider while preserving the qualified selector", () => {
+    const overlay = new SelectorOverlay({
+      title: "Models",
+      searchLabel: "Search models",
+      filters: [{
+        key: "provider",
+        label: "Provider",
+        current: "all",
+        options: [
+          { value: "all", label: "All" },
+          { value: "openai", label: "OpenAI" },
+          { value: "anthropic", label: "Anthropic" },
+        ],
+      }],
+      options: [
+        { value: "openai:gpt-5.4", label: "OpenAI / GPT-5.4" },
+        { value: "anthropic:claude-sonnet-4-5", label: "Anthropic / Claude" },
+      ],
+      filterOptions: (options, values) => values.provider === "all"
+        ? options
+        : options.filter((option) => option.value.startsWith(`${values.provider}:`)),
+      onSelect: () => {},
+      onCancel: () => {},
+    });
+
+    expect(overlay.getSelectedValue()).toBe("openai:gpt-5.4");
+    overlay.handleInput("\t");
+    overlay.handleInput("\x1b[C");
+    expect(overlay.getSelectedValue()).toBe("openai:gpt-5.4");
+    expect(overlay.render(120).join("\n")).toContain("Provider: All [OpenAI] Anthropic");
+  });
 });

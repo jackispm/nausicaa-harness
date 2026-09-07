@@ -1,5 +1,6 @@
 import {
   Container,
+  type Component,
   Input,
   type Focusable,
   getKeybindings,
@@ -7,6 +8,8 @@ import {
   type SelectItem,
   type SelectListLayoutOptions,
   type SelectListTheme,
+  Spacer,
+  Text,
   truncateToWidth,
 } from "@earendil-works/pi-tui";
 
@@ -53,6 +56,142 @@ export interface SelectorFilter {
   label: string;
   options: readonly SelectorFilterOption[];
   current?: string;
+}
+
+/**
+ * Pi's model selector boundary, adapted to Nausicaa's provider-neutral model
+ * candidates. The selector owns only its search/list state; the interactive
+ * mode owns mounting, focus restoration, and the selection side effect.
+ */
+export class ModelSelectorComponent extends Container implements Focusable {
+  private readonly searchInput = new Input();
+  private readonly allOptions: readonly SelectorOption[];
+  private filteredOptions: readonly SelectorOption[];
+  private selectedIndex = 0;
+  private _focused = false;
+
+  constructor(options: {
+    options: readonly SelectorOption[];
+    current?: string;
+    subtitle?: string;
+    initialSearchInput?: string;
+    onSelect: (value: string) => void;
+    onCancel: () => void;
+  }) {
+    super();
+    this.allOptions = [...options.options];
+    this.filteredOptions = this.allOptions;
+    if (options.initialSearchInput !== undefined) {
+      this.searchInput.setValue(options.initialSearchInput);
+    }
+    this.searchInput.onEscape = options.onCancel;
+    this.searchInput.onSubmit = () => {
+      const selected = this.filteredOptions[this.selectedIndex];
+      if (selected !== undefined && selected.disabled !== true) options.onSelect(selected.value);
+    };
+
+    const currentIndex = options.current === undefined
+      ? -1
+      : this.allOptions.findIndex((item) => item.value === options.current);
+    if (currentIndex >= 0) this.selectedIndex = currentIndex;
+
+    this.addChild(new Text(nausicaaMarkdownTheme.heading("Models"), 0, 0));
+    this.addChild(new Spacer(1));
+    if (options.subtitle !== undefined && options.subtitle.trim().length > 0) {
+      this.addChild(new Text(nausicaaMarkdownTheme.linkUrl(options.subtitle), 0, 0));
+      this.addChild(new Spacer(1));
+    }
+    this.addChild(this.searchInput);
+    this.addChild(new Spacer(1));
+    this.addChild(new ModelSelectorList(
+      () => this.filteredOptions,
+      () => this.selectedIndex,
+    ));
+    this.addChild(new Spacer(1));
+    this.addChild(new Text("  Up/Down navigate · Enter select · Esc cancel", 0, 0));
+    this.filter(this.searchInput.getValue());
+  }
+
+  get focused(): boolean {
+    return this._focused;
+  }
+
+  set focused(value: boolean) {
+    this._focused = value;
+    this.searchInput.focused = value;
+  }
+
+  handleInput(data: string): void {
+    const keybindings = getKeybindings();
+    if (keybindings.matches(data, "tui.select.cancel")) {
+      this.searchInput.onEscape?.();
+      return;
+    }
+    if (keybindings.matches(data, "tui.select.up")) {
+      if (this.filteredOptions.length > 0) {
+        this.selectedIndex = this.selectedIndex === 0
+          ? this.filteredOptions.length - 1
+          : this.selectedIndex - 1;
+      }
+      return;
+    }
+    if (keybindings.matches(data, "tui.select.down")) {
+      if (this.filteredOptions.length > 0) {
+        this.selectedIndex = this.selectedIndex === this.filteredOptions.length - 1
+          ? 0
+          : this.selectedIndex + 1;
+      }
+      return;
+    }
+    if (keybindings.matches(data, "tui.select.confirm")) {
+      this.searchInput.onSubmit?.(this.searchInput.getValue());
+      return;
+    }
+    this.searchInput.handleInput(data);
+    this.filter(this.searchInput.getValue());
+  }
+
+  override invalidate(): void {
+    this.searchInput.invalidate();
+  }
+
+  private filter(query: string): void {
+    this.filteredOptions = filterSelectorOptions(this.allOptions, query);
+    this.selectedIndex = query.length > 0
+      ? 0
+      : Math.min(this.selectedIndex, Math.max(0, this.filteredOptions.length - 1));
+  }
+}
+
+class ModelSelectorList implements Component {
+  constructor(
+    private readonly readOptions: () => readonly SelectorOption[],
+    private readonly readSelectedIndex: () => number,
+  ) {}
+
+  render(width: number): string[] {
+    const options = this.readOptions();
+    const selectedIndex = this.readSelectedIndex();
+    if (options.length === 0) return ["  No matching models"];
+    const maxVisible = 10;
+    const startIndex = Math.max(
+      0,
+      Math.min(selectedIndex - Math.floor(maxVisible / 2), options.length - maxVisible),
+    );
+    const endIndex = Math.min(startIndex + maxVisible, options.length);
+    const lines = options.slice(startIndex, endIndex).map((option, offset) => {
+      const index = startIndex + offset;
+      const marker = index === selectedIndex ? "→ " : "  ";
+      const line = `${marker}${option.label}${option.description === undefined ? "" : ` [${option.description}]`}`;
+      return truncateToWidth(line, Math.max(1, width), "");
+    });
+    if (startIndex > 0 || endIndex < options.length) {
+      lines.push(`  (${selectedIndex + 1}/${options.length})`);
+    }
+    return lines;
+  }
+
+  invalidate(): void {}
 }
 
 const SELECT_LIST_LAYOUT: SelectListLayoutOptions = {

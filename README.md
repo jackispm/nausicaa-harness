@@ -43,6 +43,30 @@ npm install -g nausicaa-harness
 nausicaa --help
 ```
 
+模型与 provider：
+
+Nausicaa 默认加载 `pi-ai` 的完整 provider/model 目录，OpenRouter 只是其中一个选项。
+在 TUI 中使用 `/model` 搜索并按 provider 筛选，使用 `/providers` 浏览模型数量和认证方式，
+使用 `/login` 选择 provider，再选择 API key 或浏览器/设备 OAuth。非交互命令可用
+`--provider <provider> --model <id>`，也兼容 `provider:model` 选择器。
+
+```bash
+# OpenAI
+export OPENAI_API_KEY="..."
+export NAUSICAA_MODEL="openai:gpt-5.4"
+
+# Anthropic (API key or /login anthropic oauth)
+export ANTHROPIC_API_KEY="..."
+export NAUSICAA_MODEL="anthropic:claude-sonnet-4-5"
+
+# OpenRouter (one of the available providers)
+export OPENROUTER_API_KEY="..."
+export NAUSICAA_MODEL="openrouter:openai/gpt-5-mini"
+```
+
+凭据也可以通过 `nausicaa auth login <provider> [api-key|oauth]` 或 TUI 的 `/login` 保存。
+`nausicaa auth status <provider>` 只显示本地配置状态，不会验证或打印密钥。
+
 源码开发：
 
 ```bash
@@ -52,16 +76,17 @@ npm ci
 npm run build
 npm link
 
-export OPENROUTER_API_KEY="..."
-export NAUSICAA_MODEL="openrouter:openai/gpt-5-mini"
+export OPENAI_API_KEY="..."
+export NAUSICAA_MODEL="openai:gpt-5.4"
 nausicaa "Summarize this workspace"
 ```
 
-凭据也可以通过 `nausicaa auth login` 或 TUI 的 `/login` 保存。
+项目内的 `.agents/skills`、`.pi/skills` 和 `skills` 目录会默认进行元数据发现；首轮只向模型提供 Skill 名称和描述，完整 `SKILL.md` 由模型按需通过 `skill` 工具加载。MCP 等外部 Edge 仍需显式配置和授权，并通过配置或 `--edges` 开启；`--no-edges` 会关闭本地 Skill 发现。
 
 常用入口：`--print`、`--json`、`--topology`、`--worker`、`--daemon`、
 `--daemon-worker-command <path>`、`--attach <run-id>`；TUI 提供
-`/list-agents`、`/permissions`、`/plan`、`/skills` 和 `/edges`。
+`/providers`、`/model`、`/login`、`/list-agents`、`/permissions`、`/plan`、
+`/skills` 和 `/edges`。
 
 开发检查：`npm run typecheck`、`npm test`、`npm run test:smoke`、`npm run build`。
 
@@ -103,6 +128,32 @@ npm install -g nausicaa-harness
 nausicaa --help
 ```
 
+Model and provider setup:
+
+Nausicaa loads the complete `pi-ai` provider/model catalog by default; OpenRouter is
+one option among many. Use `/model` to search and filter by provider, `/providers`
+to browse model counts and authentication methods, and `/login` to choose a provider
+and then API key or browser/device OAuth. Non-interactive runs accept
+`--provider <provider> --model <id>` as well as the `provider:model` selector form.
+
+```bash
+# OpenAI
+export OPENAI_API_KEY="..."
+export NAUSICAA_MODEL="openai:gpt-5.4"
+
+# Anthropic (API key or /login anthropic oauth)
+export ANTHROPIC_API_KEY="..."
+export NAUSICAA_MODEL="anthropic:claude-sonnet-4-5"
+
+# OpenRouter (one available provider)
+export OPENROUTER_API_KEY="..."
+export NAUSICAA_MODEL="openrouter:openai/gpt-5-mini"
+```
+
+Credentials can also be saved with `nausicaa auth login <provider> [api-key|oauth]`
+or the TUI `/login` command. `nausicaa auth status <provider>` reports local
+configuration only; it never verifies or prints a key.
+
 Source checkout:
 
 ```bash
@@ -112,16 +163,17 @@ npm ci
 npm run build
 npm link
 
-export OPENROUTER_API_KEY="..."
-export NAUSICAA_MODEL="openrouter:openai/gpt-5-mini"
+export OPENAI_API_KEY="..."
+export NAUSICAA_MODEL="openai:gpt-5.4"
 nausicaa "Summarize this workspace"
 ```
 
-Credentials can also be saved with `nausicaa auth login` or the TUI `/login` command.
+Project-local `.agents/skills`, `.pi/skills`, and `skills` directories are discovered by default at metadata level. The first request receives only Skill names and descriptions; the full `SKILL.md` is loaded on demand through the `skill` tool. External edges such as MCP still require explicit configuration and authorization, and are enabled through settings or `--edges`; `--no-edges` disables local Skill discovery.
 
 Common entry points are `--print`, `--json`, `--topology`, `--worker`, `--daemon`,
 `--daemon-worker-command <path>`, and `--attach <run-id>`. The TUI includes
-`/list-agents`, `/permissions`, `/plan`, `/skills`, and `/edges`.
+`/providers`, `/model`, `/login`, `/list-agents`, `/permissions`, `/plan`,
+`/skills`, and `/edges`.
 
 Development checks: `npm run typecheck`, `npm test`, `npm run test:smoke`, and
 `npm run build`.

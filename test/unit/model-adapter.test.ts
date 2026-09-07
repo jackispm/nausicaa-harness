@@ -288,7 +288,7 @@ describe("PiAiModelPort", () => {
     expect(adapter.catalog().map((entry) => entry.id)).toEqual(["stable"]);
   });
 
-  it("offers an explicit all-provider factory while retaining openrouter as the default", () => {
+  it("loads the complete provider catalog while retaining openrouter as the default", () => {
     const builtin = createBuiltinModelPort();
     const providers = new Set(builtin.catalog().map((entry) => entry.provider));
     const openrouterModel = builtin.catalog().find((entry) => entry.provider === "openrouter");
@@ -305,6 +305,24 @@ describe("PiAiModelPort", () => {
     expect(builtin.hasProvider("does-not-exist")).toBe(false);
     expect(builtin.providers().find((provider) => provider.id === "openai"))
       .toMatchObject({ name: "OpenAI", modelCount: expect.any(Number), authTypes: ["api_key"] });
+  });
+
+  it("normalizes provider ids consistently across auth and refresh boundaries", async () => {
+    const faux = fauxProvider({
+      provider: "case-provider",
+      models: [{ id: "demo" }],
+    });
+    const models = createModels();
+    models.setProvider(faux.provider);
+    const adapter = new PiAiModelPort({ models, defaultProvider: "CASE-PROVIDER" });
+
+    expect(adapter.hasProvider("CASE-PROVIDER")).toBe(true);
+    expect(adapter.providerAuthTypes("CASE-PROVIDER")).toEqual(["api_key"]);
+    await expect(adapter.checkAuth("CASE-PROVIDER"))
+      .resolves.toMatchObject({ type: "api_key" });
+    await expect(adapter.refreshCatalog({ providers: ["CASE-PROVIDER"] }))
+      .resolves.toMatchObject({ aborted: false });
+    expect(adapter.capabilities("CASE-PROVIDER:demo")).toMatchObject({ imageInput: true });
   });
 
   it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
@@ -939,6 +957,10 @@ describe("PiAiModelPort", () => {
     expect(parseModelSelector("anthropic/claude")).toEqual({
       provider: "openrouter",
       model: "anthropic/claude",
+    });
+    expect(parseModelSelector("OPENAI:gpt-5.4")).toEqual({
+      provider: "openai",
+      model: "gpt-5.4",
     });
   });
 });

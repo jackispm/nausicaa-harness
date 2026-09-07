@@ -60,9 +60,16 @@ export const PUBLIC_INTERACTIVE_COMMANDS: readonly InteractiveCommandSpec[] = Ob
   command({
     name: "login",
     description: "Sign in to the current model provider",
-    argumentHint: "[provider]",
+    argumentHint: "[provider] [api-key|oauth]",
     references: ["prime", "pi", "codex"],
     alignment: "shared",
+    visibility: "public",
+  }),
+  command({
+    name: "providers",
+    description: "Browse available model providers and authentication methods",
+    references: ["prime", "pi"],
+    alignment: "semantic-review",
     visibility: "public",
   }),
   command({

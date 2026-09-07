@@ -37,7 +37,7 @@ import {
 } from "../fukai/index.js";
 import type { FukaiCompactionSelection } from "../fukai/types.js";
 import { JsonlLedger, type Ledger } from "../ledger/index.js";
-import { createOpenRouterModelPort } from "../model/index.js";
+import { createBuiltinModelPort } from "../model/index.js";
 import {
   projectRunMetrics,
   type RunMetrics,
@@ -373,7 +373,7 @@ export const executeRun = async (
     const compactionEnabled = policy.fukaiCompaction?.enabled === true
       && policy.fukaiCompaction.provider === "pi-ai";
     const compactionModel = compactionEnabled
-      ? deps.mainModel ?? createOpenRouterModelPort()
+      ? deps.mainModel ?? createBuiltinModelPort()
       : undefined;
     const compactionRuntime = compactionModel === undefined
       ? undefined
@@ -433,7 +433,7 @@ export const executeRun = async (
       };
     }
 
-    const mainModel = compactionModel ?? deps.mainModel ?? createOpenRouterModelPort();
+    const mainModel = compactionModel ?? deps.mainModel ?? createBuiltinModelPort();
     const edgeProjection = await captureEdgeTurnSnapshot(
       edgeSnapshotProvider,
       edgeSnapshot,

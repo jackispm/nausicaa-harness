@@ -6,7 +6,8 @@ import { stripTerminalSequences, type Terminal } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 
 import { FileCredentialStore } from "../../src/auth/index.js";
-import { createOpenRouterModelPort } from "../../src/model/index.js";
+import type { AuthModelPort } from "../../src/cli/auth.js";
+import { createBuiltinModelPort, createOpenRouterModelPort } from "../../src/model/index.js";
 import {
   clipboardImagePasteKey,
   runInteractive,
@@ -133,6 +134,121 @@ describe("interactive TUI", () => {
       await expect(credentialStore.read("openrouter")).resolves.toBeUndefined();
 
       terminal.type("/quit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("shows provider-owned auth sources in the provider browser", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-providers-"));
+    const previousExitCode = process.exitCode;
+    try {
+      const environment: NodeJS.ProcessEnv = { OPENAI_API_KEY: "provider-browser-key" };
+      const credentialStore = new FileCredentialStore({
+        filePath: join(root, "credentials.json"),
+      });
+      const modelPort = createBuiltinModelPort({
+        credentials: credentialStore,
+        authContext: {
+          env: async (name) => environment[name],
+          fileExists: async () => false,
+        },
+      });
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted/main",
+        policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      }, { mainModel: new ScriptedModel([]), createRunId: () => "provider-browser-run" });
+      const terminal = new MemoryTerminal(120, 36);
+      const running = runInteractive({
+        session,
+        terminal,
+        forceAltScreen: true,
+        auth: {
+          credentialStore,
+          modelPort,
+          environment,
+        },
+      });
+
+      await terminal.started;
+      terminal.type("/providers");
+      terminal.send("\r");
+      await waitForOutput(terminal, "OpenAI");
+      await waitForOutput(terminal, "ready locally");
+      expect(normalizeTerminalOutput(terminal.output)).toContain("OPENAI_API_KEY");
+
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("renders visible provider fields in the TUI login input without exposing secrets", async () => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-visible-auth-"));
+    const previousExitCode = process.exitCode;
+    try {
+      const credentialStore = new FileCredentialStore({
+        filePath: join(root, "credentials.json"),
+      });
+      const authModel: AuthModelPort = {
+        providers: () => [{
+          id: "demo",
+          name: "Demo Provider",
+          modelCount: 1,
+          authTypes: ["api_key"],
+          apiKeyName: "Demo API key",
+        }],
+        hasProvider: (provider) => provider === "demo",
+        providerAuthTypes: () => ["api_key"],
+        checkAuth: async () => undefined,
+        logout: async () => {},
+        login: async (_type, interaction) => {
+          const key = await interaction.prompt({ type: "secret", message: "Enter demo API key" });
+          const account = await interaction.prompt({ type: "text", message: "Enter demo account id" });
+          expect(key).toBe("hidden-demo-key");
+          expect(account).toBe("account-visible");
+          return { type: "api_key", key };
+        },
+      };
+      const session = await SessionController.open({
+        workspace: root,
+        dataDir: join(root, "state"),
+        model: "scripted/main",
+        policy: { maxMainStepsPerActivation: 1, tetoEnabled: false },
+      }, { mainModel: new ScriptedModel([]), createRunId: () => "visible-auth-run" });
+      const terminal = new MemoryTerminal(100, 28);
+      const running = runInteractive({
+        session,
+        terminal,
+        forceAltScreen: true,
+        auth: {
+          credentialStore,
+          modelPort: authModel,
+          provider: "demo",
+          environment: {},
+        },
+      });
+
+      await terminal.started;
+      terminal.type("/login");
+      terminal.send("\r");
+      await waitForOutput(terminal, "input is hidden");
+      terminal.send("hidden-demo-key\r");
+      await waitForOutput(terminal, "Enter demo account id");
+      terminal.send("account-visible\r");
+      await waitForOutput(terminal, "Signed in to demo");
+      expect(normalizeTerminalOutput(terminal.output)).toContain("account-visible");
+      expect(terminal.output).not.toContain("hidden-demo-key");
+
+      terminal.type("/exit");
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
     } finally {
@@ -2169,7 +2285,10 @@ describe("interactive TUI", () => {
         "selector cancellation render",
       );
       const cancelFrame = terminal.output.slice(beforeCancel);
-      expect(cancelFrame).toContain("\x1b[2K");
+      // pi-tui's clear-on-shrink path may use either differential line clears
+      // or a synchronized full redraw when the viewport has scrolled.
+      expect(cancelFrame.includes("\x1b[2K") || cancelFrame.includes("\x1b[2J")).toBe(true);
+      expect(cancelFrame).not.toContain("\x1b[?1049h");
 
       terminal.type("/exit");
       terminal.send("\r");

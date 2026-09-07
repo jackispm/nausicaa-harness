@@ -133,7 +133,8 @@ describe("built CLI PTY", () => {
 
         expect(stderr).toBe("");
         // Pi's default is the regular main-screen renderer. Alternate-screen
-        // mode remains an explicit embedding/test option.
+        // mode is an explicit opt-in, so normal CLI sessions remain in
+        // scrollback and restore no alternate buffer on exit.
         expect(stdout).not.toContain("\x1b[?1049h");
         expect(stdout).not.toContain("\x1b[?1049l");
         const plainStdout = stripTerminalSequences(stdout);

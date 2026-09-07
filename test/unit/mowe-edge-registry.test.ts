@@ -182,6 +182,69 @@ describe("Mowe edge registry", () => {
     await registry.close();
   });
 
+  it("publishes adapter health reasons in the immutable snapshot", async () => {
+    const registry = new MoweEdgeRegistry({
+      adapters: [{
+        sourceId: "degraded",
+        sourceType: "plugin",
+        discover: async () => [],
+        load: async (candidate) => createEdgeCapability({
+          manifest: candidate,
+          tool: tool(candidate.capabilityName),
+        }),
+        health: async () => ({
+          sourceId: "degraded",
+          sourceType: "plugin",
+          status: "degraded",
+          checkedAt: "2026-08-31T00:00:00.000Z",
+          message: "upstream metadata is stale",
+        }),
+      }],
+    });
+
+    const snapshot = await registry.refresh();
+    expect(snapshot.edges[0]?.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: "adapter-health",
+        severity: "warning",
+        message: "upstream metadata is stale",
+      }),
+    ]));
+    expect(snapshot.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "adapter-health", sourceId: "degraded" }),
+    ]));
+    expect(registry.health("degraded")).toMatchObject({ health: "degraded" });
+    await registry.close();
+  });
+
+  it("does not downgrade a healthy adapter that includes an informational message", async () => {
+    const registry = new MoweEdgeRegistry({
+      adapters: [{
+        sourceId: "healthy-with-note",
+        sourceType: "plugin",
+        discover: async () => [],
+        load: async (candidate) => createEdgeCapability({
+          manifest: candidate,
+          tool: tool(candidate.capabilityName),
+        }),
+        health: async () => ({
+          sourceId: "healthy-with-note",
+          sourceType: "plugin",
+          status: "healthy",
+          checkedAt: "2026-08-31T00:00:00.000Z",
+          message: "using the cached metadata",
+        }),
+      }],
+    });
+
+    const snapshot = await registry.refresh();
+    expect(snapshot.edges[0]?.health).toBe("healthy");
+    expect(snapshot.edges[0]?.diagnostics).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "adapter-health" }),
+    ]));
+    await registry.close();
+  });
+
   it("publishes completed edges when another edge exceeds its refresh deadline", async () => {
     const hanging: EdgeAdapter = {
       sourceId: "hanging",

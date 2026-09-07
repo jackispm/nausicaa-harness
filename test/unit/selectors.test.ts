@@ -74,6 +74,7 @@ describe("Prime-style CLI selectors", () => {
 
   it("rejects unsafe or ambiguous model selectors", () => {
     expect(normalizeModelSelector(" openrouter:main ")).toBe("openrouter:main");
+    expect(normalizeModelSelector(" OPENAI:gpt-5.4 ")).toBe("openai:gpt-5.4");
     expect(() => normalizeModelSelector("openrouter:main other")).toThrow(/without spaces/);
     expect(() => normalizeModelSelector("\u0000")).toThrow(/without spaces/);
   });

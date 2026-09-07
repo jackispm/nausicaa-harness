@@ -15,7 +15,9 @@ import {
 } from "./cli/edge-status.js";
 import {
   createConfiguredEdgeComposition,
+  DEFAULT_LOCAL_SKILL_ROOTS,
   loadSettings,
+  planCliSkillDiscovery,
   resolveSettings,
   SettingsError,
   type ConfiguredEdgeComposition,
@@ -62,12 +64,13 @@ import {
   inspectCredential,
   readAvailableBoundedStdinTask,
   readBoundedStdinTask,
+  providerCredentialHint,
+  providerSupportsAmbientCredentialChain,
   startupGuidance,
   UNCONFIGURED_MODEL,
 } from "./cli/onboarding.js";
 import {
   createBuiltinModelPort,
-  createOpenRouterModelPort,
   parseModelSelector,
 } from "./model/index.js";
 import { createNausicaaCredentialStore } from "./auth/index.js";
@@ -248,9 +251,9 @@ const main = async (): Promise<number> => {
       }
     }
     const credentialStore = createNausicaaCredentialStore();
-    const mainModel = options.allProviders
-      ? createBuiltinModelPort({ credentials: credentialStore })
-      : createOpenRouterModelPort({ credentials: credentialStore });
+    // The shipped pi-ai registry is provider-neutral. `--all-providers` is
+    // retained only so older scripts continue to parse successfully.
+    const mainModel = createBuiltinModelPort({ credentials: credentialStore });
     let modelRefreshAborted = false;
     let modelRefreshErrors: ReadonlyMap<string, Error> = new Map();
     if (options.refreshModels === true) {
@@ -262,7 +265,6 @@ const main = async (): Promise<number> => {
       refreshTimer.unref?.();
       try {
         const refreshed = await mainModel.refreshCatalog({
-          ...(options.allProviders ? {} : { providers: ["openrouter"] }),
           signal: refreshController.signal,
         });
         modelRefreshAborted = refreshed.aborted;
@@ -301,7 +303,7 @@ const main = async (): Promise<number> => {
         ? { provider, type }
         : undefined;
     };
-    const selectedModelProvider = selectedProvider(resolvedSettings.model);
+    let selectedModelProvider = selectedProvider(resolvedSettings.model);
     let selectedAuthCheck: Awaited<ReturnType<typeof mainModel.checkAuth>>;
     let selectedAuthCheckFailed = false;
     if (selectedModelProvider === undefined) {
@@ -316,12 +318,15 @@ const main = async (): Promise<number> => {
         selectedAuthCheck = undefined;
       }
     }
-    const credentialStatus = applyProviderAuthStatus(inspectCredential(
+    const credentialStatusBase = inspectCredential(
       resolvedSettings.model,
       modelCatalog,
       process.env,
       savedCredentialFor(resolvedSettings.model),
-    ), selectedAuthCheck);
+    );
+    const credentialStatus = selectedAuthCheckFailed
+      ? { ...credentialStatusBase, authCheckFailed: true }
+      : applyProviderAuthStatus(credentialStatusBase, selectedAuthCheck);
     const selectedRunId = options.continue
       ? await findLatestRunId(resolvedSettings.dataDir, workspace)
       : options.resume;
@@ -338,12 +343,13 @@ const main = async (): Promise<number> => {
       || (
         credentialStatus.credentialEnv !== undefined
         && !credentialStatus.credentialPresent
+        && !selectedAuthCheckFailed
       )
       || (
         !selectedAuthCheckFailed
         && selectedModelProvider !== undefined
+        && !providerSupportsAmbientCredentialChain(selectedModelProvider)
         && credentialStatus.authConfigured === false
-        && !credentialStatus.credentialPresent
       );
     if (
       options.mode !== "interactive"
@@ -381,16 +387,18 @@ const main = async (): Promise<number> => {
         (
           credentialStatus.credentialEnv !== undefined
           && !credentialStatus.credentialPresent
+          && !selectedAuthCheckFailed
         )
         || (
           !selectedAuthCheckFailed
           && selectedModelProvider !== undefined
+          && !providerSupportsAmbientCredentialChain(selectedModelProvider)
           && credentialStatus.authConfigured === false
-          && !credentialStatus.credentialPresent
         )
       )
     ) {
-      const credentialSource = credentialStatus.credentialEnv
+      const credentialSource = providerCredentialHint(credentialStatus.provider)
+        ?? credentialStatus.credentialEnv
         ?? credentialStatus.authSource
         ?? `credentials for ${credentialStatus.provider ?? "the selected provider"}`;
       const message = `Credential not detected: ${credentialSource}. `
@@ -417,6 +425,7 @@ const main = async (): Promise<number> => {
       resolvedSettings,
       options.refreshEdges === true,
       !(isNewRun && localModelPreflightFailed),
+      options.edgesEnabled,
     );
     openedEdgeComposition = edgeRuntime.composition;
     // Keep resume semantics explicit: when neither the settings file nor the
@@ -466,20 +475,30 @@ const main = async (): Promise<number> => {
     // into the Pi-style composer. Authentication is surfaced on /setup,
     // /login, or when the first request actually needs it; it is not a chat
     // transcript entry at startup.
-    const showStartupSetup = startupModelMissing
-      || !credentialStatus.selectorRecognized
-      || credentialStatus.catalogKnown === false;
-    const modelChoices = modelCatalog.map((entry) => ({
-      value: entry.selector,
-      label: entry.selector,
-      description: `${entry.name} · context ${entry.contextWindowTokens} · `
-        + `max ${entry.maxOutputTokens} · ${entry.imageInput ? "images" : "text only"} · `
-        + "tools unverified · auth unverified",
-      contextWindowTokens: entry.contextWindowTokens,
-      imageInput: entry.imageInput,
-      toolUse: entry.toolUse,
-      authStatus: entry.authStatus,
-    }));
+    // Pi keeps the regular composer compact after a model is selected. Setup
+    // diagnostics remain available through `/setup`; only the first-run
+    // missing-model gate needs the startup setup surface before selection.
+    const showStartupSetup = startupModelMissing;
+    const modelChoices = () => {
+      const providerInfoById = new Map(mainModel.providers().map((provider) => [provider.id, provider]));
+      return mainModel.catalog().map((entry) => {
+        const provider = providerInfoById.get(entry.provider);
+        const authHint = provider === undefined || provider.authTypes.length === 0
+          ? "no interactive auth"
+          : provider.authTypes.map((type) => type === "oauth" ? "OAuth" : "API key").join(" / ");
+        return {
+          value: entry.selector,
+          label: `${provider?.name ?? entry.provider} / ${entry.name}`,
+          description: `${entry.selector} · ${authHint} · context ${entry.contextWindowTokens} · `
+            + `max ${entry.maxOutputTokens} · ${entry.imageInput ? "images" : "text only"} · `
+            + "tools unverified · auth unverified",
+          contextWindowTokens: entry.contextWindowTokens,
+          imageInput: entry.imageInput,
+          toolUse: entry.toolUse,
+          authStatus: entry.authStatus,
+        };
+      });
+    };
     const processedImages = await processImageInputs(options.fileArgs, {
       workspace,
       protectedPaths: [resolvedSettings.dataDir],
@@ -532,7 +551,7 @@ const main = async (): Promise<number> => {
           ...(selectedRunId === undefined ? {} : { runId: selectedRunId }),
         }, {
           mainModel,
-          modelCatalog,
+          modelCatalog: () => mainModel.catalog(),
           awareness: readWorkspaceAwareness,
           crossRun,
         });
@@ -549,11 +568,40 @@ const main = async (): Promise<number> => {
             modelPort: mainModel,
             provider: () => selectedProvider(session.model) ?? "openrouter",
             environment: process.env,
+            refreshModels: async (provider) => {
+              const refreshController = new AbortController();
+              const refreshTimer = setTimeout(
+                () => refreshController.abort(new Error("model catalog refresh timed out")),
+                MODEL_REFRESH_TIMEOUT_MS,
+              );
+              refreshTimer.unref?.();
+              try {
+                const refreshed = await mainModel.refreshCatalog({
+                  providers: [provider],
+                  signal: refreshController.signal,
+                });
+                if (refreshed.aborted) {
+                  throw new Error(
+                    refreshController.signal.aborted
+                      ? "model catalog refresh timed out"
+                      : "refresh was cancelled",
+                  );
+                }
+                if (refreshed.errors.size > 0) {
+                  throw new Error([...refreshed.errors.values()]
+                    .map((error) => persistedErrorText(error, "refresh failed"))
+                    .join("; "));
+                }
+              } finally {
+                clearTimeout(refreshTimer);
+              }
+            },
             onChanged: async () => {
               savedCredentials = new Map(
                 (await credentialStore.list()).map((entry) => [entry.providerId, entry.type]),
               );
               const provider = selectedProvider(session.model);
+              selectedModelProvider = provider;
               if (provider === undefined) {
                 selectedAuthCheck = undefined;
                 selectedAuthCheckFailed = false;
@@ -571,19 +619,21 @@ const main = async (): Promise<number> => {
           credentialStatus: () => {
             const model = session.model === UNCONFIGURED_MODEL ? undefined : session.model;
             const provider = selectedProvider(model);
-            return applyProviderAuthStatus(
-              inspectCredential(model, modelCatalog, process.env, savedCredentialFor(model)),
-              provider !== undefined && provider === selectedModelProvider
-                ? selectedAuthCheck
-                : undefined,
-            );
+            const status = inspectCredential(model, mainModel.catalog(), process.env, savedCredentialFor(model));
+            const auth = provider !== undefined && provider === selectedModelProvider
+              ? selectedAuthCheck
+              : undefined;
+            return selectedAuthCheckFailed && provider === selectedModelProvider
+              ? { ...status, authCheckFailed: true }
+              : applyProviderAuthStatus(status, auth);
           },
           startupModelMissing,
           showStartupSetup,
           startupNotice: () => startupGuidance({
             model: session.model === UNCONFIGURED_MODEL ? undefined : session.model,
-            catalog: modelCatalog,
+            catalog: mainModel.catalog(),
             ...(selectedAuthCheck === undefined ? {} : { auth: selectedAuthCheck }),
+            ...(selectedAuthCheckFailed ? { authCheckFailed: true } : {}),
             ...(savedCredentialFor(
               session.model === UNCONFIGURED_MODEL ? undefined : session.model,
               session.model === UNCONFIGURED_MODEL,
@@ -938,15 +988,38 @@ const openCliEdgeRuntime = async (
   refreshRequested: boolean,
   /** Defer adapter discovery while interactive setup is incomplete. */
   startupRefreshAllowed = true,
+  cliEdgesEnabled?: boolean,
 ): Promise<CliEdgeRuntime> => {
-  const startupRefresh = startupRefreshAllowed
+  const skillPlan = planCliSkillDiscovery(
+    settings,
+    cliEdgesEnabled === undefined ? {} : { cliEdgesEnabled },
+  );
+  const externalStartupRefresh = startupRefreshAllowed
     && (refreshRequested || settings.edges.refreshOnStart);
   const composition = await createConfiguredEdgeComposition({
     workspace,
-    settings,
-    constructors: cliEdgeConstructors(),
-    startupRefresh,
+    settings: skillPlan.edges,
+    constructors: cliEdgeConstructors(
+      skillPlan.localSkillSourceId,
+      skillPlan.localSkillRoots,
+    ),
+    startupRefresh: externalStartupRefresh,
   });
+  // Local Skill discovery is metadata-only and does not start a provider or
+  // external process. Refresh it independently so default Skills do not force
+  // configured MCP sources to refresh when their external gate is off.
+  let localRefreshFailed = false;
+  if (skillPlan.localSkillSourceId !== undefined && !externalStartupRefresh) {
+    try {
+      await composition.registry.refresh({
+        workspace,
+        timeoutMs: skillPlan.edges.refreshTimeoutMs,
+        sourceIds: [skillPlan.localSkillSourceId],
+      });
+    } catch {
+      localRefreshFailed = true;
+    }
+  }
   // Discovery is visible in status, but Skill bodies require an explicit host
   // selector. The predicate closes over the controller so each Turn captures
   // the latest selection without mutating the registry snapshot.
@@ -956,27 +1029,26 @@ const openCliEdgeRuntime = async (
     (summary) => selection?.selectionPredicate(summary) ?? false,
   );
   selection = createEdgeSelectionController(provider);
-  const configured = projectConfiguredEdgeStatus(settings.edges);
+  const configured = projectConfiguredEdgeStatus(skillPlan.edges);
   return {
     composition,
     provider,
     selection,
     status: () => {
-      const runtime = projectRuntimeEdgeStatus(edgeStatusFromProvider(provider, {
-        enabled: configured.enabled,
-        refreshRequested: configured.refreshRequested,
-        generation: configured.generation,
-        toolCount: configured.toolCount ?? 0,
-        contextCount: configured.contextCount ?? 0,
-        diagnostics: configured.diagnostics ?? [],
-        sources: [],
-      }));
+      // Prefer the immutable registry snapshot so `/edges` reflects discovered
+      // Skill metadata and generation, while the host policy remains the
+      // source of truth for the overall enabled flag.
+      const runtime = projectRuntimeEdgeStatus(edgeStatusFromProvider(provider));
       return {
         ...runtime,
-        enabled: settings.edges.enabled,
-        refreshRequested: startupRefresh,
+        enabled: skillPlan.edges.enabled,
+        ...(runtime.sources.length === 0 && configured.sources.length > 0
+          ? { sources: configured.sources }
+          : {}),
+        refreshRequested: externalStartupRefresh,
         diagnostics: Object.freeze([
           ...(runtime.diagnostics ?? []),
+          ...(localRefreshFailed ? ["local Skill discovery failed"] : []),
           ...(
             !startupRefreshAllowed && (refreshRequested || settings.edges.refreshOnStart)
               ? ["edge startup refresh deferred until local model setup is complete"]
@@ -993,7 +1065,10 @@ const openCliEdgeRuntime = async (
   };
 };
 
-const cliEdgeConstructors = (): EdgeAdapterConstructors => ({
+const cliEdgeConstructors = (
+  localSkillSourceId?: string,
+  localSkillRoots: readonly string[] = DEFAULT_LOCAL_SKILL_ROOTS,
+): EdgeAdapterConstructors => ({
   mcp: (source, context) => createMcpEdgeAdapter({
     sourceId: source.sourceId,
     ...(source.command === undefined ? {} : { command: source.command }),
@@ -1003,10 +1078,18 @@ const cliEdgeConstructors = (): EdgeAdapterConstructors => ({
     ...(source.sessionId === undefined ? {} : { sessionId: source.sessionId }),
     cwd: context.workspace,
   }),
-  skill: (source) => createSkillsEdgeAdapter({
-    sourceId: source.sourceId,
-    roots: [source.location ?? "skills"],
-  }),
+  skill: (source) => source.sourceId === localSkillSourceId
+    ? createSkillsEdgeAdapter({
+        sourceId: source.sourceId,
+        roots: localSkillRoots,
+        // The conventional roots have deterministic precedence when the same
+        // Skill name is present in more than one project directory.
+        conflictMode: "first",
+      })
+    : createSkillsEdgeAdapter({
+        sourceId: source.sourceId,
+        roots: [source.location ?? "skills"],
+      }),
 });
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;

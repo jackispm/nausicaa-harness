@@ -49,6 +49,7 @@ export type MoweEdgeDiagnosticSeverity = "warning" | "error";
 export interface MoweEdgeDiagnostic {
   readonly code:
     | "adapter-failed"
+    | "adapter-health"
     | "adapter-invalid"
     | "manifest-invalid"
     | "manifest-mismatch"
@@ -612,6 +613,21 @@ export class MoweEdgeRegistry {
           delete edge.adapterHealth;
         } else {
           edge.adapterHealth = await awaitWithSignal(edge.adapter.health(), edgeSignal);
+        }
+        if (
+          edge.adapterHealth?.message !== undefined
+          && edge.adapterHealth.status !== "healthy"
+        ) {
+          // Adapter health is otherwise only available through the mutable
+          // health() API. Copy the bounded reason into this immutable
+          // generation so status/TUI projections do not show a bare
+          // degraded/failed state with no explanation.
+          edge.diagnostics.push(diagnostic(
+            "adapter-health",
+            edge.adapterHealth.status === "degraded" ? "warning" : "error",
+            edge.sourceId,
+            edge.adapterHealth.message,
+          ));
         }
         edge.health = healthFrom(edge, edge.adapterHealth);
         if (edge.adapterHealth?.status === "unavailable" || edge.adapterHealth?.status === "closed") {

@@ -13,6 +13,7 @@ export interface AuthCommand {
   readonly kind: "auth";
   readonly action: "login" | "status" | "logout";
   readonly provider: string;
+  readonly authType?: "api_key" | "oauth";
   readonly json: boolean;
 }
 
@@ -38,8 +39,10 @@ export interface CliOptions {
   mode: OutputMode;
   modeExplicit: boolean;
   continue: boolean;
-  /** Opt into the complete pi-ai built-in provider/model catalog. */
+  /** Legacy compatibility flag; the complete catalog is enabled by default. */
   allProviders?: boolean;
+  /** Provider prefix paired with --model <id>. */
+  provider?: string;
   /** Explicitly refresh dynamic provider model metadata before the Run. */
   refreshModels?: boolean;
   model?: string;
@@ -190,6 +193,10 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
         options.model = readValue(args, index, argument);
         index += 1;
         break;
+      case "--provider":
+        options.provider = readValue(args, index, argument);
+        index += 1;
+        break;
       case "--all-providers":
         options.allProviders = true;
         break;
@@ -338,6 +345,17 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
   if (options.resolveOperation !== undefined && options.resume === undefined) {
     throw new CliUsageError("--resolve-operation requires --resume");
   }
+  if (options.provider !== undefined) {
+    const provider = normalizeProviderId(options.provider);
+    if (options.model === undefined) {
+      throw new CliUsageError("--provider requires --model <id>");
+    }
+    if (options.model.includes(":")) {
+      throw new CliUsageError("--provider cannot be combined with a provider:model --model value");
+    }
+    options.provider = provider;
+    options.model = `${provider}:${options.model}`;
+  }
   if (options.resume !== undefined && options.continue) {
     throw new CliUsageError("--resume and --continue are mutually exclusive");
   }
@@ -364,6 +382,7 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
     || options.edges !== undefined
     || options.fukaiCompaction !== undefined
     || options.allProviders !== undefined
+    || options.provider !== undefined
     || options.refreshModels !== undefined
   )) {
     throw new CliUsageError(
@@ -398,6 +417,7 @@ export const parseCliArgs = (args: string[], cwd: string): CliOptions => {
     || options.edges !== undefined
     || options.fukaiCompaction !== undefined
     || options.allProviders !== undefined
+    || options.provider !== undefined
     || options.refreshModels !== undefined
     || options.topology
     || options.fileArgs.length > 0
@@ -437,13 +457,28 @@ function parseUtilityCommand(args: string[], cwd: string): CliOptions {
   if (kind === "auth") {
     const action = positional[0];
     if (action !== "login" && action !== "status" && action !== "logout") {
-      throw new CliUsageError("Usage: nausicaa auth <login|status|logout> [provider]");
+      throw new CliUsageError("Usage: nausicaa auth <login|status|logout> [provider] [api-key|oauth]");
     }
-    const provider = positional[1] ?? "openrouter";
-    if (positional.length > 2) {
-      throw new CliUsageError("Usage: nausicaa auth <login|status|logout> [provider]");
+    let provider = normalizeProviderId(positional[1] ?? "openrouter");
+    let authType: "api_key" | "oauth" | undefined;
+    if (action === "login" && positional[1] !== undefined && positional.length === 2
+      && isAuthTypeToken(positional[1])) {
+      authType = normalizeAuthType(positional[1]);
+      provider = "openrouter";
+    } else if (action === "login" && positional[2] !== undefined) {
+      authType = normalizeAuthType(positional[2]);
     }
-    command = { kind, action, provider, json };
+    const maxPositional = action === "login" ? 3 : 2;
+    if (positional.length > maxPositional || (action !== "login" && authType !== undefined)) {
+      throw new CliUsageError("Usage: nausicaa auth <login|status|logout> [provider] [api-key|oauth]");
+    }
+    command = {
+      kind,
+      action,
+      provider,
+      ...(authType === undefined ? {} : { authType }),
+      json,
+    };
   } else {
     const action = positional[0];
     if (action !== "set-model" && action !== "get-model" && action !== "path") {
@@ -483,7 +518,7 @@ Usage:
   nausicaa [options] [@image ...] [message]
   nausicaa --daemon [options]
   nausicaa --attach <run-id> [options]
-  nausicaa auth <login|status|logout> [provider]
+  nausicaa auth <login|status|logout> [provider] [api-key|oauth]
   nausicaa config <set-model|get-model|path> [value]
 
 Options:
@@ -502,7 +537,8 @@ Options:
                           Select the output mode
   --model <provider:id>   Main model, for example openrouter:openai/gpt-5-mini
                           Or set NAUSICAA_MODEL; provider auth is not pre-verified
-  --all-providers         Use the complete pi-ai built-in provider/model catalog
+  --provider <provider>   Prefix an unqualified --model id (for example --provider openai --model gpt-5.4)
+  --all-providers         Legacy compatibility flag; all built-in providers are enabled by default
   --refresh-models        Refresh dynamic provider catalogs before the Run (network)
   --teto-model <value>    Optional model override for the Teto lane
   --resume <run-id>       Resume an interrupted Run
@@ -523,9 +559,10 @@ Options:
   --allow-write           Allow workspace writes (default; use settings/profile to restrict)
   --allow-shell           Allow host-level shell access (default; use /permissions to restrict)
   --allow-network         Allow public web fetch/search tools (default)
-  --edges                 Enable configured Skills/MCP/plugin edge sources
-  --no-edges              Disable all configured edge sources for this run
-  --refresh-edges         Refresh edge sources before starting the host/Turn
+  --edges                 Enable configured external Skills/MCP/plugin edge sources
+                          (project-local Skills are discovered by default)
+  --no-edges              Disable configured edge sources and project-local Skill discovery
+  --refresh-edges         Refresh edge sources (including project-local Skills) before the host/Turn
   --workspace <path>      Bound tools to this workspace
   --data-dir <path>       Runtime state directory (default: .nausicaa)
   --max-steps <number>    Maximum Main model steps (default: 24)
@@ -535,7 +572,8 @@ Options:
   -v, --version           Show version
 
 Commands:
-  auth login [provider]   Save a provider credential through a hidden TTY prompt
+  auth login [provider] [api-key|oauth]
+                          Save a provider credential through a hidden TTY/browser/device flow
   auth status [provider]  Show credential presence (never verifies over the network)
   auth logout [provider]  Remove a saved credential; environment credentials remain
   config set-model <id>   Save the user-level default model selector
@@ -546,4 +584,25 @@ Commands:
 Environment:
   NAUSICAA_MODEL          Fallback model selector when settings/CLI omit model
   OPENROUTER_API_KEY      Ambient credential (a saved credential from auth login wins)
+  OPENAI_API_KEY          OpenAI ambient credential
+  ANTHROPIC_API_KEY       Anthropic ambient credential (provider-owned alternatives are also supported)
+  DEEPSEEK_API_KEY        DeepSeek ambient credential
 `;
+
+function normalizeProviderId(value: string): string {
+  const normalized = value.trim().toLocaleLowerCase();
+  if (normalized.length === 0 || !/^[a-z0-9][a-z0-9._-]*$/u.test(normalized)) {
+    throw new CliUsageError("--provider must be a provider id such as openai or openrouter");
+  }
+  return normalized;
+}
+
+function isAuthTypeToken(value: string): boolean {
+  return value === "api-key" || value === "api_key" || value === "oauth";
+}
+
+function normalizeAuthType(value: string): "api_key" | "oauth" {
+  if (value === "oauth") return "oauth";
+  if (value === "api-key" || value === "api_key") return "api_key";
+  throw new CliUsageError("auth login method must be api-key or oauth");
+}

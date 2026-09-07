@@ -824,6 +824,11 @@ class SkillsEdgeAdapterImpl implements SkillsEdgeAdapter {
   async refresh(context: EdgeRefreshContext): Promise<void> {
     this.#assertOpen();
     throwIfAborted(context.signal);
+    // A refresh starts a new discovery generation. Do not keep reporting an
+    // error from the previous generation while the new one is being built.
+    // The registry retains the last published snapshot until discovery
+    // completes, so clearing this local error does not expose partial data.
+    this.#lastError = undefined;
     this.#cachedWorkspace = undefined;
     this.#cachedContributions = undefined;
   }

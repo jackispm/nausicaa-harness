@@ -96,6 +96,11 @@ export interface ModelProviderInfo {
   name: string;
   modelCount: number;
   authTypes: readonly AuthType[];
+  /** Provider-owned labels used by setup surfaces when available. */
+  apiKeyName?: string;
+  oauthName?: string;
+  oauthLoginLabel?: string;
+  oauthSubscription?: boolean;
 }
 
 /**
@@ -109,7 +114,7 @@ export class PiAiModelPort implements ModelPort {
 
   constructor(options: PiAiModelPortOptions) {
     this.models = options.models;
-    this.defaultProvider = options.defaultProvider ?? "openrouter";
+    this.defaultProvider = normalizeProviderId(options.defaultProvider ?? "openrouter");
     this.fetch = options.fetch ?? globalThis.fetch;
   }
 
@@ -144,15 +149,25 @@ export class PiAiModelPort implements ModelPort {
         ...(provider.auth.apiKey === undefined ? [] : ["api_key" as const]),
         ...(provider.auth.oauth === undefined ? [] : ["oauth" as const]),
       ]),
+      ...(provider.auth.apiKey === undefined ? {} : { apiKeyName: provider.auth.apiKey.name }),
+      ...(provider.auth.oauth === undefined ? {} : {
+        oauthName: provider.auth.oauth.name,
+        ...(provider.auth.oauth.loginLabel === undefined
+          ? {}
+          : { oauthLoginLabel: provider.auth.oauth.loginLabel }),
+        ...(provider.auth.oauth.isSubscription === undefined
+          ? {}
+          : { oauthSubscription: provider.auth.oauth.isSubscription }),
+      }),
     }));
   }
 
   hasProvider(provider: string): boolean {
-    return this.models.getProvider(provider) !== undefined;
+    return this.models.getProvider(normalizeProviderId(provider)) !== undefined;
   }
 
   providerAuthTypes(provider: string): readonly AuthType[] {
-    const entry = this.models.getProvider(provider);
+    const entry = this.models.getProvider(normalizeProviderId(provider));
     if (entry === undefined) return [];
     return [
       ...(entry.auth.apiKey === undefined ? [] : ["api_key" as const]),
@@ -168,7 +183,11 @@ export class PiAiModelPort implements ModelPort {
   async refreshCatalog(
     options: ModelsRefreshOptions = {},
   ): Promise<ModelCatalogRefreshResult> {
-    const result = await this.models.refresh(options);
+    const normalizedProviders = options.providers?.map((provider) => normalizeProviderId(provider));
+    const result = await this.models.refresh({
+      ...options,
+      ...(normalizedProviders === undefined ? {} : { providers: normalizedProviders }),
+    });
     return {
       aborted: result.aborted,
       errors: new Map(result.errors),
@@ -190,7 +209,7 @@ export class PiAiModelPort implements ModelPort {
 
   /** Check local credential configuration without making a provider request. */
   async checkAuth(provider = this.defaultProvider): Promise<AuthCheck | undefined> {
-    return this.models.checkAuth(provider);
+    return this.models.checkAuth(normalizeProviderId(provider));
   }
 
   /** Run the provider-owned login flow and persist its credential. */
@@ -199,12 +218,12 @@ export class PiAiModelPort implements ModelPort {
     interaction: AuthInteraction,
     provider = this.defaultProvider,
   ): Promise<Credential> {
-    return this.models.login(provider, type, interaction);
+    return this.models.login(normalizeProviderId(provider), type, interaction);
   }
 
   /** Remove the saved credential for a provider; ambient environment remains untouched. */
   async logout(provider = this.defaultProvider): Promise<void> {
-    await this.models.logout(provider);
+    await this.models.logout(normalizeProviderId(provider));
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
@@ -387,10 +406,7 @@ export function createOpenRouterModelPort(
   });
 }
 
-/**
- * Explicit all-provider Pi catalog. The default CLI intentionally keeps the
- * lighter OpenRouter-only factory until a host opts into this heavier catalog.
- */
+/** Construct the complete provider/model catalog shipped by pi-ai. */
 export function createBuiltinModelPort(
   options: BuiltinModelPortOptions = {},
 ): PiAiModelPort {
@@ -418,15 +434,25 @@ export function parseModelSelector(
     if (selector.length === 0) {
       throw new Error("Model selector cannot be empty");
     }
-    return { provider: defaultProvider, model: selector };
+    return { provider: normalizeProviderId(defaultProvider), model: selector };
   }
 
-  const provider = selector.slice(0, separator);
+  const rawProvider = selector.slice(0, separator);
   const model = selector.slice(separator + 1);
-  if (provider.length === 0 || model.length === 0) {
+  if (rawProvider.trim().length === 0 || model.length === 0) {
     throw new Error(`Invalid model selector: ${selector}`);
   }
+  const provider = normalizeProviderId(rawProvider);
   return { provider, model };
+}
+
+/** Provider identifiers are case-insensitive at every public host boundary. */
+export function normalizeProviderId(value: string): string {
+  const normalized = value.trim().toLocaleLowerCase();
+  if (normalized.length === 0 || !/^[a-z0-9][a-z0-9._-]*$/u.test(normalized)) {
+    throw new Error("Provider id must contain only letters, numbers, dots, underscores, or hyphens");
+  }
+  return normalized;
 }
 
 /** Normalize and validate a user/config supplied model selector. */
@@ -439,8 +465,11 @@ export function normalizeModelSelector(value: string): string {
   ) {
     throw new Error("Model selector must be non-empty, at most 256 characters, and contain no spaces");
   }
-  parseModelSelector(selector);
-  return selector;
+  const separator = selector.indexOf(":");
+  const parsed = parseModelSelector(selector);
+  // Provider ids are case-insensitive in the CLI and catalog. Preserve
+  // unqualified selectors for compatibility with injected/test models.
+  return separator < 0 ? selector : `${parsed.provider}:${parsed.model}`;
 }
 
 function toPiMessage(

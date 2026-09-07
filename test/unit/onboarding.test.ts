@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyProviderAuthStatus,
+  inspectEnvironmentCredential,
   inspectCredential,
   maskSecret,
   nonInteractiveGuidance,
@@ -51,6 +52,74 @@ describe("CLI onboarding", () => {
     expect(inspectCredential("demo", catalog, {})).toMatchObject({
       provider: "openrouter",
       selectorRecognized: true,
+      catalogKnown: true,
+    });
+  });
+
+  it("recognizes ambient credentials for non-OpenRouter providers", () => {
+    expect(inspectCredential("openai:gpt-5.4", [], { OPENAI_API_KEY: "openai-secret-1234" }))
+      .toMatchObject({
+        provider: "openai",
+        credentialEnv: "OPENAI_API_KEY",
+        credentialPresent: true,
+        credentialMask: "****1234",
+      });
+    expect(inspectCredential("anthropic:claude-sonnet", [], { ANTHROPIC_AUTH_TOKEN: "anthropic-token" }))
+      .toMatchObject({
+        provider: "anthropic",
+        credentialEnv: "ANTHROPIC_AUTH_TOKEN",
+        credentialPresent: true,
+      });
+    expect(inspectCredential("anthropic:claude-sonnet", [], {
+      ANTHROPIC_API_KEY: "api-key",
+      ANTHROPIC_AUTH_TOKEN: "bearer-token",
+    })).toMatchObject({
+      credentialEnv: "ANTHROPIC_AUTH_TOKEN",
+      credentialMask: "****oken",
+    });
+  });
+
+  it("requires complete composite provider environment credentials", () => {
+    expect(inspectEnvironmentCredential("cloudflare-workers-ai", {
+      CLOUDFLARE_API_KEY: "key",
+    })).toMatchObject({ present: false, partial: true, detected: ["CLOUDFLARE_API_KEY"] });
+    expect(inspectCredential("cloudflare-workers-ai:demo", [], {
+      CLOUDFLARE_API_KEY: "key",
+    })).toMatchObject({
+      credentialEnv: "CLOUDFLARE_API_KEY",
+      credentialPresent: false,
+      credentialPartial: true,
+      credentialSource: "environment",
+    });
+    expect(inspectEnvironmentCredential("cloudflare-workers-ai", {
+      CLOUDFLARE_API_KEY: "key",
+      CLOUDFLARE_ACCOUNT_ID: "account",
+    })).toMatchObject({ present: true, partial: false });
+    expect(inspectEnvironmentCredential("cloudflare-ai-gateway", {
+      CLOUDFLARE_API_KEY: "key",
+      CLOUDFLARE_ACCOUNT_ID: "account",
+    })).toMatchObject({ present: false, partial: true });
+    expect(inspectEnvironmentCredential("google-vertex", {
+      GOOGLE_CLOUD_PROJECT: "project",
+      GOOGLE_CLOUD_LOCATION: "us-central1",
+    })).toMatchObject({ present: false, partial: true });
+    expect(inspectEnvironmentCredential("amazon-bedrock", {
+      AWS_ACCESS_KEY_ID: "access",
+    })).toMatchObject({ present: false, partial: true });
+    expect(inspectEnvironmentCredential("amazon-bedrock", {
+      AWS_ACCESS_KEY_ID: "access",
+      AWS_SECRET_ACCESS_KEY: "secret",
+    })).toMatchObject({ present: true, partial: false });
+  });
+
+  it("normalizes provider ids in onboarding inspection", () => {
+    expect(inspectCredential("OPENAI:gpt-5.4", [], { OPENAI_API_KEY: "key" })).toMatchObject({
+      provider: "openai",
+      credentialEnv: "OPENAI_API_KEY",
+      credentialPresent: true,
+    });
+    expect(inspectCredential("OPENROUTER:demo", catalog, {})).toMatchObject({
+      provider: "openrouter",
       catalogKnown: true,
     });
   });
@@ -158,13 +227,62 @@ describe("CLI onboarding", () => {
     })).toContain("ANTHROPIC_API_KEY");
   });
 
+  it("labels provider-owned saved credentials as saved, not ambient", () => {
+    const local = inspectCredential("openai:gpt-5.4", [], {});
+    expect(applyProviderAuthStatus(local, {
+      type: "api_key",
+      source: "stored credential",
+    })).toMatchObject({
+      credentialPresent: true,
+      credentialSource: "saved",
+      authConfigured: true,
+    });
+    expect(applyProviderAuthStatus(local, {
+      type: "oauth",
+      source: "OAuth",
+    })).toMatchObject({
+      credentialPresent: true,
+      credentialSource: "saved",
+      authConfigured: true,
+    });
+  });
+
+  it("keeps a failed local auth check distinct from a missing credential", () => {
+    const status = { ...inspectCredential("openai:gpt-5.4", [], {}), authCheckFailed: true };
+    expect(status).toMatchObject({
+      credentialPresent: false,
+      authCheckFailed: true,
+    });
+    expect(startupGuidance({
+      model: "openai:gpt-5.4",
+      environment: {},
+      authCheckFailed: true,
+    })).toContain("local auth check was unavailable");
+  });
+
+  it("explains composite requirements instead of naming a partial variable", () => {
+    expect(startupGuidance({
+      model: "cloudflare-ai-gateway:demo",
+      environment: { CLOUDFLARE_ACCOUNT_ID: "account" },
+    })).toContain("CLOUDFLARE_API_KEY, CLOUDFLARE_ACCOUNT_ID, and CLOUDFLARE_GATEWAY_ID");
+  });
+
+  it("does not render undefined as a mask for non-secret provider settings", () => {
+    const guidance = startupGuidance({
+      model: "amazon-bedrock:anthropic.claude-3-5-sonnet-20241022-v2:0",
+      environment: { AWS_PROFILE: "work" },
+    });
+    expect(guidance).toContain("AWS_PROFILE (configured)");
+    expect(guidance).not.toContain("(undefined)");
+  });
+
   it("gives a copyable non-interactive next step without accepting a key argument", () => {
     const guidance = nonInteractiveGuidance();
     expect(guidance).toContain("nausicaa --print --model 'openrouter:<model-id>' '<task>'");
     expect(guidance).toContain("OPENROUTER_API_KEY");
     expect(guidance).not.toContain("--api-key");
     const anthropic = nonInteractiveGuidance("anthropic:claude-sonnet-4");
-    expect(anthropic).toContain("nausicaa --print --all-providers --model 'anthropic:claude-sonnet-4'");
+    expect(anthropic).not.toContain("--all-providers");
     expect(anthropic).toContain("nausicaa auth login anthropic");
   });
 

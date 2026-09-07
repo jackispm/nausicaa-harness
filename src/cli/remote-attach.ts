@@ -27,7 +27,6 @@ import {
   NoticeBlock,
   parseExternalA2APrompt,
   SessionTray,
-  StableStatusSlot,
   ToolStatusBlock,
   UserMessageBlock,
   WorkerTaskSummaryLine,
@@ -38,6 +37,7 @@ export interface RemoteAttachOptions {
   readonly session: RemoteAttachSession;
   /** Test/embedding seam; production uses ProcessTerminal. */
   readonly terminal?: Terminal;
+  /** Explicitly opt into Pi's fullscreen/alternate-screen layout. */
   readonly forceAltScreen?: boolean;
 }
 
@@ -56,18 +56,16 @@ export interface RemoteAttachSession {
 /** Read-only product surface over one daemon-owned Run attachment. */
 export async function runRemoteAttach(options: RemoteAttachOptions): Promise<number> {
   const terminal = options.terminal ?? new ProcessTerminal();
-  // Match Pi's regular main-screen default. Attachments can explicitly opt
-  // into the alternate-screen viewport when an embedding needs a fixed dock.
+  // Match Pi's renderer choice: regular/main-screen is the default and the
+  // alternate-screen viewport is an explicit embedding option.
   const useAltScreen = options.forceAltScreen === true;
   const tui: TUI = useAltScreen
-    ? new TuiAltScreen(terminal, true, undefined, { mouse: true })
-    : new TuiMainScreen(terminal, true);
+    ? new TuiAltScreen(terminal, undefined, undefined, { mouse: true })
+    : new TuiMainScreen(terminal);
+  // Match Pi: clearOnShrink is controlled by the TUI default, environment, or
+  // host settings. A forced true value would clear main-screen scrollback.
   const requestTuiRender = (force = false): void => {
-    tui.invalidate();
-    if (force && tui instanceof TuiAltScreen) {
-      tui.requestRender(true);
-      return;
-    }
+    if (force) tui.invalidate();
     tui.requestRender();
   };
   terminal.setTitle("Nausicaa");
@@ -75,10 +73,22 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
   const documentContainer = new Container();
   const transcript = new Container();
   const activity = new ActivityLine(() => options.session.snapshot(), tui);
-  const statusSlot = new StableStatusSlot(
-    activity,
-    () => tui.mode === "regular" && tui.getClearOnShrink(),
-  );
+  const statusContainer = new Container();
+  let activityMounted = false;
+  const syncActivityStatus = (): void => {
+    const status = options.session.snapshot().status;
+    const shouldMount = status === "running" || status === "cancelling";
+    if (shouldMount && !activityMounted) {
+      activity.start();
+      statusContainer.clear();
+      statusContainer.addChild(activity);
+      activityMounted = true;
+    } else if (!shouldMount && activityMounted) {
+      activity.stop();
+      statusContainer.clear();
+      activityMounted = false;
+    }
+  };
   const header = new BrandSplashHeader({
     version: "0.1.0",
   });
@@ -108,10 +118,14 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
     () => options.session.snapshot(),
     () => attachmentLabel(options.session.state().attachmentStatus),
   );
+  const widgetContainerAbove = new Container();
+  widgetContainerAbove.addChild(workerTaskSummary);
+  const footerContainer = new Container();
+  footerContainer.addChild(sessionTray);
   const dock = new VStack([
-    { component: statusSlot, shrink: 1, minSize: 0 },
-    { component: workerTaskSummary, shrink: 1, minSize: 0 },
-    { component: sessionTray, basis: 2, shrink: 0, minSize: 2 },
+    { component: statusContainer, shrink: 1, minSize: 0 },
+    { component: widgetContainerAbove, shrink: 1, minSize: 0 },
+    { component: footerContainer, shrink: 1, minSize: 1 },
   ]);
   screen.addChild(viewport, { basis: 0, grow: 1, shrink: 1, minSize: 1 });
   if (tui instanceof TuiAltScreen) {
@@ -119,9 +133,9 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
     tui.setLayoutRoot(screen);
   } else {
     tui.addChild(documentContainer);
-    tui.addChild(statusSlot);
-    tui.addChild(workerTaskSummary);
-    tui.addChild(sessionTray);
+    tui.addChild(statusContainer);
+    tui.addChild(widgetContainerAbove);
+    tui.addChild(footerContainer);
   }
 
   const append = (
@@ -140,6 +154,7 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
     transcript.clear();
     agentMessageBlocks.clear();
     const state = options.session.state();
+    syncActivityStatus();
     if (state.error !== undefined) {
       append(new NoticeBlock(state.error, "warning"));
     }
@@ -212,6 +227,8 @@ export async function runRemoteAttach(options: RemoteAttachOptions): Promise<num
     finishPromise = (async () => {
       unsubscribe();
       activity.stop();
+      statusContainer.clear();
+      activityMounted = false;
       await refreshTail.catch(() => undefined);
       await terminal.drainInput(250, 25).catch(() => undefined);
       try {

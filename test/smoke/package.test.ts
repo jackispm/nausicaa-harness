@@ -20,6 +20,14 @@ interface PackResult {
   files: PackFile[];
 }
 
+interface LockPackage {
+  version?: string;
+  integrity?: string;
+  cpu?: string[];
+  os?: string[];
+  optionalDependencies?: Record<string, string>;
+}
+
 const REQUIRED_PACK_FILES = [
   "README.md",
   "LICENSE",
@@ -63,6 +71,26 @@ const FORBIDDEN_PACK_PREFIXES = [
 ] as const;
 
 describe("npm package surface", () => {
+  it("locks the Linux native build dependencies used by CI", async () => {
+    const lock = JSON.parse(
+      await readFile(new URL("../../package-lock.json", import.meta.url), "utf8"),
+    ) as { packages?: Record<string, LockPackage> };
+    const packages = lock.packages ?? {};
+
+    for (const parentPath of ["node_modules/rollup", "node_modules/esbuild"] as const) {
+      const parent = packages[parentPath];
+      expect(parent?.optionalDependencies).toBeDefined();
+      for (const [name, version] of Object.entries(parent?.optionalDependencies ?? {})) {
+        const native = packages[`node_modules/${name}`];
+        expect(native, `${name} is missing from package-lock.json`).toBeDefined();
+        expect(native?.version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
+        if (/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u.test(version)) {
+          expect(native?.version).toBe(version);
+        }
+      }
+    }
+  });
+
   it("keeps documented beta commands aligned with built CLI help", async () => {
     const readme = await readFile(new URL("../../README.md", import.meta.url), "utf8");
     const { stdout: help } = await execFileAsync(

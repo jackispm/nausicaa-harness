@@ -20,6 +20,7 @@ describe("interactive command registry", () => {
       "setup",
       "status",
       "login",
+      "providers",
       "logout",
       "list-agents",
       "edges",

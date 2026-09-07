@@ -75,7 +75,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.84.3",
-    "@earendil-works/pi-tui": "^0.84.3",
+    "@earendil-works/pi-tui": "0.84.4",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@vscode/ripgrep": "1.18.0",
     "diff": "8.0.4",
