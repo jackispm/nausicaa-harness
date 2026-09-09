@@ -22,6 +22,46 @@ function tool(parameters: AgentTool["definition"]["parameters"], execute?: Agent
 }
 
 describe("Mowe boundaries", () => {
+  it.each([
+    {
+      keyword: "const",
+      constraint: { const: { target: "allowed", count: 1 } },
+      reason: "arguments must equal the declared constant",
+    },
+    {
+      keyword: "enum",
+      constraint: { enum: [{ target: "allowed", count: 1 }] },
+      reason: "arguments must be one of the declared values",
+    },
+  ])("enforces root object $keyword before invoking the tool", async ({ constraint, reason }) => {
+    const executed: Record<string, unknown>[] = [];
+    const candidate = tool({
+      type: "object",
+      properties: { target: { type: "string" }, count: { type: "integer" } },
+      required: ["target", "count"],
+      additionalProperties: false,
+      ...constraint,
+    }, async (args) => {
+      executed.push(args);
+      return { content: "done", isError: false };
+    });
+    expect(validateArguments(candidate, { count: 1, target: "allowed" })).toEqual({ ok: true });
+    expect(validateArguments(candidate, { count: 1, target: "forbidden" })).toEqual({ ok: false, reason });
+
+    const response = await new MoweExecutor({ catalog: [candidate] }).execute({
+      runId: "root-value-constraints",
+      laneId: "main",
+      workspace: "/tmp",
+      calls: [
+        { id: "denied", name: "boundary", arguments: { target: "forbidden", count: 1 } },
+        { id: "allowed", name: "boundary", arguments: { count: 1, target: "allowed" } },
+      ],
+    });
+    expect(response.results.map((result) => result.status)).toEqual(["failed", "succeeded"]);
+    expect(response.results[0]?.error).toBe(`boundary: ${reason}`);
+    expect(executed).toEqual([{ count: 1, target: "allowed" }]);
+  });
+
   it("admits nested schemas and enforces common JSON Schema constraints", () => {
     const candidate = tool({
       type: "object",

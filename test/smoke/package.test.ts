@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
+import { VERSION } from "../../src/version.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -150,6 +151,7 @@ describe("npm package surface", () => {
     expect(packageJson.name).toBe("nausicaa-harness");
     expect(packageJson.name).toMatch(/^@[a-z0-9._-]+\/[a-z0-9._-]+$|^[a-z0-9._-]+$/u);
     expect(packageJson.version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/u);
+    expect(packageJson.version).toBe(VERSION);
     expect(packageJson.license).toBe("MIT");
     expect(packageJson.author).toBe("Dongjie Gong <jack@gieey.com>");
     expect(packageJson.repository?.url).toBe("git+https://github.com/jackispm/nausicaa-harness.git");

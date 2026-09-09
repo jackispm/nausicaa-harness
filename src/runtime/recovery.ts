@@ -347,6 +347,7 @@ const hasOperatorResolution = (
 
 export const recoverLaneConversationRefs = (events: readonly AnyEvent[], laneId = "main"): FukaiConversationRef[] => {
   const refs: FukaiConversationRef[] = [];
+  const toolRequestOffsets = new Map<string, number>();
   let stepStartedOffset = 0;
   const pendingModelMessages: Array<{
     ref: ArtifactRef;
@@ -398,11 +399,17 @@ export const recoverLaneConversationRefs = (events: readonly AnyEvent[], laneId 
           consumed: false,
         });
         break;
+      case "tool.requested":
+        toolRequestOffsets.set(`${event.runId}\0${event.payload.operationId}`, event.globalOffset);
+        break;
       case "tool.succeeded":
       case "tool.failed":
         add(
           event.payload.contextRef ?? event.payload.resultRef,
-          event.globalOffset,
+          // Tools commit independently, but the provider must receive their
+          // results in source call order after both live execution and replay.
+          toolRequestOffsets.get(`${event.runId}\0${event.payload.operationId}`)
+            ?? event.globalOffset,
           mainStepConversationGroup(event.idempotencyKey)
             ?? `operation:${event.payload.operationId}`,
         );

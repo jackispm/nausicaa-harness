@@ -32,6 +32,7 @@ import type {
 import { systemClock } from "../domain/ports.js";
 import { sha256, stableJson } from "../ledger/hash.js";
 import { prepareModelPort } from "../model/prepared-model.js";
+import { providerUsageFromError } from "../model/provider-error.js";
 import type { ContentAddressedStore } from "../store/index.js";
 import { persistedErrorText } from "./redaction.js";
 import type { RunTokenBudget } from "./run-token-budget.js";
@@ -557,7 +558,28 @@ export class WorkerTaskExecutor {
               signal: deadline.signal,
             }), deadline.signal);
           } catch (error: unknown) {
-            this.runTokenBudget?.cancel(runReservationId);
+            const failureUsage = providerUsageFromError(error);
+            if (failureUsage === undefined) {
+              this.runTokenBudget?.cancel(runReservationId);
+            } else {
+              try {
+                await this.append({
+                  runId: this.runId,
+                  laneId: this.laneId,
+                  type: "budget.charged",
+                  payload: { laneId: this.laneId, usage: failureUsage },
+                  correlationId: request.correlationId,
+                  idempotencyKey: `${prefix}:budget`,
+                  visibility: request.visibility,
+                  occurredAt: this.clock.now().toISOString(),
+                });
+              } finally {
+                // Reported consumption remains charged in memory even when
+                // persistence fails, matching Main's provider failure boundary.
+                this.runTokenBudget?.settle(runReservationId, failureUsage);
+                runReservationSettled = true;
+              }
+            }
             if (this.isStopping()) return { kind: "cancelled" };
             const reason = persistedErrorText(error, "Worker model failed");
             const retryable = isRetryable(error);
@@ -703,20 +725,18 @@ export class WorkerTaskExecutor {
             ? "Tool call was not executed because the Worker response hit its output token limit; re-issue the complete tool call."
             : undefined;
           if (calls.length > 0) {
-            const toolMessages = await Promise.all(calls.map((call) => (
-              this.toolExecutor.execute({
-                taskId: task.taskId,
-                turn,
-                eventPrefix: prefix,
-                call,
-                signal: deadline.signal,
-                correlationId: request.correlationId,
-                visibility: request.visibility,
-                ...(blockedToolCallError === undefined
-                  ? {}
-                  : { executionError: blockedToolCallError }),
-              })
-            )));
+            const toolMessages = await this.toolExecutor.executeBatch({
+              taskId: task.taskId,
+              turn,
+              eventPrefix: prefix,
+              calls,
+              signal: deadline.signal,
+              correlationId: request.correlationId,
+              visibility: request.visibility,
+              ...(blockedToolCallError === undefined
+                ? {}
+                : { executionError: blockedToolCallError }),
+            });
             for (const toolMessage of toolMessages) {
               const projected = projectWorkerToolMessage(
                 toolMessage.message,
@@ -794,11 +814,43 @@ export class WorkerTaskExecutor {
       completion.payload.responseRef,
       this.stopController.signal,
     );
+    const terminalTools = (await this.readEvents?.() ?? []).filter((event): event is Extract<
+      AnyEvent,
+      { type: "tool.succeeded" | "tool.failed" }
+    > => (
+      event.runId === this.runId
+      && event.laneId === this.laneId
+      && event.correlationId === request.correlationId
+      && event.globalOffset <= completion.globalOffset
+      && (event.type === "tool.succeeded" || event.type === "tool.failed")
+    ));
+    const toolsByKey = new Map(terminalTools.map((event) => [event.idempotencyKey, event]));
+    const recoveredEvidenceRefs = [...evidenceRefs];
+    let recoveredToolCalls = 0;
     for (const committed of completions) {
       const eventPrefix = committed.idempotencyKey.slice(
         0,
         -":model:completed".length,
       );
+      const committedAssistant = committed === completion
+        ? assistant
+        : await readCommittedWorkerAssistant(
+            this.store,
+            committed.payload.responseRef,
+            this.stopController.signal,
+          );
+      // Terminal events can arrive in completion order; evidence follows
+      // the original calls just as it did before a crash.
+      for (const call of committedAssistant.toolCalls) {
+        const toolPrefix = `${eventPrefix}:tool:${call.id}`;
+        const terminal = toolsByKey.get(`${toolPrefix}:succeeded`)
+          ?? toolsByKey.get(`${toolPrefix}:failed`);
+        if (terminal?.payload.toolCallId !== call.id || terminal.payload.name !== call.name) continue;
+        recoveredToolCalls += 1;
+        if (terminal.payload.resultRef !== undefined) {
+          recoveredEvidenceRefs.push(terminal.payload.resultRef.contentHash);
+        }
+      }
       await this.append({
         runId: this.runId,
         laneId: this.laneId,
@@ -827,10 +879,10 @@ export class WorkerTaskExecutor {
       request.payload,
       completion.payload.responseRef,
       assistant.content,
-      assistant.toolCalls.length,
+      recoveredToolCalls,
       completion.payload.stopReason,
       structuredClone(cumulativeUsage),
-      evidenceRefs,
+      recoveredEvidenceRefs,
       false,
     );
   }
@@ -934,6 +986,7 @@ export class WorkerTaskExecutor {
       this.isStopping()
       && event.type !== "tool.succeeded"
       && event.type !== "tool.failed"
+      && event.type !== "budget.charged"
     ) {
       throw new WorkerTaskCancelledError("Worker lane is stopping");
     }

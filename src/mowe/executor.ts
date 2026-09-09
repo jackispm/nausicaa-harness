@@ -264,10 +264,19 @@ export class MoweExecutor {
     workspaceMutexKey: string | undefined,
     retention: BatchResultRetention,
   ): Promise<void> {
+    const failureController = new AbortController();
+    const executionRequest: MoweExecutionRequest = {
+      ...request,
+      signal: request.signal === undefined
+        ? failureController.signal
+        : AbortSignal.any([request.signal, failureController.signal]),
+    };
     const pending = request.calls.map((_, index) => index);
     const activeByTool = new Map<string, number>();
     let activeWorkspaceWrites = 0;
     let active = 0;
+    let failed = false;
+    let firstFailure: unknown;
 
     await new Promise<void>((resolve) => {
       const pump = (): void => {
@@ -299,7 +308,7 @@ export class MoweExecutor {
           active += 1;
           activeByTool.set(toolKey, (activeByTool.get(toolKey) ?? 0) + 1);
           if (workspaceWrite) activeWorkspaceWrites += 1;
-          void this.executeCall(request, call, index, workspaceMutexKey)
+          void this.executeCall(executionRequest, call, index, workspaceMutexKey)
             .catch((error: unknown) => {
               // executeCall normally converts failures into a per-call result;
               // retain that isolation if a future projector escapes its guard.
@@ -318,10 +327,20 @@ export class MoweExecutor {
                 );
               });
             })
-            .then((result) => {
+            .then(async (result) => {
               results[index] = result;
+              await request.onResult?.(result, index);
             })
-            .finally(() => {
+            .catch((error: unknown) => {
+              // A terminal recorder failure is a batch failure, not another
+              // tool outcome. Cancel peers, then keep draining their results.
+              if (!failed) {
+                failed = true;
+                firstFailure = error;
+                failureController.abort(error);
+              }
+            })
+            .then(() => {
               active -= 1;
               const current = activeByTool.get(toolKey) ?? 1;
               if (current <= 1) activeByTool.delete(toolKey);
@@ -335,6 +354,7 @@ export class MoweExecutor {
       };
       pump();
     });
+    if (failed) throw firstFailure;
   }
 
   private async executeCall(
@@ -474,8 +494,8 @@ export class MoweExecutor {
       const invokeTool = async (): Promise<ToolResult> => {
         // This is the last durable boundary before user code or an external
         // process can create a side effect.
-        if (isSignalAborted(request.signal)) {
-          throw abortReason(request.signal);
+        if (isSignalAborted(deadline.signal)) {
+          throw abortReason(deadline.signal);
         }
         try {
           await request.toolLifecycle?.started(lifecycleContext);
@@ -485,8 +505,8 @@ export class MoweExecutor {
         // The started hook is asynchronous because it normally commits a
         // durable fact. Cancellation can win during that write; do not let a
         // late callback completion turn it into an unrecorded side effect.
-        if (isSignalAborted(request.signal)) {
-          throw abortReason(request.signal);
+        if (isSignalAborted(deadline.signal)) {
+          throw abortReason(deadline.signal);
         }
         return entry.tool.execute(call.arguments, context);
       };

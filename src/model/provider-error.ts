@@ -43,6 +43,35 @@ export class ProviderModelError extends Error {
   }
 }
 
+/** Read accounting from provider failures, including compatible custom ports. */
+export function providerUsageFromError(error: unknown): TokenUsage | undefined {
+  if (error === null || typeof error !== "object" || !("providerUsage" in error)) {
+    return undefined;
+  }
+  const usage = error.providerUsage;
+  if (usage === null || typeof usage !== "object") return undefined;
+  const candidate = usage as Partial<TokenUsage>;
+  for (const name of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+    if (!Number.isSafeInteger(candidate[name]) || (candidate[name] as number) < 0) return undefined;
+  }
+  if (!Number.isSafeInteger(candidate.input! + candidate.output! + candidate.cacheRead! + candidate.cacheWrite!)) {
+    return undefined;
+  }
+  if (
+    candidate.costUsd !== undefined
+    && (!Number.isFinite(candidate.costUsd) || candidate.costUsd < 0)
+  ) {
+    return undefined;
+  }
+  return {
+    input: candidate.input!,
+    output: candidate.output!,
+    cacheRead: candidate.cacheRead!,
+    cacheWrite: candidate.cacheWrite!,
+    ...(candidate.costUsd === undefined ? {} : { costUsd: candidate.costUsd }),
+  };
+}
+
 function safeUsage(value: TokenUsage | undefined): TokenUsage | undefined {
   if (value === undefined) return undefined;
   for (const name of ["input", "output", "cacheRead", "cacheWrite"] as const) {

@@ -2091,7 +2091,7 @@ describe("MainLoop", () => {
     expect(events
       .filter((event) => event.type === "tool.succeeded")
       .map((event) => event.type === "tool.succeeded" ? event.payload.name : undefined))
-      .toEqual(["alpha", "beta"]);
+      .toEqual(["beta", "alpha"]);
     expect(events.filter((event) => event.type === "tool.admitted")).toHaveLength(2);
     expect(events.filter((event) => event.type === "tool.started")).toHaveLength(2);
     expect(events.filter((event) => event.type === "navigation.updated")).toHaveLength(2);

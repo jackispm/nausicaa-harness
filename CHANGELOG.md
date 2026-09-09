@@ -4,6 +4,25 @@ All notable changes to Nausicaa are documented here.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-09
+
+- Start Teto automatically for new Runs. Explicit stops remain effective after
+  restart and resume; the owner can restart observation through `teto_start`.
+- Use Nausicaa as the public Agent identity across runtime roles, shorten the
+  Teto introduction, and align lifecycle guidance with the actual tool catalog.
+- Preserve Skill resource directories when loading instructions on demand and
+  clarify metadata discovery and loading in the bilingual README.
+- Add `/traces [status|preview]` for local Run events and metrics. Keep legacy
+  command spellings executable without duplicating public help or autocomplete,
+  and reject surplus arguments on control commands.
+- Persist Main and Worker tool results as each call settles while preserving
+  source order in model context, including after recovery. A terminal-write
+  failure cancels the batch and drains its remaining result handlers.
+- Run each Worker tool batch through one Mowe scheduler so declared concurrency
+  limits apply to the whole batch. Restore committed tool evidence in recovered
+  Worker results and account for provider-reported usage on failed requests.
+- Recheck cancellation after Main completion hooks and tool deadlines before
+  adapter execution. Enforce root object schema `const` and `enum` constraints.
 - Fixed Teto treating temporary shared-budget reservations as permanent
   exhaustion; later owner events can resume observation without losing
   already-persisted context.

@@ -143,6 +143,13 @@ export interface MoweExecutionRequest {
   approvalLifecycle?: MoweApprovalLifecycle;
   /** Durable admission/start recorder; failures fail closed before the effect. */
   toolLifecycle?: MoweToolLifecycle;
+  /**
+   * Called once per retained result, including denied and cancelled calls, in
+   * completion order. The response still uses source order. Rejection aborts
+   * the batch; execution drains every call and callback before rethrowing the
+   * first callback failure. Asynchronous callbacks may overlap.
+   */
+  onResult?: (result: MoweCallResult, index: number) => void | Promise<void>;
 }
 
 export interface MoweApprovalContext {

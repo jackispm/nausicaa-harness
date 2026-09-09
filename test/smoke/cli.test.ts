@@ -7,6 +7,7 @@ import type { Readable } from "node:stream";
 import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
+import { VERSION } from "../../src/version.js";
 
 const execFileAsync = promisify(execFile);
 const builtCli = join(process.cwd(), "dist", "cli.js");
@@ -26,7 +27,7 @@ describe("built CLI", () => {
 
   it("reports a stable version", async () => {
     const { stdout } = await execFileAsync(builtCli, ["--version"]);
-    expect(stdout.trim()).toBe("0.1.2");
+    expect(stdout.trim()).toBe(VERSION);
   });
 
   it.each([

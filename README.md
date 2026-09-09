@@ -38,7 +38,7 @@ Nausicaa (primary lane: main)
 `- A2A -> another Run
 ```
 
-当前版本：`0.1.2` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
+当前版本：`0.1.3` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
 edge 集成仍在完善。
 
 ### 快速开始
@@ -163,7 +163,7 @@ Nausicaa (primary lane: main)
 `- A2A -> another Run
 ```
 
-Current version: `0.1.2` beta. Core runtime contracts have offline test coverage;
+Current version: `0.1.3` beta. Core runtime contracts have offline test coverage;
 provider, daemon, RPC, and edge integrations are still evolving.
 
 ### Quick start

@@ -2,7 +2,7 @@ import type { A2AMessage, AppendEvent, Clock, ConversationMessage, EventType, La
 import type { AgentTool, ToolResult } from "../domain/ports.js";
 import { sha256, stableJson } from "../ledger/hash.js";
 import { MoweExecutor } from "../mowe/index.js";
-import type { MoweCall } from "../mowe/types.js";
+import type { MoweCall, MoweCallResult } from "../mowe/types.js";
 import type { ContentAddressedStore } from "../store/index.js";
 import {
   boundedRedactedText,
@@ -51,6 +51,15 @@ export interface WorkerToolExecutionRequest {
   executionError?: string;
 }
 
+export interface WorkerToolBatchExecutionRequest extends Omit<WorkerToolExecutionRequest, "call"> {
+  calls: readonly ToolCall[];
+}
+
+export interface WorkerToolExecutionResult {
+  message: ConversationMessage;
+  ref: Awaited<ReturnType<ContentAddressedStore["put"]>>;
+}
+
 /** Executes only the fixed read-only Worker tool surface and records its lifecycle. */
 export class WorkerToolExecutor {
   readonly definitions: AgentTool["definition"][];
@@ -86,59 +95,57 @@ export class WorkerToolExecutor {
     this.clock = options.clock;
     this.mowe = new MoweExecutor({
       catalog: options.tools,
-      maxConcurrency: 1,
       sanitizeResult: boundWorkerToolResult,
     });
     this.append = options.append;
   }
 
-  async execute(request: WorkerToolExecutionRequest): Promise<{
-    message: ConversationMessage;
-    ref: Awaited<ReturnType<ContentAddressedStore["put"]>>;
-  }> {
-    throwIfAborted(request.signal);
-    const call = request.call;
-    const operationId = `op:${sha256(stableJson({
-      runId: this.runId,
-      laneId: this.laneId,
-      taskId: request.taskId,
-      turn: request.turn,
-      toolCallId: call.id,
-      toolName: call.name,
-    }))}`;
-    const argumentsRef = await this.store.put(
-      stableJson(call.arguments),
-      TOOL_ARGUMENTS_MEDIA_TYPE,
-    );
-    const toolPrefix = `${request.eventPrefix}:tool:${call.id}`;
-    await this.append({
-      runId: this.runId,
-      laneId: this.laneId,
-      type: "tool.requested",
-      payload: {
-        operationId,
-        toolCallId: call.id,
-        name: call.name,
-        argumentsRef,
-      },
-      correlationId: request.correlationId,
-      idempotencyKey: `${toolPrefix}:requested`,
-      visibility: request.visibility,
-      occurredAt: this.clock.now().toISOString(),
-    });
+  async execute(request: WorkerToolExecutionRequest): Promise<WorkerToolExecutionResult> {
+    const results = await this.executeBatch({ ...request, calls: [request.call] });
+    return results[0]!;
+  }
 
-    const moweCall: MoweCall = {
-      ...structuredClone(call),
-      operationId,
-      ...(request.executionError === undefined
-        ? {}
-        : { forcedError: request.executionError }),
-    };
-    const execution = await this.mowe.execute({
+  async executeBatch(request: WorkerToolBatchExecutionRequest): Promise<WorkerToolExecutionResult[]> {
+    throwIfAborted(request.signal);
+    const calls: MoweCall[] = [];
+    for (const call of request.calls) {
+      throwIfAborted(request.signal);
+      const operationId = `op:${sha256(stableJson({
+        runId: this.runId,
+        laneId: this.laneId,
+        taskId: request.taskId,
+        turn: request.turn,
+        toolCallId: call.id,
+        toolName: call.name,
+      }))}`;
+      const argumentsRef = await this.store.put(
+        stableJson(call.arguments),
+        TOOL_ARGUMENTS_MEDIA_TYPE,
+      );
+      await this.append({
+        runId: this.runId,
+        laneId: this.laneId,
+        type: "tool.requested",
+        payload: { operationId, toolCallId: call.id, name: call.name, argumentsRef },
+        correlationId: request.correlationId,
+        idempotencyKey: `${request.eventPrefix}:tool:${call.id}:requested`,
+        visibility: request.visibility,
+        occurredAt: this.clock.now().toISOString(),
+      });
+      calls.push({
+        ...structuredClone(call),
+        operationId,
+        ...(request.executionError === undefined
+          ? {}
+          : { forcedError: request.executionError }),
+      });
+    }
+    const results: WorkerToolExecutionResult[] = new Array(calls.length);
+    await this.mowe.execute({
       runId: this.runId,
       laneId: this.laneId,
       workspace: this.workspace,
-      calls: [moweCall],
+      calls,
       allowedEffects: ["read"],
       approvalLifecycle: {
         requested: async (context, argumentsHash) => {
@@ -153,7 +160,7 @@ export class WorkerToolExecutor {
               argumentsHash,
             },
             correlationId: request.correlationId,
-            idempotencyKey: `${toolPrefix}:approval:requested`,
+            idempotencyKey: `${request.eventPrefix}:tool:${context.call.id}:approval:requested`,
             visibility: request.visibility,
             occurredAt: this.clock.now().toISOString(),
           });
@@ -173,7 +180,7 @@ export class WorkerToolExecutor {
               }),
             },
             correlationId: request.correlationId,
-            idempotencyKey: `${toolPrefix}:approval:decided`,
+            idempotencyKey: `${request.eventPrefix}:tool:${context.call.id}:approval:decided`,
             visibility: request.visibility,
             occurredAt: this.clock.now().toISOString(),
           });
@@ -192,7 +199,7 @@ export class WorkerToolExecutor {
               argumentsHash: context.argumentsHash,
             },
             correlationId: request.correlationId,
-            idempotencyKey: `${toolPrefix}:admitted`,
+            idempotencyKey: `${request.eventPrefix}:tool:${context.call.id}:admitted`,
             visibility: request.visibility,
             occurredAt: this.clock.now().toISOString(),
           });
@@ -209,24 +216,35 @@ export class WorkerToolExecutor {
               argumentsHash: context.argumentsHash,
             },
             correlationId: request.correlationId,
-            idempotencyKey: `${toolPrefix}:started`,
+            idempotencyKey: `${request.eventPrefix}:tool:${context.call.id}:started`,
             visibility: request.visibility,
             occurredAt: this.clock.now().toISOString(),
           });
         },
       },
+      onResult: async (result, index) => {
+        results[index] = await this.recordResult(request, result);
+      },
       signal: request.signal,
     });
-    let result = execution.results[0]?.result ?? {
-      content: `Unknown tool: ${call.name}`,
-      isError: true,
-    };
-    result = boundWorkerToolResult(result);
+    // Mowe drains the entire batch, including terminal persistence, before
+    // cancellation escapes or the next model request sees source-ordered results.
+    throwIfAborted(request.signal);
+    return results;
+  }
+
+  private async recordResult(
+    request: WorkerToolBatchExecutionRequest,
+    completed: MoweCallResult,
+  ): Promise<WorkerToolExecutionResult> {
+    const result = boundWorkerToolResult(completed.result);
+    const operationId = completed.operationId;
+    const toolPrefix = `${request.eventPrefix}:tool:${completed.callId}`;
     const message: ConversationMessage = {
       role: "tool",
       content: result.content,
-      toolCallId: call.id,
-      toolName: call.name,
+      toolCallId: completed.callId,
+      toolName: completed.name,
       isError: result.isError,
       ...(result.images === undefined ? {} : { images: structuredClone(result.images) }),
       createdAt: this.clock.now().toISOString(),
@@ -239,8 +257,8 @@ export class WorkerToolExecutor {
         type: "tool.failed",
         payload: {
           operationId,
-          toolCallId: call.id,
-          name: call.name,
+          toolCallId: completed.callId,
+          name: completed.name,
           error: boundedRedactedText(result.content, 1_024),
           resultRef,
         },
@@ -256,8 +274,8 @@ export class WorkerToolExecutor {
         type: "tool.succeeded",
         payload: {
           operationId,
-          toolCallId: call.id,
-          name: call.name,
+          toolCallId: completed.callId,
+          name: completed.name,
           resultRef,
         },
         correlationId: request.correlationId,
@@ -266,9 +284,6 @@ export class WorkerToolExecutor {
         occurredAt: this.clock.now().toISOString(),
       });
     }
-    // Record the Mowe terminal result before propagating lane cancellation;
-    // otherwise recovery would mistake a settled tool for pending work.
-    throwIfAborted(request.signal);
     return { message, ref: resultRef };
   }
 }

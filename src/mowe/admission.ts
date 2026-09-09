@@ -1,4 +1,4 @@
-import type { AgentTool, JsonSchema } from "../domain/ports.js";
+import type { AgentTool } from "../domain/ports.js";
 
 export class MoweAdmissionError extends Error {
   override readonly name = "MoweAdmissionError";
@@ -95,7 +95,7 @@ export function validateArguments(tool: AgentTool, value: Record<string, unknown
   const schemaDiagnostic = inspectSchema(schema, "parameters", { requireObjectRoot: true });
   if (schemaDiagnostic !== undefined) return admissionFailure(schemaDiagnostic);
   if (!isRecord(value)) return { ok: false, reason: "Tool arguments must be an object" };
-  const result = validateValue(value, schema, "arguments");
+  const result = validateProperty(value, schema, "arguments");
   return result === undefined ? { ok: true } : { ok: false, reason: result };
 }
 
@@ -137,12 +137,6 @@ export function assertSupportedSchema(
 ): void {
   const diagnostic = inspectSchema(schema, path, options);
   if (diagnostic !== undefined) throw new MoweAdmissionError(diagnostic.message, diagnostic);
-}
-
-function validateValue(value: unknown, schema: JsonSchema, path: string): string | undefined {
-  const node = schema as unknown as SchemaNode;
-  if (node.type !== "object") return validateProperty(value, node, path);
-  return validateObject(value, node, path);
 }
 
 function validateProperty(value: unknown, schema: unknown, path: string): string | undefined {

@@ -144,7 +144,8 @@ describe("Pi-compatible single-lane L0 oracle", () => {
       .map((event) => event.type === "tool.succeeded" ? event.payload.name : "");
 
     expect({ completionOrder, modelVisibleOrder }).toEqual(PI_L0_ORACLE.parallelToolCalls);
-    expect(terminalOrder).toEqual(PI_L0_ORACLE.parallelToolCalls.modelVisibleOrder);
+    // Durable completion is immediate; only provider context follows source order.
+    expect(terminalOrder).toEqual(PI_L0_ORACLE.parallelToolCalls.completionOrder);
   });
 
   it("fails invalid tool arguments closed before admission or execution", async () => {

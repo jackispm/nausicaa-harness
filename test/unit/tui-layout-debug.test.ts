@@ -14,6 +14,7 @@ import type { ModelResponse } from "../../src/domain/index.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { VERSION } from "../../src/version.js";
 
 class TerminalStub implements Terminal {
   readonly output: string[] = [];
@@ -69,7 +70,7 @@ describe("debug prompt layout", () => {
     try {
       const running = runInteractive({ session, terminal, forceAltScreen: true });
       await terminal.started;
-      await waitFor(() => stripTerminalSequences(terminal.output.join("")).includes("version  v0.1.2"));
+      await waitFor(() => stripTerminalSequences(terminal.output.join("")).includes(`version  v${VERSION}`));
       const rootComponent = captured?.root;
       expect(rootComponent).toBeDefined();
       const findEditorContainer = (component: unknown): Container | undefined => {
@@ -136,7 +137,7 @@ describe("debug prompt layout", () => {
       const running = runInteractive({ session, terminal, forceAltScreen: false });
       await terminal.started;
       await waitFor(() => frames.some((frame) => (
-        stripTerminalSequences(frame.join("\n")).includes("version  v0.1.2")
+        stripTerminalSequences(frame.join("\n")).includes(`version  v${VERSION}`)
       )));
       // Pi leaves this setting disabled unless the host or PI_CLEAR_ON_SHRINK
       // explicitly enables it. Regular mode therefore keeps its scrollback
@@ -271,7 +272,7 @@ describe("debug prompt layout", () => {
       });
       await terminal.started;
       await waitFor(() => frames.some((frame) => (
-        stripTerminalSequences(frame.join("\n")).includes("version  v0.1.2")
+        stripTerminalSequences(frame.join("\n")).includes(`version  v${VERSION}`)
       )));
       // Capture the settled baseline after the initial composer frame.
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -344,13 +345,13 @@ describe("debug prompt layout", () => {
       const running = runInteractive({ session, terminal, forceAltScreen: false });
       await terminal.started;
       await waitFor(() => frames.some((frame) => (
-        stripTerminalSequences(frame.join("\n")).includes("version  v0.1.2")
+        stripTerminalSequences(frame.join("\n")).includes(`version  v${VERSION}`)
       )));
       terminal.send("/help");
       terminal.send("\r");
       await waitFor(() => stripTerminalSequences((frames.at(-1) ?? []).join("\n")).includes("Commands"));
       const welcomeFrame = frames.findIndex((frame) => (
-        stripTerminalSequences(frame.join("\n")).includes("version  v0.1.2")
+        stripTerminalSequences(frame.join("\n")).includes(`version  v${VERSION}`)
       ));
       const helpFrame = frames.findIndex((frame) => (
         stripTerminalSequences(frame.join("\n")).includes("Commands")

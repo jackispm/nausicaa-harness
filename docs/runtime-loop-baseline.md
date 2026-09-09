@@ -1,6 +1,6 @@
 # Runtime Loop Baseline
 
-Source audit for the 0.1.2 work, updated 2026-09-09. This records the current execution
+Source audit for the 0.1.3 work, updated 2026-09-09. This records the current execution
 paths, not a promise that every Lane already runs through one generic kernel.
 Existing private design notes remain historical; their proposed L0 integration
 must not be mistaken for a completed production migration.
@@ -104,7 +104,7 @@ transaction or a universal lane admission layer
 ([scope](../src/runtime/task-dispatcher.ts#L30)). Different admission paths are
 not evidence that Main or Teto is missing a dispatcher.
 
-## Scope For 0.1.2
+## Scope For 0.1.3
 
 The L0 API contract exists: typed input, result and events, independent ports,
 streaming, cancellation, validation and bounded execution. It is exported and
@@ -150,3 +150,41 @@ These are local contract tests, not a claim of complete upstream Pi parity or
 live-provider coverage. The existing [Team L0 boundary](team-collaboration.md#l0-boundary)
 already makes the same distinction between an available kernel and completed
 runtime reuse.
+
+## Tool and completion contracts in 0.1.3
+
+Main and Worker use the existing Mowe scheduler for each complete tool batch.
+The new optional `onResult(result, index)` hook runs after a call's output has
+been bounded and retained. Each runtime commits that call's artifact and
+terminal event there, while indexing model messages by source call order.
+Replay uses the durable `tool.requested` order; older records without a request
+retain their previous event-order fallback. Worker recovery also restores
+committed tool evidence in source order.
+
+A result recorder failure aborts the batch and waits for active adapters and
+all result callbacks before propagating the original error. Queued calls are
+cancelled without invoking their adapters. Ordinary tool errors remain local
+to their calls. This preserves existing cooperative cancellation: an adapter
+that ignores its signal cannot be forcibly stopped by an in-process promise.
+The runtime does not report a fully drained batch while that adapter is active.
+
+Main checks cancellation after `beforeCompletion` and before admitting its
+terminal append. Once that append begins, its durable outcome decides
+completion. Tool invocation checks its own deadline after the asynchronous
+`started` write, and argument admission applies root `const`/`enum` constraints.
+
+Worker and Main share the existing provider-failure usage extraction contract.
+Reported usage is charged under the request's stable budget key even when the
+model fails; recovery uses the durable charge without billing it twice.
+An existing limitation remains when cancellation wins the provider race:
+Worker's `withAbort(model.complete(...), signal)` returns the cancellation
+reason, so usage attached to a subsequent provider rejection is not reconciled.
+This can also happen when a provider rejects from its abort listener. Handling
+late accounting needs a separate contract for provider cleanup and host lifetime;
+the 0.1.3 failure-usage fix covers failures observed before cancellation wins.
+These changes extend the existing execution and accounting boundaries; no new
+loop kernel, scheduler hierarchy, or storage format is introduced.
+
+Regression gates include `test/protocol/main-terminal-contracts.test.ts`,
+`test/protocol/worker-terminal-contract.test.ts`,
+`test/unit/mowe-result-lifecycle.test.ts`, and `test/unit/mowe-boundaries.test.ts`.

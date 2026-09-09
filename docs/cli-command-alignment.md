@@ -6,7 +6,8 @@
   `/import`, `/hotkeys`, `/reload`, and explicit `/skill:name` semantics.
 - Prime Agent local snapshot `7787f0741`, MIT: adopt the `/mcp` connection
   inspection boundary and separate Skill invocation from resource management.
-- Prime Agent v0.9.1, MIT: adopt the `/traces` status/preview command shape after
+- Prime Agent v0.7.2, snapshot `7787f0741`, MIT: adopt the `/traces`
+  status/preview command shape from `modes/interactive/interactive-mode.ts` after
   semantic review. Nausicaa reads its existing local Run Ledger and rejects
   Prime's upload, account, credential, and network-dependent trace operations.
 - Existing direct dependency `@earendil-works/pi-tui` 0.84.4, MIT: continue using

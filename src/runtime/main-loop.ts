@@ -62,7 +62,7 @@ import type {
   MoweExecutionRequest,
 } from "../mowe/types.js";
 import { MAX_MOWE_MAX_OUTPUT_BYTES } from "../mowe/types.js";
-import { ProviderModelError } from "../model/provider-error.js";
+import { ProviderModelError, providerUsageFromError } from "../model/provider-error.js";
 import { stableJson } from "../ledger/hash.js";
 import {
   boundedRedactedText,
@@ -1173,7 +1173,11 @@ export class MainLoop {
         if (response.stopReason === "aborted") break;
 
         if (response.toolCalls.length === 0 && response.stopReason === "stop") {
-          if (await this.beforeCompletion?.()) continue;
+          const deferCompletion = await this.beforeCompletion?.();
+          // No further await precedes completion admission. Once append begins,
+          // its durable outcome wins over cancellation arriving during commit.
+          throwIfAborted(input.signal);
+          if (deferCompletion) continue;
           const completionMode = input.completionMode
             ?? (input.turnId !== undefined && input.completeRun !== true ? "turn" : "run");
           if (completionMode === "none") {
@@ -1326,7 +1330,8 @@ export class MainLoop {
       });
     }
 
-    const execution = await this.mowe.execute({
+    const messages: { message: ConversationMessage; ref: ArtifactRef }[] = [];
+    await this.mowe.execute({
       runId: input.runId,
       laneId,
       workspace: input.workspace,
@@ -1396,76 +1401,75 @@ export class MainLoop {
           });
         },
       },
+      onResult: async (item, index) => {
+        // Mowe's retained boundary may already reference a complete source;
+        // never read it back to make an unaccounted duplicate in the Ledger.
+        const retainedResult = {
+          content: redactSensitiveText(item.result.content),
+          isError: item.result.isError,
+          ...(item.result.images === undefined
+            ? {}
+            : { images: structuredClone(item.result.images) }),
+        } satisfies ToolResult;
+        const sourceArtifactRef = item.projection?.artifactRef;
+        if (sourceArtifactRef !== undefined) {
+          this.artifactAuthorization?.authorize(input.runId, sourceArtifactRef);
+        }
+        const boundedResult = projectToolResultForContext(
+          item,
+          retainedResult,
+          input.runId,
+          this.mowe.catalog.has(ARTIFACT_READ_TOOL_NAME)
+            && (
+              this.artifactAuthorization === undefined
+              || this.artifactAuthorization.hasAny(input.runId)
+            ),
+        );
+        const message: ConversationMessage = {
+          role: "tool",
+          content: boundedResult.content,
+          toolCallId: item.callId,
+          toolName: item.name,
+          isError: boundedResult.isError,
+          ...(boundedResult.images === undefined
+            ? {}
+            : { images: structuredClone(boundedResult.images) }),
+          createdAt: this.clock.now().toISOString(),
+        };
+        // Transcript and model context intentionally share one bounded artifact.
+        const resultRef = await this.writeMessage(message);
+        const terminalPayload = {
+          operationId: item.operationId,
+          toolCallId: item.callId,
+          name: item.name,
+          contextRef: resultRef,
+          ...(sourceArtifactRef === undefined ? {} : { sourceArtifactRef }),
+        };
+        if (retainedResult.isError) {
+          await this.emit(input, laneId, correlationId, eventState, {
+            type: "tool.failed",
+            payload: {
+              ...terminalPayload,
+              error: boundedRedactedText(retainedResult.content, 1_024),
+              resultRef,
+            },
+            idempotencyKey: `${eventPrefix}:step:${step}:tool:${item.callId}:failed`,
+          });
+        } else {
+          await this.emit(input, laneId, correlationId, eventState, {
+            type: "tool.succeeded",
+            payload: {
+              ...terminalPayload,
+              resultRef,
+            },
+            idempotencyKey: `${eventPrefix}:step:${step}:tool:${item.callId}:succeeded`,
+          });
+        }
+        // Commit completion facts immediately; model context keeps call order.
+        messages[index] = { message, ref: resultRef };
+      },
       ...(input.signal === undefined ? {} : { signal: input.signal }),
     });
-    const messages: { message: ConversationMessage; ref: ArtifactRef }[] = [];
-    for (const item of execution.results) {
-      // Mowe's response is the retained boundary. A complete source may
-      // already exist once behind projection.artifactRef; do not read it back
-      // and create an unaccounted duplicate in the Ledger store.
-      const retainedResult = {
-        content: redactSensitiveText(item.result.content),
-        isError: item.result.isError,
-        ...(item.result.images === undefined
-          ? {}
-          : { images: structuredClone(item.result.images) }),
-      } satisfies ToolResult;
-      const sourceArtifactRef = item.projection?.artifactRef;
-      if (sourceArtifactRef !== undefined) {
-        this.artifactAuthorization?.authorize(input.runId, sourceArtifactRef);
-      }
-      const boundedResult = projectToolResultForContext(
-        item,
-        retainedResult,
-        input.runId,
-        this.mowe.catalog.has(ARTIFACT_READ_TOOL_NAME)
-          && (
-            this.artifactAuthorization === undefined
-            || this.artifactAuthorization.hasAny(input.runId)
-          ),
-      );
-      const message: ConversationMessage = {
-        role: "tool",
-        content: boundedResult.content,
-        toolCallId: item.callId,
-        toolName: item.name,
-        isError: boundedResult.isError,
-        ...(boundedResult.images === undefined
-          ? {}
-          : { images: structuredClone(boundedResult.images) }),
-        createdAt: this.clock.now().toISOString(),
-      };
-      // Transcript and model context intentionally share one bounded artifact.
-      const resultRef = await this.writeMessage(message);
-      const terminalPayload = {
-        operationId: item.operationId,
-        toolCallId: item.callId,
-        name: item.name,
-        contextRef: resultRef,
-        ...(sourceArtifactRef === undefined ? {} : { sourceArtifactRef }),
-      };
-      if (retainedResult.isError) {
-        await this.emit(input, laneId, correlationId, eventState, {
-          type: "tool.failed",
-          payload: {
-            ...terminalPayload,
-            error: boundedRedactedText(retainedResult.content, 1_024),
-            resultRef,
-          },
-          idempotencyKey: `${eventPrefix}:step:${step}:tool:${item.callId}:failed`,
-        });
-      } else {
-        await this.emit(input, laneId, correlationId, eventState, {
-          type: "tool.succeeded",
-          payload: {
-            ...terminalPayload,
-            resultRef,
-          },
-          idempotencyKey: `${eventPrefix}:step:${step}:tool:${item.callId}:succeeded`,
-        });
-      }
-      messages.push({ message, ref: resultRef });
-    }
     // Mowe returns a terminal result for every admitted call, including calls
     // cancelled while the batch was in flight. Persist those terminal facts
     // before propagating cancellation so recovery never sees a false pending
@@ -2032,31 +2036,6 @@ function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
 
 function chargedTokens(usage: TokenUsage): number {
   return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
-}
-
-function providerUsageFromError(error: unknown): TokenUsage | undefined {
-  if (error === null || typeof error !== "object" || !("providerUsage" in error)) {
-    return undefined;
-  }
-  const usage = error.providerUsage;
-  if (usage === null || typeof usage !== "object") return undefined;
-  const candidate = usage as Partial<TokenUsage>;
-  for (const name of ["input", "output", "cacheRead", "cacheWrite"] as const) {
-    if (!Number.isFinite(candidate[name]) || (candidate[name] as number) < 0) return undefined;
-  }
-  if (
-    candidate.costUsd !== undefined
-    && (!Number.isFinite(candidate.costUsd) || candidate.costUsd < 0)
-  ) {
-    return undefined;
-  }
-  return {
-    input: candidate.input!,
-    output: candidate.output!,
-    cacheRead: candidate.cacheRead!,
-    cacheWrite: candidate.cacheWrite!,
-    ...(candidate.costUsd === undefined ? {} : { costUsd: candidate.costUsd }),
-  };
 }
 
 function providerRetryability(error: unknown): boolean | undefined {
