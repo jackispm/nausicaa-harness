@@ -2624,9 +2624,9 @@ describe("interactive TUI", () => {
         await waitForOutput(terminal, "Permissions set to full-access");
         expect(session.snapshot().permissionProfile).toBe("full-access");
 
-        terminal.type("/mode pl");
-        await waitForOutput(terminal, "Plan");
-        terminal.send("\r");
+        // `/mode` remains executable for compatibility but stays out of the
+        // public autocomplete surface; `/plan` is the public command.
+        terminal.type("/mode plan");
         terminal.send("\r");
         await waitForOutput(terminal, "Plan mode selected");
         expect(session.snapshot().collaborationMode).toBe("plan");

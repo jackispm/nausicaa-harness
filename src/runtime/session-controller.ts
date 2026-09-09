@@ -53,6 +53,10 @@ import {
   validateEvent,
 } from "../ledger/index.js";
 import {
+  projectRunMetrics,
+  type RunTraceSnapshot,
+} from "../observability/index.js";
+import {
   createBuiltinModelPort,
   DEFAULT_MODEL_RETRY_OPTIONS,
   normalizeModelSelector,
@@ -1092,6 +1096,25 @@ export class SessionController {
       },
       usage: structuredClone(snapshot.usage),
       lanes,
+    };
+  }
+
+  /**
+   * Read the attached Run's durable event stream and project its metrics.
+   * This is intentionally read-only and remains useful while a Turn is active;
+   * the Ledger flush only waits for already-admitted writes.
+   */
+  async traceSnapshot(): Promise<RunTraceSnapshot | undefined> {
+    this.assertOpen();
+    const attached = this.attached;
+    if (attached === undefined) return undefined;
+    await attached.ledger.flush();
+    const events = await attached.ledger.read({ runId: attached.runId });
+    return {
+      runId: attached.runId,
+      ledgerPath: resolve(this.dataDir, "runs", attached.runId, "ledger.jsonl"),
+      events,
+      metrics: projectRunMetrics(events, attached.runId),
     };
   }
 

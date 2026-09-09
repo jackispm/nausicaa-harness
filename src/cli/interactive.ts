@@ -151,6 +151,10 @@ import type {
 import type { ModelProviderInfo } from "../model/index.js";
 import { diagnosePermissionFailure } from "../tools/permission-diagnostics.js";
 import type { PermissionDiagnostic } from "../tools/permission-diagnostics.js";
+import {
+  formatTracePreview,
+  formatTraceStatus,
+} from "../observability/index.js";
 import { loadProjectInstructions } from "../runtime/project-instructions.js";
 import { exportSessionFile, readSessionImportFile } from "./session-files.js";
 import { displaySkillInvocation } from "./skill-invocation.js";
@@ -671,11 +675,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           options.session.snapshot().permissionProfile,
           options.session.snapshot().workspaceBashAvailability,
         ),
-        prefix,
-      );
-    } else if (spec.name === "mode") {
-      completion.getArgumentCompletions = (prefix) => commandArgumentCompletions(
-        collaborationModeOptions(options.session.snapshot().collaborationMode),
         prefix,
       );
     } else if (spec.name === "thinking") {
@@ -3584,6 +3583,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           break;
         }
         case "/help":
+          if (argument.length > 0) throw new Error("Usage: /help");
           appendBlock(new Markdown([
             "### Commands",
             formatInteractiveCommandHelp(),
@@ -3596,6 +3596,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           ].join("\n\n"), 1, 0, nausicaaMarkdownTheme));
           break;
         case "/status":
+          if (argument.length > 0) throw new Error("Usage: /status");
           writeStatus(options.session.snapshot());
           break;
         case "/settings":
@@ -3620,6 +3621,21 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             0,
           ));
           break;
+        case "/traces": {
+          const action = argument.length === 0 ? "status" : argument.toLowerCase();
+          if (action !== "status" && action !== "preview") {
+            throw new Error("Usage: /traces [status|preview]");
+          }
+          const snapshot = await options.session.traceSnapshot();
+          appendBlock(new Text(
+            terminalSafeText(action === "preview"
+              ? formatTracePreview(snapshot)
+              : formatTraceStatus(snapshot)),
+            1,
+            0,
+          ));
+          break;
+        }
         case "/changelog":
           if (argument.length > 0) throw new Error("Usage: /changelog");
           appendBlock(new Markdown(
@@ -3699,10 +3715,6 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         }
         case "/context":
           if (argument.length > 0) throw new Error("Usage: /context");
-          appendBlock(new ContextUsageBlock(options.session.contextOverview()));
-          break;
-        case "/usage":
-          if (argument.length > 0) throw new Error("Usage: /usage");
           appendBlock(new ContextUsageBlock(options.session.contextOverview()));
           break;
         case "/compact": {
@@ -3876,8 +3888,8 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           await forkSession(argument, "clone");
           break;
         case "/new": {
-          if (enteredCommand === "/clear" && argument.length > 0) {
-            throw new Error("Usage: /clear");
+          if (argument.length > 0) {
+            throw new Error(enteredCommand === "/clear" ? "Usage: /clear" : "Usage: /new");
           }
           if (await performRunNavigation(() => options.session.newRun()) === undefined) break;
           resetQueueSelection();
@@ -3914,14 +3926,16 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           await showSessionSelector();
           break;
         case "/stop":
-          await options.session.cancel();
-          break;
-        case "/cancel":
+          if (argument.length > 0) {
+            throw new Error(enteredCommand === "/cancel" ? "Usage: /cancel" : "Usage: /stop");
+          }
           await options.session.cancel();
           break;
         case "/resolve":
-          if (argument.length === 0) throw new Error("/resolve requires an operation id");
-          await options.session.resolveOperation(argument.split(/\s+/u)[0]!);
+          if (argument.length === 0 || argument.split(/\s+/u).length !== 1) {
+            throw new Error("Usage: /resolve <operation-id>");
+          }
+          await options.session.resolveOperation(argument);
           appendNotice("Operation resolved as failed.", "warning");
           break;
         case "/copy": {
@@ -3949,6 +3963,9 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           await askSideQuestion(argument);
           break;
         case "/quit":
+          if (argument.length > 0) {
+            throw new Error(enteredCommand === "/exit" ? "Usage: /exit" : "Usage: /quit");
+          }
           // Finish after this worker drains; awaiting it here would await the
           // worker from inside its own queue item.
           closing = true;

@@ -6,6 +6,7 @@ import {
   formatInteractiveCommandHelp,
   PENDING_APPROVAL_COMMANDS,
   PUBLIC_INTERACTIVE_COMMANDS,
+  publicInteractiveCommandSpecs,
 } from "../../src/cli/command-registry.js";
 
 describe("interactive command registry", () => {
@@ -24,6 +25,7 @@ describe("interactive command registry", () => {
       "settings",
       "system-prompt",
       "logs",
+      "traces",
       "changelog",
       "update",
       "login",
@@ -55,6 +57,11 @@ describe("interactive command registry", () => {
       "stop",
       "quit",
     ]);
+    const publicNames = publicInteractiveCommandSpecs().map((spec) => spec.name);
+    expect(publicNames).not.toContain("setup");
+    expect(publicNames).not.toContain("mode");
+    expect(publicNames).not.toContain("resolve");
+    expect(publicNames).toContain("traces");
   });
 
   it("canonicalizes established compatibility aliases", () => {
@@ -80,13 +87,13 @@ describe("interactive command registry", () => {
     expect(findInteractiveCommand("/side")?.name).toBe("btw");
   });
 
-  it("keeps the pending extension list empty and includes compatibility help", () => {
+  it("keeps compatibility commands executable but out of public help", () => {
     const help = formatInteractiveCommandHelp();
     for (const name of PENDING_APPROVAL_COMMANDS) {
       expect(findInteractiveCommand(name)).toBeUndefined();
       expect(help).not.toMatch(new RegExp(String.raw`/${name}(?:\\s|$)`, "u"));
     }
-    expect(help).toContain("/setup");
+    expect(help).not.toContain("/setup");
     expect(help).toContain("/list-agents");
     expect(help).not.toContain("/agents");
     expect(help).not.toContain("/topology");
@@ -94,11 +101,12 @@ describe("interactive command registry", () => {
     expect(findInteractiveCommand("/providers")).toBeUndefined();
     expect(help).toContain("/mcp [status|refresh]");
     expect(help).toContain("/thinking [level|default]");
-    expect(help).toContain("/mode [default|plan]");
+    expect(help).not.toContain("/mode [default|plan]");
     expect(help).toContain("/fork [run-id]");
     expect(help).toContain("/clone");
     expect(help).toContain("/system-prompt");
     expect(help).toContain("/logs");
+    expect(help).toContain("/traces [status|preview]");
     expect(help).toContain("/changelog");
     expect(help).toContain("/update");
     expect(help).toContain("/btw <question>");
@@ -106,7 +114,7 @@ describe("interactive command registry", () => {
     expect(help).not.toContain("/side");
     expect(help).toContain("/tree");
     expect(help).toContain("/compact");
-    expect(help).toContain("/resolve <operation-id>");
+    expect(help).not.toContain("/resolve <operation-id>");
     expect(help).toContain("/stop");
     expect(help).toContain("/quit");
   });

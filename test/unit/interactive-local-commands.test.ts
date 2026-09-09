@@ -115,6 +115,8 @@ describe("interactive local commands", () => {
       terminal.type("keep working");
       terminal.send("\r");
       await started;
+      await sendCommand(terminal, "/traces status", "Storage: local Run Ledger");
+      expect(model.callCount).toBe(1);
       await sendCommand(terminal, "/update", "Wait for the current Turn to finish");
       expect(updateCalls).toBe(0);
       releaseModel(response("ACTIVE_TURN_DONE"));
@@ -122,6 +124,75 @@ describe("interactive local commands", () => {
       await closeInteractive(terminal, running);
     } finally {
       releaseModel(response("cleanup"));
+      await stopIfRunning(terminal, running);
+      await session.close();
+    }
+  });
+
+  it("previews the attached Run Ledger locally without model calls or new events", async () => {
+    const root = await temporaryRoot("nausicaa-tui-traces-");
+    const terminal = new MemoryTerminal(160, 80);
+    const model = new ScriptedModel([response("TRACE_ANSWER")]);
+    const session = await openSession(root, model, () => "trace-run");
+    const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+    try {
+      await terminal.started;
+      await sendCommand(terminal, "/traces", "Run: none attached");
+      await sendCommand(terminal, "/traces preview", "there are no durable events to preview");
+      await sendCommand(terminal, "/traces upload", "Usage: /traces [status|preview]");
+
+      terminal.type("TRACE_PROMPT");
+      terminal.send("\r");
+      await waitForOutput(terminal, "TRACE_ANSWER");
+      await session.waitForIdle();
+      const before = await session.traceSnapshot();
+      expect(before?.events.length).toBeGreaterThan(0);
+
+      await sendCommand(terminal, "/traces status", "Run: trace-run");
+      await sendCommand(terminal, "/traces preview", "Recent events:");
+      expect(normalizedOutput(terminal.output)).toContain("assistant.message");
+
+      const after = await session.traceSnapshot();
+      expect(after?.events).toEqual(before?.events);
+      expect(model.callCount).toBe(1);
+      await closeInteractive(terminal, running);
+    } finally {
+      await stopIfRunning(terminal, running);
+      await session.close();
+    }
+  });
+
+  it("rejects surplus arguments instead of silently running control commands", async () => {
+    const root = await temporaryRoot("nausicaa-tui-command-arguments-");
+    const terminal = new MemoryTerminal(100, 30);
+    const model = new ScriptedModel([response("ARGUMENT_SEED_ANSWER")]);
+    const session = await openSession(root, model, () => "argument-run");
+    await session.submit({ inputId: "argument-seed", text: "ARGUMENT_SEED" });
+    await session.waitForIdle();
+    const before = await session.traceSnapshot();
+    const running = runInteractive({ session, terminal, forceAltScreen: true });
+
+    try {
+      await terminal.started;
+      for (const [command, usage] of [
+        ["/help extra", "Usage: /help"],
+        ["/status extra", "Usage: /status"],
+        ["/new extra", "Usage: /new"],
+        ["/stop extra", "Usage: /stop"],
+        ["/cancel extra", "Usage: /cancel"],
+        ["/resolve operation-a extra", "Usage: /resolve <operation-id>"],
+        ["/quit extra", "Usage: /quit"],
+        ["/exit extra", "Usage: /exit"],
+      ] as const) {
+        await sendCommand(terminal, command, usage);
+      }
+
+      expect(session.snapshot().runId).toBe("argument-run");
+      expect((await session.traceSnapshot())?.events).toEqual(before?.events);
+      expect(model.callCount).toBe(1);
+      await closeInteractive(terminal, running);
+    } finally {
       await stopIfRunning(terminal, running);
       await session.close();
     }

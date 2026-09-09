@@ -31,9 +31,9 @@ const command = (
 });
 
 /**
- * Commands are ordered as they should appear in `/help` and autocomplete.
- * Compatibility commands remain executable because removing an established
- * command is a breaking change, even when its preferred spelling has changed.
+ * Commands are kept in one dispatch registry. Public entries retain this
+ * order in `/help` and autocomplete; compatibility entries remain executable
+ * without adding obsolete spellings or internal recovery controls to menus.
  */
 export const PUBLIC_INTERACTIVE_COMMANDS: readonly InteractiveCommandSpec[] = Object.freeze([
   command({
@@ -88,6 +88,14 @@ export const PUBLIC_INTERACTIVE_COMMANDS: readonly InteractiveCommandSpec[] = Ob
   command({
     name: "logs",
     description: "Show local diagnostic paths",
+    references: ["prime"],
+    alignment: "semantic-review",
+    visibility: "public",
+  }),
+  command({
+    name: "traces",
+    description: "Inspect local Run traces and metrics",
+    argumentHint: "[status|preview]",
     references: ["prime"],
     alignment: "semantic-review",
     visibility: "public",
@@ -363,11 +371,11 @@ export function canonicalInteractiveCommandName(name: string): string {
 }
 
 export function publicInteractiveCommandSpecs(): readonly InteractiveCommandSpec[] {
-  return PUBLIC_INTERACTIVE_COMMANDS;
+  return PUBLIC_INTERACTIVE_COMMANDS.filter((spec) => spec.visibility === "public");
 }
 
 export function formatInteractiveCommandHelp(): string {
-  return PUBLIC_INTERACTIVE_COMMANDS
+  return publicInteractiveCommandSpecs()
     .map((spec) => {
       // Compatibility aliases remain accepted by dispatch, but the public
       // help stays canonical and does not present duplicate commands.

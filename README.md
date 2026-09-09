@@ -95,7 +95,7 @@ nausicaa auth login openrouter api-key
 | `/skills`、`/mcp`、`/reload` | 选择 Skill、管理 MCP、刷新资源 |
 | `/context`、`/compact` | 上下文用量与压缩 |
 | `/permissions`、`/plan`、`/stop` | 权限、规划模式、停止当前任务 |
-| `/settings`、`/system-prompt`、`/logs` | 会话设置、实际系统提示词、日志位置 |
+| `/settings`、`/system-prompt`、`/logs`、`/traces` | 会话设置、实际系统提示词、日志位置、本地 Run 事件与指标 |
 | `/btw <问题>`（`/side`） | 当前会话的无工具侧问，不写入主对话；用量计入预算 |
 | `/changelog`、`/update` | 版本记录、更新安装包（完成后重启） |
 
@@ -227,7 +227,7 @@ Use `nausicaa auth status <provider>` for local authentication status and
 | `/skills`, `/mcp`, `/reload` | Choose a Skill, manage MCP, refresh resources |
 | `/context`, `/compact` | Context usage and compaction |
 | `/permissions`, `/plan`, `/stop` | Permissions, Plan mode, stop the current task |
-| `/settings`, `/system-prompt`, `/logs` | Session settings, effective system prompt, log locations |
+| `/settings`, `/system-prompt`, `/logs`, `/traces` | Session settings, effective system prompt, log locations, local Run events and metrics |
 | `/btw <question>` (`/side`) | Tool-free side question on the attached session; separate transcript, shared budget |
 | `/changelog`, `/update` | Release notes, update the installation (then restart) |
 
