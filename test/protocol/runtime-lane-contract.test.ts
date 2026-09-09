@@ -25,6 +25,31 @@ afterEach(async () => {
 });
 
 describe("runtime lane contracts", () => {
+  it.each(["none", "reflection"] as const)("respects the nested %s auxiliary policy over automatic Teto defaults", async (auxiliaryMode) => {
+    const root = await temporaryRoot();
+    const main = new ScriptedModel([response("done")]);
+    const teto = new RecordingModel();
+    const result = await executeRun({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted/main",
+      message: "Complete the request",
+      policy: { maxMainStepsPerActivation: 1, auxiliaryMode },
+    }, {
+      mainModel: main,
+      tetoModel: teto,
+      reflectionModel: new ScriptedModel([response('{"action":"silent"}')]),
+      tools: [],
+    });
+    expect(result.completed).toBe(true);
+    expect(teto.requests).toHaveLength(0);
+    expect(main.requests[0]?.tools.some((tool) => tool.name.startsWith("teto_"))).toBe(false);
+    const events = await readEvents(result.stateDir, result.runId);
+    expect(events.find((event) => event.type === "run.created")?.payload)
+      .toMatchObject({ policy: { auxiliaryMode, tetoEnabled: false } });
+    expect(events.some((event) => event.laneId === "teto")).toBe(false);
+  });
+
   it("keeps a manually available Teto dormant until Main starts it", async () => {
     const root = await temporaryRoot();
     const main = new ScriptedModel([response("done")]);

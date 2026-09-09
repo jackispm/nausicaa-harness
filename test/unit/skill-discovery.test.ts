@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,6 +17,7 @@ import { ScriptedModel } from "../../src/model/index.js";
 import {
   createRegistryEdgeTurnSnapshotProvider,
   executeRun,
+  SessionController,
 } from "../../src/runtime/index.js";
 
 function settings(
@@ -185,8 +186,8 @@ describe("CLI Skill discovery policy", () => {
     }
   });
 
-  it("exposes the default catalog and paired skill tool on the first Run request", async () => {
-    const workspace = await mkdtemp(join(tmpdir(), "nausicaa-default-skills-run-"));
+  it.each(["one-shot", "interactive"] as const)("loads default Skills and references on %s requests", async (mode) => {
+    const workspace = await realpath(await mkdtemp(join(tmpdir(), "nausicaa-default-skills-run-")));
     const skillDirectory = join(workspace, ".agents", "skills", "review-code");
     await mkdir(skillDirectory, { recursive: true });
     await writeFile(join(skillDirectory, "SKILL.md"), [
@@ -196,6 +197,8 @@ describe("CLI Skill discovery policy", () => {
       "---",
       "PRIVATE_SKILL_BODY_MUST_NOT_BE_IN_FIRST_REQUEST",
     ].join("\n"));
+    await mkdir(join(skillDirectory, "references"), { recursive: true });
+    await writeFile(join(skillDirectory, "references", "checklist.md"), "PRIVATE_SKILL_RESOURCE_BODY");
 
     const plan = planCliSkillDiscovery(settings());
     const composition = await createConfiguredEdgeComposition({
@@ -215,38 +218,96 @@ describe("CLI Skill discovery policy", () => {
       startupRefresh: true,
     });
     const provider = createRegistryEdgeTurnSnapshotProvider(composition.registry);
-    const model = new ScriptedModel([(request) => {
-      expect(request.tools.some((tool) => tool.name === "skill")).toBe(true);
-      expect(request.messages.some((message) => (
-        message.content.includes('<available_skills generation="1">')
-          && message.content.includes("review-code")
-      ))).toBe(true);
-      expect(request.messages.some((message) => (
-        message.content.includes("PRIVATE_SKILL_BODY_MUST_NOT_BE_IN_FIRST_REQUEST")
-      ))).toBe(false);
-      return {
-        content: "done",
-        toolCalls: [],
-        stopReason: "stop",
-        usage: { input: 8, output: 2, cacheRead: 0, cacheWrite: 0 },
-      };
-    }]);
+    const model = new ScriptedModel([
+      (request) => {
+        expect(request.tools.some((tool) => tool.name === "skill")).toBe(true);
+        expect(request.messages.some((message) => (
+          message.content.includes('<available_skills generation="1">')
+            && message.content.includes("review-code")
+        ))).toBe(true);
+        expect(request.messages.some((message) => (
+          message.content.includes("PRIVATE_SKILL_BODY_MUST_NOT_BE_IN_FIRST_REQUEST")
+        ))).toBe(false);
+        expect(request.messages.some((message) => message.content.includes("PRIVATE_SKILL_RESOURCE_BODY"))).toBe(false);
+        expect(request.messages.some((message) => message.content.includes(skillDirectory))).toBe(false);
+        expect(request.messages.some((message) => message.content.includes("When a request matches a listed Skill"))).toBe(true);
+        return {
+          content: "load",
+          toolCalls: [{ id: "load-skill", name: "skill", arguments: { name: "review-code" } }],
+          stopReason: "toolUse",
+          usage: { input: 8, output: 2, cacheRead: 0, cacheWrite: 0 },
+        };
+      },
+      (request) => {
+        const body = request.messages.find((message) => message.role === "tool" && message.toolCallId === "load-skill");
+        expect(JSON.parse(body?.content ?? "{}")).toMatchObject({
+          kind: "skill_instructions",
+          name: "review-code",
+          generation: 1,
+          instructions: "PRIVATE_SKILL_BODY_MUST_NOT_BE_IN_FIRST_REQUEST",
+          skillLocation: { filePath: join(skillDirectory, "SKILL.md"), baseDirectory: skillDirectory },
+        });
+        expect(request.messages.some((message) => message.content.includes("PRIVATE_SKILL_RESOURCE_BODY"))).toBe(false);
+        return {
+          content: "load referenced checklist",
+          toolCalls: [{
+            id: "load-resource",
+            name: "skill",
+            arguments: { name: "review-code", resourcePath: "references/checklist.md" },
+          }],
+          stopReason: "toolUse",
+          usage: { input: 8, output: 2, cacheRead: 0, cacheWrite: 0 },
+        };
+      },
+      (request) => {
+        const resource = request.messages.find((message) => message.role === "tool" && message.toolCallId === "load-resource");
+        expect(JSON.parse(resource?.content ?? "{}")).toMatchObject({
+          kind: "skill_resource",
+          name: "review-code",
+          generation: 1,
+          resourcePath: "references/checklist.md",
+          content: "PRIVATE_SKILL_RESOURCE_BODY",
+          skillLocation: { filePath: join(skillDirectory, "SKILL.md"), baseDirectory: skillDirectory },
+        });
+        return {
+          content: "done",
+          toolCalls: [],
+          stopReason: "stop",
+          usage: { input: 8, output: 2, cacheRead: 0, cacheWrite: 0 },
+        };
+      },
+    ]);
 
+    let session: SessionController | undefined;
     try {
-      const result = await executeRun({
+      const options = {
         workspace,
         dataDir: join(workspace, "state"),
         model: "scripted",
-        message: "Inspect the workspace",
-        policy: { maxMainSteps: 1, tetoEnabled: false },
+        policy: { maxMainStepsPerActivation: 3, tetoEnabled: false },
         edgeSnapshotProvider: provider,
         closeEdgeCompositionOnClose: false,
-      }, {
+      };
+      const dependencies = {
         mainModel: model,
-        createRunId: () => "default-skill-first-request",
-      });
-      expect(result).toMatchObject({ completed: true, finalText: "done" });
+        createRunId: () => `default-skill-${mode}-request`,
+      };
+      if (mode === "one-shot") {
+        const result = await executeRun({ ...options, message: "Inspect the workspace" }, dependencies);
+        expect(result).toMatchObject({ completed: true, finalText: "done" });
+      } else {
+        session = await SessionController.open(options, dependencies);
+        await session.submit({ inputId: "skill-input", text: "Inspect the workspace" });
+        await session.waitForIdle();
+        expect(session.snapshot().blocker).toBeUndefined();
+      }
+      expect(model.callCount).toBe(3);
+      for (const request of model.requests) {
+        expect(request.tools.filter((tool) => tool.name === "skill")).toHaveLength(1);
+        expect(request.messages.filter((message) => message.content.includes('<available_skills generation="1">'))).toHaveLength(1);
+      }
     } finally {
+      await session?.close();
       await composition.close();
       await rm(workspace, { recursive: true, force: true });
     }

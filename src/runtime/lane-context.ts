@@ -309,7 +309,7 @@ export function createTetoCapabilityManifest(
     {
       name: options.recommended === true ? "recommended-for-this-run" : "optional-for-this-run",
       kind: "lifecycle",
-      description: "For complex analysis, debugging, planning, or review, open Teto early through the available control tool. Reuse an active lane and keep working while it observes. For simple tasks, weigh the value against the overhead.",
+      description: "When available, use teto_stop to close this observer and teto_start to reopen it.",
     },
   ];
   return createLaneCapabilityManifest({

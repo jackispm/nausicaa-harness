@@ -40,7 +40,7 @@ export interface TetoLaneControllerOptions {
   signal?: AbortSignal;
   readWatermark?: () => Promise<number>;
   tokenBudget?: RunTokenBudget;
-  /** Legacy one-shot callers may preserve the old automatic behavior. */
+  /** Start on first initialization only; a durable stop always takes precedence. */
   autoStart?: boolean;
 }
 
@@ -108,70 +108,7 @@ export class TetoLaneController implements TetoControl {
 
   /** Start is serialized so a batched pair of tool calls cannot create two Teto lanes. */
   start(context: ToolExecutionContext): Promise<TetoControlResult> {
-    return this.enqueueLifecycle(async () => {
-      assertOwner(context, this.runId, this.mainLaneId);
-      if (!this.available) return { active: false, changed: false, reason: "Teto is disabled by policy" };
-      if (this.active) return { active: true, changed: false, laneId: this.laneId };
-      this.stopping = false;
-      const events = await this.readEvents();
-      await this.ensureAvailableInLifecycle(events);
-      const schedulerOptions = {
-        eventSink: this.options.eventSink,
-        inbox: this.options.inbox,
-        store: this.options.store,
-        model: this.options.model,
-        modelName: this.options.modelName,
-        runId: this.options.runId,
-        goal: this.goal,
-        policy: this.options.policy,
-        workspace: this.options.workspace,
-        events,
-        clock: this.clock,
-        mainLaneId: this.mainLaneId,
-        tetoLaneId: this.laneId,
-        replayPublicEvents: true,
-        tokenBudget: this.tokenBudget,
-        ...(this.options.signal === undefined
-          ? { signal: this.lifecycleController.signal }
-          : { signal: AbortSignal.any([this.options.signal, this.lifecycleController.signal]) }),
-        ...(this.options.policyVersion === undefined ? {} : { policyVersion: this.options.policyVersion }),
-        ...(this.options.readWatermark === undefined ? {} : { readWatermark: this.options.readWatermark }),
-        ...(this.options.createCompactionRuntime === undefined
-          ? {}
-          : (() => {
-              const compactionRuntime = this.options.createCompactionRuntime!();
-              return compactionRuntime === undefined ? {} : { compactionRuntime };
-            })()),
-      };
-      const scheduler = new TetoLaneScheduler(schedulerOptions);
-      this.scheduler = scheduler;
-      const requestedBy = context.laneId ?? this.mainLaneId;
-      try {
-        await this.eventSink.append({
-          runId: this.runId,
-          laneId: this.laneId,
-          type: "lane.status",
-          payload: {
-            status: "ready",
-            reason: `Teto opened by ${requestedBy}`,
-            control: { action: "start", requestedBy },
-          },
-          correlationId: `${this.runId}:${this.laneId}:lifecycle`,
-          idempotencyKey: `${this.runId}:${this.laneId}:status:ready:${this.createId()}`,
-          visibility: "run",
-          occurredAt: this.clock.now().toISOString(),
-        });
-      } catch (error: unknown) {
-        // Do not expose an active scheduler when the durable start intent was
-        // rejected. A later start must be able to retry from a clean state.
-        this.scheduler = undefined;
-        this.stopping = true;
-        await scheduler.stop().catch(() => undefined);
-        this.stopping = false;
-        throw error;
-      }
-      return { active: true, changed: true, laneId: this.laneId };
-    });
+    return this.enqueueLifecycle(() => this.startInLifecycle(context));
   }
 
   stop(context?: ToolExecutionContext): Promise<TetoControlResult> {
@@ -179,11 +116,11 @@ export class TetoLaneController implements TetoControl {
       if (context !== undefined) assertOwner(context, this.runId, this.mainLaneId);
       if (this.closed) return { active: false, changed: false, laneId: this.laneId };
       if (!this.active) return { active: false, changed: false, laneId: this.laneId };
-      this.stopping = true;
       const scheduler = this.scheduler;
-      this.scheduler = undefined;
-      await scheduler?.stop();
       const requestedBy = context?.laneId ?? this.mainLaneId;
+      // Persist the owner's stop intent before retiring the scheduler. If the
+      // Ledger rejects it, the observer remains active and a retry can still
+      // establish the durable fact used by recovery.
       await this.eventSink.append({
         runId: this.runId,
         laneId: this.laneId,
@@ -198,6 +135,9 @@ export class TetoLaneController implements TetoControl {
         visibility: "run",
         occurredAt: this.clock.now().toISOString(),
       });
+      this.stopping = true;
+      this.scheduler = undefined;
+      await scheduler?.stop();
       return { active: false, changed: true, laneId: this.laneId };
     });
   }
@@ -212,7 +152,7 @@ export class TetoLaneController implements TetoControl {
     };
   }
 
-  /** Restore an intentionally active Teto after a process/session restart. */
+  /** Restore the latest explicit intent, or apply automatic startup once. */
   async restoreIfRequested(requestedBy: LaneId = this.mainLaneId): Promise<boolean> {
     return this.enqueueLifecycle(async () => {
       if (!this.available || this.active) return this.active;
@@ -222,38 +162,19 @@ export class TetoLaneController implements TetoControl {
       // that intent so a resumed Run can be observed even when its original
       // registration was interrupted.
       await this.ensureAvailableInLifecycle(events);
-      if (!lastControlIsStart(events, this.runId, this.laneId)) return false;
+      const action = lastControlAction(events, this.runId, this.laneId);
+      if (action === "stop") return false;
+      if (action === undefined) {
+        if (this.options.autoStart !== true) return false;
+        return (await this.startInLifecycle({
+          runId: this.runId,
+          laneId: requestedBy,
+          workspace: this.options.workspace,
+          operationId: `${this.runId}:${this.laneId}:auto-start`,
+        })).active;
+      }
       this.stopping = false;
-      const current = await this.readEvents();
-      const schedulerOptions = {
-        eventSink: this.options.eventSink,
-        inbox: this.options.inbox,
-        store: this.options.store,
-        model: this.options.model,
-        modelName: this.options.modelName,
-        runId: this.options.runId,
-        goal: this.goal,
-        policy: this.options.policy,
-        workspace: this.options.workspace,
-        events: current,
-        clock: this.clock,
-        mainLaneId: this.mainLaneId,
-        tetoLaneId: this.laneId,
-        replayPublicEvents: true,
-        tokenBudget: this.tokenBudget,
-        ...(this.options.signal === undefined
-          ? { signal: this.lifecycleController.signal }
-          : { signal: AbortSignal.any([this.options.signal, this.lifecycleController.signal]) }),
-        ...(this.options.policyVersion === undefined ? {} : { policyVersion: this.options.policyVersion }),
-        ...(this.options.readWatermark === undefined ? {} : { readWatermark: this.options.readWatermark }),
-        ...(this.options.createCompactionRuntime === undefined
-          ? {}
-          : (() => {
-              const compactionRuntime = this.options.createCompactionRuntime!();
-              return compactionRuntime === undefined ? {} : { compactionRuntime };
-            })()),
-      };
-      this.scheduler = new TetoLaneScheduler(schedulerOptions);
+      this.scheduler = this.createScheduler(await this.readEvents());
       return this.active;
     });
   }
@@ -293,6 +214,69 @@ export class TetoLaneController implements TetoControl {
     const result = this.lifecycleTail.then(operation);
     this.lifecycleTail = result.then(() => undefined, () => undefined);
     return result;
+  }
+
+  private async startInLifecycle(context: ToolExecutionContext): Promise<TetoControlResult> {
+    assertOwner(context, this.runId, this.mainLaneId);
+    if (!this.available) return { active: false, changed: false, reason: "Teto is disabled by policy" };
+    if (this.active) return { active: true, changed: false, laneId: this.laneId };
+    this.stopping = false;
+    const events = await this.readEvents();
+    await this.ensureAvailableInLifecycle(events);
+    const scheduler = this.createScheduler(events);
+    this.scheduler = scheduler;
+    const requestedBy = context.laneId ?? this.mainLaneId;
+    try {
+      await this.eventSink.append({
+        runId: this.runId,
+        laneId: this.laneId,
+        type: "lane.status",
+        payload: {
+          status: "ready",
+          reason: `Teto opened by ${requestedBy}`,
+          control: { action: "start", requestedBy },
+        },
+        correlationId: `${this.runId}:${this.laneId}:lifecycle`,
+        idempotencyKey: `${this.runId}:${this.laneId}:status:ready:${this.createId()}`,
+        visibility: "run",
+        occurredAt: this.clock.now().toISOString(),
+      });
+    } catch (error: unknown) {
+      // Failed admission must leave no active scheduler so startup is retryable.
+      this.scheduler = undefined;
+      this.stopping = true;
+      await scheduler.stop().catch(() => undefined);
+      this.stopping = false;
+      throw error;
+    }
+    return { active: true, changed: true, laneId: this.laneId };
+  }
+
+  private createScheduler(events: readonly AnyEvent[]): TetoLaneScheduler {
+    const compactionRuntime = this.options.createCompactionRuntime?.();
+    return new TetoLaneScheduler({
+      eventSink: this.eventSink,
+      inbox: this.options.inbox,
+      store: this.options.store,
+      model: this.options.model,
+      modelName: this.options.modelName,
+      runId: this.runId,
+      goal: this.goal,
+      policy: this.options.policy,
+      workspace: this.options.workspace,
+      events,
+      clock: this.clock,
+      mainLaneId: this.mainLaneId,
+      tetoLaneId: this.laneId,
+      replayPublicEvents: true,
+      tokenBudget: this.tokenBudget,
+      signal: this.options.signal === undefined
+        ? this.lifecycleController.signal
+        : AbortSignal.any([this.options.signal, this.lifecycleController.signal]),
+      ...(this.options.policyVersion === undefined ? {} : { policyVersion: this.options.policyVersion }),
+      ...(this.options.readWatermark === undefined ? {} : { readWatermark: this.options.readWatermark }),
+      ...(compactionRuntime === undefined ? {} : { compactionRuntime }),
+    });
   }
 
   private async ensureRegistered(events: readonly AnyEvent[]): Promise<void> {
@@ -340,10 +324,14 @@ function assertOwner(context: ToolExecutionContext, runId: RunId, laneId: LaneId
   }
 }
 
-function lastControlIsStart(events: readonly AnyEvent[], runId: RunId, laneId: LaneId): boolean {
+function lastControlAction(
+  events: readonly AnyEvent[],
+  runId: RunId,
+  laneId: LaneId,
+): "start" | "stop" | undefined {
   const controls = events
     .filter((event) => event.runId === runId && event.laneId === laneId && event.type === "lane.status" && event.payload.control !== undefined)
     .sort((left, right) => left.globalOffset - right.globalOffset);
   const latest = controls.at(-1);
-  return latest?.type === "lane.status" && latest.payload.control?.action === "start";
+  return latest?.type === "lane.status" ? latest.payload.control?.action : undefined;
 }

@@ -7,8 +7,8 @@
   </picture>
 </p>
 
-> 面向通用任务的多 Lane、多拓扑 Agent 执行运行时。
-> An execution runtime for general-purpose agents that think and act as a topology.
+> 面向通用任务的下一代 Agent，以多 Lane、多拓扑支持协作。
+> A next-generation general-purpose agent built around collaborating Lanes.
 
 [![CI](https://github.com/jackispm/nausicaa-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/jackispm/nausicaa-harness/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/nausicaa-harness)](https://www.npmjs.com/package/nausicaa-harness)
@@ -17,21 +17,20 @@
 
 ## 中文说明
 
-Nausicaa 的核心不是更复杂的 workflow，而是让更强的模型自己决定何时协作。
-我们认为随着模型计算更多转移到云端，未来的 Agent 将由多个不同职责、上下文和
-节奏的 Lane 组成动态拓扑，而不再只是一个窗口里的线性循环。
+Nausicaa 让模型在不同职责、上下文和节奏的 Lane 之间协作，按任务组织动态拓扑。
+Agent 的对外身份是 **Nausicaa**；`main`、Team member、Worker 是运行角色和通信地址。
 
-- **Teto**：独立的感知与思考 Lane，默认按需开启，观察 Main 的公开行为并提供
-  第二视角，不是隐藏的 chain-of-thought。Main 会被建议在复杂任务中尽早开启；
-  Teto 的观察与反馈权限独立于 Main 的执行权限。
+- **Teto**：独立的感知与思考 Lane，默认开启，观察主 Agent 的公开行为并提供
+  第二视角。主 Agent 可通过已授权的控制工具关闭或重新开启；
+  Teto 的观察与反馈权限独立于主 Agent 的执行权限。
 - **Lane**：每个 Agent 都是可寻址、可恢复、拥有独立上下文和生命周期的执行单位。
-- **多拓扑**：Main、Teto、Worker、Team branch 以及跨 Run A2A 可以按任务自然组合；
-  Team branch 也可以拥有自己的 Teto。
+- **多拓扑**：主 Agent、Teto、Worker、Team member 以及跨 Run A2A 可以按任务自然组合；
+  Team member 也可以按需开启自己的 Teto。
 - **Host 边界**：模型负责决定协作方式，Host 只负责身份、授权、持久化和恢复等
   不可妥协的事实。
 
 ```text
-Main
+Nausicaa (primary lane: main)
 |- observes Teto
 |- delegates Team:research
 |  `- observes Teto
@@ -104,10 +103,23 @@ CLI：`--print` 单次回答，`--json` 输出事件，`--continue` 恢复最近
 `--resume <run-id>` 恢复指定会话，`--topology` 查看拓扑；`--daemon` 启动后台控制主机，
 `--attach <run-id>` 以只读 TUI 查看 daemon 会话。
 
-内置 `codebase-map`、`task-plan`、`code-review` 三个 Skill，项目或配置来源的同名 Skill 优先。
-项目内 `.agents/skills`、`.pi/skills`、`skills` 默认发现元数据；完整内容按需加载，
-也可通过 `/skills` 插入 `/skill:name` 调用。`--no-edges` 关闭 Skill 和 MCP 来源；
+### Teto 与 Skills
+
+新 Run 默认开启 Teto，交互会话和 `--print`、`--json` 使用相同的观察者机制。
+你可以让主 Agent 关闭或重启 Teto，由它调用 `teto_stop`、`teto_start`；关闭决定在
+同一 Run 的重启和恢复后仍然有效。Plan 模式保留只读边界，不提供启停工具。
+创建新 Run 时可用 `nausicaa --main-only` 或配置 `tetoEnabled: false` 禁用 Teto。
 Worker 默认可按需委派，`--no-worker` 可禁用。
+
+内置 `codebase-map`、`task-plan`、`code-review` 三个 Skill，项目或配置来源的同名 Skill 优先。
+默认发现项目内 `.agents/skills`、`.pi/skills`、`skills`；不会自动扫描
+`~/.agents/skills` 或 `~/.codex/skills`。添加项目 Skill 时可使用
+`.agents/skills/<name>/SKILL.md`。
+
+主 Agent 的上下文自动包含技能名称和描述，任务匹配时通过 `skill` 工具加载正文，
+再按需读取引用文件。加载结果提供技能目录，作为脚本和资源相对路径的基准。
+也可通过 `/skills` 插入 `/skill:name` 显式使用。`/system-prompt` 只显示系统提示词，
+不包含动态的技能目录；可用 `/skills` 查看发现结果。`--no-edges` 关闭 Skill 和 MCP 来源。
 
 `/mcp` 用居中菜单添加 HTTP/stdio 服务、明确授权、启用、禁用或移除配置；配置变更需重启生效。
 `/mcp refresh` 只刷新现有连接，`/mcp status` 查看状态。本版不提供通用 MCP OAuth。
@@ -126,24 +138,24 @@ npm link
 
 ## English
 
-Nausicaa is deliberately not a more complicated workflow. It lets capable models
-decide when to collaborate. As more model computation moves to the cloud, we
-expect future Agents to form dynamic topologies of Lanes with different roles,
-contexts, and cadences instead of one linear loop in one window.
+Nausicaa lets models collaborate across Lanes with different roles, contexts,
+and cadences, organizing their topology around the task. The Agent's public
+identity is **Nausicaa**; `main`, Team member, and Worker describe runtime roles
+and addresses.
 
-- **Teto**: an independent sensing and thinking Lane, opened on demand. It
-  observes Main's public behavior and offers a second perspective, not hidden
-  chain-of-thought. Main is encouraged to open it early for complex tasks;
-  Teto's observation and feedback permissions are separate from Main's execution authority.
+- **Teto**: an independent sensing and thinking Lane enabled by default. It
+  observes the primary Agent's public behavior and offers a second perspective.
+  The primary Agent may stop or restart it through the authorized controls;
+  Teto's observation and feedback permissions are separate from the primary Agent's execution authority.
 - **Lane**: an addressable, resumable execution unit with its own context and
   lifecycle.
-- **Multi-topology**: Main, Teto, Worker, Team branches, and cross-Run A2A can be
-  composed as a task unfolds; a Team branch may own its own Teto.
+- **Multi-topology**: the primary Agent, Teto, Worker, Team members, and cross-Run
+  A2A can be composed as a task unfolds; a Team member may start its own Teto.
 - **Host boundary**: the model chooses how to collaborate; the Host owns the
   non-negotiable facts of identity, authority, durability, and recovery.
 
 ```text
-Main
+Nausicaa (primary lane: main)
 |- observes Teto
 |- delegates Team:research
 |  `- observes Teto
@@ -224,12 +236,28 @@ latest session, `--resume <run-id>` resumes a specific session, and `--topology`
 prints the topology. `--daemon` starts the control host; `--attach <run-id>` opens
 a read-only TUI for a daemon session.
 
+### Teto and Skills
+
+New Runs start Teto by default. Interactive sessions, `--print`, and `--json`
+use the same observer mechanism. Ask the primary Agent to stop or restart Teto
+using `teto_stop` or `teto_start`; a stop remains effective when the same Run
+restarts or resumes. Plan mode retains its read-only boundary and omits these
+controls. To disable Teto when creating a Run, use `nausicaa --main-only` or set
+`tetoEnabled: false`. Worker delegation is available on demand by default;
+`--no-worker` disables it.
+
 Three Skills are bundled: `codebase-map`, `task-plan`, and `code-review`.
-Same-name project or configured Skills take precedence. Project `.agents/skills`,
-`.pi/skills`, and `skills` directories are discovered as metadata by default;
-full instructions load on demand, or `/skills` inserts a `/skill:name` invocation.
-`--no-edges` disables Skill and MCP sources. Worker delegation is available on demand by
-default; `--no-worker` disables it.
+Same-name project or configured Skills take precedence. Discovery includes
+project `.agents/skills`, `.pi/skills`, and `skills` directories. It does not
+automatically scan `~/.agents/skills` or `~/.codex/skills`. Add project Skills at
+`.agents/skills/<name>/SKILL.md`.
+
+The primary Agent's context includes Skill names and descriptions. For matching
+tasks, it uses `skill` to load instructions and then any referenced text files
+it needs. Loaded results include the Skill directory for resolving script and
+resource paths. `/skills` can also insert an explicit `/skill:name` invocation.
+`/system-prompt` shows system text rather than the dynamic Skill catalog; use
+`/skills` to inspect discovery. `--no-edges` disables Skill and MCP sources.
 
 `/mcp` opens a centered menu to add HTTP/stdio servers, grant explicit access,
 enable, disable, or remove configurations. Changes require a restart.

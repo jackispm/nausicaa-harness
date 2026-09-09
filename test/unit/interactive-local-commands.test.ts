@@ -53,7 +53,7 @@ describe("interactive local commands", () => {
       await terminal.started;
 
       await sendCommand(terminal, "/system-prompt", "System Prompt");
-      expect(normalizedOutput(terminal.output)).toContain("You are Main");
+      expect(normalizedOutput(terminal.output)).toContain("You are Nausicaa");
       await sendCommand(terminal, "/system-prompt extra", "Usage: /system-prompt");
 
       await sendCommand(terminal, "/logs", "Current Run ledger: no Run is attached");

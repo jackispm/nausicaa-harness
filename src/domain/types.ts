@@ -479,7 +479,7 @@ interface RunPolicyBase {
   tetoMaxOutputTokens: number;
   /** Optional Teto/Main token ratio gate; omitted means no ratio limit. */
   tetoTokenRatio?: number;
-  /** Optional for legacy Runs; manual makes `teto_start` the only opener. */
+  /** Optional for legacy Runs; automatic starts on first initialization, manual makes `teto_start` the only opener. */
   tetoActivation?: TetoActivationMode;
   /** Optional for schema-v1 compatibility; omitted means the Worker lane is off. */
   workerEnabled?: boolean;

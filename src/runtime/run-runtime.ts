@@ -68,6 +68,7 @@ import {
   type RunRecoveryState,
 } from "./recovery.js";
 import {
+  DEFAULT_RUN_POLICY,
   normalizeFukaiCompactionPolicy,
   resolveRunPolicy,
 } from "./run-policy.js";
@@ -302,15 +303,11 @@ export const executeRun = async (
     }
 
     const requestedAuxiliaryMode = request.auxiliaryMode
+      ?? request.policy?.auxiliaryMode
       ?? (request.policy?.tetoEnabled === false
+        || (request.tetoActivation ?? request.policy?.tetoActivation ?? DEFAULT_RUN_POLICY.tetoActivation) === "manual"
         ? "none"
-        : request.tetoActivation !== undefined
-          ? request.tetoActivation === "manual" ? "none" : "teto"
-          : request.policy?.tetoActivation !== undefined
-            ? request.policy.tetoActivation === "manual" ? "none" : "teto"
-            : request.policy?.maxMainSteps !== undefined
-              ? "teto"
-              : "none");
+        : "teto");
     const requestedWorkerEnabled = request.workerEnabled ?? request.policy?.workerEnabled;
     const setup = recovered === undefined
       ? await createNewRun(
@@ -595,6 +592,7 @@ export const executeRun = async (
           readEvents: () => ledger.read({ runId }),
           clock,
           tokenBudget: tetoTokenBudget,
+          autoStart: policy.tetoActivation !== "manual",
           ...(createTetoCompactionRuntime === undefined
             ? {}
             : { createCompactionRuntime: createTetoCompactionRuntime }),
@@ -603,16 +601,7 @@ export const executeRun = async (
           ...(request.signal === undefined ? {} : { signal: request.signal }),
         });
         scheduler = controller;
-        if (policy.tetoActivation !== "manual") {
-          await controller.start({
-            runId,
-            laneId: "main",
-            workspace,
-            operationId: `${runId}:teto:auto-start`,
-          });
-        } else {
-          await controller.restoreIfRequested();
-        }
+        await controller.restoreIfRequested();
       }
     } else if (auxiliaryMode === "reflection") {
       scheduler = new ReflectionScheduler({
@@ -985,7 +974,7 @@ export const executeRun = async (
         `main:status:${result.completed ? "completed" : "waiting"}:${setup.startStep}`,
         clock,
       );
-      await scheduler?.stop();
+      await closeScheduler();
       await workerScheduler?.stop();
       await teamRuntime?.stop();
       await commitRunCheckpoint(ledger, runId);
@@ -1002,7 +991,7 @@ export const executeRun = async (
       };
     } catch (error: unknown) {
       if (request.signal?.aborted) await teamRuntime?.cancelAll("Run aborted");
-      await scheduler?.stop();
+      await closeScheduler();
       await workerScheduler?.stop();
       await teamRuntime?.stop();
       if (error instanceof MainRunTokenBudgetExhaustedError) {
@@ -1066,7 +1055,7 @@ export const executeRun = async (
       throw error;
     }
   } finally {
-    await scheduler?.stop().catch(() => undefined);
+    await closeScheduler().catch(() => undefined);
     await workerScheduler?.stop().catch(() => undefined);
     await teamRuntime?.stop().catch(() => undefined);
     await processJobManager?.close().catch(() => undefined);
@@ -1078,6 +1067,11 @@ export const executeRun = async (
       }
     }
     await ledger.close();
+  }
+
+  async function closeScheduler(): Promise<void> {
+    if (scheduler instanceof TetoLaneController) await scheduler.close();
+    else await scheduler?.stop();
   }
 };
 
@@ -1125,11 +1119,9 @@ const createNewRun = async (
     ...(request.fukaiCompaction === undefined
       ? {}
       : { fukaiCompaction: request.fukaiCompaction }),
-    tetoActivation: request.tetoActivation
-      ?? request.policy?.tetoActivation
-      ?? (request.policy?.maxMainSteps !== undefined || request.auxiliaryMode === "teto"
-        ? "automatic"
-        : "manual"),
+    ...(request.tetoActivation === undefined
+      ? {}
+      : { tetoActivation: request.tetoActivation }),
     ...(auxiliaryMode === "teto"
       ? { tetoEnabled: true }
       : auxiliaryMode === "reflection"

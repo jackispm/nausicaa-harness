@@ -79,7 +79,7 @@ edges.refreshOnStart = false
 示例：
 
 ```xml
-Available Skills (metadata only). Call `skill` with an exact name to load instructions when needed.
+Available Skills (metadata only). When a request matches a listed Skill, call `skill` with its exact name to load the instructions.
 
 <available_skills generation="12">
   <skill>
@@ -310,3 +310,45 @@ Skill 文件属于本地输入，不应被当成 host policy：
 - `src/cli.ts`
 - `HARNESS-CAPABILITY-COMPARISON.md`
 - `TOOL-CALL-FLOW-SIMULATION.md`
+
+## 13. 模型按需加载的资源位置补齐（2026-09-09）
+
+本轮核对 Prime Agent `v0.7.2`，commit
+`7787f07415d843b9a800f6a4720e0c739bd608e5`（MIT，copyright 2025 Mario
+Zechner、2026 Prime Intellect）。其
+`packages/coding-agent/src/core/skills.ts:450` 的 `formatSkillsForPrompt`
+提供 `name / type / description / location`，要求任务匹配时读取正文，并以
+Skill 文件所在目录解析相对引用。`core/system-prompt.ts` 在存在文件读取工具时
+加入目录；`core/resource-loader.ts` / `loadSkills` 负责启动发现。
+`core/package-manager.ts:436` 收集项目祖先的 `.agents/skills`，`:2181`
+加入 `~/.agents/skills`，由 resource loader 传给 `loadSkills`。
+
+复用边界是“匹配描述后按需加载、相对引用有明确基准”。直接依赖 Prime session
+或移植整个 loader 会带入其 IPython、用户目录策略和 session 所有权，超出当前
+需求；继续使用现有 registry/loader 的薄适配，没有引入新依赖或执行环境。
+
+实际缺口在模型调用 `skill(name)` 后：filesystem adapter 和 registry 已提供
+可信 `skillLocation`，runtime validator 只保留了 `resources`，丢失了文件位置。
+现在正文和资源结果带有 `skillLocation: { filePath, baseDirectory }`（若 adapter
+提供），让后续脚本和资源路径有明确基准。首轮 catalog 仍只包含名称、描述，
+正文和绝对路径都在模型请求加载后才提供；该信息不授予任何执行或目录访问权限。
+目录前导也明确提醒匹配的任务调用 `skill`，不强制每次请求加载无关 Skill。
+
+默认发现范围继续是工作区 `.agents/skills`、`.pi/skills`、`skills`，加上三个内置
+Skills；不自动扫描 `~/.agents/skills` 或 `~/.codex/skills`。这意味着只安装在个人
+目录中的 Skill 不会出现在 Nausicaa 的目录中。当前工作区没有上述三个项目目录，
+默认可用项来自 `assets/skills`：`codebase-map`、`code-review`、`task-plan`。
+本轮实际 discovery 得到 3 项，描述分别为 138、157、170 UTF-8 bytes；渲染目录
+900 bytes，`complete=true`，diagnostics 为空。
+项目 Skill 应放在 `<workspace>/.agents/skills/<name>/SKILL.md`；仅设置一个工作区外
+location 不会绕过现有 workspace 访问边界。
+
+单条描述超过 512 UTF-8 bytes 会在 runtime catalog capture 时独立跳过并记录
+`description-limit`，其余有效项保留；整个 catalog 超过 128 项或 32 KiB 才整体
+隐藏。模型请求的 context budget 不足时，catalog 和 `skill` schema 同时隐藏。
+
+请求边界回归覆盖 one-shot `executeRun` 和交互 `SessionController` 的同一条链路：
+首轮 metadata + schema → `skill(name)` 正文及目录 → `skill(name, resourcePath)`
+引用资源。验证通过 model port 捕获实际构建的请求，不调用付费模型。
+相关 7 个测试文件共 103 项通过，包含上述两种入口、目录/工具原子可见、字节限制、
+显式 `/skill:`、内置 Skills、路径和符号链接边界。

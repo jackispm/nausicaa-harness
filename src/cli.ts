@@ -726,7 +726,7 @@ const main = async (): Promise<number> => {
           ? {}
           : { resolveOperationId: options.resolveOperation }),
         policy: {
-          maxMainSteps: resolvedSettings.maxSteps,
+          maxMainStepsPerActivation: resolvedSettings.maxSteps,
           ...(resolvedSettings.maxModelTokens === undefined
             ? {}
             : { maxModelTokens: resolvedSettings.maxModelTokens }),

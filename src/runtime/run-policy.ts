@@ -17,9 +17,7 @@ export const DEFAULT_RUN_POLICY: RunPolicy = {
   mainRequestTimeoutMs: DEFAULT_MAIN_REQUEST_TIMEOUT_MS,
   tetoEnabled: true,
   tetoMaxOutputTokens: 1_024,
-  // New lanes expose Teto as a capability; the owning model opens it when
-  // the task warrants a second line of thought.
-  tetoActivation: "manual",
+  tetoActivation: "automatic",
   workerEnabled: true,
 };
 
@@ -27,10 +25,6 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
   const allowance = input.maxMainStepsPerActivation
     ?? input.maxMainSteps
     ?? mainStepAllowance(DEFAULT_RUN_POLICY);
-  const defaultTetoActivation = input.tetoActivation
-    ?? (input.maxMainSteps !== undefined || input.auxiliaryMode === "teto"
-      ? "automatic"
-      : DEFAULT_RUN_POLICY.tetoActivation);
   const policy = {
     maxMainStepsPerActivation: allowance,
     ...(input.maxModelTokens === undefined
@@ -38,12 +32,14 @@ export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
       : { maxModelTokens: input.maxModelTokens }),
     mainRequestTimeoutMs: input.mainRequestTimeoutMs
       ?? DEFAULT_MAIN_REQUEST_TIMEOUT_MS,
-    tetoEnabled: input.tetoEnabled ?? DEFAULT_RUN_POLICY.tetoEnabled,
+    tetoEnabled: input.auxiliaryMode === "none" || input.auxiliaryMode === "reflection"
+      ? false
+      : input.tetoEnabled ?? DEFAULT_RUN_POLICY.tetoEnabled,
     tetoMaxOutputTokens: input.tetoMaxOutputTokens ?? DEFAULT_RUN_POLICY.tetoMaxOutputTokens,
     ...(input.tetoTokenRatio === undefined
       ? {}
       : { tetoTokenRatio: input.tetoTokenRatio }),
-    tetoActivation: defaultTetoActivation,
+    tetoActivation: input.tetoActivation ?? DEFAULT_RUN_POLICY.tetoActivation,
     workerEnabled: input.workerEnabled ?? DEFAULT_RUN_POLICY.workerEnabled ?? false,
     ...(input.auxiliaryMode === undefined ? {} : { auxiliaryMode: input.auxiliaryMode }),
     ...(input.tetoAdviceDelivery === undefined

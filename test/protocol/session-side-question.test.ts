@@ -47,7 +47,7 @@ describe("session side questions", () => {
 
       const request = model.requests[1]!;
       const effectivePrompt = await session.systemPrompt();
-      expect(request.systemPrompt).toContain("You are Main");
+      expect(request.systemPrompt).toContain("You are Nausicaa");
       expect(request.systemPrompt).toBe(effectivePrompt);
       expect(request.systemPrompt).toContain(`Workspace root: ${JSON.stringify(session.workspace)}`);
       expect(request.systemPrompt).toContain("Keep answers exact.");

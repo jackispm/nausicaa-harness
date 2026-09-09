@@ -294,14 +294,12 @@ describe("runtime activation parity", () => {
     ]);
   });
 
-  it("assembles the same unified Teto lane contract around Main", async () => {
+  it("starts the same unified Teto observer by default in one-shot and interactive Runs", async () => {
     const root = await temporaryRoot();
     const runId = "activation-teto-contract";
     const task = "Complete six bounded decisions";
     const sidecarGoal: Goal = { ...sharedGoal, statement: task };
     const policy = {
-      tetoEnabled: true,
-      tetoActivation: "automatic",
       maxMainStepsPerActivation: 6,
       maxModelTokens: 50_000,
     } as const;

@@ -444,7 +444,7 @@ export interface SessionControllerOptions {
   workerEnabled?: boolean;
   /** Explicit Fukai capability settings; omitted keeps the legacy disabled path. */
   fukaiCompaction?: FukaiCompactionPolicy;
-  /** Manual leaves Teto dormant until Main calls `teto_start`. */
+  /** Automatic starts Teto on first Run initialization; manual leaves it dormant until `teto_start`. */
   tetoActivation?: TetoActivationMode;
   policy?: Partial<RunPolicy>;
   maxOutputTokens?: number;
@@ -654,14 +654,6 @@ export class SessionController {
       ...(options.tetoActivation === undefined
         ? {}
         : { tetoActivation: options.tetoActivation }),
-      ...(options.tetoActivation !== undefined || options.policy?.tetoActivation !== undefined
-        ? {}
-        : {
-            tetoActivation: options.policy?.maxMainSteps !== undefined
-              || options.policy?.auxiliaryMode === "teto"
-              ? "automatic"
-              : "manual",
-          }),
     });
   }
 
@@ -1176,7 +1168,10 @@ export class SessionController {
     this.assertOpen();
     const instructions = await loadProjectInstructions(this.workspace);
     return composeFukaiSystemPrompt(
-      effectiveSystemPrompt({ collaborationMode: this.collaborationMode }),
+      effectiveSystemPrompt({
+        collaborationMode: this.collaborationMode,
+        policy: this.attached?.policy ?? this.policy,
+      }),
       this.workspace,
       instructions.files,
     );
@@ -2831,23 +2826,14 @@ export class SessionController {
         readWatermark: () => attached.ledger.watermark(),
         clock: this.clock,
         tokenBudget: tetoBudget,
+        autoStart: attached.policy.tetoActivation !== "manual",
         ...(createTetoCompactionRuntime === undefined
           ? {}
           : { createCompactionRuntime: createTetoCompactionRuntime }),
         policyVersion: deriveRuntimePolicyVersion(attached.policy),
       });
       attached.teto = teto;
-      await teto.ensureAvailable();
-      if (attached.policy.tetoActivation !== "manual") {
-        await teto.start({
-          runId: attached.runId,
-          laneId: "main",
-          workspace: this.workspace,
-          operationId: `${attached.runId}:teto:auto-start`,
-        });
-      } else {
-        await teto.restoreIfRequested();
-      }
+      await teto.restoreIfRequested();
     }
 
     const branchModel = this.deps.workerModel

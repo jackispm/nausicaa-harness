@@ -1,5 +1,5 @@
 import type { AgentTool, ToolResult } from "../domain/ports.js";
-import { isAbsolute } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { sha256, stableJson } from "../ledger/hash.js";
 import {
   validateEdgeContextContribution,
@@ -287,7 +287,7 @@ function renderModelEntries(
   entries: readonly RuntimeSkillCatalogModelEntry[],
 ): string {
   return [
-    "Available Skills (metadata only). Call `skill` with an exact name to load instructions when needed.",
+    "Available Skills (metadata only). When a request matches a listed Skill, call `skill` with its exact name to load the instructions.",
     `<available_skills generation="${generation}">`,
     ...entries.map((entry) => [
       "  <skill>",
@@ -361,7 +361,7 @@ export function createRuntimeSkillTool(
   const tool: AgentTool = {
     definition: {
       name: "skill",
-      description: "Load the full instructions for an available Skill, or read one text resource referenced by that Skill. Use an exact name from the current Skill catalog. Omit resourcePath to load the instructions; when provided, resourcePath is resolved relative to the Skill directory.",
+      description: "Load the full instructions for an available Skill, or read one text resource referenced by that Skill. Use an exact name from the current Skill catalog. Omit resourcePath to load instructions; resourcePath is relative to the Skill directory. Resolve script and asset paths against the returned skillLocation.baseDirectory.",
       parameters: {
         type: "object",
         properties: {
@@ -403,6 +403,7 @@ export function createRuntimeSkillTool(
           throw new Error(`Skill ${name} is no longer model-invocable`);
         }
         const contentHash = contribution.contentHash ?? sha256(contribution.body ?? "");
+        const skillLocation = readSkillLocation(loaded);
         if (resourcePath === undefined) {
           if (typeof contribution.body !== "string") throw new Error(`Skill ${name} returned no instruction body`);
           const bodyBytes = Buffer.byteLength(contribution.body, "utf8");
@@ -415,6 +416,9 @@ export function createRuntimeSkillTool(
             generation: catalog.generation,
             contentHash,
             instructions: contribution.body,
+            ...(skillLocation === undefined
+              ? {}
+              : { skillLocation }),
           });
         }
         const resources = readResources(contribution).map((candidate) => ({
@@ -453,6 +457,9 @@ export function createRuntimeSkillTool(
           resourcePath: resource.relativePath,
           contentHash: sha256(resource.content),
           content: resource.content,
+          ...(skillLocation === undefined
+            ? {}
+            : { skillLocation }),
         });
       } catch (error: unknown) {
         return failure(error);
@@ -568,6 +575,10 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function requiredName(value: unknown): string {
   if (typeof value !== "string" || !SKILL_NAME.test(value) || value.length > 64) {
     throw new TypeError("name must be an exact model-invocable Skill name");
@@ -626,6 +637,20 @@ function validateLoadedContribution(value: unknown): EdgeContextContribution {
     return Object.freeze(enriched) as EdgeContextContribution;
   }
   return contribution;
+}
+
+function readSkillLocation(value: unknown):
+  { readonly filePath: string; readonly baseDirectory: string } | undefined {
+  if (!isRecord(value)) return undefined;
+  // Only the adapter's host-owned extension may supply reference locations.
+  const descriptor = Object.getOwnPropertyDescriptor(value, "skillLocation");
+  if (descriptor === undefined || descriptor.enumerable || !isRecord(descriptor.value)) return undefined;
+  const { filePath, baseDirectory } = descriptor.value;
+  if (typeof filePath !== "string" || typeof baseDirectory !== "string"
+    || !isAbsolute(filePath) || !isAbsolute(baseDirectory)
+    || /[\u0000-\u001f\u007f]/u.test(filePath + baseDirectory)
+    || dirname(filePath) !== baseDirectory) return undefined;
+  return Object.freeze({ filePath, baseDirectory });
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

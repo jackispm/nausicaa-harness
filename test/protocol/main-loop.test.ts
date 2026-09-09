@@ -37,6 +37,7 @@ import {
 } from "../../src/runtime/main-loop.js";
 import { projectMainExecutionRecovery } from "../../src/runtime/recovery.js";
 import { RunTokenBudget } from "../../src/runtime/run-token-budget.js";
+import { createTetoControlTools } from "../../src/runtime/teto-control-tool.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
 import {
   artifactReadPointer,
@@ -52,6 +53,40 @@ afterEach(async () => {
 });
 
 describe("MainLoop", () => {
+  it.each(["default", "plan"] as const)("aligns Teto guidance with the %s request's control tools", async (collaborationMode) => {
+    const workspace = await temporaryDirectory();
+    const store = new MemoryContentAddressedStore();
+    const model = new ScriptedModel([(request) => {
+      const names = request.tools.map((tool) => tool.name);
+      expect(names).toContain("teto_status");
+      expect(names.includes("teto_stop")).toBe(collaborationMode === "default");
+      expect(request.systemPrompt.includes("teto_stop")).toBe(collaborationMode === "default");
+      expect(request.systemPrompt).toContain("starts automatically by default");
+      return { content: "done", toolCalls: [], stopReason: "stop", usage: tokenUsage(5, 2) };
+    }]);
+    const loop = new MainLoop({
+      model,
+      contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(store)),
+      conversationStore: store,
+      eventSink: new MemoryLedger(),
+      tools: createTetoControlTools({
+        start: async () => ({ active: true, changed: true }),
+        stop: async () => ({ active: false, changed: true }),
+        status: () => ({ active: true, available: true }),
+      }),
+    });
+    expect((await loop.run({
+      runId: `teto-prompt-${collaborationMode}`,
+      goal: { version: 1, statement: "Inspect the request", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: { ...policy(1), tetoEnabled: true, tetoActivation: "automatic" },
+      collaborationMode,
+      initialMessage: "Inspect",
+    })).completed).toBe(true);
+    expect(model.callCount).toBe(1);
+  });
+
   it("does not preserve a Skill schema from a historical catalog marker", async () => {
     const workspace = await temporaryDirectory();
     const store = new MemoryContentAddressedStore();
@@ -537,7 +572,7 @@ describe("MainLoop", () => {
     });
 
     const prompt = model.requests[0]?.systemPrompt ?? "";
-    expect(prompt).toContain("You are Main, the primary execution lane in Nausicaa.");
+    expect(prompt).toContain("You are Nausicaa, a next-generation general-purpose task agent.");
     expect(prompt).toContain("complete tool-call interface");
     expect(prompt).not.toContain("Match all user-visible progress and final answers");
     expect(prompt).not.toContain("Search before broad traversal");

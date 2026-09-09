@@ -35,7 +35,7 @@ describe("scoped lane context validation", () => {
 });
 
 describe("Teto capability guidance", () => {
-  it.each([false, true])("encourages early observation without changing recommended=%s metadata", (recommended) => {
+  it.each([false, true])("describes lifecycle controls without changing recommended=%s metadata", (recommended) => {
     const manifest = createTetoCapabilityManifest({
       workspaceId: "workspace",
       sessionId: "session",
@@ -45,10 +45,8 @@ describe("Teto capability guidance", () => {
     });
     const lifecycle = manifest.capabilities.find((capability) => capability.kind === "lifecycle");
     expect(lifecycle?.name).toBe(recommended ? "recommended-for-this-run" : "optional-for-this-run");
-    expect(lifecycle?.description).toContain("complex analysis, debugging, planning, or review");
-    expect(lifecycle?.description).toContain("open Teto early through the available control tool");
-    expect(lifecycle?.description).toContain("Reuse an active lane and keep working while it observes");
-    expect(lifecycle?.description).toContain("For simple tasks, weigh the value against the overhead");
+    expect(lifecycle?.description).toContain("teto_stop to close this observer");
+    expect(lifecycle?.description).toContain("teto_start to reopen it");
     expect(renderLaneCapabilityManifest([manifest])).toContain(lifecycle!.description);
     expect(manifest.role).toBe("Main-owned observer lane");
     expect(manifest.state).toBe("dormant");

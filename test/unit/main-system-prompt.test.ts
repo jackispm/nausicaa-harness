@@ -2,15 +2,35 @@ import { describe, expect, it } from "vitest";
 
 import { effectiveSystemPrompt } from "../../src/runtime/main-loop.js";
 
-describe("Main collaboration guidance", () => {
-  it("encourages early, focused Teto collaboration only when the tool is available", () => {
+describe("Nausicaa identity and collaboration guidance", () => {
+  it("introduces Nausicaa and its default observer without a task-selection playbook", () => {
     const prompt = effectiveSystemPrompt({});
-    expect(prompt).toContain("When teto_start is available, proactively open Teto early");
-    expect(prompt).toContain("reason documents why to open the lane, not a task assignment to Teto");
-    expect(prompt).toContain("Reuse an active Teto, keep working while it observes");
-    expect(prompt).toContain("respect the host's permissions and budgets");
-    expect(prompt).toContain("Brief factual answers and trivial one-step tasks usually do not need it");
+    expect(prompt).toMatch(/^You are Nausicaa, a next-generation general-purpose task agent\./u);
+    expect(prompt).toContain("Teto is your auxiliary observer lane");
+    expect(prompt).toContain("public messages and tool requests");
+    expect(prompt).toContain("advice through A2A");
+    expect(prompt).toContain("starts automatically by default");
+    expect(prompt).toContain("teto_stop to stop it");
+    expect(prompt).not.toContain("You are Main");
+    expect(prompt.split(/\s+/u).length).toBeLessThan(120);
     expect(effectiveSystemPrompt({ collaborationMode: "plan" })).toContain("Plan mode is active");
+  });
+
+  it("describes explicit manual mode accurately and omits disabled Teto", () => {
+    const manual = effectiveSystemPrompt({ policy: { tetoEnabled: true, tetoActivation: "manual" } });
+    expect(manual).toContain("available on demand");
+    expect(manual).toContain("teto_start to restart it");
+    expect(manual).not.toContain("automatically");
+    expect(effectiveSystemPrompt({ policy: { tetoEnabled: false } })).not.toContain("Teto");
+  });
+
+  it("omits lifecycle directions when control tools are absent from the request", () => {
+    for (const options of [{ tetoControlsAvailable: false }, { collaborationMode: "plan" as const }]) {
+      const prompt = effectiveSystemPrompt(options);
+      expect(prompt).toContain("starts automatically by default");
+      expect(prompt).not.toContain("teto_start");
+      expect(prompt).not.toContain("teto_stop");
+    }
   });
 
   it("retains explicitly supplied system prompts", () => {

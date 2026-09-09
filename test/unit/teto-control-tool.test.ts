@@ -20,13 +20,12 @@ function control() {
 }
 
 describe("Teto control tools", () => {
-  it("encourages early independent observation and lets simple tasks weigh the overhead", () => {
+  it("describes observer lifecycle controls concisely", () => {
     const tools = createTetoControlTools(control());
     const description = tools[0]!.definition.description;
-    expect(description).toContain("Open Teto early for complex analysis, debugging, planning, or review");
-    expect(description).toContain("observes public events and offers a second perspective, not task execution");
-    expect(description).toContain("An active lane is reused; keep working while it observes");
-    expect(description).toContain("For simple tasks, weigh the overhead");
+    expect(description).toContain("Start or restart your Teto observer");
+    expect(description).toContain("Reuses an active lane");
+    expect(description).toContain("reason explains why to enable observation");
     expect(() => createLaneCapabilityManifest({
       schemaVersion: 1,
       lane: { workspaceId: "workspace", sessionId: "session", runId: "run", laneId: "main", laneKind: "main" },

@@ -87,12 +87,11 @@ import {
   type ArtifactReadStore,
 } from "../tools/artifact-read.js";
 
-const DEFAULT_SYSTEM_PROMPT = `You are Main, the primary execution lane in Nausicaa.
+const DEFAULT_SYSTEM_PROMPT = `You are Nausicaa, a next-generation general-purpose task agent.
 Handle the current user request with the runtime-provided context and tools.
 The tools attached to this request are the complete tool-call interface; runtime results are authoritative.
-When teto_start is available, proactively open Teto early for multi-step analysis, investigation, debugging, planning, implementation, or review where an independent perspective can help. State the value of that second perspective in the reason, such as checking assumptions, finding missed risks, or evaluating alternatives; reason documents why to open the lane, not a task assignment to Teto.
-Teto is an independent sensing and thinking lane that observes your public work and offers feedback, not a replacement for your own execution or verification. Reuse an active Teto, keep working while it observes, and evaluate its feedback against evidence. You do not need separate user approval to use this available collaboration tool; respect the host's permissions and budgets. Brief factual answers and trivial one-step tasks usually do not need it.
 Return a grounded result when the current request is complete.`;
+const TETO_OVERVIEW = "Teto is your auxiliary observer lane: it follows your public messages and tool requests and can send advice through A2A.";
 
 /** Conservative per-request input ceiling for custom ports without model metadata. */
 export const UNKNOWN_MODEL_REQUEST_INPUT_FALLBACK_TOKENS = 32_768;
@@ -678,7 +677,11 @@ export class MainLoop {
           ...(input.activeObjective === undefined
             ? {}
             : { activeObjective: input.activeObjective }),
-          systemPrompt: effectiveSystemPrompt(input),
+          systemPrompt: effectiveSystemPrompt({
+            ...input,
+            tetoControlsAvailable: tools.some((tool) => tool.name === "teto_stop")
+              && tools.some((tool) => tool.name === "teto_start"),
+          }),
           projectInstructions: projectInstructions?.files ?? [],
           ...(projectInstructionsManifest === undefined
             ? {}
@@ -1850,6 +1853,9 @@ function boundedToolArguments(arguments_: Record<string, unknown>): string {
 
 export interface MainSystemPromptOptions {
   systemPrompt?: string;
+  policy?: Pick<RunPolicy, "tetoEnabled" | "tetoActivation">;
+  /** Actual request catalog; prompt previews default to the collaboration mode. */
+  tetoControlsAvailable?: boolean;
   collaborationMode?: "default" | "plan";
   laneCapabilityManifests?: readonly LaneCapabilityManifest[];
 }
@@ -1862,8 +1868,16 @@ export function effectiveSystemPrompt(
   const manifests = input.laneCapabilityManifests === undefined
     ? ""
     : renderLaneCapabilityManifest(input.laneCapabilityManifests);
+  const tetoControlsAvailable = input.tetoControlsAvailable ?? input.collaborationMode !== "plan";
   return [
     base,
+    input.systemPrompt !== undefined || input.policy?.tetoEnabled === false
+      ? undefined
+      : [
+          TETO_OVERVIEW,
+          input.policy?.tetoActivation === "manual" ? "It is available on demand." : "It starts automatically by default.",
+          ...(tetoControlsAvailable ? ["Use teto_stop to stop it and teto_start to restart it."] : []),
+        ].join(" "),
     input.collaborationMode === "plan" ? PLAN_MODE_PROMPT : undefined,
     manifests.length === 0 ? undefined : manifests,
   ].filter((part): part is string => part !== undefined).join("\n\n");

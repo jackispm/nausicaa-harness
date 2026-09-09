@@ -3,17 +3,26 @@ import { describe, expect, it } from "vitest";
 import { resolveRunPolicy } from "../../src/runtime/run-policy.js";
 
 describe("run policy", () => {
-  it("makes Worker delegation available by default without activating Teto automatically", () => {
+  it("makes Worker delegation available and activates Teto by default", () => {
     expect(resolveRunPolicy()).toMatchObject({
       workerEnabled: true,
       tetoEnabled: true,
-      tetoActivation: "manual",
+      tetoActivation: "automatic",
     });
   });
 
   it("preserves explicit Worker and Teto opt-outs", () => {
     expect(resolveRunPolicy({ workerEnabled: false, tetoEnabled: false }))
       .toMatchObject({ workerEnabled: false, tetoEnabled: false });
+  });
+
+  it("preserves explicit manual Teto activation", () => {
+    expect(resolveRunPolicy({ tetoActivation: "manual" }))
+      .toMatchObject({ tetoEnabled: true, tetoActivation: "manual" });
+  });
+
+  it.each(["none", "reflection"] as const)("does not auto-start Teto in the %s auxiliary mode", (auxiliaryMode) => {
+    expect(resolveRunPolicy({ auxiliaryMode })).toMatchObject({ auxiliaryMode, tetoEnabled: false });
   });
 
   it("gives tool-using Teto room for complete messages and preserves explicit output caps", () => {

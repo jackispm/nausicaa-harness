@@ -54,16 +54,63 @@ describe("runtime Skill catalog and tool", () => {
     expect(renderRuntimeSkillCatalog(catalog)).not.toContain("<safe>");
   });
 
+  it("omits an oversized description without invalidating other Skills", () => {
+    const snapshot = {
+      generation: 1,
+      contextContributions: [summary("large", "a".repeat(513)), summary("small", "Brief description")],
+    };
+    const registry = { loadContribution: async () => ({}) };
+    const catalog = captureRuntimeSkillCatalog({ snapshot, registry });
+    expect(catalog.complete).toBe(true);
+    expect(catalog.modelEntries).toEqual([{ name: "small", description: "Brief description" }]);
+    expect(catalog.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "description-limit", name: "large" }),
+    ]));
+    expect(() => createRuntimeSkillTool(catalog, registry, { snapshot })).not.toThrow();
+  });
+
+  it.each([
+    { filePath: "skills/docs/SKILL.md", baseDirectory: "skills/docs" },
+    { filePath: "/workspace/skills/docs/SKILL.md", baseDirectory: "/workspace/other" },
+    { filePath: "/workspace/skills/\0docs/SKILL.md", baseDirectory: "/workspace/skills/\0docs" },
+  ])("omits malformed adapter reference locations: %j", async (location) => {
+    const snapshot = { generation: 1, contextContributions: [summary("docs", "docs")] };
+    const registry = {
+      loadContribution: async (candidate: EdgeContextContributionSummary) => {
+        const loaded = { ...candidate, body: "# Docs\n" };
+        Object.defineProperty(loaded, "skillLocation", { value: location, enumerable: false });
+        return loaded;
+      },
+    };
+    const catalog = captureRuntimeSkillCatalog({ snapshot, registry });
+    const result = await createRuntimeSkillTool(catalog, registry).execute({ name: "docs" }, {
+      runId: "run", workspace: "/workspace", operationId: "invalid-location",
+    });
+    expect(result.isError).toBe(false);
+    const body = JSON.parse(result.content);
+    expect(body.instructions).toBe("# Docs\n");
+    expect(body).not.toHaveProperty("skillLocation");
+  });
+
   it("pins exact summary and snapshot, and returns stable instruction/resource envelopes", async () => {
     const snapshot = { generation: 3, contextContributions: [summary("docs", "docs")] };
     let call: { summary: unknown; context: Record<string, unknown> } | undefined;
     const registry = {
       loadContribution: async (candidate: EdgeContextContributionSummary, context: Record<string, unknown>) => {
         call = { summary: candidate, context };
-        return {
+        const loaded = {
           ...candidate,
           body: "# Docs\n",
         };
+        Object.defineProperty(loaded, "skillLocation", {
+          configurable: false,
+          enumerable: false,
+          value: {
+            filePath: "/workspace/skills/docs/SKILL.md",
+            baseDirectory: "/workspace/skills/docs",
+          },
+        });
+        return loaded;
       },
     };
     const catalog = captureRuntimeSkillCatalog({ snapshot, registry });
@@ -81,6 +128,10 @@ describe("runtime Skill catalog and tool", () => {
       generation: 3,
       contentHash: sha256("# Docs\n"),
       instructions: "# Docs\n",
+      skillLocation: {
+        filePath: "/workspace/skills/docs/SKILL.md",
+        baseDirectory: "/workspace/skills/docs",
+      },
     });
     expect(call?.summary).toBe(catalog.entries[0]?.summary);
     expect(call?.context.snapshot).toBe(snapshot);
@@ -90,10 +141,10 @@ describe("runtime Skill catalog and tool", () => {
     const resourceRegistry = {
       loadContribution: async (candidate: EdgeContextContributionSummary, context: Record<string, unknown>) => {
         call = { summary: candidate, context };
-        return withLoadedResources({
+        return withLoadedLocation(withLoadedResources({
           ...candidate,
           body: "# Docs\n",
-        }, [{ relativePath: "references/example.md", content: "example\n" }]);
+        }, [{ relativePath: "references/example.md", content: "example\n" }]));
       },
     };
     const resourceTool = createRuntimeSkillTool(catalog, resourceRegistry, { snapshot });
@@ -109,6 +160,10 @@ describe("runtime Skill catalog and tool", () => {
       generation: 3,
       resourcePath: "references/example.md",
       content: "example\n",
+      skillLocation: {
+        filePath: "/workspace/skills/docs/SKILL.md",
+        baseDirectory: "/workspace/skills/docs",
+      },
     });
     expect(call?.context.resourcePaths).toEqual(["references/example.md"]);
   });
@@ -269,6 +324,18 @@ function withLoadedResources(
     configurable: false,
     enumerable: false,
     value: resources,
+  });
+  return value;
+}
+
+function withLoadedLocation(value: object): object {
+  Object.defineProperty(value, "skillLocation", {
+    configurable: false,
+    enumerable: false,
+    value: {
+      filePath: "/workspace/skills/docs/SKILL.md",
+      baseDirectory: "/workspace/skills/docs",
+    },
   });
   return value;
 }

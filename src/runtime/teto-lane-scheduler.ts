@@ -53,7 +53,7 @@ import { RunTokenBudget } from "./run-token-budget.js";
 const DEFAULT_MAIN_LANE = "main";
 const DEFAULT_TETO_LANE = "teto";
 const DEFAULT_STOP_WAIT_MS = 250;
-const DEFAULT_TETO_SYSTEM_PROMPT = `You are Teto, an independent observer lane assisting your owner lane.
+const DEFAULT_TETO_SYSTEM_PROMPT = `You are Nausicaa operating as Teto, an independent observer lane assisting your owner lane.
 Observe the supplied public activity and choose whether an observation, question, or suggestion is useful.
 Use the available tools for your observer work; you do not take over the owner's task.`;
 const TETO_OBSERVATION_CONTRACT = `Input contract:

@@ -29,7 +29,7 @@ export function createTetoControlTools(control: TetoControl): readonly AgentTool
   const start: AgentTool = {
     definition: {
       name: "teto_start",
-      description: "Open Teto early for complex analysis, debugging, planning, or review. It observes public events and offers a second perspective, not task execution. An active lane is reused; keep working while it observes. For simple tasks, weigh the overhead.",
+      description: "Start or restart your Teto observer. Reuses an active lane; the reason explains why to enable observation.",
       parameters: {
         type: "object",
         properties: { reason: { type: "string", description: "Why a second thinking line is useful" } },

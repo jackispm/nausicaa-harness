@@ -186,6 +186,109 @@ describe("Teto and Team lane architecture", () => {
     await restored.close();
   });
 
+  it("auto-starts once, preserves an explicit stop across recovery, and allows reopening", async () => {
+    const ledger = new MemoryLedger({ clock });
+    const inbox = new A2AInbox({ sink: ledger, clock });
+    const store = new MemoryContentAddressedStore();
+    const model = new RecordingModel(() => response("Observed"));
+    const runId = "automatic-teto-control";
+    const controllers: TetoLaneController[] = [];
+    const createController = () => {
+      const controller = new TetoLaneController({
+        eventSink: ledger, inbox, store, model, modelName: "scripted-teto", runId,
+        goal, policy, workspace: "/workspace", clock, autoStart: true,
+        readEvents: () => ledger.read({ runId }),
+        readWatermark: () => ledger.watermark(),
+      });
+      controllers.push(controller);
+      return controller;
+    };
+    try {
+      const first = createController();
+      expect(await Promise.all([first.restoreIfRequested(), first.restoreIfRequested()]))
+        .toEqual([true, true]);
+      expect(first.active).toBe(true);
+      expect(model.callCount).toBe(0);
+      expect(await first.stop(context(runId, "main"))).toMatchObject({ active: false, changed: true });
+
+      const messageRef = await store.put(JSON.stringify({
+        role: "user", content: "Observe the next task", createdAt: clock.now().toISOString(),
+      }), MESSAGE_MEDIA_TYPE);
+      const event = await ledger.append({
+        runId, laneId: "main", type: "user.message", payload: { messageRef },
+        correlationId: runId, idempotencyKey: "main:after-stop", visibility: "run",
+      });
+      first.observeMainEvent(event);
+      await first.drain();
+      expect(model.callCount).toBe(0);
+      await first.close();
+
+      const restored = createController();
+      expect(await restored.restoreIfRequested()).toBe(false);
+      expect(restored.active).toBe(false);
+      await restored.drain();
+      expect(model.callCount).toBe(0);
+      expect(await restored.start(context(runId, "main"))).toMatchObject({ active: true, changed: true });
+      await restored.drain();
+      expect(model.callCount).toBe(1);
+      const controls = (await ledger.read({ runId })).flatMap((item) => (
+        item.type === "lane.status" && item.laneId === "teto" && item.payload.control !== undefined
+          ? [item.payload.control.action] : []
+      ));
+      expect(controls).toEqual(["start", "stop", "start"]);
+    } finally {
+      await Promise.all(controllers.map((controller) => controller.close()));
+    }
+  });
+
+  it("restores automatic Teto after host close without adding another start control", async () => {
+    const ledger = new MemoryLedger({ clock });
+    const inbox = new A2AInbox({ sink: ledger, clock });
+    const options = {
+      eventSink: ledger, inbox, store: new MemoryContentAddressedStore(),
+      model: new RecordingModel(() => response("Observed")), modelName: "scripted-teto",
+      runId: "automatic-teto-host-close", goal, policy, workspace: "/workspace", clock,
+      autoStart: true,
+      readEvents: () => ledger.read({ runId: "automatic-teto-host-close" }),
+      readWatermark: () => ledger.watermark(),
+    };
+    const first = new TetoLaneController(options);
+    const restored = new TetoLaneController(options);
+    try {
+      expect(await first.restoreIfRequested()).toBe(true);
+      await first.close();
+      expect(await restored.restoreIfRequested()).toBe(true);
+      expect(await restored.restoreIfRequested()).toBe(true);
+      expect(restored.active).toBe(true);
+      const controls = (await ledger.read({ runId: options.runId })).filter((event) => (
+        event.type === "lane.status" && event.laneId === "teto" && event.payload.control !== undefined
+      ));
+      expect(controls).toHaveLength(1);
+      expect(controls[0]?.payload).toMatchObject({ control: { action: "start", requestedBy: "main" } });
+    } finally {
+      await first.close();
+      await restored.close();
+    }
+  });
+
+  it("does not auto-start when policy disables Teto", async () => {
+    const ledger = new MemoryLedger({ clock });
+    const controller = new TetoLaneController({
+      eventSink: ledger, inbox: new A2AInbox({ sink: ledger, clock }),
+      store: new MemoryContentAddressedStore(), model: new RecordingModel(() => response("Observed")),
+      modelName: "scripted-teto", runId: "disabled-automatic-teto", goal,
+      policy: { ...policy, tetoEnabled: false }, workspace: "/workspace", clock, autoStart: true,
+      readEvents: () => ledger.read(),
+    });
+    try {
+      expect(await controller.restoreIfRequested()).toBe(false);
+      expect(controller.available).toBe(false);
+      expect(await ledger.read()).toEqual([]);
+    } finally {
+      await controller.close();
+    }
+  });
+
   it("rolls back Teto when the durable start status cannot be written", async () => {
     const ledger = new FailFirstTetoStartLedger();
     const inbox = new A2AInbox({ sink: ledger, clock });
@@ -214,6 +317,77 @@ describe("Teto and Team lane architecture", () => {
       changed: true,
     });
     await controller.close();
+  });
+
+  it("retries automatic startup when persisting its start control fails", async () => {
+    const ledger = new FailFirstTetoStartLedger();
+    const controller = new TetoLaneController({
+      eventSink: ledger, inbox: new A2AInbox({ sink: ledger, clock }),
+      store: new MemoryContentAddressedStore(), model: new RecordingModel(() => response("Observed")),
+      modelName: "scripted-teto", runId: "automatic-teto-start-rollback", goal, policy,
+      workspace: "/workspace", clock, autoStart: true,
+      readEvents: () => ledger.read({ runId: "automatic-teto-start-rollback" }),
+      readWatermark: () => ledger.watermark(),
+    });
+    try {
+      await expect(controller.restoreIfRequested()).rejects.toThrow(/injected Teto start failure/u);
+      expect(controller.active).toBe(false);
+      expect(await controller.restoreIfRequested()).toBe(true);
+      expect(controller.active).toBe(true);
+    } finally {
+      await controller.close();
+    }
+  });
+
+  it("keeps Teto active after a rejected stop and preserves the successful retry on recovery", async () => {
+    const ledger = new FailFirstTetoStopLedger();
+    const inbox = new A2AInbox({ sink: ledger, clock });
+    const store = new MemoryContentAddressedStore();
+    const model = new RecordingModel(() => response("Still observing"));
+    const runId = "teto-stop-retry";
+    const options = {
+      eventSink: ledger, inbox, store, model, modelName: "scripted-teto", runId,
+      goal, policy, workspace: "/workspace", clock, autoStart: true,
+      readEvents: () => ledger.read({ runId }),
+      readWatermark: () => ledger.watermark(),
+    };
+    const controller = new TetoLaneController(options);
+    const restored = new TetoLaneController(options);
+    try {
+      expect(await controller.restoreIfRequested()).toBe(true);
+      await expect(controller.stop(context(runId, "main")))
+        .rejects.toThrow("injected Teto stop failure");
+      expect(controller.active).toBe(true);
+      expect((await ledger.read({ runId })).some((event) => (
+        event.type === "lane.status" && event.payload.control?.action === "stop"
+      ))).toBe(false);
+
+      const messageRef = await store.put(JSON.stringify({
+        role: "user", content: "The rejected stop did not disable observation", createdAt: clock.now().toISOString(),
+      }), MESSAGE_MEDIA_TYPE);
+      controller.observeMainEvent(await ledger.append({
+        runId, laneId: "main", type: "user.message", payload: { messageRef },
+        correlationId: runId, idempotencyKey: "main:after-stop-failure", visibility: "run",
+      }));
+      await controller.drain();
+      expect(model.callCount).toBe(1);
+
+      expect(await controller.stop(context(runId, "main")))
+        .toMatchObject({ active: false, changed: true });
+      expect(await controller.stop(context(runId, "main")))
+        .toMatchObject({ active: false, changed: false });
+      await controller.close();
+      expect(await restored.restoreIfRequested()).toBe(false);
+      expect(restored.active).toBe(false);
+      const controls = (await ledger.read({ runId })).flatMap((event) => (
+        event.type === "lane.status" && event.laneId === "teto" && event.payload.control !== undefined
+          ? [event.payload.control.action] : []
+      ));
+      expect(controls).toEqual(["start", "stop"]);
+    } finally {
+      await controller.close();
+      await restored.close();
+    }
   });
 
   it("runs a Team branch as an ordinary lane with its own optional Teto and returns a later-boundary result", async () => {
@@ -607,6 +781,19 @@ class FailFirstTetoStartLedger extends MemoryLedger {
     ) {
       this.failed = true;
       throw new Error("injected Teto start failure");
+    }
+    return super.append(input);
+  }
+}
+
+class FailFirstTetoStopLedger extends MemoryLedger {
+  private failed = false;
+
+  override async append<K extends EventType>(input: AppendEvent<K>) {
+    if (!this.failed && input.type === "lane.status"
+      && "control" in input.payload && input.payload.control?.action === "stop") {
+      this.failed = true;
+      throw new Error("injected Teto stop failure");
     }
     return super.append(input);
   }

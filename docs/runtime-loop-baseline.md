@@ -1,6 +1,6 @@
 # Runtime Loop Baseline
 
-Source audit for the 0.1.2 work, 2026-09-08. This records the current execution
+Source audit for the 0.1.2 work, updated 2026-09-09. This records the current execution
 paths, not a promise that every Lane already runs through one generic kernel.
 Existing private design notes remain historical; their proposed L0 integration
 must not be mistaken for a completed production migration.
@@ -8,16 +8,14 @@ must not be mistaken for a completed production migration.
 ## Production Entry Points
 
 - Interactive CLI opens `SessionController`; it composes Main, optional Worker,
-  ordinary Teto, and Team runtimes
+  ordinary Teto (enabled and started by default), and Team runtimes
   ([CLI](../src/cli.ts#L546), [composition](../src/runtime/session-controller.ts#L2690)).
-- Non-interactive CLI calls `executeRun` and currently supplies the legacy
-  `maxMainSteps` policy field
-  ([CLI](../src/cli.ts#L709)). `executeRun` selects legacy Teto for that field or
-  a recovered legacy policy; an explicit evaluation `auxiliaryMode` also selects
-  the compatibility path
-  ([selection](../src/runtime/run-runtime.ts#L328)). Legacy Teto is therefore
-  not exclusively test-only. Changing this CLI policy field changes behavior,
-  not just terminology.
+- Non-interactive CLI calls `executeRun` with `maxMainStepsPerActivation`,
+  using the same ordinary Teto observer and lifecycle controls as interactive
+  sessions ([CLI](../src/cli.ts#L709)). Embedders that explicitly supply legacy
+  `maxMainSteps`, recovered legacy policies, and explicit evaluation
+  `auxiliaryMode` still use the compatibility path
+  ([selection](../src/runtime/run-runtime.ts#L328)).
 - The default daemon runtime factory also opens `SessionController`
   ([factory](../src/runtime/daemon-runtime.ts#L153)).
 
@@ -115,7 +113,10 @@ let existing production runtimes use it without duplicating conversations or
 losing operation identity, context rebuilding, approval, budget settlement,
 boundary delivery, and crash recovery.
 
-For this release, preserve and clarify the existing paths. Focused regression
+For this release, preserve and clarify the existing paths. Teto is enabled and
+started automatically for a new Run unless the policy explicitly chooses
+`tetoEnabled: false` or `tetoActivation: "manual"`; an explicit `teto_stop`
+control remains authoritative across recovery. Focused regression
 tests should pin the behavior that matters: provider-aborted responses cannot
 execute tools or produce observer advice; usage still settles; a cancelled
 task cannot start a model; committed terminal results are not replayed; and

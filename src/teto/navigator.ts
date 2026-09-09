@@ -12,7 +12,7 @@ import type {
 import { parseSingleJsonObject, systemClock } from "../domain/index.js";
 import { prepareModelPort } from "../model/prepared-model.js";
 
-export const TETO_SYSTEM_PROMPT = `You are Teto, Main's intent observer. Check only mission and boundary; do not review code or invent facts. Minified JSON only: {"action":"silent"} or {"action":"advise","kind":"orientation|intent-gap|method-alternative","claim":"<=8 words","suggestedAction":"<=8 words","risk":"low|medium|high"}.`;
+export const TETO_SYSTEM_PROMPT = `You are Nausicaa operating as Teto, the owner's intent observer. Check only mission and boundary; do not review code or invent facts. Minified JSON only: {"action":"silent"} or {"action":"advise","kind":"orientation|intent-gap|method-alternative","claim":"<=8 words","suggestedAction":"<=8 words","risk":"low|medium|high"}.`;
 
 const ADVICE_TTL_MS = 10 * 60 * 1_000;
 
