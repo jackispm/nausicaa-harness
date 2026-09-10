@@ -226,6 +226,8 @@ interface BrowserPage {
 interface BrowserDriver { newPage(): Promise<BrowserPage>; close(): Promise<void> }
 
 async function captureBrowser(workspace: string, output: string, phase: "before" | "after") {
+  const capturedAt = new Date().toISOString();
+  const artifactSha256 = await fileHash(join(workspace, "index.html"));
   const pageErrors: string[] = [];
   const consoleMessages: Array<{ type: string; text: string }> = [];
   const checkpoints: Record<string, unknown>[] = [];
@@ -280,6 +282,7 @@ async function captureBrowser(workspace: string, output: string, phase: "before"
       await lastPage.screenshot({ path: join(output, `${phase}-failure.png`), fullPage: true }).catch(() => undefined);
     }
   } finally { await browser?.close(); }
+  if (await fileHash(join(workspace, "index.html")) !== artifactSha256) error ??= "Artifact changed during browser capture";
   const at = (stage: string) => checkpoints.find((checkpoint) => checkpoint.stage === stage);
   const numeric = (stage: string, key: string) => Number(String(at(stage)?.[key] ?? "").replace(/[^\d.-]/g, ""));
   const checks = {
@@ -293,7 +296,7 @@ async function captureBrowser(workspace: string, output: string, phase: "before"
     noPageErrors: pageErrors.length === 0,
     noConsoleErrors: consoleMessages.every((message) => message.type !== "error"),
   };
-  return { error, pageErrors, consoleMessages, checkpoints, checks, headless: process.env.NAUSICAA_FLIGHT_HEADFUL !== "1",
+  return { capturedAt, artifactSha256, error, pageErrors, consoleMessages, checkpoints, checks, headless: process.env.NAUSICAA_FLIGHT_HEADFUL !== "1",
     scope: "Real Chrome file load, rendered screenshots, keyboard thrust/turn, pointer-locked mouse motion, pause and resume. This smoke does not exhaust collision, flight physics, or visual quality." };
 }
 

@@ -4260,9 +4260,15 @@ describe("interactive TUI", () => {
     let releaseMember = (_response: ModelResponse): void => {};
     let releaseLead = (_response: ModelResponse): void => {};
     let releaseTool = (): void => {};
+    let markMemberStarted = (): void => {};
+    let markLeadWaiting = (): void => {};
+    let markToolStarted = (): void => {};
     const memberGate = new Promise<ModelResponse>((resolve) => { releaseMember = resolve; });
     const leadGate = new Promise<ModelResponse>((resolve) => { releaseLead = resolve; });
     const toolGate = new Promise<void>((resolve) => { releaseTool = resolve; });
+    const memberStarted = new Promise<void>((resolve) => { markMemberStarted = resolve; });
+    const leadWaiting = new Promise<void>((resolve) => { markLeadWaiting = resolve; });
+    const toolStarted = new Promise<void>((resolve) => { markToolStarted = resolve; });
     let mainCalls = 0;
     let memberCalls = 0;
     let session: SessionController | undefined;
@@ -4275,11 +4281,13 @@ describe("interactive TUI", () => {
         if (mainCalls === 1) return response("Creating a team", [{ id: "create-ui-team", name: "team_create",
           arguments: { teamId: "flight", members: [{ memberId: "physics", statement: "Polish the aircraft mesh" }] },
         }], "toolUse");
-        if (mainCalls === 2) return leadGate;
+        if (mainCalls === 2) { markLeadWaiting(); return leadGate; }
         return response("UI_DONE");
       }
       memberCalls += 1;
-      return memberCalls === 1 ? memberGate : response("REPORT_UI_READY: aircraft mesh improved");
+      expect(request.tools.some((tool) => tool.name === "mesh_test")).toBe(true);
+      if (memberCalls === 1) { markMemberStarted(); return memberGate; }
+      return response("REPORT_UI_READY: aircraft mesh improved");
     } };
     try {
       session = await SessionController.open({
@@ -4288,18 +4296,28 @@ describe("interactive TUI", () => {
       }, {
         mainModel: model,
         workerModel: model,
-        tools: [{ definition: { name: "mesh_test", description: "Check the aircraft mesh", parameters: { type: "object", properties: {} } },
-          async execute() { await toolGate; return { content: "mesh checked", isError: false }; } }],
+        tools: [],
+        teamTools: [{ definition: { name: "mesh_test", description: "Check the aircraft mesh", parameters: { type: "object", properties: {} } },
+          async execute() { markToolStarted(); await toolGate; return { content: "mesh checked", isError: false }; } }],
       });
       running = runInteractive({ session, terminal, forceAltScreen });
       await terminal.started;
       terminal.type("Make the flight game prettier with a team");
       terminal.send("\r");
-      await waitForCondition(() => mainCalls === 2 && memberCalls === 1, "both lanes started");
+      await Promise.all([leadWaiting, memberStarted]);
       await waitForOutput(terminal, "flight/physics");
       await waitForOutput(terminal, "waiting for model");
       releaseMember(response("Checking mesh", [{ id: "mesh-tool", name: "mesh_test", arguments: {} }], "toolUse"));
-      await waitForOutput(terminal, "executing mesh_test");
+      // Start the rendering deadline after durable tool admission, not while
+      // the model result and Operation are still being persisted.
+      await toolStarted;
+      expect(session.teamActivity().members[0]).toMatchObject({
+        phase: "tools", tools: ["mesh_test"], completedTools: 0,
+      });
+      await waitForCondition(
+        () => normalizeTerminalOutput(terminal.output).includes("executing mesh_test"),
+        "executing Team tool is rendered",
+      );
       terminal.send("\x1b");
       await waitForCondition(() => session!.snapshot().status === "idle", "lead interruption");
       releaseLead(response("retired lead result"));
@@ -4308,6 +4326,9 @@ describe("interactive TUI", () => {
       await waitForOutput(terminal, "REPORT_UI_READY");
       await waitForOutput(terminal, "report ready");
       expect(session.teamActivity().members[0]).toMatchObject({ phase: "reported", completedTools: 1 });
+      expect(requests.filter((request) => request.laneId !== "main").at(-1)?.messages).toContainEqual(
+        expect.objectContaining({ role: "tool", content: "mesh checked", isError: false }),
+      );
       expect(mainCalls).toBe(2);
       terminal.type("Summarize the reports");
       terminal.send("\r");

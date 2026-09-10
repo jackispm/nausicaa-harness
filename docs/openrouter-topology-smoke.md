@@ -157,6 +157,20 @@ step, and the default prompt now explicitly requires acting before ending a
 turn. Neither a successful model stop nor that prompt rule is an automatic
 test of whether a natural-language request was fulfilled.
 
+The continued CLI task completed through the existing Team: a reviewer
+identified cockpit nodes, the original developer reduced and repositioned the
+frame, and the same reviewer reread the changed file before lead acceptance
+and close. The final turn completed at Ledger offset 1571. The new screenshot
+shows a clear central horizon, and the nine Chrome controls/error checks still
+pass. This required explicit host feedback about browser failure, visibility,
+and a promised-but-unexecuted assignment, plus Escape/resume to load the TUI
+repair. It is a completed real Team repair cycle with recorded interventions,
+not an unattended reliability pass. Artifacts are under the same flight record's
+`cli-bx8U4r/visibility-check` directory; the final Chrome capture in
+`cli-bx8U4r/final` includes its timestamp and artifact SHA-256. A different local
+Run later continued editing the workspace, so these checks apply to the saved
+capture version, not those later changes. The later working file was preserved.
+
 This natural run exposed a gap in the short observation fixtures. Replaying
 its original long Chinese request reproduced routine A2A; merely tightening
 the system wording did not solve it. The final change gives each observer
