@@ -4,6 +4,24 @@ All notable changes to Nausicaa are documented here.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-09-11
+
+- Show Team member phases, current tools, and time since activity in both TUI
+  modes. Render public group messages and reports while the lead is interrupted.
+- Cache session and Team activity projections by Ledger revision so animation
+  frames do not repeatedly clone and project a growing event log.
+- Keep transcript margins at a stable render width so TUI animation does not
+  repeatedly invalidate historical tool and Markdown layouts and stall work.
+- Yield active task waits for new Team collaboration and other member reports;
+  preserve the original task, avoid repeated delivery, and reject circular waits.
+  Deliver nested-Team reports through the member lead's ordinary boundaries.
+- Record forced cancellation of explicitly read/compute tools as cancelled
+  failures; retain unknown outcomes for uncertain side effects.
+- Give Teto an observer-specific A2A schema without progress updates and clarify
+  that missing observations do not prove the owner skipped an action. Separate
+  its current observation objective from quoted owner requests; keep silent
+  notes as ordinary text. Add real-provider replays of recorded observations.
+
 ## [0.1.6] - 2026-09-11
 
 - Preserve the current Run, conversation, and asynchronous Team work when

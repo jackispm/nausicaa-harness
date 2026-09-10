@@ -234,6 +234,15 @@ const validPayloads = {
   "team.created": teamDefinition,
   "team.member.added": { teamId: "team-1", member: { ...teamMember, task: { ...teamTask, taskId: "team-1:alpha" } },
     addedBy: "main", operationId: "add-alpha" },
+  "team.task.assigned": {
+    teamId: "team-1", taskId: teamTask.taskId, memberId: "alpha", laneId: teamMember.laneId,
+    assignmentVersion: 1, task: teamTask, assignedBy: "main", operationId: "assign-alpha",
+  },
+  "team.run.reported": {
+    teamId: "team-1", taskId: teamTask.taskId, laneId: teamMember.laneId,
+    assignmentVersion: 0, kind: "ready-for-review", summary: "Review complete",
+    artifactRefs: [], openQuestions: [], reportId: "report-alpha", runId: "run-1",
+  },
   "team.message.sent": {
     teamId: "team-1",
     channelId: "general",
@@ -567,6 +576,8 @@ const validPayloads = {
 const invalidPayloads = {
   "team.created": { ...teamDefinition, members: [{ ...teamMember, dependsOn: ["missing"] }] },
   "team.member.added": { ...validPayloads["team.member.added"], member: { ...teamMember, laneId: "main" } },
+  "team.task.assigned": { ...validPayloads["team.task.assigned"], taskId: "mismatched-task" },
+  "team.run.reported": { ...validPayloads["team.run.reported"], reportId: "" },
   "team.message.sent": { ...validPayloads["team.message.sent"], sequence: 0 },
   "team.closed": { ...validPayloads["team.closed"], reason: "" },
   "team.member.settled": {

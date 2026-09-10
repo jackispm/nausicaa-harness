@@ -874,7 +874,7 @@ export const executeRun = async (
                     messageId: outputContinuationMessageId,
                   }];
               outputContinuationMessageId = undefined;
-              return [
+              const messages = [
                 ...continuation,
                 ...await (
                   scheduler !== undefined && "beforeMainStep" in scheduler
@@ -884,6 +884,8 @@ export const executeRun = async (
                 ...await (workerScheduler?.beforeMainStep({ step }) ?? Promise.resolve([])),
                 ...await (teamRuntime?.beforeMainStep({ step }) ?? Promise.resolve([])),
               ];
+              teamRuntime?.observeBoundaryMessages("main", messages);
+              return messages;
             },
             ...(scheduler === undefined && workerScheduler === undefined
               && teamRuntime === undefined

@@ -35,6 +35,7 @@ export interface SessionLaneMessage {
   from: string;
   to: string;
   payloadType: "message.inform" | "question.ask" | "question.answer";
+  teamChannel?: { teamId: string; channelId: string };
   sourceEndpoint?: CrossRunEndpoint;
   targetEndpoint?: CrossRunEndpoint;
   relationship?: CrossRunRelationship;
@@ -71,6 +72,17 @@ export type SessionTranscriptEntry =
 /** Only explicit public lane communication belongs beside Main's transcript. */
 export function projectSessionLaneMessage(event: AnyEvent, runId: string): SessionLaneMessage | undefined {
   if (event.runId !== runId || !isTranscriptVisible(event.visibility)) return undefined;
+  if (event.type === "team.message.sent") {
+    if (event.laneId !== event.payload.fromLane) return undefined;
+    return {
+      role: "agent", content: event.payload.body,
+      turnId: event.turnId ?? legacyTurnIdForTranscript(runId),
+      messageId: `team-channel:${event.eventId}`,
+      from: event.payload.fromLane, to: `team:${event.payload.teamId}`,
+      payloadType: "message.inform",
+      teamChannel: { teamId: event.payload.teamId, channelId: event.payload.channelId },
+    };
+  }
   if (event.type === "a2a.outbox.pending") {
     return projectSessionCrossRunMessage(event, runId);
   }

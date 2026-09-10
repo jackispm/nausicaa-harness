@@ -38,7 +38,7 @@ const live = new TopologyLiveModel(createOpenRouterModelPort({ models }), {
   maxOutputTokens, timeoutMs: 120_000,
   inputPrice: Math.max(price.input, price.cacheRead, price.cacheWrite), outputPrice: price.output,
 });
-const caseIds = ["workspace", "worker", "team-sequential", "team-calendar", "team-natural-calendar", "team-peer-reducer", "resume-fork", "teto", "teto-restraint", "team-cancel"] as const;
+const caseIds = ["workspace", "worker", "team-sequential", "team-calendar", "team-natural-calendar", "team-peer-reducer", "resume-fork", "teto", "teto-restraint", "teto-flight-replay", "team-cancel"] as const;
 // Development, review, repair, and re-review each require real provider turns.
 const teamTurnTimeoutMs = 10 * 60_000;
 type CaseId = typeof caseIds[number];
@@ -96,8 +96,9 @@ try {
       else if (id === "team-natural-calendar") await naturalTeamCalendarCase(f);
       else if (id === "team-peer-reducer") await teamPeerCase(f);
       else if (id === "teto") await tetoCase(f);
-      else if (id === "teto-restraint") {
-        const probe = await runTetoRestraintProbe({ live, modelName: model!, runId: f.runId, workspace: f.workspace, policy: policy(true) });
+      else if (id === "teto-restraint" || id === "teto-flight-replay") {
+        const probe = await runTetoRestraintProbe({ live, modelName: model!, runId: f.runId, workspace: f.workspace, policy: policy(true),
+          scenario: id === "teto-flight-replay" ? "flight-replay" : "restraint" });
         Object.assign(f, probe);
         if (probe.error !== undefined) throw new Error(probe.error);
       }
@@ -136,7 +137,7 @@ async function persist(): Promise<void> {
     limits: live.limits, pricesSource: "Installed pi-ai OpenRouter catalog; reservations are not a billing guarantee",
     requests: live.calls.length, usage: live.usage, knownCostUsd: live.knownCostUsd,
     costComplete: !live.uncertain,
-    invocation: "Guided probes and a natural-language calendar case use provider responses. teto-restraint supplies fixed owner observation fixtures; only Teto's decisions and A2A calls come from the provider, using its production scheduler and prompt.",
+    invocation: "Guided probes and a natural-language calendar case use provider responses. teto-restraint and teto-flight-replay supply fixed owner observation fixtures; only Teto's decisions and A2A calls come from the provider, using its production scheduler and prompt.",
     requestCounting: "ModelPort calls, not a claim about provider-internal HTTP retries",
     cases: reports,
   }, null, 2));

@@ -124,6 +124,8 @@ export interface EventPayloadMap {
   "team.created": TeamDefinition;
   "team.member.added": import("./team.js").TeamMemberAddition;
   "team.member.settled": TeamMemberSettlement;
+  "team.task.assigned": TeamTaskAssignment;
+  "team.run.reported": TeamRunReport & { reportId: string; runId: string };
   "team.joined": TeamJoined;
   "team.cancel.requested": { teamId: string; reason: string; requestedBy: LaneId };
   "team.cancelled": { teamId: string; reason: string };

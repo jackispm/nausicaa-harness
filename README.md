@@ -53,14 +53,18 @@ Team 的主管由实际创建它的 lane 决定，负责汇总和判断结果。
 成员每次任务的最终报告自动进入群里的任务线程；`team_message` 用于群协作，A2A 用于私信。
 群消息通过 `mentions` 送到成员的下一轮上下文；`nausicaa` 是根主管的地址。
 未提及成员的聊天按需翻页查看，已完成成员由 `team_assign` 派发后续任务。
-`task_wait` 真正等待结果，`team_status` 才是即时查询。主管可以安排返工和复验，
+`task_wait` 等待结果；期间收到新的团队协作消息或其他成员报告，也会返回控制权，
+让主管先处理消息，原任务继续运行。`team_status` 用于即时查询。主管可以安排返工和复验，
 普通调度分段结束后会自动继续，不会仅因达到默认 24 步而要求手动恢复。
+
+TUI 的成员状态区显示正在等模型、执行的工具、等待任务，以及距上次活动的时间。
+群消息和成员最终报告会出现在对话里，可以展开查看；主管被打断时仍会更新。
 
 主管无需为成员填写 token 预算、轮数或总时长限制。新任务也没有隐藏的“两轮结束”
 或“30 分钟截止”默认值。交互会话保持打开时，主管可以先结束当前轮次；成员继续工作，
 结果返回后主管自动继续协调。关闭会话或取消任务会停止相关工作。
 
-当前版本：`0.1.6` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
+当前版本：`0.1.7` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
 edge 集成仍在完善。
 
 ### 快速开始
@@ -140,6 +144,7 @@ Nausicaa，也可以是有自己名字的团队成员。
 
 Teto 默认对所属 Agent 保持沉默，但可以在自己的对话记录中记下简短观察。
 只有新的高价值建议时，它才主动发 A2A；直接收到 A2A 协作请求时，可以作实质性答复。
+Teto 的消息工具不提供 `progress` 类型；提示词也明确，没观察到某项操作不代表主管没执行。
 积压的观察事件会合并处理，完全重复的主动提醒会去重，长任务仍可收到不同的新建议。
 订阅内容是观察资料，不是交给 Teto 执行的用户任务。
 
@@ -213,12 +218,17 @@ Build Teams incrementally: `team_create` starts ready work, then `team_assign`
 adds a member or reuses an existing one with a concise handoff. No `dependsOn`
 graph is required. Every task's final report enters the shared task thread;
 `team_message` is for group coordination and A2A is private. `task_wait` waits
-for the result; `team_status` is an immediate snapshot. The lead can assign
+for the result or yields control for new Team messages and other member reports,
+while the original task keeps running. `team_status` is an immediate snapshot. The lead can assign
 repairs and reviews and continues across ordinary scheduling slices without
 a manual resume at the default 24-step boundary.
 Group `mentions` deliver messages at the recipient's next boundary; `nausicaa`
 addresses the root lead. Unmentioned chat is paged on demand, and completed
 members receive further work through `team_assign`.
+
+The TUI shows each member's model, tool, or task-wait phase and time since its
+last activity. Expandable group messages and final reports appear in the
+transcript, including while the lead is interrupted.
 
 Members start with independent contexts and, by default, inherit the Team
 Lead's host-authorized workspace tool catalog. The lead can narrow a member
@@ -234,7 +244,7 @@ session, the lead may finish its current turn while members keep working;
 durable reports automatically resume coordination. Session closure or task
 cancellation stops the corresponding work.
 
-Current version: `0.1.6` beta. Core runtime contracts have offline test coverage;
+Current version: `0.1.7` beta. Core runtime contracts have offline test coverage;
 provider, daemon, RPC, and edge integrations are still evolving.
 
 ### Quick start
@@ -330,6 +340,8 @@ coordination requests. Subscribed content is observation material, not
 a user task assigned to Teto.
 Queued observations are coalesced and exact repeated unsolicited notes are
 deduplicated, while distinct new findings can still arrive during long tasks.
+Teto's message tool omits the `progress` kind, and its prompt distinguishes
+missing observations from evidence that the owner skipped an action.
 
 During execution, `Esc` or `Ctrl+C` preserves context and asynchronous Teams
 for your next input. Member reports remain available but do not automatically

@@ -41,6 +41,7 @@ export * from "./team-tool.js";
 export * from "./team-channel.js";
 export * from "./team-runtime.js";
 export * from "./team-board.js";
+export * from "./team-activity.js";
 export * from "./team-branch-executor.js";
 export * from "./agent-message-tool.js";
 export * from "./cross-run-runtime.js";

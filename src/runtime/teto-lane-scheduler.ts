@@ -58,7 +58,8 @@ const DEFAULT_STOP_WAIT_MS = 250;
 const MAX_OBSERVATION_BATCH = 32;
 const TETO_OBSERVATION_GUIDANCE = `Your core tasks:
 1. Detect drift from the user's intent or constraints.
-2. Suggest improvements when the current solution is inadequate or a materially better approach is available.
+2. Suggest a materially better approach when observed evidence supports it.
+Missing or truncated observations are not evidence that your owner skipped work.
 Keep routine observations in your own transcript. Use agent_message only for a new, concrete finding that would change your owner's next action, or to answer a direct A2A request. Do not repeat advice already sent or addressed. Otherwise finish with NO_UPDATE and no tool calls.`;
 
 export interface TetoLaneSchedulerOptions {
@@ -258,7 +259,20 @@ export class TetoLaneScheduler {
       definition: {
         ...defaultTool.definition,
         description: "Notify your owner of a concrete intent deviation or a materially better solution. Routine progress and speculative requirements belong in your private notes. Omit target to use the bound owner; use replyTo for a direct A2A reply. queued confirms admission, not that the recipient has read it.",
+        parameters: {
+          ...defaultTool.definition.parameters,
+          properties: {
+            ...defaultTool.definition.parameters.properties,
+            text: { type: "string", minLength: 1, maxLength: 8_192,
+              description: "A new finding supported by observed evidence, or the answer to your owner's direct request" },
+            kind: { type: "string", enum: ["inform", "request"],
+              description: "inform shares a finding or answer; request asks your owner a question needed to resolve a concrete concern" },
+          },
+        },
       },
+      execute: (arguments_, context) => arguments_.kind === "progress"
+        ? Promise.resolve({ isError: true, content: JSON.stringify({ error: "Teto keeps progress in its own transcript; agent_message accepts inform or request" }) })
+        : defaultTool.execute(arguments_, context),
     };
     this.tools = options.tools === undefined
       // The preregistered auxiliary arm explicitly freezes an empty tool
@@ -491,6 +505,8 @@ export class TetoLaneScheduler {
         model: this.modelName,
         workspace: this.workspace,
         goal: this.goal,
+        // Pin Teto's own task after the owner's observed request and activity.
+        activeObjective: "Evaluate the observed behavior and any direct A2A request; if no response is needed, output NO_UPDATE as plain assistant text with no tool calls.",
         policy: this.policy,
         systemPrompt: this.systemPrompt,
         laneKind: "intent-navigator",

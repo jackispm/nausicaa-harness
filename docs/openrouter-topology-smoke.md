@@ -7,7 +7,7 @@ Most prompts explicitly request the topology under test. The separate
 `team-natural-calendar` case uses an ordinary Chinese product request, without
 tool names, prefilled arguments, or anti-polling instructions. It asks for
 separate development/review responsibilities and leaves coordination to the agent.
-The `teto-restraint` case instead supplies fixed owner observations to isolate
+The `teto-restraint` and `teto-flight-replay` cases instead supply fixed owner observations to isolate
 Teto's behavior; its observer responses still come from the real provider.
 
 The runner reuses Nausicaa's pi-ai adapter, workspace tools, `executeRun`, and
@@ -51,6 +51,7 @@ when any selected case fails or is skipped.
 | `resume-fork` | Recall an unpredictable identifier after reopening, then modify the total in a fork | Current turns complete, inherited context, durable fork lineage, unchanged parent Ledger |
 | `teto` | Main opens an observer, requests a shipping reminder, reports amounts back | Labelled public observations, actual messaging tools, both directions consumed and visible in the hydrated transcript, no duplicate messages or self-addressed sends, token round trip |
 | `teto-restraint` | Feed the production observer fixed greetings, routine reads, intent drift and a direct A2A question | Silence on routine observations, a concrete warning on an unauthorized write plan, correctly associated direct reply, durable source projections present in model context |
+| `teto-flight-replay` | Replay five public observation phases from the reported flight-game session with sanitized paths and IDs | Silence without failed tool attempts during the first three routine phases; later Team-phase messages retained for human review; real observer inference and source projection |
 | `team-cancel` | Main creates then cancels a reader Team | Durable cancellation and cancelled task outcome, no later success |
 
 Worker and the `teto` round-trip use the persistent session entry point intentionally. They do
@@ -118,6 +119,63 @@ These checks validate the smoke's local safety mechanisms. They do not count
 as successful OpenRouter or multi-topology live runs.
 
 ## Recorded Review
+
+The first flight-polish run used the production interactive entry point with
+a recorded terminal and OpenRouter in the existing `test1` workspace. Nausicaa
+created a developer, waited for its real edit and report, added an independent
+reviewer, then accepted and summarized. All 13 collaboration/TUI checks passed;
+49 model calls took 696 seconds and reported $0.1980594044. However, independent
+Chrome testing still failed to start the game, and four routine Teto messages
+were unhelpful. The overall task is recorded as failed despite structural
+collaboration success. Record: `flight-team-live/2026-09-10T19-34-11-152Z-kk6WsL`.
+
+A follow-up used the literal source CLI under a PTY and resumed the same Run.
+Nausicaa's own developer repaired duplicate pointer-lock requests from the
+start-button click bubbling to the document handler. Independent Chrome checks
+then passed WebGL initialization, start, thrust, keyboard and mouse steering,
+Escape pause, resume, and absence of JavaScript/console errors (nine checks).
+The host did not edit the game. The screenshot still showed an oversized cockpit
+frame obscuring the horizon; functional checks alone do not establish visual
+quality, so that observation was returned to Nausicaa for review.
+
+This CLI also exposed a TUI CPU stall: a live profile attributed 92.1% of samples
+to rendering. The fixed-margin HStack alternated full and inset widths and
+invalidated historical tool/Markdown caches on every frame. With the same
+57-block transcript, the corrected single-width Box rendering averaged 0.69ms
+after warmup; the earlier HStack measurement averaged about 220ms. These are
+local timing samples, not a cross-machine performance guarantee. All 216
+geometry comparisons passed, including narrow widths, ANSI, CJK and cursor
+markers. The resumed CLI's Teto still sent some routine/speculative notes;
+the explicit observation objective improves the recorded probes but does not
+guarantee useful advice throughout a natural long task.
+
+This natural run exposed a gap in the short observation fixtures. Replaying
+its original long Chinese request reproduced routine A2A; merely tightening
+the system wording did not solve it. The final change gives each observer
+request an explicit observation objective and specifies plain-text `NO_UPDATE`
+with no tool calls. Four recorded phases then produced zero tool calls and
+zero A2A, with successful provider responses. Record:
+`teto-recorded-plain-text-hjfRiV`. The separate restraint probe also passed,
+including an actual intent-drift warning and a linked direct reply. Record:
+`2026-09-10T19-52-00-541Z-2FG2Fi`. These passes are individual samples, not a
+guarantee that every future unsolicited message is useful.
+
+To repeat the recorded-input check with an existing local Run:
+
+```sh
+NAUSICAA_TETO_RECORDED_LIVE=1 node --env-file=.env --import tsx test/eval/teto-recorded-restraint.ts /absolute/path/to/ledger.jsonl replay
+```
+
+The script reads source artifacts, runs only Teto, and writes a separate
+report under `.local`. A model failure cannot count as silence.
+
+The updated observer passed both restraint probes with
+`openrouter:deepseek/deepseek-v4-pro-0813`: all five flight observation phases
+were silent, a deliberate read-only violation produced one warning, and a
+direct question received one linked reply. Nine model calls reported
+$0.0109814628 with complete accounting. Record:
+`2026-09-10T19-27-19-344Z-ZGMi6q`. These are fixed owner observations with real
+Teto inference, not proof of general restraint or a natural Team task.
 
 The 0.1.6 calendar probe passed all 12 checks using
 `openrouter:deepseek/deepseek-v4-pro-0813`. The lead and two persistent members

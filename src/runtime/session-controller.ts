@@ -102,6 +102,8 @@ import {
   resolvePendingToolOperation,
 } from "./recovery.js";
 import { persistedErrorText } from "./redaction.js";
+import type { MoweAgentTool } from "../mowe/types.js";
+import { projectTeamActivity, type TeamActivitySnapshot } from "./team-activity.js";
 import {
   normalizeFukaiCompactionPolicy,
   resolveRunPolicy,
@@ -551,6 +553,7 @@ interface ActiveTurn {
   inputId: string;
   controller: AbortController;
   retired?: boolean;
+  cancellationSafeTools?: ReadonlySet<string>;
 }
 
 export class SessionController {
@@ -589,6 +592,18 @@ export class SessionController {
     runId: string;
     lastOffset: number;
     summary: WorkerTaskSummary;
+  } | undefined;
+  private snapshotLedgerCache: {
+    sink: SessionEventSink;
+    revision: number;
+    turnId: string | undefined;
+    model: string;
+    value: Pick<SessionSnapshot, "usage" | "pendingInputs" | "blocker" | "lastCommittedStep" | "mainContextTokens">;
+  } | undefined;
+  private teamActivityCache: {
+    sink: SessionEventSink;
+    revision: number;
+    value: TeamActivitySnapshot;
   } | undefined;
   private attached: AttachedRun | undefined;
   private active: ActiveTurn | undefined;
@@ -1048,12 +1063,36 @@ export class SessionController {
   }
 
   snapshot(): SessionSnapshot {
-    const events = this.attached?.sink.cachedEvents ?? [];
-    const usage = this.attached === undefined
-      ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-      : recoverRunTokenUsage(events, this.attached.runId);
-    const pending = projectPendingAdmissions(events);
-    const blocker = blockingReason(events);
+    const attached = this.attached;
+    const turnId = this.active?.turnId;
+    const model = this.model;
+    if (attached === undefined) {
+      this.snapshotLedgerCache = undefined;
+    } else if (
+      this.snapshotLedgerCache?.sink !== attached.sink
+      || this.snapshotLedgerCache.revision !== attached.sink.cacheRevision
+      || this.snapshotLedgerCache.turnId !== turnId
+      || this.snapshotLedgerCache.model !== model
+    ) {
+      // Animation frames reuse these projections. Revision also changes on
+      // cache replacement, which may preserve or lower the last event offset.
+      const events = attached.sink.cachedEvents;
+      const blocker = blockingReason(events);
+      this.snapshotLedgerCache = {
+        sink: attached.sink,
+        revision: attached.sink.cacheRevision,
+        turnId,
+        model,
+        value: {
+          usage: recoverRunTokenUsage(events, attached.runId),
+          pendingInputs: projectPendingAdmissions(events).length,
+          lastCommittedStep: turnId === undefined ? 0 : highestTurnStep(events, turnId),
+          mainContextTokens: latestMainContextTokens(events, model),
+          ...(blocker === undefined ? {} : { blocker }),
+        },
+      };
+    }
+    const derived = this.snapshotLedgerCache?.value;
     return {
       workspace: this.workspace,
       ...(this.attached === undefined ? {} : { runId: this.attached.runId }),
@@ -1062,7 +1101,7 @@ export class SessionController {
         ? {}
         : { goal: structuredClone(this.attached.threadGoal) }),
       status: this.status,
-      model: this.model,
+      model,
       ...(this.thinkingLevel === undefined ? {} : { thinkingLevel: this.thinkingLevel }),
       tetoEnabled: this.attached?.policy.tetoEnabled ?? this.policy.tetoEnabled,
       workerEnabled: this.attached?.policy.workerEnabled === true
@@ -1075,15 +1114,30 @@ export class SessionController {
       workspaceBashAvailability: structuredClone(
         this.workspaceCommandSandbox.availability(),
       ),
-      pendingInputs: pending.length,
-      lastCommittedStep: this.active === undefined
-        ? 0
-        : highestTurnStep(events, this.active.turnId),
-      mainContextTokens: latestMainContextTokens(events, this.model),
+      pendingInputs: derived?.pendingInputs ?? 0,
+      lastCommittedStep: derived?.lastCommittedStep ?? 0,
+      mainContextTokens: derived?.mainContextTokens ?? null,
       mainContextWindowTokens: this.selectedModelContextWindowTokens() ?? null,
-      usage,
-      ...(blocker === undefined ? {} : { blocker }),
+      usage: { ...(derived?.usage ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }) },
+      ...(derived?.blocker === undefined ? {} : { blocker: derived.blocker }),
     };
+  }
+
+  /** Compact activity metadata for Team status displays. */
+  teamActivity(): TeamActivitySnapshot {
+    const attached = this.attached;
+    if (attached === undefined) {
+      this.teamActivityCache = undefined;
+      return { members: [] };
+    }
+    if (this.teamActivityCache?.sink !== attached.sink || this.teamActivityCache.revision !== attached.sink.cacheRevision) {
+      this.teamActivityCache = {
+        sink: attached.sink,
+        revision: attached.sink.cacheRevision,
+        value: projectTeamActivity(attached.sink.cachedEvents, attached.runId),
+      };
+    }
+    return structuredClone(this.teamActivityCache.value);
   }
 
   /** Project current context capacity separately from cumulative Run spend. */
@@ -3529,6 +3583,12 @@ export class SessionController {
       // Optional runtime capabilities are host-owned too; append edge tools
       // only after they are admitted so an edge cannot shadow their names.
       const admittedTools = appendPermittedEdgeTools(tools, edgeProjection.edgeSnapshot, turnCapabilities);
+      // Only explicit metadata on the captured tool can prove cancellation
+      // has no uncertain external effect. Unannotated extensions stay unknown.
+      turn.cancellationSafeTools = new Set(admittedTools.flatMap((tool) => {
+        const effect = (tool as MoweAgentTool).metadata?.effect;
+        return effect === "read" || effect === "compute" ? [tool.definition.name.trim()] : [];
+      }));
       let latestEvents = await attached.ledger.read({ runId: attached.runId });
       const recoveredMain = projectMainExecutionRecovery(latestEvents);
       const preTurnConversationRefs = projectMainExecutionRecovery(
@@ -3604,7 +3664,7 @@ export class SessionController {
                 messageId: outputContinuationMessageId,
               }];
           outputContinuationMessageId = undefined;
-          return [
+          const messages = [
             ...continuation,
             ...this.takeGoalSteering(turn.turnId),
             ...await this.deliverSteering(turn.turnId, step),
@@ -3612,6 +3672,8 @@ export class SessionController {
             ...await (attached.worker?.scheduler.beforeMainStep({ step }) ?? Promise.resolve([])),
             ...await (attached.team?.beforeMainStep({ step }) ?? Promise.resolve([])),
           ];
+          attached.team?.observeBoundaryMessages("main", messages);
+          return messages;
         },
         ...(attached.teto === undefined && attached.worker === undefined && attached.team === undefined
           ? {}
@@ -4076,7 +4138,8 @@ export class SessionController {
         visibility: "run",
       });
     }
-    const unknown = pendingStartedToolRequests(events, attached.runId, turn.turnId);
+    const unknown = pendingStartedToolRequests(events, attached.runId, turn.turnId)
+      .filter((request) => request.laneId !== "main" || !turn.cancellationSafeTools?.has(request.payload.name));
     const terminalOperations = new Set(events.flatMap((event) => (
       event.type === "tool.succeeded" || event.type === "tool.failed" || event.type === "tool.unknown"
         ? [event.payload.operationId] : []
@@ -4089,9 +4152,10 @@ export class SessionController {
       && event.laneId === "main"
       && event.turnId === turn.turnId
       && !terminalOperations.has(event.payload.operationId)
-      && !startedOperations.has(event.payload.operationId)
+      && (!startedOperations.has(event.payload.operationId) || turn.cancellationSafeTools?.has(event.payload.name) === true)
     ))) {
-      const error = "Tool was cancelled before execution";
+      const started = startedOperations.has(request.payload.operationId);
+      const error = started ? "Tool execution was cancelled" : "Tool was cancelled before execution";
       const resultRef = await attached.store.put(stableJson({
         role: "tool", toolCallId: request.payload.toolCallId, toolName: request.payload.name,
         content: error, isError: true, createdAt: this.clock.now().toISOString(),
@@ -4103,7 +4167,7 @@ export class SessionController {
           name: request.payload.name, error, resultRef,
         },
         causationId: request.eventId, correlationId: request.correlationId,
-        idempotencyKey: `${attached.runId}:turn:${turn.turnId}:tool:${request.payload.operationId}:cancelled-before-start`,
+        idempotencyKey: `${attached.runId}:turn:${turn.turnId}:tool:${request.payload.operationId}:${started ? "cancelled" : "cancelled-before-start"}`,
         visibility: "run",
       });
     }
@@ -5084,6 +5148,7 @@ class SessionEventSink implements Ledger {
   private active = true;
   private events: AnyEvent[];
   private lastOffset: number;
+  private revision = 0;
 
   constructor(
     private readonly ledger: Ledger,
@@ -5104,9 +5169,14 @@ class SessionEventSink implements Ledger {
     return this.lastOffset;
   }
 
+  get cacheRevision(): number {
+    return this.revision;
+  }
+
   replaceCache(events: readonly AnyEvent[]): void {
     this.events = [...events];
     this.lastOffset = highestGlobalOffset(events);
+    this.revision += 1;
   }
 
   deactivate(): void {
@@ -5151,6 +5221,7 @@ class SessionEventSink implements Ledger {
     if (!this.events.some((candidate) => candidate.eventId === event.eventId)) {
       this.events.push(event as AnyEvent);
       this.lastOffset = Math.max(this.lastOffset, event.globalOffset);
+      this.revision += 1;
       this.onEvent({ kind: "event", event: event as AnyEvent });
     }
     return event;

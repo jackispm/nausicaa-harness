@@ -31,6 +31,7 @@ import type {
   CrossRunRelationship,
 } from "../domain/types.js";
 import type { SessionLaneMessage } from "../runtime/session-artifacts.js";
+import type { TeamActivityPhase, TeamActivitySnapshot } from "../runtime/team-activity.js";
 import {
   renderToolPresentation,
   type ToolPresentationLine,
@@ -266,6 +267,9 @@ export const NAUSICAA_LOGO_MARK = "█";
 
 /** Render a component inside a stable horizontal margin without changing its height. */
 export class HorizontalInset extends HStack {
+  private readonly box: Box;
+  private readonly inset: number;
+
   constructor(child: Component, padding = 1) {
     const inset = Math.max(0, Math.floor(padding));
     super([
@@ -273,6 +277,22 @@ export class HorizontalInset extends HStack {
       { component: child, basis: 0, grow: 1, shrink: 1, minSize: 1 },
       { component: new Spacer(1), basis: inset, shrink: 1, minSize: 0 },
     ]);
+    this.inset = inset;
+    this.box = new Box(inset, 0);
+    this.box.addChild(child);
+  }
+
+  override render(width: number): string[] {
+    const safeWidth = Math.max(1, width);
+    // Keep HStack's layout node for the dock, but avoid its intrinsic-width
+    // probe: alternating full/inset widths invalidates the whole transcript.
+    if (safeWidth <= this.inset * 2) return super.render(safeWidth);
+    const lines = this.box.render(safeWidth);
+    return lines.length === 0 && this.inset > 0 ? [" ".repeat(safeWidth)] : lines;
+  }
+
+  override invalidate(): void {
+    this.box.invalidate();
   }
 }
 
@@ -645,6 +665,57 @@ export class WorkerTaskSummaryLine implements Component {
   invalidate(): void {}
 }
 
+/** Cached lane metadata; painting only formats rows and elapsed time. */
+export class TeamActivityPanel implements Component {
+  constructor(
+    private readonly readActivity: () => TeamActivitySnapshot,
+    private readonly now: () => number = Date.now,
+    private readonly maxRows: () => number = () => 4,
+  ) {}
+
+  render(width: number): string[] {
+    const { members } = this.readActivity();
+    if (members.length === 0) return [];
+    const safeWidth = Math.max(1, width);
+    const isSettled = (phase: TeamActivityPhase): boolean => ["idle", "reported", "blocked", "failed", "cancelled"].includes(phase);
+    const reported = members.filter((member) => member.phase === "reported").length;
+    const waiting = members.filter((member) => member.phase === "waiting").length;
+    const attention = members.filter((member) => member.phase === "blocked" || member.phase === "failed").length;
+    const active = members.filter((member) => !isSettled(member.phase) && member.phase !== "waiting").length;
+    const lines = [palette.muted(truncateToWidth([
+      `Team activity · ${members.length} members`,
+      ...(active === 0 ? [] : [`${active} active`]),
+      ...(waiting === 0 ? [] : [`${waiting} waiting`]),
+      `${reported} reported`,
+      ...(attention === 0 ? [] : [`${attention} need attention`]),
+    ].join(" · "), safeWidth, "…"))];
+    const labels: Record<TeamActivityPhase, string> = {
+      queued: "queued", context: "building context", model: "waiting for model",
+      tools: "executing", waiting: "waiting for task", working: "working",
+      idle: "idle", reported: "report ready", blocked: "blocked", failed: "failed",
+      cancelling: "cancelling", cancelled: "cancelled",
+    };
+    const ordered = [...members].sort((a, b) => Number(isSettled(a.phase)) - Number(isSettled(b.phase)));
+    const count = Math.max(1, this.maxRows());
+    for (const member of ordered.slice(0, count)) {
+      const seconds = Math.max(0, Math.floor((this.now() - Date.parse(member.lastActivityAt)) / 1_000));
+      const elapsed = seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+      const since = isSettled(member.phase) ? `${elapsed} ago` : `${elapsed} since activity`;
+      const marker = member.phase === "reported" ? palette.success("✓")
+        : member.phase === "failed" || member.phase === "blocked" ? palette.warning("!") : palette.dim("·");
+      const tool = member.tools.length === 0 || member.phase === "waiting" ? "" : ` ${member.tools.join(", ")}`;
+      lines.push(truncateToWidth(
+        ` ${marker} ${terminalSafeText(member.teamId)}/${terminalSafeText(member.memberId)} · ${labels[member.phase]}${terminalSafeText(tool)} · ${since} · ${member.completedTools} tools finished`,
+        safeWidth, "…",
+      ));
+    }
+    if (ordered.length > count) lines.push(palette.dim(truncateToWidth(` + ${ordered.length - count} members · /list-agents`, safeWidth, "…")));
+    return lines;
+  }
+
+  invalidate(): void {}
+}
+
 /** Pi's live request indicator, kept outside the transcript. */
 export class ActivityLine implements Component {
   private readonly loader: Loader;
@@ -931,6 +1002,7 @@ export class ThinkingRow implements Component {
  */
 export class AssistantMessageBlock extends Container {
   private readonly contentContainer = new Container();
+  private cachedRender: { width: number; lines: string[] } | undefined;
   private text = "";
   private thinkingText = "";
   private thinkingExpanded = true;
@@ -996,8 +1068,12 @@ export class AssistantMessageBlock extends Container {
   }
 
   render(width: number): string[] {
-    const lines = fitLines(super.render(Math.max(1, width)), Math.max(1, width));
-    return this.hasToolCalls ? lines : markSemanticPrompt(lines);
+    const safeWidth = Math.max(1, width);
+    if (this.cachedRender?.width === safeWidth) return this.cachedRender.lines;
+    const fitted = fitLines(super.render(safeWidth), safeWidth);
+    const lines = this.hasToolCalls ? fitted : markSemanticPrompt(fitted);
+    this.cachedRender = { width: safeWidth, lines };
+    return lines;
   }
 
   invalidate(): void {
@@ -1006,6 +1082,8 @@ export class AssistantMessageBlock extends Container {
   }
 
   private updateContent(): void {
+    // Loader frames should not remeasure every historical Markdown line.
+    this.cachedRender = undefined;
     this.contentContainer.clear();
     const hasThinking = this.thinkingText.trim().length > 0;
     const hasAnswer = this.text.trim().length > 0;
@@ -1054,6 +1132,7 @@ export interface AgentMessagePresentation {
   delivery?: "submitted";
   relationship?: CrossRunRelationship;
   payloadType?: A2AMessage["payload"]["type"];
+  teamChannel?: { teamId: string; channelId: string };
 }
 
 /**
@@ -1104,7 +1183,8 @@ export class AgentMessageBlock extends Container {
 
   private headerText(): string {
     const participant = formatAgentMessageParticipant(this.details);
-    const label = this.details.delivery === "submitted" ? "Agent message submitted"
+    const label = this.details.teamChannel !== undefined ? "Team message"
+      : this.details.delivery === "submitted" ? "Agent message submitted"
       : this.details.direction === "outgoing" ? "Agent message sent"
       : this.details.direction === "peer" ? "Agent message" : "Agent message received";
     const hint = palette.dim(`(Ctrl+P ${this.expanded ? "to collapse" : "to expand"})`);
@@ -1126,6 +1206,13 @@ export class AgentMessageBlock extends Container {
 }
 
 export function agentMessagePresentationFromTranscript(message: SessionLaneMessage): AgentMessagePresentation {
+  if (message.teamChannel !== undefined) {
+    return {
+      messageId: message.messageId, message: message.content,
+      source: message.from, target: `${message.teamChannel.teamId}#${message.teamChannel.channelId}`,
+      payloadType: message.payloadType, direction: "peer", teamChannel: { ...message.teamChannel },
+    };
+  }
   if (message.sourceEndpoint !== undefined && message.targetEndpoint !== undefined) {
     const relationship = message.direction === "incoming"
       ? message.relationship === "parent" ? "child" : message.relationship === "child" ? "parent" : message.relationship
@@ -1152,13 +1239,19 @@ function sessionEndpointLabel(endpoint: CrossRunEndpoint): string {
 }
 
 class AgentMessageBody implements Component {
+  private cachedRender: { width: number; lines: string[] } | undefined;
+
   constructor(private readonly message: string) {}
 
   render(width: number): string[] {
-    return agentMessageBodyLines(this.message, width);
+    const safeWidth = Math.max(1, width);
+    if (this.cachedRender?.width === safeWidth) return this.cachedRender.lines;
+    const lines = agentMessageBodyLines(this.message, safeWidth);
+    this.cachedRender = { width: safeWidth, lines };
+    return lines;
   }
 
-  invalidate(): void {}
+  invalidate(): void { this.cachedRender = undefined; }
 }
 
 function agentMessageSummaryLine(label: string, participant: string, tail?: string): string {
@@ -1365,10 +1458,11 @@ export class ToolStatusBlock implements Component {
     this.expanded = !this.expanded;
     this.invalidate();
   }
-  advance(): void {
-    if (this.status !== "running") return;
+  advance(): boolean {
+    if (this.status !== "running") return false;
     this.frame += 1;
     this.invalidate();
+    return true;
   }
 
   render(width: number): string[] {

@@ -93,6 +93,12 @@ export interface TeamBranchExecutorOptions {
   onTaskSettled?: () => void;
   readTaskTerminal?: () => Promise<TaskResult | TaskFailed | undefined>;
   readGroupMessages?: () => Promise<readonly MainBoundaryMessage[]>;
+  onBoundaryMessages?: (messages: readonly MainBoundaryMessage[]) => void;
+  childTeam?: {
+    beforeStep: (context: { step: number }) => Promise<readonly MainBoundaryMessage[]>;
+    afterStep: (context: import("./main-loop.js").MainAfterStepContext) => void;
+    hasReadyMessages: () => Promise<boolean>;
+  };
   resolveMessageTargets?: () => readonly string[] | Promise<readonly string[]>;
   resolveMessageSenders?: () => readonly string[] | Promise<readonly string[]>;
   onMessage?: (message: A2AMessage) => void | Promise<void>;
@@ -399,7 +405,8 @@ export class TeamBranchExecutor {
           if (summary.trim().length === 0) {
             return { kind: "failed", payload: failed(task, "Recovered Team member model completed without a non-empty report") };
           }
-          if (!await mailbox.hasReadyMessages({ step: startStep }) && (await this.options.readGroupMessages?.() ?? []).length === 0) {
+          if (!await mailbox.hasReadyMessages({ step: startStep }) && (await this.options.readGroupMessages?.() ?? []).length === 0
+            && !await this.options.childTeam?.hasReadyMessages()) {
             return { kind: "result", payload: {
               type: "task.result", taskId: task.taskId, status: "completed", summary,
               evidenceRefs: task.inputRefs.map((ref) => ref.contentHash), artifactRefs: [completedModel.payload.responseRef], openQuestions: [],
@@ -449,12 +456,22 @@ export class TeamBranchExecutor {
         eventObserver: (event) => this.teto.observeMainEvent(event),
         beforeStep: async ({ step }) => {
           currentStep = step;
-          return [...await this.teto.beforeMainStep({ step }), ...await mailbox.beforeStep({ step }),
-            ...(await this.options.readGroupMessages?.() ?? [])];
+          const messages = [...new Map([
+            ...await this.teto.beforeMainStep({ step }), ...await mailbox.beforeStep({ step }),
+            ...(await this.options.readGroupMessages?.() ?? []),
+            ...(await this.options.childTeam?.beforeStep({ step }) ?? []),
+          ].map((message) => [message.messageId, message])).values()];
+          this.options.onBoundaryMessages?.(messages);
+          return messages;
         },
-        afterStep: (context) => { this.teto.afterMainStep(context); void mailbox.afterStep(context); },
+        afterStep: (context) => {
+          this.teto.afterMainStep(context);
+          void mailbox.afterStep(context);
+          this.options.childTeam?.afterStep(context);
+        },
         beforeCompletion: async () => await mailbox.hasReadyMessages({ step: currentStep + 1 })
-          || (await this.options.readGroupMessages?.() ?? []).length > 0,
+          || (await this.options.readGroupMessages?.() ?? []).length > 0
+          || await this.options.childTeam?.hasReadyMessages() === true,
         ...(selectCompaction === undefined ? {} : { selectCompaction }),
         ...(compactForPressure === undefined ? {} : { compactForPressure }),
         includeProjectInstructions: false,

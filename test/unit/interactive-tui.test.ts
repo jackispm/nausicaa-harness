@@ -4253,6 +4253,80 @@ describe("interactive TUI", () => {
     }
   });
 
+  it.each([true, false])("shows Team tools and group reports while the lead is paused (fullscreen=%s)", async (forceAltScreen) => {
+    const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-team-activity-"));
+    const terminal = new MemoryTerminal(160, 32);
+    const previousExitCode = process.exitCode;
+    let releaseMember = (_response: ModelResponse): void => {};
+    let releaseLead = (_response: ModelResponse): void => {};
+    let releaseTool = (): void => {};
+    const memberGate = new Promise<ModelResponse>((resolve) => { releaseMember = resolve; });
+    const leadGate = new Promise<ModelResponse>((resolve) => { releaseLead = resolve; });
+    const toolGate = new Promise<void>((resolve) => { releaseTool = resolve; });
+    let mainCalls = 0;
+    let memberCalls = 0;
+    let session: SessionController | undefined;
+    let running: Promise<number> | undefined;
+    const requests: ModelRequest[] = [];
+    const model: ModelPort = { async complete(request) {
+      requests.push(request);
+      if (request.laneId === "main") {
+        mainCalls += 1;
+        if (mainCalls === 1) return response("Creating a team", [{ id: "create-ui-team", name: "team_create",
+          arguments: { teamId: "flight", members: [{ memberId: "physics", statement: "Polish the aircraft mesh" }] },
+        }], "toolUse");
+        if (mainCalls === 2) return leadGate;
+        return response("UI_DONE");
+      }
+      memberCalls += 1;
+      return memberCalls === 1 ? memberGate : response("REPORT_UI_READY: aircraft mesh improved");
+    } };
+    try {
+      session = await SessionController.open({
+        workspace: root, dataDir: join(root, "state"), model: "test-team-ui", workerEnabled: true,
+        policy: { maxMainStepsPerActivation: 8, tetoEnabled: false }, cancelGraceMs: 20,
+      }, {
+        mainModel: model,
+        workerModel: model,
+        tools: [{ definition: { name: "mesh_test", description: "Check the aircraft mesh", parameters: { type: "object", properties: {} } },
+          async execute() { await toolGate; return { content: "mesh checked", isError: false }; } }],
+      });
+      running = runInteractive({ session, terminal, forceAltScreen });
+      await terminal.started;
+      terminal.type("Make the flight game prettier with a team");
+      terminal.send("\r");
+      await waitForCondition(() => mainCalls === 2 && memberCalls === 1, "both lanes started");
+      await waitForOutput(terminal, "flight/physics");
+      await waitForOutput(terminal, "waiting for model");
+      releaseMember(response("Checking mesh", [{ id: "mesh-tool", name: "mesh_test", arguments: {} }], "toolUse"));
+      await waitForOutput(terminal, "executing mesh_test");
+      terminal.send("\x1b");
+      await waitForCondition(() => session!.snapshot().status === "idle", "lead interruption");
+      releaseLead(response("retired lead result"));
+      releaseTool();
+      await waitForOutput(terminal, "Team message");
+      await waitForOutput(terminal, "REPORT_UI_READY");
+      await waitForOutput(terminal, "report ready");
+      expect(session.teamActivity().members[0]).toMatchObject({ phase: "reported", completedTools: 1 });
+      expect(mainCalls).toBe(2);
+      terminal.type("Summarize the reports");
+      terminal.send("\r");
+      await waitForOutput(terminal, "UI_DONE");
+      expect(requests.filter((request) => request.laneId === "main").at(-1)?.messages.some(
+        (message) => message.content.includes("Make the flight game prettier with a team"),
+      )).toBe(true);
+      terminal.type("/exit");
+      terminal.send("\r");
+      await expect(running).resolves.toBe(0);
+    } finally {
+      releaseMember(response("cleanup")); releaseLead(response("cleanup")); releaseTool();
+      if (running !== undefined) { terminal.type("/exit"); terminal.send("\r"); await running; }
+      await session?.close();
+      process.exitCode = previousExitCode;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("updates the durable Worker summary from running through ready and done", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-worker-summary-"));
     const terminal = new MemoryTerminal(100, 28);

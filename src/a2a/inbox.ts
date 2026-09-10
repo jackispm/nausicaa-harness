@@ -335,6 +335,7 @@ export class A2AInbox {
   private readonly clock: Clock;
   private readonly claimLeaseMs: number;
   private commandTail: Promise<void> = Promise.resolve();
+  private readonly listeners = new Map<LaneId, Set<() => void>>();
 
   constructor(options: A2AInboxOptions = {}) {
     const events = options.events ?? [];
@@ -364,10 +365,23 @@ export class A2AInbox {
   rehydrate(events: readonly AnyEvent[]): void {
     this.projector.rehydrate(events);
     this.ephemeralSink?.rehydrate(events);
+    for (const laneId of [...this.listeners.keys()]) this.notify(laneId);
   }
 
   snapshot(): InboxProjection {
     return this.projector.snapshot();
+  }
+
+  /** Subscribe before inspecting readiness; notifications follow durable projection. */
+  subscribe(laneId: LaneId, listener: () => void): () => void {
+    nonEmpty(laneId, "laneId");
+    const listeners = this.listeners.get(laneId) ?? new Set<() => void>();
+    listeners.add(listener);
+    this.listeners.set(laneId, listeners);
+    return () => {
+      listeners.delete(listener);
+      if (listeners.size === 0 && this.listeners.get(laneId) === listeners) this.listeners.delete(laneId);
+    };
   }
 
   /** Read-only delay until the next matching message can be claimed. */
@@ -716,7 +730,21 @@ export class A2AInbox {
   ): Promise<EventEnvelope<K>> {
     const stored = await this.sink.append(event);
     this.projector.apply(stored as AnyEvent);
+    if (this.listeners.size > 0) {
+      const committed = stored as AnyEvent;
+      const message = committed.type === "message.sent" ? committed.payload.message
+        : "messageId" in committed.payload && typeof committed.payload.messageId === "string"
+          ? this.projector.get(committed.payload.messageId)?.message : undefined;
+      if (message !== undefined) this.notify(message.to);
+    }
     return stored;
+  }
+
+  private notify(laneId: LaneId): void {
+    for (const listener of [...this.listeners.get(laneId) ?? []]) {
+      // A subscriber cannot turn a committed delivery into a failed send.
+      try { void Promise.resolve(listener()).catch(() => undefined); } catch { /* notification only */ }
+    }
   }
 
   private runExclusive<T>(operation: () => Promise<T>): Promise<T> {

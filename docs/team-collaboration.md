@@ -8,9 +8,10 @@ Status: Shared Team channels with incremental membership, reusable assignments,
 cursor history, explicit close, and restart-safe claim recovery. Member admission
 is limited to 16 members per Team. `team_assign` admits a new named member or
 assigns further work to an existing one; `task_wait` waits for a durable task
-result without spending model calls on polling. Initial and follow-up reports
-are persisted and published to the task thread. Full artifact-derived change-set extraction and
-a TUI task board remain follow-up work.
+result or new collaboration without spending model calls on polling. Initial
+and follow-up reports are persisted and published to the task thread. The TUI
+shows member activity and public group reports. Full artifact-derived change-set
+extraction and an editable task board remain follow-up work.
 
 The model-facing `team_create`, `team_assign`,
 and `team_reduce` tools do not accept per-member token, attempt, wall-clock,
@@ -38,6 +39,23 @@ messages, durable boundary notifications, and lead-owned synthesis. Nausicaa
 keeps its existing Ledger, Inbox, task dispatch, and Mowe tool execution boundaries.
 Its coordinator adds durable settlement and recovery to the lane collaboration
 mechanism already owned by this runtime.
+
+The Team activity display uses the existing pi-tui 0.84.4 components (MIT).
+Prime Agent 0.9.1's `subagent-summary-line.js` (MIT) was inspected for its
+compact status presentation and cheap render contract. Its private daemon
+roster cannot project Nausicaa's Ledger facts, so the adopted boundary is a
+small presentation adapter over cached local activity metadata; no roster,
+session manager, or polling framework is copied. Rendering must never scan
+or clone the conversation history, and elapsed time must not imply progress.
+
+The fixed horizontal margin retains pi-tui's HStack layout node for viewport
+and dock coordinates, but uses its Box renderer at one content width. HStack's
+intrinsic-size render alternated full and inset widths, invalidating every
+historical Markdown/tool cache on each animation frame. A thin render override
+avoids that unnecessary measurement without changing upstream code. Completed
+assistant and expanded message layouts are reused until content, width or
+display settings change. Idle tool rows do not request animation frames;
+active Team elapsed-time labels refresh once per second even after lead interruption.
 
 ## Ownership And Names
 
@@ -115,6 +133,9 @@ in its own lane transcript without sending them to the owner. Unsolicited
 `agent_message` advice is reserved for a new, concrete finding that would change
 the owner's next action. Teto may also answer direct A2A requests. There is no
 per-request message cap: a long task may reveal several independent problems.
+Its observer-specific message schema accepts `inform` and `request`, including
+direct replies, and rejects `progress`. Missing or truncated observations are
+not evidence that the owner skipped work. Other lanes retain generic A2A kinds.
 
 When there is nothing useful to record or suggest, the prompt asks for ordinary
 assistant text `NO_UPDATE` with no tool calls. The runtime treats that text as
@@ -122,6 +143,11 @@ part of Teto's transcript, just like its brief observation notes. Ordinary
 assistant text is not an A2A delivery; an explicit `agent_message` call sends a
 message to the owner. The guidance does not add a host-side semantic judge of
 each suggestion's value.
+
+Each observer request ends with a separate current-turn objective: evaluate
+the observations and direct A2A requests; when no response is needed, output
+`NO_UPDATE` as plain assistant text with no tool calls. This keeps the actual
+observation task distinct from quoted owner requests and from private A2A.
 
 The scheduler combines already queued observations in batches of up to 32,
 preserving every source event in its transcript. It does not insert a timer or
@@ -272,10 +298,26 @@ can be cancelled. `team_status` remains an immediate snapshot. If the lead has
 other ready work, it can continue that work or end the current turn for automatic
 report-driven continuation instead of calling `task_wait`.
 
+New consumable Team A2A, group mentions, or other member reports release an
+active wait with `waiting: true` and `wakeReason: "collaboration"`. The task
+continues; the next ordinary model boundary delivers the messages. Already
+delivered messages, including the current uncommitted step, cannot trigger
+repeated returns. Terminal task results take precedence. Subscriptions are
+removed on return or cancellation. An Inbox lease can schedule a wake at its
+actual expiry; there is no model polling or task-duration cap.
+
 Members use these same read tools for their own Team and any nested Teams
 they lead. `task_wait` routes by Team ID and rejects waiting for the caller's
-own unfinished task. Permission to create nested Teams is independent of
+own unfinished task or forming a circular wait between members. Permission to create nested Teams is independent of
 reading the member's shared task board.
+
+The TUI displays bounded rows of actual Team members with their current phase,
+tool names, completed tool count, and elapsed time since activity. Elapsed time
+does not imply progress. Public group messages and automatic reports share
+the expandable transcript, without exposing private member turns. Cached
+projections are invalidated by Ledger revision, including cache replacement;
+animation frames do not clone or project the whole event history. Terminal
+lane status alone is not labelled as a report.
 
 Group chat enters context through explicit `team_message.mentions`: use a
 member ID, its full lane ID, or `nausicaa` for the root lead. An idle lead may
@@ -372,6 +414,12 @@ user input resumes coordination with those reports available. A normally
 completed lead turn still resumes automatically for arriving reports.
 `/stop` and direct `SessionController.cancel()` calls cancel Team work too;
 `team_cancel` cancels the selected Team.
+
+Forced interruption records explicitly annotated read/compute tools, including
+`task_wait`, as cancelled failures. Started write, external, or unannotated
+tools retain an unknown outcome if their result cannot be established. Old
+unknown outcomes still require the existing `/resolve` path; tool names alone
+cannot establish a historical extension's effects.
 
 If a provider or tool ignores cancellation beyond the grace period, the host
 fences that old execution and releases its slot while preserving the attachment.

@@ -13,6 +13,7 @@ import {
   AssistantMessageBlock,
   BrandSplashHeader,
   ContextUsageBlock,
+  HorizontalInset,
   EdgeStatusBlock,
   EdgeSkillPickerSummary,
   NoticeBlock,
@@ -64,6 +65,32 @@ const snapshot: SessionSnapshot = {
 };
 
 describe("TUI components", () => {
+  it("keeps a stable content width when adding transcript margins", () => {
+    const widths: number[] = [];
+    let invalidations = 0;
+    const inset = new HorizontalInset({
+      render: (width) => {
+        widths.push(width);
+        return ["界".repeat(Math.floor(width / 2))];
+      },
+      invalidate: () => { invalidations += 1; },
+    });
+    const first = inset.render(80);
+    expect(inset.render(80)).toEqual(first);
+    expect(widths).toEqual([78, 78]);
+    expect(first).toHaveLength(1);
+    expect(visibleWidth(first[0]!)).toBe(80);
+    expect(first[0]!.startsWith(" ")).toBe(true);
+    expect(first[0]!.endsWith(" ")).toBe(true);
+    inset.render(100);
+    expect(widths.at(-1)).toBe(98);
+    for (const width of [1, 2, 3, 4]) {
+      expect(inset.render(width).every((line) => visibleWidth(line) <= width)).toBe(true);
+    }
+    inset.invalidate();
+    expect(invalidations).toBe(1);
+  });
+
   it("keeps every rendered line inside the terminal width", () => {
     const tool = new ToolStatusBlock("read_file", "running", "src/a.ts");
     tool.setStatus("succeeded");
@@ -195,10 +222,14 @@ describe("TUI components", () => {
   it("uses Prime's diamond pulse for running tools", () => {
     const tool = new ToolStatusBlock("bash", "running");
     const first = stripTerminalSequences(tool.render(80).join("\n"));
-    tool.advance();
+    expect(tool.advance()).toBe(true);
     const second = stripTerminalSequences(tool.render(80).join("\n"));
     expect(first).toContain("◇ bash · running");
     expect(second).toContain("◈ bash · running");
+    tool.setStatus("succeeded");
+    const completed = tool.render(80);
+    expect(tool.advance()).toBe(false);
+    expect(tool.render(80)).toBe(completed);
   });
 
   it("removes the status slot when a turn settles", () => {
@@ -326,6 +357,36 @@ describe("TUI components", () => {
 
     const empty = new AssistantMessageBlock().render(80);
     expect(empty).toEqual([]);
+  });
+
+  it("reuses static assistant layout until content, width, display or theme changes", () => {
+    const block = new AssistantMessageBlock("模型更新 ✈️ **Ready**");
+    const first = block.render(80);
+    expect(block.render(80)).toBe(first);
+    block.setText("模型更新 ✈️ **Ready**\nNew output");
+    expect(stripTerminalSequences(block.render(80).join("\n"))).toContain("New output");
+    const narrow = block.render(12);
+    expect(narrow.every((line) => visibleWidth(line) <= 12)).toBe(true);
+    expect(block.render(12)).toBe(narrow);
+    block.setThinking("Checking the model", false);
+    expect(stripTerminalSequences(block.render(80).join("\n"))).toContain("Checking the model");
+    block.setThinkingExpanded(false);
+    expect(stripTerminalSequences(block.render(80).join("\n"))).not.toContain("Checking the model");
+    block.setHasToolCalls(true);
+    expect(block.render(80).join("\n")).not.toContain("\x1b]133;");
+    const beforeInvalidation = block.render(80);
+    block.invalidate();
+    expect(block.render(80)).not.toBe(beforeInvalidation);
+    expect(block.render(80)).toEqual(beforeInvalidation);
+
+    const scheme = getNausicaaColorScheme();
+    try {
+      setNausicaaColorScheme(scheme === "dark" ? "light" : "dark");
+      block.invalidate();
+      expect(block.render(80)).not.toEqual(beforeInvalidation);
+    } finally {
+      setNausicaaColorScheme(scheme);
+    }
   });
 
   it("keeps user messages grounded while the prompt and assistant stay transparent", () => {

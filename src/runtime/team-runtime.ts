@@ -65,6 +65,7 @@ import { FIRST_PARTY_MOWE_METADATA, MoweCatalog } from "../mowe/catalog.js";
 import type { MoweAgentTool } from "../mowe/types.js";
 import { TeamLifecycle } from "./team-lifecycle.js";
 import { LaneMailbox } from "./lane-mailbox.js";
+import { TeamWaitCoordinator } from "./team-wait-coordinator.js";
 import { createInRunAgentMessageTool } from "./in-run-agent-message-tool.js";
 import { publicAgentName, publicLaneName, resolveLaneTarget } from "./lane-names.js";
 import {
@@ -205,7 +206,7 @@ export class TeamRuntime implements TeamControl {
   private deliveryCursor = 0;
   private lifecycleTail: Promise<void> = Promise.resolve();
   private stopped = false;
-  private readonly stateListeners = new Set<() => void>();
+  private waitCoordinator = new TeamWaitCoordinator();
 
   constructor(options: TeamRuntimeOptions) {
     if (options.runId.trim().length === 0 || options.modelName.trim().length === 0) throw new TypeError("Team runtime runId and modelName must be non-empty");
@@ -882,30 +883,58 @@ export class TeamRuntime implements TeamControl {
   }
 
   async wait(request: TeamWaitRequest, context: ToolExecutionContext): Promise<unknown> {
-    while (true) {
-      this.assertAdmissionActive(context.signal);
-      let changed!: () => void;
-      const notification = new Promise<void>((resolve) => { changed = resolve; });
-      this.stateListeners.add(changed);
-      context.signal?.addEventListener("abort", changed, { once: true });
-      this.options.signal?.addEventListener("abort", changed, { once: true });
-      try {
-        // Subscribe before reading so a report committed during the read cannot
-        // strand this waiter. Lifecycle reconciliation never invokes a model.
-        await this.lifecycle.reconcile();
-        const state = await this.taskState(request, context);
+    const laneId = context.laneId ?? this.parentLaneId;
+    let finishWait: (() => void) | undefined;
+    try {
+      while (true) {
         this.assertAdmissionActive(context.signal);
-        if (!state.waiting) return state;
-        await notification;
-      } finally {
-        this.stateListeners.delete(changed);
-        context.signal?.removeEventListener("abort", changed);
-        this.options.signal?.removeEventListener("abort", changed);
+        let changed!: () => void;
+        const notification = new Promise<void>((resolve) => { changed = resolve; });
+        const unsubscribeInbox = this.inbox.subscribe(laneId, changed);
+        const unsubscribeState = this.waitCoordinator.subscribe(changed);
+        context.signal?.addEventListener("abort", changed, { once: true });
+        this.options.signal?.addEventListener("abort", changed, { once: true });
+        let leaseTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          // Subscribe before reading; a result or message arriving during the
+          // projection must not strand this waiter. No model polling is needed.
+          await this.lifecycle.reconcile();
+          const state = await this.taskState(request, context);
+          this.assertAdmissionActive(context.signal);
+          if (!state.waiting) return state;
+          const collaboration = await this.waitingCollaboration(laneId);
+          if (collaboration.ready) {
+            // Prefer a result that committed while readiness was being read.
+            const latest = await this.taskState(request, context);
+            this.assertAdmissionActive(context.signal);
+            return latest.waiting ? {
+              ...latest,
+              wakeReason: "collaboration",
+              note: "The task is still running. New Team messages or results will be delivered at the next model step; handle them before waiting again.",
+            } : latest;
+          }
+          finishWait ??= this.waitCoordinator.beginWait(laneId, state.laneId);
+          if (collaboration.nextClaimableDelayMs !== undefined) {
+            // A recovered Inbox claim has a real lease boundary. This timer
+            // follows that boundary; it is neither a task timeout nor polling.
+            leaseTimer = setTimeout(changed, Math.min(collaboration.nextClaimableDelayMs, 2_147_483_647));
+            leaseTimer.unref?.();
+          }
+          await notification;
+        } finally {
+          clearTimeout(leaseTimer);
+          unsubscribeState();
+          unsubscribeInbox();
+          context.signal?.removeEventListener("abort", changed);
+          this.options.signal?.removeEventListener("abort", changed);
+        }
       }
+    } finally {
+      finishWait?.();
     }
   }
 
-  private async taskState(request: TeamWaitRequest, context: ToolExecutionContext): Promise<Record<string, unknown> & { waiting: boolean }> {
+  private async taskState(request: TeamWaitRequest, context: ToolExecutionContext): Promise<Record<string, unknown> & { waiting: boolean; laneId: LaneId }> {
     const teamId = normalizeId(request.teamId, "teamId");
     const board = (await this.lifecycle.boards()).find((item) => item.teamId === teamId);
     if (board === undefined) throw new Error(`Unknown Team ${teamId}`);
@@ -943,6 +972,46 @@ export class TeamRuntime implements TeamControl {
       ...(closed && task.latestReport === undefined ? { status: "cancelled" } : {}),
       waiting,
     };
+  }
+
+  private async waitingCollaboration(laneId: LaneId): Promise<{ ready: boolean; nextClaimableDelayMs?: number }> {
+    const events = await this.options.readEvents();
+    const excluded = new Set([
+      ...projectCommittedBoundaryMessageIds(events, this.runId, laneId),
+      ...this.waitCoordinator.currentMessages(laneId),
+    ]);
+    if ((await this.groupBoundaryMessages(laneId, events, excluded)).length > 0) return { ready: true };
+    const inbox = this.inbox.snapshot();
+    const records = inbox.records;
+    const boards = projectTeamBoards(events, { runId: this.runId, inbox })
+      .filter((board) => board.lifecycleState !== "closed" && !board.cancellationRequested);
+    const senders = new Set<LaneId>();
+    for (const board of boards) {
+      if (board.leadLaneId === laneId) {
+        senders.add(laneId);
+        for (const member of board.members) senders.add(member.laneId);
+        if (board.reducer !== undefined) senders.add(board.reducer.laneId);
+      } else if (board.members.some((member) => member.laneId === laneId)) {
+        senders.add(board.leadLaneId);
+        if (board.definition?.peerMessaging === "team-members") {
+          for (const member of board.members) senders.add(member.laneId);
+        }
+      }
+    }
+    const messageIds = records.filter((record) => {
+      const message = record.message;
+      if (record.status === "handled" || excluded.has(message.messageId)
+        || message.runId !== this.runId || message.to !== laneId || !senders.has(message.from)
+        || message.routeId !== undefined || message.sourceEndpoint !== undefined || message.targetEndpoint !== undefined
+        || (message.delivery !== "urgent" && message.delivery !== "next-step")) return false;
+      if (["message.inform", "question.ask", "question.answer"].includes(message.payload.type)) return true;
+      if (message.payload.type !== "task.result" && message.payload.type !== "task.failed") return false;
+      const payload = message.payload;
+      return boards.some((board) => board.leadLaneId === laneId && teamReplyMatches(board, message.from, payload));
+    }).map((record) => record.message.messageId);
+    if (messageIds.length === 0) return { ready: false };
+    const delay = this.inbox.nextClaimableDelayMs(laneId, { runId: this.runId, messageIds });
+    return { ready: delay === 0, ...(delay === undefined || delay === 0 ? {} : { nextClaimableDelayMs: delay }) };
   }
 
   private async reportAssignedTask(
@@ -1073,6 +1142,7 @@ export class TeamRuntime implements TeamControl {
         : await this.options.eventSink.append(candidate.event);
       const current = (await this.lifecycle.boards()).find((item) => item.teamId === teamId);
       if (!candidate.duplicate && !this.stopped && current?.lifecycleState === "open" && !current.cancellationRequested) {
+        if (mentions.some((mention) => mention !== sender)) this.notifyStateChange();
         for (const mention of mentions) {
           if (mention === sender) continue;
           if (mention === this.parentLaneId) this.options.onWake?.();
@@ -1124,44 +1194,51 @@ export class TeamRuntime implements TeamControl {
   }
 
   async beforeMainStep(context?: { step: number }): Promise<readonly import("./main-loop.js").MainBoundaryMessage[]> {
-    if (this.teams.size === 0) return [];
+    if (this.teams.size === 0) {
+      this.waitCoordinator.delivered(this.parentLaneId, []);
+      return [];
+    }
     await this.lifecycle.reconcile();
     this.mailbox ??= this.createMailbox(await this.options.readEvents());
     const messages = [...await this.groupBoundaryMessages(this.parentLaneId), ...await this.mailbox.beforeStep({ step: context?.step ?? 1 })];
     const runtimes = [...this.branches.values(), ...this.reducers.values()];
-    const boards = await this.lifecycle.boards();
     for (let visited = 0; visited < runtimes.length && messages.length < 64; visited += 1) {
       const runtime = runtimes[this.deliveryCursor % runtimes.length]!;
       this.deliveryCursor = (this.deliveryCursor + 1) % runtimes.length;
       const replies = await runtime.scheduler.beforeMainStep({ step: context?.step ?? 1, maxResults: 64 - messages.length });
+      if (replies.length === 0) continue;
+      // A reply may settle during its claim. Validate against the board after
+      // claiming, so a fresh durable report cannot be discarded as untrusted.
+      const board = (await this.lifecycle.boards()).find((item) => item.teamId === runtime.teamId);
       for (const reply of replies) {
-        const board = boards.find((item) => item.teamId === runtime.teamId);
-        const outcome = board?.reducer?.laneId === runtime.laneId ? board.reduction : board?.members.find((item) => item.laneId === runtime.laneId);
         const record = this.inbox.snapshot().records.find((item) => item.message.messageId === reply.messageId);
         const payload = record?.message.payload;
-        const dynamicTask = payload?.type === "task.result" || payload?.type === "task.failed"
-          ? (board?.tasks ?? []).find((task) => task.taskId === payload.taskId && task.laneId === runtime.laneId)
-          : undefined;
-        const matches = board?.definition === undefined || dynamicTask !== undefined
-          || (payload?.type === "task.result" && outcome?.result !== undefined && stableJson(payload) === stableJson(outcome.result))
-          || (payload?.type === "task.failed" && outcome?.failure !== undefined && stableJson(payload) === stableJson(outcome.failure));
+        const matches = board !== undefined && (payload?.type === "task.result" || payload?.type === "task.failed")
+          && teamReplyMatches(board, runtime.laneId, payload);
         if (matches) messages.push(reply);
         else await this.inbox.handle(reply.messageId, this.parentLaneId);
       }
     }
+    this.waitCoordinator.delivered(this.parentLaneId, messages.map((message) => message.messageId));
     return messages;
   }
 
+  /** Hosts compose several mailboxes; record the complete delivered boundary. */
+  observeBoundaryMessages(laneId: LaneId, messages: readonly import("./main-loop.js").MainBoundaryMessage[]): void {
+    if (!this.stopped) this.waitCoordinator.delivered(laneId, messages.map((message) => message.messageId));
+  }
+
   /** Group mentions share the ordinary committed-step receipt boundary. */
-  private async groupBoundaryMessages(laneId: LaneId): Promise<readonly import("./main-loop.js").MainBoundaryMessage[]> {
+  private async groupBoundaryMessages(laneId: LaneId, snapshot?: readonly AnyEvent[], excluded?: ReadonlySet<string>): Promise<readonly import("./main-loop.js").MainBoundaryMessage[]> {
     if (this.stopped || this.options.signal?.aborted) return [];
-    const events = await this.options.readEvents();
+    const events = snapshot ?? await this.options.readEvents();
     const consumed = new Set(projectCommittedBoundaryMessageIds(events, this.runId, laneId));
     const candidates = events.filter((event): event is Extract<AnyEvent, { type: "team.message.sent" }> => (
       event.runId === this.runId && event.type === "team.message.sent"
       && event.payload.mentions.includes(laneId) && event.payload.fromLane !== laneId
       && event.laneId === event.payload.fromLane
       && !consumed.has(`team-channel:${event.eventId}`)
+      && !excluded?.has(`team-channel:${event.eventId}`)
     ));
     if (candidates.length === 0) return [];
     const boards = projectTeamBoards(events, { runId: this.runId, inbox: this.inbox.snapshot() });
@@ -1553,6 +1630,12 @@ export class TeamRuntime implements TeamControl {
       readWatermark: this.options.readWatermark,
       readAwareness: this.options.readAwareness,
       ...(reducer ? {} : { readGroupMessages: () => this.groupBoundaryMessages(laneId) }),
+      onBoundaryMessages: (messages) => this.waitCoordinator.delivered(laneId, messages.map((message) => message.messageId)),
+      ...(nested === undefined ? {} : { childTeam: {
+        beforeStep: (context: { step: number }) => nested.beforeMainStep(context),
+        afterStep: (context: import("./main-loop.js").MainAfterStepContext) => nested.enqueue(context),
+        hasReadyMessages: async () => (await nested.waitingCollaboration(laneId)).ready,
+      } }),
       policy: branchPolicy,
       ...(member === undefined ? {} : {
         taskDefinition: member.task,
@@ -1666,6 +1749,7 @@ export class TeamRuntime implements TeamControl {
       ...(this.options.signal === undefined ? {} : { signal: this.options.signal }),
       onWake: () => this.branches.get(parentLaneId)?.scheduler.enqueue(),
     });
+    nested.waitCoordinator = this.waitCoordinator;
     this.nestedRuntimes.set(parentLaneId, nested);
     return nested;
   }
@@ -1677,7 +1761,7 @@ export class TeamRuntime implements TeamControl {
   }
 
   private notifyStateChange(): void {
-    for (const listener of this.stateListeners) listener();
+    this.waitCoordinator.notify();
   }
 
   private assertAdmissionActive(signal?: AbortSignal): void {
@@ -1946,6 +2030,16 @@ function laneFamilyTokens(events: readonly AnyEvent[], runId: string, laneId: st
 
 function isOpenResidentTaskStatus(status: string): boolean {
   return status === "queued" || status === "running" || status === "waiting" || status === "blocked";
+}
+
+function teamReplyMatches(board: TeamBoard, laneId: LaneId, payload: TaskResult | TaskFailed): boolean {
+  if (board.definition === undefined) return true;
+  const task = (board.tasks ?? []).find((item) => item.taskId === payload.taskId && item.laneId === laneId);
+  const outcome = task?.latestReport ?? (board.reducer?.laneId === laneId ? board.reduction
+    : board.members.find((member) => member.taskId === payload.taskId && member.laneId === laneId));
+  return payload.type === "task.result"
+    ? outcome?.result !== undefined && stableJson(payload) === stableJson(outcome.result)
+    : outcome?.failure !== undefined && stableJson(payload) === stableJson(outcome.failure);
 }
 
 function isCollectedTeam(board: TeamBoard): boolean {

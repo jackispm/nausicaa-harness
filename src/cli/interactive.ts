@@ -114,6 +114,7 @@ import {
   ToolStatusBlock,
   UserMessageBlock,
   WorkerTaskSummaryLine,
+  TeamActivityPanel,
   selectLatestToolExpandHint,
   setNausicaaColorScheme,
   terminalSafeText,
@@ -509,6 +510,12 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
     () => options.session.workerTaskSummary(),
   );
   widgetContainerAbove.addChild(workerTaskSummary);
+  const teamActivity = new TeamActivityPanel(
+    () => options.session.teamActivity(),
+    Date.now,
+    () => Math.max(1, Math.min(4, Math.floor(terminal.rows / 6))),
+  );
+  widgetContainerAbove.addChild(teamActivity);
   const editor = new CustomEditor(tui, nausicaaEditorTheme, keybindings, { paddingX: 0 });
   const editorContainer = new Container();
   editorContainer.addChild(editor);
@@ -800,9 +807,20 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
   tui.setTerminalColorSchemeNotifications(true);
   // Tool rows retain Prime's shared four-frame pulse. The request indicator is
   // a real pi-tui Loader and owns its braille interval independently.
+  let lastTeamActivitySecond = 0;
   const toolAnimationTimer = setInterval(() => {
-    for (const block of toolBlocks.values()) block.advance();
-    tui.requestRender();
+    let changed = false;
+    for (const block of toolBlocks.values()) {
+      if (block.advance()) changed = true;
+    }
+    const second = Math.floor(Date.now() / 1_000);
+    if (second !== lastTeamActivitySecond) {
+      lastTeamActivitySecond = second;
+      // Member work continues when the lead is idle or interrupted.
+      if (options.session.teamActivity().members.some((member) =>
+        !["idle", "reported", "blocked", "failed", "cancelled"].includes(member.phase))) changed = true;
+    }
+    if (changed) tui.requestRender();
   }, 250);
   toolAnimationTimer.unref?.();
 
@@ -1944,6 +1962,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           toolBlocks.get(event.payload.operationId)?.setExpanded(true);
           tui.requestRender();
           break;
+        case "team.message.sent":
         case "a2a.outbox.pending":
           if (laneMessage !== undefined) appendAgentMessage(agentMessagePresentationFromTranscript(laneMessage));
           break;

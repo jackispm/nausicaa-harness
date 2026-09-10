@@ -203,7 +203,7 @@ export function createTaskWaitTool(control: Pick<TeamControl, "wait">): AgentToo
   }
   return annotateTool(createTeamCommand(
     "task_wait",
-    "Wait for one Team task's durable result or cancellation. This call blocks in the runtime; use it once when you have no other ready work, or end your current turn and let arriving reports resume coordination. Use team_status for an immediate snapshot. Waiting does not copy the member's full transcript.",
+    "Wait for a Team task's durable result or cancellation. New Team messages or other member reports also return control with waiting:true and wakeReason:collaboration; the task keeps running and the next model step receives those messages. Handle them before waiting again. Use this when no other work is ready, or end your turn for automatic continuation. Use team_status for an immediate snapshot. Add a later reviewer with team_assign once the relevant work is ready.",
     { teamId: teamIdSchema, taskId: { type: "string", minLength: 1, maxLength: 128 } },
     ["teamId", "taskId"],
     (arguments_, context) => {
@@ -472,7 +472,7 @@ export function createTeamTool(control: TeamControl): AgentTool {
   const tool: AgentTool = {
     definition: {
       name: "team_create",
-      description: "Create a Team with members whose work can start now. Members have independent contexts and run in parallel; give each a clear statement and concise input. When later work needs an earlier result, create the first member now and add the next with team_assign after its report arrives. Reuse members for follow-up work. Members inherit your authorized tools unless capabilities narrows them. Final reports enter the shared Team channel; team_message is group chat and agent_message is private A2A. You own synthesis and acceptance; partial or failed outcomes are not success. When no other work is ready, task_wait awaits a report, or end your turn for automatic continuation.",
+      description: "Create a Team with members whose work can start now. Every listed member starts immediately in an independent context; listing a reviewer last does not delay it. Give each a clear statement and concise input, with separate edit scopes when sharing a file. When later work needs an earlier result, add or assign that member with team_assign after the report arrives. Reuse members for follow-up work. Members inherit your authorized tools unless capabilities narrows them. Final reports enter the shared Team channel; team_message is group chat and agent_message is private A2A. You own synthesis and acceptance; partial or failed outcomes are not success. When no other work is ready, task_wait awaits a result or new collaboration, or end your turn for automatic continuation.",
       parameters: {
         type: "object",
         properties: {

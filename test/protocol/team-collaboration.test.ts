@@ -339,9 +339,12 @@ describe("durable Team collaboration", () => {
       release.resolve(response("Calendar layout checked"));
     }
     await team.drain();
-    for (const result of await Promise.all(waits)) {
+    for (const [index, result] of (await Promise.all(waits)).entries()) {
       expect(result.isError).toBe(false);
-      expect(JSON.parse(result.content)).toMatchObject({ terminal: true, waiting: false });
+      const state = JSON.parse(result.content);
+      // The later task may yield for UI's report before its own work settles.
+      if (index === 1 && state.waiting) expect(state).toMatchObject({ terminal: false, wakeReason: "collaboration" });
+      else expect(state).toMatchObject({ terminal: true, waiting: false });
     }
     expect(await team.wait({ teamId: created.teamId, taskId: uiTask.taskId }, context)).toMatchObject({
       status: "completed", outcome: "succeeded", terminal: true, waiting: false,

@@ -42,6 +42,13 @@ function toolResult(request: ModelRequest, id: string): unknown {
   return JSON.parse(message.content);
 }
 
+async function consumeLeadReports(team: TeamRuntime, ledger: MemoryLedger, step: number): Promise<void> {
+  const messages = await team.beforeMainStep({ step });
+  await ledger.append({ runId, laneId: "main", type: "step.completed", payload: {
+    step, hasToolCalls: false, boundaryMessageIds: messages.map((message) => message.messageId),
+  }, correlationId: "lead-read-reports", idempotencyKey: `lead-read-reports-${step}` });
+}
+
 function fixture(options: {
   ledger?: MemoryLedger;
   store?: MemoryContentAddressedStore;
@@ -167,6 +174,7 @@ describe("sequential resident Team collaboration", () => {
     const initialHistory = await f.team.history({ teamId: "calendar" }, context);
     expect(initialHistory.messages).toHaveLength(1);
     expect(initialHistory.messages[0]).toMatchObject({ fromLane: "team:calendar:developer", threadId: "task:calendar:developer" });
+    await consumeLeadReports(f.team, f.ledger, 1);
 
     const added = await f.team.assign({ teamId: "calendar", memberId: "reviewer", statement: "Review the existing index.html", input: "Read the developer's report and inspect the artifact", capabilities: { tools: [], allowNestedTeam: false } }, { ...context, operationId: "add-reviewer" });
     await vi.waitFor(() => expect(f.requests).toHaveLength(2));
@@ -181,9 +189,11 @@ describe("sequential resident Team collaboration", () => {
     review.release();
     expect(await f.team.wait({ teamId: "calendar", taskId: added.taskId }, context)).toMatchObject({ waiting: false, report: { assignmentVersion: 0 } });
     await f.team.drain();
+    await consumeLeadReports(f.team, f.ledger, 2);
     const repaired = await f.team.assign({ teamId: "calendar", memberId: "developer", statement: "Fix the two review findings" }, { ...context, operationId: "repair" });
     expect(await f.team.wait({ teamId: "calendar", taskId: repaired.taskId }, context)).toMatchObject({ waiting: false, report: { assignmentVersion: 1 } });
     await f.team.drain();
+    await consumeLeadReports(f.team, f.ledger, 3);
     const verified = await f.team.assign({ teamId: "calendar", memberId: "reviewer", statement: "Recheck the fixes" }, { ...context, operationId: "verify" });
     expect(await f.team.wait({ teamId: "calendar", taskId: verified.taskId }, context)).toMatchObject({ waiting: false, status: "review" });
     await f.team.drain();
