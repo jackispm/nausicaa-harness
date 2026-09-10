@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -12,6 +12,7 @@ import {
 
 const workspaces: string[] = [];
 const managers: ProcessJobManager[] = [];
+const waitForTestRelease = "while [ ! -f .process-release ]; do sleep 0.02; done";
 
 afterEach(async () => {
   const closing = managers.splice(0);
@@ -133,11 +134,11 @@ describe("process jobs", () => {
     const registry = await FileProcessJobRegistry.open(registryPath);
     const manager = new ProcessJobManager({
       registry,
-      defaultTimeoutSeconds: 2,
+      defaultTimeoutSeconds: 10,
     });
     managers.push(manager);
     const context = toolContext(workspace);
-    const started = await manager.start({ command: "printf persisted; sleep 0.1" }, context);
+    const started = await manager.start({ command: `printf persisted; ${waitForTestRelease}` }, context);
     await manager.flush();
 
     const runningEntries = await registry.load();
@@ -148,6 +149,7 @@ describe("process jobs", () => {
       state: "running",
     });
 
+    await writeFile(path.join(workspace, ".process-release"), "");
     await eventually(async () => {
       expect((await manager.status(started.id, context)).state).toBe("succeeded");
     });
@@ -177,11 +179,11 @@ describe("process jobs", () => {
     const registryPath = path.join(workspace, "process-jobs.json");
     const manager = new ProcessJobManager({
       registry: await FileProcessJobRegistry.open(registryPath),
-      defaultTimeoutSeconds: 2,
+      defaultTimeoutSeconds: 10,
     });
     managers.push(manager);
     const context = toolContext(workspace);
-    const started = await manager.start({ command: "sleep 1" }, context);
+    const started = await manager.start({ command: waitForTestRelease }, context);
     await manager.flush();
 
     const reopened = new ProcessJobManager({
@@ -256,10 +258,10 @@ describe("process jobs", () => {
     const workspace = await temporaryDirectory();
     const registryPath = path.join(workspace, "process-jobs.json");
     const sourceRegistry = await FileProcessJobRegistry.open(registryPath);
-    const source = new ProcessJobManager({ registry: sourceRegistry, defaultTimeoutSeconds: 2 });
+    const source = new ProcessJobManager({ registry: sourceRegistry, defaultTimeoutSeconds: 10 });
     managers.push(source);
     const sourceContext = toolContext(workspace, undefined, "old-run");
-    const started = await source.start({ command: "sleep 1" }, sourceContext);
+    const started = await source.start({ command: waitForTestRelease }, sourceContext);
     await source.flush();
 
     const reopened = new ProcessJobManager({
