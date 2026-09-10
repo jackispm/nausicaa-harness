@@ -149,6 +149,14 @@ markers. The resumed CLI's Teto still sent some routine/speculative notes;
 the explicit observation objective improves the recorded probes but does not
 guarantee useful advice throughout a natural long task.
 
+After Escape and source-CLI resume, the same Run retained its developer and
+reports; measured lead context construction fell from earlier 159–168 second
+samples to 79–131ms. The model also stopped once after promising to assign a
+reviewer, without making that call. This is retained as a failed coordination
+step, and the default prompt now explicitly requires acting before ending a
+turn. Neither a successful model stop nor that prompt rule is an automatic
+test of whether a natural-language request was fulfilled.
+
 This natural run exposed a gap in the short observation fixtures. Replaying
 its original long Chinese request reproduced routine A2A; merely tightening
 the system wording did not solve it. The final change gives each observer

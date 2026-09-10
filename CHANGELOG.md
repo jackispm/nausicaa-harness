@@ -12,6 +12,8 @@ All notable changes to Nausicaa are documented here.
   frames do not repeatedly clone and project a growing event log.
 - Keep transcript margins at a stable render width so TUI animation does not
   repeatedly invalidate historical tool and Markdown layouts and stall work.
+- Make the default agent prompt explicitly require performing authorized
+  actions before ending a turn instead of stopping at a promise to act.
 - Yield active task waits for new Team collaboration and other member reports;
   preserve the original task, avoid repeated delivery, and reject circular waits.
   Deliver nested-Team reports through the member lead's ordinary boundaries.
