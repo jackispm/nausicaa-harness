@@ -200,6 +200,7 @@ interface DraftTeam {
 interface DraftTask {
   assignment: TeamTaskAssignment;
   assignedAt: string;
+  requestMessageId?: string;
   latestReport?: TeamRunReport & { reportId: string; runId: RunId };
   status: TeamTaskStatus;
 }
@@ -274,7 +275,9 @@ function projectRunBoards(
       dependsOn: [], required: true,
     }, record.sentAtOffset);
     team.members.set(message.to, member);
-    if (message.from !== team.coordinator || message.payload.taskId !== member.definition.task.taskId) {
+    // Follow-up requests are checked against assignments in timeline order.
+    if (message.payload.taskId !== member.definition.task.taskId) continue;
+    if (message.from !== team.coordinator) {
       anomaly(member, "task.request does not match its declared task or lead");
       continue;
     }
@@ -321,7 +324,7 @@ function projectRunBoards(
   const inbox = new InboxProjector();
   for (const entry of timeline) {
     if ("record" in entry) {
-      applyReply(teams, entry.record);
+      applyTaskMessage(teams, entry.record);
       continue;
     }
     const event = entry.event;
@@ -338,7 +341,7 @@ function projectRunBoards(
     // claims cannot authenticate a settlement; their snapshot remains diagnostic.
     if (event.type === "message.sent" && event.payload.message.runId === runId) {
       inbox.apply(event);
-      applyReply(teams, recordFromEvent(event));
+      applyTaskMessage(teams, recordFromEvent(event));
     } else if (event.type === "message.claimed" || event.type === "message.handled") {
       if (inbox.get(event.payload.messageId) !== undefined) inbox.apply(event);
       if (event.type === "message.claimed") {
@@ -569,11 +572,40 @@ function consistentOutcome(value: TeamReduction, taskId: string): boolean {
   return true;
 }
 
-function applyReply(teams: Map<string, DraftTeam>, record: InboxRecord): void {
+function applyTaskMessage(teams: Map<string, DraftTeam>, record: InboxRecord): void {
   const message = record.message;
   const payload = message.payload;
+  if (payload.type === "task.request") {
+    for (const team of teams.values()) {
+      const member = team.members.get(message.to);
+      if (member === undefined || payload.taskId === member.definition.task.taskId) continue;
+      const task = team.tasks.get(payload.taskId);
+      if (task === undefined || message.from !== team.coordinator
+        || message.to !== task.assignment.laneId || stableJson(payload) !== stableJson(task.assignment.task)) {
+        anomaly(member, "task.request does not match its declared task or lead");
+      } else if (task.requestMessageId !== undefined && task.requestMessageId !== message.messageId) {
+        anomaly(member, `multiple task requests target ${payload.taskId}`);
+      } else {
+        task.requestMessageId = message.messageId;
+      }
+    }
+    return;
+  }
   if (payload.type !== "task.accept" && payload.type !== "task.result" && payload.type !== "task.failed") return;
   for (const team of teams.values()) {
+    const task = team.tasks.get(payload.taskId);
+    if (task !== undefined) {
+      if (message.from !== task.assignment.laneId || message.to !== team.coordinator
+        || task.requestMessageId === undefined || message.parentId !== task.requestMessageId
+        || (message.replyTo !== undefined && message.replyTo !== task.requestMessageId)) {
+        anomaly(team, `reply ${message.messageId} has a mismatched sender, task, or parent`);
+      } else if (team.cancellationRequested && payload.type !== "task.accept") {
+        anomaly(team, `late terminal reply ${message.messageId} after Team cancellation ignored`);
+      }
+      // A follow-up report owns task status; its transport cannot settle the
+      // member's original task or change the original Team join outcome.
+      continue;
+    }
     for (const member of team.members.values()) {
       const requestId = member.request?.message.messageId;
       if (message.from !== member.definition.laneId && payload.taskId !== member.definition.task.taskId) continue;

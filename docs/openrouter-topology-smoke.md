@@ -133,6 +133,11 @@ assignment was correctly rejected; a cancelled Team is not a reusable fixture
 for recovery validation. Separate protocol tests cover restored group access
 and preservation of workspace and nested-Team grants.
 
+The parent-channel fix was subsequently replayed against that saved event
+stream: the resident assignment now projects with no task or reply anomalies.
+This is an offline projection check, not a new provider call; the original
+paid run remains recorded as incomplete above.
+
 The September 7-8 reliability review found and fixed status-context bloat,
 member completion missing already-arrived mail, recovery resetting attempt
 budgets, and empty reducer summaries. Those probes used the old per-task controls.

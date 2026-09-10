@@ -83,7 +83,71 @@ function scenario(runId = "run-team", memberCount = 1) {
   return { definition, events, append, request, claim, result, settle, board, join };
 }
 
+function residentScenario() {
+  const s = scenario();
+  s.append("team.created", s.definition);
+  const initial = s.request();
+  s.append("lane.registered", { kind: "team" }, initial.to);
+  s.claim(); s.settle(); s.join();
+  const task = { ...s.definition.members[0]!.task, taskId: "alpha:member-0:task-1" };
+  const assignment = {
+    teamId: "alpha", taskId: task.taskId, memberId: "member-0", laneId: initial.to,
+    assignmentVersion: 1, task, assignedBy: "main", operationId: "resident-assign",
+  };
+  const request: A2AMessage = {
+    ...initial, messageId: "resident-request", idempotencyKey: "resident-request", payload: task,
+  };
+  const reply: A2AMessage = {
+    ...request, messageId: "resident-result", idempotencyKey: "resident-result",
+    from: request.to, to: request.from, parentId: request.messageId, replyTo: request.messageId,
+    payload: { ...s.result(), taskId: task.taskId },
+  };
+  return { ...s, assignment, residentRequest: request, residentReply: reply };
+}
+
 describe("durable Team state", () => {
+  it("validates resident transport without changing the initial settlement or accepting transport as a report", () => {
+    const s = residentScenario();
+    const initial = s.board().members[0];
+    s.append("team.task.assigned" as never, s.assignment as never);
+    s.append("message.sent", { message: s.residentRequest });
+    s.append("message.sent", { message: s.residentReply }, s.residentReply.from);
+    expect(s.board()).toMatchObject({ anomalies: [], joinSatisfied: true, tasks: [{ status: "queued" }] });
+    expect(s.board().members[0]?.result).toEqual(initial?.result);
+    const records = projectInbox(s.events).records;
+    const withoutRequest = s.events.filter((event) => event.type !== "message.sent"
+      || event.payload.message.messageId !== s.residentRequest.messageId);
+    expect(projectTeamBoard(withoutRequest, "alpha", { inbox: records })?.anomalies).toEqual([]);
+  });
+
+  it.each(["sender", "payload", "before-assignment"] as const)("keeps a diagnostic for a resident request with invalid %s", (kind) => {
+    const s = residentScenario();
+    if (kind !== "before-assignment") s.append("team.task.assigned" as never, s.assignment as never);
+    const request = s.residentRequest;
+    if (kind === "sender") request.from = "team:alpha:outsider";
+    if (kind === "payload" && request.payload.type === "task.request") request.payload.goal.statement = "Changed work";
+    s.append("message.sent", { message: request });
+    if (kind === "before-assignment") s.append("team.task.assigned" as never, s.assignment as never);
+    expect(s.board().anomalies).toContain("task.request does not match its declared task or lead");
+    expect(s.board().tasks?.[0]?.status).toBe("queued");
+  });
+
+  it.each(["sender", "recipient", "task", "parent", "replyTo", "missing-request"] as const)("keeps a diagnostic for a resident reply with invalid %s", (kind) => {
+    const s = residentScenario();
+    s.append("team.task.assigned" as never, s.assignment as never);
+    if (kind !== "missing-request") s.append("message.sent", { message: s.residentRequest });
+    const reply = s.residentReply;
+    if (kind === "sender") reply.from = "team:alpha:outsider";
+    if (kind === "recipient") reply.to = "other-lead";
+    if (kind === "task" && reply.payload.type === "task.result") reply.payload.taskId = "unknown-task";
+    if (kind === "parent") reply.parentId = "other-request";
+    if (kind === "replyTo") reply.replyTo = "other-request";
+    s.append("message.sent", { message: reply }, reply.from);
+    expect(s.board().anomalies).toContain("reply resident-result has a mismatched sender, task, or parent");
+    expect(s.board().tasks?.[0]?.status).toBe("queued");
+    expect(s.board().members[0]?.result?.taskId).toBe("alpha:member-0");
+  });
+
   it("reconstructs every admitted member when a crash prevents dispatch", () => {
     const s = scenario("run-team", 2);
     s.definition.members[1]!.dependsOn = ["member-0"];

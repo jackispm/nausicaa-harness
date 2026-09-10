@@ -385,6 +385,7 @@ describe("durable Team collaboration", () => {
       taskId: assigned.taskId, assignmentVersion: 1, status: "review", waiting: false,
       report: { kind: "ready-for-review", result: { taskId: assigned.taskId } },
     });
+    expect((await board(team, "resident")).anomalies).toEqual([]);
     expect(await team.wait({ teamId: "resident", taskId: "resident:researcher" }, context)).toEqual(initialStatus);
     const events = await ledger.read({ runId: RUN_ID });
     expect(events.some((event) => (event as unknown as { type?: string }).type === "team.task.assigned")).toBe(true);
@@ -403,6 +404,7 @@ describe("durable Team collaboration", () => {
     await team.drain();
     expect(next.assignmentVersion).toBe(2);
     expect(model.requests).toHaveLength(before + 2);
+    expect((await board(team, "resident")).anomalies).toEqual([]);
   });
 
   it("rebuilds an unreported resident assignment after a restart", async () => {
