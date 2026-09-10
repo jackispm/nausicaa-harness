@@ -3650,6 +3650,7 @@ export class SessionController {
         maxOutputTokens: this.maxOutputTokens,
         collaborationMode: turnCollaborationMode,
         completeRun: false,
+        continueAfterStepAllowance: true,
         signal: turn.controller.signal,
       });
       await this.recordThreadGoalProgress(
@@ -3667,7 +3668,11 @@ export class SessionController {
       if (!result.completed) {
         const waitingReason = result.stopReason === "length"
           ? "model-output-limit"
-          : "step-allowance-exhausted";
+          : result.stopReason === "aborted"
+            ? "model-aborted"
+            : result.stopReason !== undefined && result.stopReason !== "stop" && result.stopReason !== "toolUse"
+              ? "model-response-incomplete"
+              : "step-allowance-exhausted";
         await attached.sink.append({
           runId: attached.runId,
           turnId: turn.turnId,

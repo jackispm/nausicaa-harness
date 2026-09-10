@@ -122,6 +122,7 @@ export interface EventPayloadMap {
     control?: { action: "start" | "stop"; requestedBy: LaneId };
   };
   "team.created": TeamDefinition;
+  "team.member.added": import("./team.js").TeamMemberAddition;
   "team.member.settled": TeamMemberSettlement;
   "team.joined": TeamJoined;
   "team.cancel.requested": { teamId: string; reason: string; requestedBy: LaneId };

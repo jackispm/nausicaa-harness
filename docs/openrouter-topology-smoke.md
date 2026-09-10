@@ -3,8 +3,10 @@
 This is a development smoke, not a reliability benchmark or a release gate.
 Every Main, Worker, member, reducer, and Teto model response must come from the
 selected real OpenRouter provider. No model response or tool call is scripted.
-Prompts explicitly request the topology under test, so passing does not prove
-that the model will spontaneously select that topology for an ordinary task.
+Most prompts explicitly request the topology under test. The separate
+`team-natural-calendar` case uses an ordinary Chinese product request, without
+tool names, prefilled arguments, or anti-polling instructions. It asks for
+separate development/review responsibilities and leaves coordination to the agent.
 
 The runner reuses Nausicaa's pi-ai adapter, workspace tools, `executeRun`, and
 `SessionController`. Its evaluation-only meter adds concurrent cost reservations
@@ -40,8 +42,9 @@ when any selected case fails or is skipped.
 | --- | --- | --- |
 | `workspace` | Read a synthetic checkout, write JSON, read it back | Correct file and answer; successful write and later read |
 | `worker` | Delegate subtotal computation, request the result in a second user turn | Worker read, completed task result, committed Main consumption |
-| `team-dag` | Two independent readers feed a dependent total calculator | Concurrent requests, definition before dispatch, dependency settlement order and context, join, Main acceptance |
-| `team-calendar` | Two builders write a week-calendar/Todo site; a dependent reviewer inspects it | Actual member writes, no implicit task limits, more than two calls per member, public review, lead turn completion followed by automatic report continuation, consumed results and acceptance |
+| `team-sequential` | Two readers finish, then the lead adds a calculator to the same Team | Concurrent reader requests, incremental membership, result handoff, ordered work, Main acceptance |
+| `team-calendar` | Two builders write a week-calendar/Todo site; the lead then adds a reviewer | Actual member writes, no implicit task limits, public review, repairs/review as needed, consumed results and acceptance |
+| `team-natural-calendar` | Build a calendar/Todo site from a plain Chinese request in an empty workspace | Multiple working members, real member file writes, automatic group reports, consumed results, no forced pause, final answer after acceptance, parseable HTML scripts |
 | `team-peer-reducer` | Members exchange checkout facts; optional reducer synthesizes | Correct numeric evidence sent after file reads and consumed in both directions, successful members, ordered reduction lifecycle, read-only reducer tools, Main acceptance |
 | `resume-fork` | Recall an unpredictable identifier after reopening, then modify the total in a fork | Current turns complete, inherited context, durable fork lineage, unchanged parent Ledger |
 | `teto` | Main opens an observer, requests a shipping reminder, reports amounts back | Labelled public observations, actual messaging tools, both directions consumed and visible in the hydrated transcript, no duplicate messages or self-addressed sends, token round trip |
@@ -74,12 +77,15 @@ Cancellation is last for this reason and may need a separately authorized batch.
   `NAUSICAA_TOPOLOGY_BUDGET_USD` and `NAUSICAA_TOPOLOGY_MAX_REQUESTS`, with
   ceilings of $0.85 and 100 calls. These count logical adapter calls, not
   provider-internal HTTP attempts.
-- Each call: at most 2,048 output tokens, 160,000 serialized input bytes,
-  and 60 seconds. Main turns and background waits also have finite limits.
+- Each call: 2,048 output tokens by default, optionally up to 4,096 with
+  `NAUSICAA_TOPOLOGY_OUTPUT_TOKENS`, 160,000 serialized input bytes,
+  and 120 seconds. Calendar lead turns allow ten minutes for development,
+  review, repairs and re-review. Other turns and background waits also have finite limits.
 - Cost reservations use conservative byte counts and the installed provider
   catalog. They are a local admission guard, not a provider billing guarantee.
   Missing cost, ambiguous failure, or exceeded limits disables later calls.
-- A newly created temporary workspace contains only synthetic checkout files.
+- A newly created temporary workspace contains only synthetic checkout files,
+  or starts empty for the natural-language calendar case.
   Shell, network tools, external projects, and real user data are not granted.
   Provider access itself still requires the environment's network permission.
 - `.local/live-topology/<timestamp>-<suffix>/` contains `report.json`,
@@ -89,6 +95,8 @@ Cancellation is last for this reason and may need a separately authorized batch.
   workspace root recorded by the report. They are not automatically deleted;
   the OS may eventually clean its temporary directory.
 
+Teto is disabled for the Team probes so their results isolate Team collaboration;
+they do not establish the behavior of Teams with the default observer enabled.
 The suite does not yet exercise cross-Run A2A, member-owned Teto, observer skills,
 deadline-best-effort, daemon restart, arbitrary Team resume, streaming steering,
 or long-running topology scale. The calendar case checks file structure and
@@ -107,6 +115,27 @@ These checks validate the smoke's local safety mechanisms. They do not count
 as successful OpenRouter or multi-topology live runs.
 
 ## Recorded Review
+
+The 0.1.5 natural-language calendar probe passed all 12 collaboration checks
+from an empty workspace. The lead created a developer, added a reviewer after
+the file existed, reassigned repairs to that developer, requested a re-review,
+recorded acceptance and delivered a final answer. Four tasks produced four
+automatic group reports and four distinct `task_wait` calls; the lead used
+12 model calls and all lanes used 27. The run took 227 seconds and reported
+$0.1398078572 with complete usage accounting. The reviewer recovered from a
+Git-status error in the non-Git workspace. This validates collaboration and
+script parsing, not browser behavior or model reliability across repeated runs.
+Record: `2026-09-10T08-44-44-424Z-jIy0fJ`.
+
+Two preceding natural-language attempts remain failed records. The first was
+cancelled by the test's former four-minute turn guard during re-review
+(`2026-09-10T07-25-39-268Z-S7MxAu`). The second exposed incorrect routing of
+member status/wait tools to only their nested Teams, then hit the test's former
+60-second request timeout (`2026-09-10T08-25-15-562Z-7AMyPS`). Their known costs
+were $0.1160490584 and $0.090132878 respectively, with incomplete final-request
+accounting. The routing fix has separate protocol coverage for membership,
+nested Teams, denied access and self-wait rejection. The final probe used the
+same Chinese request, ten-minute turn guard and 120-second request guard.
 
 On September 10, the updated Worker probe passed. A calendar Team probe then
 passed all 14 collaboration checks: parallel member writes, prerequisite order,
@@ -151,7 +180,7 @@ As of 0.1.4, live prompts use the same compact tool contract as production, with
 no per-task budget arguments. The smoke's outer cost/request guards remain
 test-only controls.
 
-The latest Team probe completed reduction and Main acceptance with the correct
+The earlier September 7-8 peer/reducer probe completed reduction and Main acceptance with the correct
 total, but remains failed overall: one model used `grand_total` instead of the
 requested `subtotal`, and spent its allowance correcting unsupported message
 kinds, leaving that member partial. The evaluator intentionally does not treat

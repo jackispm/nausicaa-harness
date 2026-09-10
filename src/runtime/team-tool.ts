@@ -131,6 +131,8 @@ export interface TeamAssignRequest {
   memberId: string;
   statement: string;
   input?: string;
+  /** Optional capability narrowing when admitting a new member. */
+  capabilities?: TeamCapabilityGrant;
 }
 
 export interface TeamAssignResult {
@@ -163,60 +165,63 @@ export interface TeamControl {
   present?(request: TeamPresentRequest, context: ToolExecutionContext): unknown | Promise<unknown>;
 }
 
-/** Assign a subsequent Task to a resident member lane. */
+/** Assign ready work to a new or existing member in the same Team. */
 export function createTeamAssignTool(control: TeamControl): AgentTool {
   if (control === null || typeof control !== "object" || typeof control.assign !== "function") {
     throw new TypeError("Team assign control must provide assign");
   }
   return createTeamCommand(
     "team_assign",
-    "Assign one new Task to an existing Team member. The member keeps its lane and context boundary, while the Task gets a new durable assignment version. Use team_status to inspect the result; do not include budgets or synthetic success criteria.",
+    "Assign ready work within an existing Team. A new memberId joins the Team; an existing member keeps its identity and authorized tools. Provide the objective in statement and relevant prior results or file paths in input. Add a reviewer after the work is ready; return fixes to the responsible member and request another review when useful. Reports arrive in the shared task thread. Use task_wait when you have no other work, or end your turn for automatic continuation.",
     {
       teamId: teamIdSchema,
       memberId: memberIdSchema,
-      statement: boundedText,
-      input: boundedText,
+      statement: { ...boundedText, description: "Ready-to-start objective for this assignment" },
+      input: { ...boundedText, description: "Concise handoff: existing results, relevant file paths, and decisions the member needs" },
+      capabilities: { ...capabilityGrantSchema, description: "Optional tool narrowing for a new member; existing member permissions cannot be expanded here" },
     },
     ["teamId", "memberId", "statement"],
     (arguments_, context) => {
-      exactKeys(arguments_, ["teamId", "memberId", "statement", "input"], "arguments");
+      exactKeys(arguments_, ["teamId", "memberId", "statement", "input", "capabilities"], "arguments");
       const input = optionalString(arguments_.input, "input");
+      const capabilities = parseCapabilityGrant(arguments_.capabilities, "capabilities");
       return control.assign!({
         teamId: normalizeTeamId(arguments_.teamId),
         memberId: memberIdentity(arguments_.memberId, "memberId"),
         statement: boundedBody(arguments_.statement),
         ...(input === undefined ? {} : { input }),
+        ...(capabilities === undefined ? {} : { capabilities }),
       }, context);
     },
   );
 }
 
-/** Read the durable state of one resident Task and yield a wake-friendly result. */
-export function createTaskWaitTool(control: TeamControl): AgentTool {
+/** Wait for a Task result without spending model calls on status polling. */
+export function createTaskWaitTool(control: Pick<TeamControl, "wait">): AgentTool {
   if (control === null || typeof control !== "object" || typeof control.wait !== "function") {
     throw new TypeError("Task wait control must provide wait");
   }
-  return createTeamCommand(
+  return annotateTool(createTeamCommand(
     "task_wait",
-    "Read one Team Task's durable state. A running task is reported as waiting and will wake the Team Lead when a new report arrives; this operation does not copy the member transcript into the Lead context.",
+    "Wait for one Team task to finish and return its durable report. The runtime waits without polling the model. Use this when you have no other ready work; use team_status for an immediate snapshot. You can also end your current turn and let arriving reports resume coordination. Waiting does not copy the member's full transcript.",
     { teamId: teamIdSchema, taskId: { type: "string", minLength: 1, maxLength: 128 } },
     ["teamId", "taskId"],
     (arguments_, context) => {
       exactKeys(arguments_, ["teamId", "taskId"], "arguments");
       return control.wait!({ teamId: normalizeTeamId(arguments_.teamId), taskId: requiredString(arguments_.taskId, "taskId") }, context);
     },
-  );
+  ), { effect: "read", deterministic: true, supportsBatch: false, concurrencySafe: true, scope: "run", inputKinds: ["json"], outputKinds: ["json"] });
 }
 
 /** Main-facing read-only capability for the durable Team board projection. */
-export function createTeamStatusTool(control: TeamControl): AgentTool {
+export function createTeamStatusTool(control: Pick<TeamControl, "status">): AgentTool {
   if (control === null || typeof control !== "object" || typeof control.status !== "function") {
     throw new TypeError("Team status control must provide status");
   }
   const tool: AgentTool = {
     definition: {
       name: "team_status",
-      description: "Read a compact snapshot of durable Team members, names, outcomes, join, reduction, and Team Lead acceptance in this Run. Use returned laneId values for A2A; names may repeat across Teams. Join collects terminal outcomes, including partial or failed work, without proving success or completing the Lead's synthesis. This is a snapshot, not a wait operation.",
+      description: "Read a compact snapshot of the Teams you belong to or manage: member names, outcomes, join, reduction, and Lead acceptance. Use returned laneId values for A2A; names may repeat across Teams. Join collects terminal outcomes, including partial or failed work, without proving success or completing the Lead's synthesis. Use task_wait to await a result.",
       parameters: {
         type: "object",
         properties: {},
@@ -376,14 +381,16 @@ function modelTeamTask(value: unknown): unknown {
 function modelTeamMember(value: unknown): unknown {
   if (!isStatusRecord(value)) return value;
   const goal = isStatusRecord(value.goal) ? value.goal : undefined;
+  const report = isStatusRecord(value.latestReport) ? value.latestReport : undefined;
   return {
     ...statusFields(value, [
       "laneId", "taskId", "registered", "status", "laneStatus", "execution", "terminal", "outcome",
-      "dependsOn", "required", "attempt", "result", "failure", "reason", "anomalies", "lastOffset",
+      "required", "attempt", "result", "failure", "reason", "anomalies", "lastOffset",
     ]),
     memberId: value.memberId ?? value.branchId,
     ...(typeof value.laneId === "string" ? { name: publicAgentName(value.laneId) } : {}),
     ...(goal === undefined ? {} : { statement: goal.statement }),
+    ...(report === undefined ? {} : { latestReport: statusFields(report, ["reportId", "runId", "kind", "summary", "artifactRefs", "openQuestions"]) }),
   };
 }
 
@@ -392,7 +399,7 @@ function modelTeamReducer(value: unknown): unknown {
   const task = isStatusRecord(value.task) ? value.task : undefined;
   const goal = task !== undefined && isStatusRecord(task.goal) ? task.goal : undefined;
   return {
-    ...statusFields(value, ["memberId", "laneId", "dependsOn", "required"]),
+    ...statusFields(value, ["memberId", "laneId", "required"]),
     ...(typeof value.laneId === "string" ? { name: publicAgentName(value.laneId) } : {}),
     ...(task === undefined ? {} : { taskId: task.taskId }),
     ...(goal === undefined ? {} : { statement: goal.statement }),
@@ -440,11 +447,10 @@ function memberSchema(): Record<string, unknown> {
     items: {
       type: "object",
       properties: {
-        memberId: { ...memberIdSchema, description: "Member name and stable ID chosen by you, e.g. researcher or reviewer; normalized for routing. Defaults to worker-1, worker-2, etc. (displayed as worker 1, worker 2). Required when another member depends on this task. Names are unique within this Team; runtime role names are reserved." },
+        memberId: { ...memberIdSchema, description: "Member name and stable ID chosen by you, e.g. researcher or reviewer. Defaults to worker-1, worker-2, etc. Names are unique within this Team; runtime role names are reserved." },
         branchId: { ...memberIdSchema, deprecated: true, description: "Compatibility alias for memberId" },
-        statement: { ...boundedText, description: "This member's objective" },
-        input: boundedText,
-        dependsOn: { type: "array", maxItems: MAX_MEMBERS - 1, items: memberIdSchema, description: "Member ids whose tasks must succeed before this task can start" },
+        statement: { ...boundedText, description: "Ready-to-start objective; add later work with team_assign once its inputs exist" },
+        input: { ...boundedText, description: "Concise handoff: relevant context, existing results, file paths, and decisions" },
         required: { type: "boolean", default: true, description: "Whether this member is required at the Team join boundary" },
         capabilities: capabilityGrantSchema,
       },
@@ -462,7 +468,7 @@ export function createTeamTool(control: TeamControl): AgentTool {
   const tool: AgentTool = {
     definition: {
       name: "team_create",
-      description: "Create independent Team lanes. Members use fresh contexts and run in parallel unless dependsOn requires a prior durable result. Name members with members[].memberId (otherwise worker 1, worker 2, etc.); they receive the host-authorized tool catalog, optionally narrowed by capabilities. Use returned laneId values for A2A. Results arrive asynchronously. You remain Team Lead and synthesize them; partial or failed outcomes are not success. Supply members or legacy branches.",
+      description: "Create a Team with members whose work can start now. Members have independent contexts and run in parallel; give each a clear statement and concise input. For example, create a developer first; once its file exists, add a reviewer using team_assign in this same Team. Reuse members for further work. Members inherit your authorized tools unless capabilities narrows them. Final reports enter the shared Team channel; team_message is group chat and agent_message is private A2A. You own synthesis and acceptance; partial or failed outcomes are not success. When no other work is ready, task_wait awaits a report, or end your turn for automatic continuation.",
       parameters: {
         type: "object",
         properties: {
@@ -645,7 +651,10 @@ export function parseTeamRequest(value: unknown): NormalizedTeamCreateRequest {
   if (!Array.isArray(collection)) throw new TypeError(`${collectionField} must be an array`);
   for (const [index, member] of collection.entries()) {
     const item = object(member, `${collectionField}[${index}]`);
-    exactKeys(item, ["memberId", "branchId", "statement", "input", "dependsOn", "required", "capabilities"], `${collectionField}[${index}]`);
+    if (Object.hasOwn(item, "dependsOn")) {
+      throw new TypeError("dependsOn is no longer supported; assign this work with team_assign after its inputs are ready");
+    }
+    exactKeys(item, ["memberId", "branchId", "statement", "input", "required", "capabilities"], `${collectionField}[${index}]`);
   }
   return normalizeTeamCreateRequest(arguments_);
 }

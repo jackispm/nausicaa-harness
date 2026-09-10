@@ -123,11 +123,11 @@ function workspaceCatalog() {
 function parentChannelModel(teamId: string) {
   return new RecordingModel((_request, call) => {
     if (call === 1) return {
-      ...response("", "tool_calls"),
+      ...response("", "toolUse"),
       toolCalls: [{ id: "parent-message", name: "team_message", arguments: { teamId, body: "Parent Team channel is available" } }],
     };
     if (call === 2) return {
-      ...response("", "tool_calls"),
+      ...response("", "toolUse"),
       toolCalls: [{ id: "parent-history", name: "team_history", arguments: { teamId } }],
     };
     return response("Parent Team communication verified");
@@ -232,30 +232,30 @@ describe("durable Team collaboration", () => {
     const { team, ledger } = fixture();
     await team.create({ teamId: "channel-review", members: [member("writer")] }, context);
 
-    const first = await team.message({ teamId: "channel-review", body: "Started the review" }, {
+    const first = await team.message({ teamId: "channel-review", channelId: "discussion", body: "Started the review" }, {
       ...context, operationId: "channel-message-1",
     });
-    const memberMessage = await team.message({ teamId: "channel-review", body: "Writer lane is ready", threadId: "task:writer" }, {
+    const memberMessage = await team.message({ teamId: "channel-review", channelId: "discussion", body: "Writer lane is ready", threadId: "task:writer" }, {
       ...context, laneId: "team:channel-review:writer", operationId: "channel-message-member-1",
     });
     expect(memberMessage.fromLane).toBe("team:channel-review:writer");
-    const duplicate = await team.message({ teamId: "channel-review", body: "Started the review" }, {
+    const duplicate = await team.message({ teamId: "channel-review", channelId: "discussion", body: "Started the review" }, {
       ...context, operationId: "channel-message-1",
     });
     expect(first.status).toBe("sent");
     expect(duplicate).toMatchObject({ status: "duplicate", messageId: first.messageId, sequence: 1 });
 
-    const second = await team.message({ teamId: "channel-review", body: "Ready for review", threadId: "task:writer" }, {
+    const second = await team.message({ teamId: "channel-review", channelId: "discussion", body: "Ready for review", threadId: "task:writer" }, {
       ...context, operationId: "channel-message-2",
     });
-    const history = await team.history({ teamId: "channel-review", threadId: "channel-review:general:general", limit: 1 }, context);
+    const history = await team.history({ teamId: "channel-review", channelId: "discussion", threadId: "channel-review:discussion:general", limit: 1 }, context);
     expect(history.messages.map((message) => message.body)).toEqual(["Started the review"]);
     expect(history.hasMore).toBe(false);
-    const taskHistory = await team.history({ teamId: "channel-review", threadId: "task:writer", limit: 1 }, context);
+    const taskHistory = await team.history({ teamId: "channel-review", channelId: "discussion", threadId: "task:writer", limit: 1 }, context);
     expect(taskHistory.messages.map((message) => message.body)).toEqual(["Writer lane is ready"]);
     expect(taskHistory.hasMore).toBe(true);
     if (taskHistory.nextCursor === undefined) throw new Error("Expected a next history cursor");
-    const next = await team.history({ teamId: "channel-review", after: taskHistory.nextCursor }, context);
+    const next = await team.history({ teamId: "channel-review", channelId: "discussion", after: taskHistory.nextCursor }, context);
     expect(next.messages.map((message) => message.body)).toEqual(["Ready for review"]);
     expect(second.threadId).toBe("task:writer");
 
@@ -266,7 +266,8 @@ describe("durable Team collaboration", () => {
     await expect(team.message({ teamId: "channel-review", body: "late" }, {
       ...context, operationId: "channel-message-late",
     })).rejects.toThrow(/closed/);
-    expect((await ledger.read({ runId: RUN_ID })).filter((event) => event.type === "team.message.sent")).toHaveLength(3);
+    expect((await ledger.read({ runId: RUN_ID })).filter((event) => event.type === "team.message.sent"
+      && event.payload.channelId === "discussion")).toHaveLength(3);
   });
 
   it("creates canonical members after one durable definition while preserving exact legacy identity objects", async () => {
@@ -299,7 +300,7 @@ describe("durable Team collaboration", () => {
     expect(events.some((event) => event.laneId === "main" && (event.type === "user.message" || event.type === "assistant.message"))).toBe(false);
   });
 
-  it("reads initial queued and running task IDs from team_create without scheduling or writing", async () => {
+  it("waits for initial queued and running task IDs without spending model calls or writing", async () => {
     const entered = deferred<void>();
     const release = deferred<ModelResponse>();
     const model = new RecordingModel((request) => {
@@ -318,15 +319,19 @@ describe("durable Team collaboration", () => {
     const eventsBefore = await ledger.read({ runId: RUN_ID });
     const inboxBefore = inbox.snapshot();
     const callsBefore = model.requests.length;
+    let settledWaits = 0;
+    const waits = [uiTask, logicTask].map(async (task) => {
+      const result = await waitTool.execute({ teamId: created.teamId, taskId: task.taskId }, context);
+      settledWaits += 1;
+      return result;
+    });
     try {
-      for (const [task, status] of [[uiTask, "running"], [logicTask, "queued"]] as const) {
-        const result = await waitTool.execute({ teamId: created.teamId, taskId: task.taskId }, context);
-        expect(result.isError).toBe(false);
-        expect(JSON.parse(result.content)).toMatchObject({
-          teamId: created.teamId, taskId: task.taskId, memberId: task.memberId, laneId: task.laneId,
-          status, terminal: false, waiting: true,
-        });
-      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(settledWaits).toBe(0);
+      expect((await board(team, "calendar")).members).toEqual(expect.arrayContaining([
+        expect.objectContaining({ memberId: "ui", status: "running", terminal: false }),
+        expect.objectContaining({ memberId: "logic", status: "queued", terminal: false }),
+      ]));
       expect(await ledger.read({ runId: RUN_ID })).toEqual(eventsBefore);
       expect(inbox.snapshot()).toEqual(inboxBefore);
       expect(model.requests).toHaveLength(callsBefore);
@@ -334,6 +339,10 @@ describe("durable Team collaboration", () => {
       release.resolve(response("Calendar layout checked"));
     }
     await team.drain();
+    for (const result of await Promise.all(waits)) {
+      expect(result.isError).toBe(false);
+      expect(JSON.parse(result.content)).toMatchObject({ terminal: true, waiting: false });
+    }
     expect(await team.wait({ teamId: created.teamId, taskId: uiTask.taskId }, context)).toMatchObject({
       status: "completed", outcome: "succeeded", terminal: true, waiting: false,
       result: { taskId: uiTask.taskId, status: "completed", summary: "Calendar layout checked" },
@@ -456,7 +465,9 @@ describe("durable Team collaboration", () => {
       ...context, operationId: "close-resident-assign",
     });
     await entered.promise;
-    expect(await team.wait({ teamId: "close-resident", taskId: "close-resident:researcher:task-1" }, context)).toMatchObject({ status: "running" });
+    expect((await board(team, "close-resident")).tasks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ taskId: "close-resident:researcher:task-1", status: "running" }),
+    ]));
     await team.close({ teamId: "close-resident" }, context);
     expect(residentSignal?.aborted).toBe(true);
     const closedOffset = await ledger.watermark();
@@ -760,7 +771,7 @@ describe("durable Team collaboration", () => {
     const unknown = tool("unclassified_host_tool");
     const model = new RecordingModel((request, call) => {
       if (request.laneId.startsWith("team-reducer:") && call === 1) {
-        return { ...response("Attempt unauthorized mutation", "tool_calls"), toolCalls: [{ id: "reducer-write", name: "mutate_workspace", arguments: {} }] };
+        return { ...response("Attempt unauthorized mutation", "toolUse"), toolCalls: [{ id: "reducer-write", name: "mutate_workspace", arguments: {} }] };
       }
       return response("Evidence report");
     });
@@ -862,8 +873,7 @@ describe("durable Team collaboration", () => {
       correlationId: RUN_ID, idempotencyKey: "status-without-settlement", visibility: "run", occurredAt: original.clock.now().toISOString(),
     });
     expect(await board(original.team)).toMatchObject({ joinSatisfied: false, members: [{ terminal: false }] });
-    expect(await original.team.wait({ teamId: "review", taskId: "review:slow" }, context))
-      .toMatchObject({ status: "unknown", terminal: false, waiting: true });
+    expect((await board(original.team)).members[0]).toMatchObject({ status: "unknown", terminal: false });
     await original.team.cancel({ teamId: "review", reason: "Lead cancelled the review" }, context);
     const state = await board(original.team);
     expect(state).toMatchObject({ joinState: "cancelled", cancellationRequested: true, members: [{ outcome: "cancelled", terminal: true }] });
@@ -1127,15 +1137,15 @@ describe("durable Team collaboration", () => {
     };
     const model = new RecordingModel((request, laneCall) => {
       if (request.laneId.endsWith(":a")) {
-        if (laneCall === 1) return { ...response("Contacting peer", "tool_calls"), toolCalls: [{ id: "a-to-b", name: "agent_message", arguments: { target: "team:review:b", text: "A evidence: auth requires a nonce", kind: "progress" } }] };
+        if (laneCall === 1) return { ...response("Contacting peer", "toolUse"), toolCalls: [{ id: "a-to-b", name: "agent_message", arguments: { target: "team:review:b", text: "A evidence: auth requires a nonce", kind: "progress" } }] };
         if (laneCall === 2) {
           aSent.resolve();
-          return { ...response("Waiting for B", "tool_calls"), toolCalls: [{ id: "a-waits", name: "read_file", arguments: { path: "wait-b" } }] };
+          return { ...response("Waiting for B", "toolUse"), toolCalls: [{ id: "a-waits", name: "read_file", arguments: { path: "wait-b" } }] };
         }
         return response("A reviewed the peer reply");
       }
-      if (laneCall === 1) return { ...response("Waiting for A", "tool_calls"), toolCalls: [{ id: "b-waits", name: "read_file", arguments: { path: "wait-a" } }] };
-      if (laneCall === 2) return { ...response("Replying to peer", "tool_calls"), toolCalls: [{ id: "b-to-a", name: "agent_message", arguments: { target: "team:review:a", text: "B evidence: nonce compatibility checked", kind: "inform" } }] };
+      if (laneCall === 1) return { ...response("Waiting for A", "toolUse"), toolCalls: [{ id: "b-waits", name: "read_file", arguments: { path: "wait-a" } }] };
+      if (laneCall === 2) return { ...response("Replying to peer", "toolUse"), toolCalls: [{ id: "b-to-a", name: "agent_message", arguments: { target: "team:review:a", text: "B evidence: nonce compatibility checked", kind: "inform" } }] };
       bSent.resolve();
       return response("B finished peer review");
     });

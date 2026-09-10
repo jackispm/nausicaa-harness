@@ -389,6 +389,9 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
       case "team.created":
         for (const member of event.payload.members) activatedLanes.add(member.laneId);
         break;
+      case "team.member.added":
+        if (event.laneId === event.payload.addedBy) activatedLanes.add(event.payload.member.laneId);
+        break;
       case "team.reduction.requested":
         activatedLanes.add(event.payload.reducer.laneId);
         break;

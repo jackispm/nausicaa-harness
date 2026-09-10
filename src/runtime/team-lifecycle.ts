@@ -1,11 +1,13 @@
 import type { A2AInbox, InboxClaim, InboxRecord } from "../a2a/index.js";
 import type { AnyEvent, EventPayloadMap, EventType } from "../domain/events.js";
 import type { Clock } from "../domain/ports.js";
-import type { TeamDefinition, TeamMemberDefinition, TeamMemberOutcome } from "../domain/team.js";
+import type { TeamDefinition, TeamMemberAddition, TeamMemberDefinition, TeamMemberOutcome, TeamTaskAssignment } from "../domain/team.js";
 import type { A2AMessage, TaskFailed, TaskResult } from "../domain/types.js";
 import type { Ledger } from "../ledger/index.js";
 import { projectTeamBoards, type TeamBoard, type TeamBoardMember } from "./team-board.js";
 import { publicAgentName } from "./lane-names.js";
+import { publishTeamRunReport } from "./team-channel.js";
+import { sha256, stableJson } from "../ledger/hash.js";
 
 interface TeamLifecycleOptions {
   runId: string;
@@ -16,6 +18,7 @@ interface TeamLifecycleOptions {
   readEvents: () => Promise<readonly AnyEvent[]>;
   stopMember: (laneId: string) => Promise<void>;
   onWake?: () => void;
+  onStateChange?: () => void;
 }
 
 /** Durable Team transitions; scheduling and model execution stay in TeamRuntime. */
@@ -55,6 +58,40 @@ export class TeamLifecycle {
     }
   }
 
+  addMember(addition: TeamMemberAddition, assertAdmission: () => void): Promise<void> {
+    return this.exclusive(async () => {
+      assertAdmission();
+      const board = await this.requireBoard(addition.teamId);
+      assertAdmission();
+      if (board.lifecycleState === "closed" || board.cancellationRequested || this.closingTeams.has(board.teamId)) throw new Error(`Team ${board.teamId} is closed`);
+      if (addition.addedBy !== this.options.leadLaneId || board.members.length >= 16
+        || board.members.some((member) => member.memberId === addition.member.memberId || member.laneId === addition.member.laneId)) {
+        throw new Error("Team member admission conflicts with an existing member or the 16-member limit");
+      }
+      await this.append("team.member.added", addition, addition.teamId, `member:${addition.member.memberId}:added`);
+    });
+  }
+
+  assignTask(assignment: TeamTaskAssignment, assertAdmission: () => void): Promise<void> {
+    return this.exclusive(async () => {
+      assertAdmission();
+      const board = await this.requireBoard(assignment.teamId);
+      assertAdmission();
+      if (board.lifecycleState === "closed" || board.cancellationRequested || this.closingTeams.has(board.teamId)) throw new Error(`Team ${board.teamId} is closed`);
+      const member = board.members.find((candidate) => candidate.memberId === assignment.memberId);
+      if (assignment.assignedBy !== this.options.leadLaneId || member?.laneId !== assignment.laneId
+        || !member.terminal || (board.tasks ?? []).some((task) => task.memberId === assignment.memberId
+          && task.latestReport === undefined && task.status !== "cancelled")) throw new Error("Team member already has unfinished work");
+      await this.options.ledger.append({
+        runId: this.options.runId, laneId: this.options.leadLaneId, type: "team.task.assigned", payload: assignment,
+        correlationId: `${this.options.runId}:team:${board.teamId}`,
+        idempotencyKey: `${this.options.runId}:team:${board.teamId}:assign:${assignment.operationId}`,
+        visibility: "run", occurredAt: this.options.clock.now().toISOString(),
+      } as never);
+      this.options.onStateChange?.();
+    });
+  }
+
   settle(teamId: string, member: TeamMemberDefinition, request: A2AMessage, claim: InboxClaim, payload: TaskResult | TaskFailed, reducer = false): Promise<void> {
     return this.exclusive(async () => {
       if (this.stopped) throw new Error("Team runtime stopped before settlement");
@@ -87,6 +124,7 @@ export class TeamLifecycle {
           claimId: claim.claimId, attempt: claim.attempt, outcome, ...result,
         }, teamId, `member:${member.memberId}:settled`);
       }
+      if (!reducer) await this.publishInitialReports(await this.requireBoard(teamId));
       // The branch executor emits the interactive wake only after the
       // terminal reply is also durable. Waking from this point would race the
       // reply and make the lead observe a false empty Inbox.
@@ -149,8 +187,14 @@ export class TeamLifecycle {
     return this.exclusive(async () => {
       const board = await this.requireBoard(teamId);
       if (!board.joinSatisfied || board.cancellationRequested || board.reductionState === "running") throw new Error("Team must join and finish any reduction before presentation");
+      if (board.members.some((member) => !member.terminal)
+        || (board.tasks ?? []).some((task) => task.latestReport === undefined && task.status !== "cancelled")) {
+        throw new Error("Team still has unfinished member tasks; wait for their reports before presentation");
+      }
       if (board.presentationState !== "pending" && board.presentationState !== disposition) throw new Error("Team already has a different presentation decision");
-      await this.append("team.presented", { teamId, disposition }, teamId, "presented");
+      if (board.presentationState === disposition) return;
+      const taskSet = [...board.members.map((member) => member.taskId), ...(board.tasks ?? []).map((task) => task.taskId)].sort();
+      await this.append("team.presented", { teamId, disposition }, teamId, `presented:${sha256(stableJson(taskSet))}`);
     });
   }
 
@@ -163,6 +207,7 @@ export class TeamLifecycle {
     const events = await this.options.readEvents();
     const records = this.options.inbox.snapshot().records;
     for (let board of await this.boards()) {
+      await this.publishInitialReports(board);
       if (board.lifecycleState === "closed") {
         this.clearTimer(board.teamId);
         this.clearTimer(`${board.teamId}:reducer`);
@@ -285,7 +330,35 @@ export class TeamLifecycle {
       correlationId: `${this.options.runId}:team:${teamId}`,
       idempotencyKey: `${this.options.runId}:team:${teamId}:${suffix}`, visibility: "run",
       occurredAt: this.options.clock.now().toISOString(),
-    });
+    }).then((event) => { this.options.onStateChange?.(); return event; });
+  }
+
+  private async publishInitialReports(board: TeamBoard): Promise<void> {
+    for (const member of board.members) {
+      if (!member.terminal || member.latestReport !== undefined) continue;
+      const payload = member.result ?? member.failure ?? {
+        type: "task.failed" as const, taskId: member.taskId,
+        reason: member.reason ?? `Team task ${member.outcome ?? "failed"}`,
+        retryable: false, evidenceRefs: [],
+      };
+      const failed = payload.type === "task.failed";
+      await publishTeamRunReport({
+        ledger: this.options.ledger, readEvents: this.options.readEvents,
+        occurredAt: this.options.clock.now().toISOString(),
+        ...(member.requestMessageId.length === 0 ? {} : { causationId: member.requestMessageId }),
+        report: {
+          teamId: board.teamId, taskId: member.taskId, laneId: member.laneId,
+          assignmentVersion: 0, kind: failed ? "failed" : payload.status === "completed" ? "ready-for-review" : "checkpoint",
+          summary: failed ? payload.reason : payload.summary,
+          artifactRefs: failed ? [] : payload.artifactRefs,
+          openQuestions: failed ? [payload.reason] : payload.openQuestions,
+          ...(failed ? { failure: payload } : { result: payload }),
+          reportId: `${this.options.runId}:team:${board.teamId}:report:${member.taskId}`,
+          runId: this.options.runId,
+        },
+      });
+      this.options.onStateChange?.();
+    }
   }
 
   private arm(key: string, deadline: string): void {

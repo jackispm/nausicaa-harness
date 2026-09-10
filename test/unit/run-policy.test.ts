@@ -3,6 +3,16 @@ import { describe, expect, it } from "vitest";
 import { resolveRunPolicy } from "../../src/runtime/run-policy.js";
 
 describe("run policy", () => {
+  it("keeps scheduling slices distinct from explicitly configured legacy hard limits", () => {
+    expect(resolveRunPolicy()).toMatchObject({ maxMainStepsPerActivation: 24 });
+    expect(resolveRunPolicy({ maxMainStepsPerActivation: 2 })).toMatchObject({ maxMainStepsPerActivation: 2 });
+    const legacy = resolveRunPolicy({ maxMainSteps: 2 });
+    expect(legacy).toMatchObject({ maxMainSteps: 2 });
+    expect(legacy.maxMainStepsPerActivation).toBeUndefined();
+    expect(() => resolveRunPolicy({ maxMainSteps: 2, maxMainStepsPerActivation: 1 } as never))
+      .toThrow("not both");
+  });
+
   it("makes Worker delegation available and activates Teto by default", () => {
     expect(resolveRunPolicy()).toMatchObject({
       workerEnabled: true,

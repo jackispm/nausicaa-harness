@@ -88,7 +88,7 @@ describe("Team tool creation contract", () => {
     expect(() => messageTool.definition.parameters?.properties?.body).not.toBeUndefined();
   });
 
-  it("exposes resident assignment and wait without model-owned budgets", async () => {
+  it("exposes member admission and assignment without model-owned budgets", async () => {
     const assign = vi.fn(async () => ({ teamId: "review", taskId: "review:security:task-1", memberId: "security", laneId: "team:review:security", assignmentVersion: 1, status: "queued" as const }));
     const wait = vi.fn(async () => ({ teamId: "review", taskId: "review:security:task-1", status: "waiting", waiting: true }));
     const control: TeamControl = { create: vi.fn(async () => ({ teamId: "review", branches: [] })), assign, wait };
@@ -99,6 +99,23 @@ describe("Team tool creation contract", () => {
     expect((await assignTool.execute({ teamId: "review", memberId: "security", statement: "Continue review" }, context)).isError).toBe(false);
     expect((await waitTool.execute({ teamId: "review", taskId: "review:security:task-1" }, context)).isError).toBe(false);
     expect(assign).toHaveBeenCalledWith({ teamId: "review", memberId: "security", statement: "Continue review" }, context);
+    const capabilities = { tools: ["read_file"], allowNestedTeam: false };
+    expect((await assignTool.execute({ teamId: "review", memberId: "reviewer", statement: "Review the completed files", input: "Read index.html", capabilities }, context)).isError).toBe(false);
+    expect(assign).toHaveBeenLastCalledWith({ teamId: "review", memberId: "reviewer", statement: "Review the completed files", input: "Read index.html", capabilities }, context);
+    expect(validateArguments(assignTool, { teamId: "review", memberId: "reviewer", statement: "Review", dependsOn: ["security"] }).ok).toBe(false);
+  });
+
+  it.each(["members", "branches"])("rejects dependency scheduling through the %s model contract", async (field) => {
+    const { tool, create } = setup();
+    const request = { [field]: [
+      { memberId: "builder", statement: "Build the page" },
+      { memberId: "reviewer", statement: "Review the page", dependsOn: ["builder"] },
+    ] };
+    const result = await tool.execute(request, context);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("team_assign after its inputs are ready");
+    expect(create).not.toHaveBeenCalled();
+    if (field === "members") expect(validateArguments(tool, request).ok).toBe(false);
   });
 
   it("canonicalizes members and legacy branches to the same bounded request", async () => {
@@ -173,7 +190,7 @@ describe("Team tool creation contract", () => {
     expect(validateArguments(tool, { branches: [{ statement: "Inspect auth" }] }).ok).toBe(true);
     expect(validateArguments(tool, { members: [{ statement: "Inspect auth", tools: ["bash"] }] }).ok).toBe(false);
     expect(validateArguments(tool, { members: [{ statement: "Inspect auth", maxAttempts: MAX_TASK_ATTEMPTS + 1 }] }).ok).toBe(false);
-    expect(tool.definition.description).toMatch(/You remain Team Lead/);
+    expect(tool.definition.description).toMatch(/You own synthesis and acceptance/);
     expect(tool.definition.description).toMatch(/partial.*not success/);
   });
 
@@ -215,11 +232,6 @@ describe("Team tool creation contract", () => {
     ["nested task shorthand", { members: [{ task: { statement: "A" } }] }, "task"],
     ["conflicting aliases", { members: [{ memberId: "a", branchId: "b", statement: "A" }] }, "same member"],
     ["normalized id collision", { members: [{ memberId: "Source Review", statement: "A" }, { memberId: "source-review", statement: "B" }] }, "Duplicate Team member"],
-    ["unknown dependency", { members: [{ memberId: "a", statement: "A", dependsOn: ["missing"] }] }, "Unknown dependency"],
-    ["self dependency", { members: [{ memberId: "a", statement: "A", dependsOn: ["a"] }] }, "itself"],
-    ["dependency cycle", { members: [{ memberId: "a", statement: "A", dependsOn: ["b"] }, { memberId: "b", statement: "B", dependsOn: ["a"] }] }, "cycle"],
-    ["duplicate dependency", { members: [{ memberId: "a", statement: "A" }, { statement: "B", dependsOn: ["a", "A"] }] }, "duplicate members"],
-    ["unnamed dependency target", { members: [{ statement: "A" }, { memberId: "b", statement: "B", dependsOn: ["a"] }] }, "explicit ids"],
     ["nonboolean required", { members: [{ statement: "A", required: "true" }] }, "boolean"],
     ["invalid join policy", { members: [{ statement: "A" }], joinPolicy: "any-success" }, "joinPolicy"],
     ["null join policy", { members: [{ statement: "A" }], joinPolicy: null }, "joinPolicy"],
@@ -244,6 +256,16 @@ describe("Team tool creation contract", () => {
     expect(result.content).toContain(expected);
     expect(create).not.toHaveBeenCalled();
     if (expected !== "not supported") expect(() => normalizeTeamCreateRequest(request)).toThrow(expected);
+  });
+
+  it.each([
+    [{ members: [{ memberId: "a", statement: "A", dependsOn: ["missing"] }] }, "Unknown dependency"],
+    [{ members: [{ memberId: "a", statement: "A", dependsOn: ["a"] }] }, "itself"],
+    [{ members: [{ memberId: "a", statement: "A", dependsOn: ["b"] }, { memberId: "b", statement: "B", dependsOn: ["a"] }] }, "cycle"],
+    [{ members: [{ memberId: "a", statement: "A" }, { statement: "B", dependsOn: ["a", "A"] }] }, "duplicate members"],
+    [{ members: [{ statement: "A" }, { memberId: "b", statement: "B", dependsOn: ["a"] }] }, "explicit ids"],
+  ])("still validates dependency facts supplied by legacy host callers", (request, expected) => {
+    expect(() => normalizeTeamCreateRequest(request)).toThrow(expected as string);
   });
 });
 
@@ -376,11 +398,11 @@ describe("Team lifecycle tools", () => {
       cancellationRequested: false, reductionState: "running", presentationState: "pending", lastOffset: 42,
       members: [{ memberId: "security", name: "security", laneId: "team:review:security", taskId: "review:security",
         statement: "Inspect auth", status: "running", execution: "running", laneStatus: "running", terminal: false,
-        registered: true, attempt: 1, dependsOn: [], required: true, anomalies: [] }],
+        registered: true, attempt: 1, required: true, anomalies: [] }],
       reducer: { memberId: "reducer", name: "reducer", laneId: "team:review:reducer", taskId: "review:reducer", statement: "Inspect auth" },
     });
     for (const field of ["definition", "branches"]) expect(status).not.toHaveProperty(field);
-    for (const field of ["branchId", "lease", "requestMessageId", "acceptedMessageId"]) {
+    for (const field of ["branchId", "lease", "requestMessageId", "acceptedMessageId", "dependsOn"]) {
       expect(status.members[0]).not.toHaveProperty(field);
     }
     expect(status.reducer).not.toHaveProperty("task");
@@ -425,7 +447,7 @@ describe("Team lifecycle tools", () => {
     expect(status.members[0].result).toEqual(result);
     expect(status.members[0]).toMatchObject({ status: "partial", outcome: "partial", terminal: true });
     expect(status.members[1]).toMatchObject({
-      status: "failed", outcome: "failed", failure, reason: "Policy input missing", dependsOn: ["security"], required: false,
+      status: "failed", outcome: "failed", failure, reason: "Policy input missing", required: false,
       anomalies: ["Policy evidence unavailable"],
     });
   });

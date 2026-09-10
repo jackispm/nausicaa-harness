@@ -104,16 +104,15 @@ describe("private cross-Run Main input", () => {
     };
     try {
       const pausedModel = new ScriptedModel([{
-        ...response("paused"), stopReason: "toolUse",
-        toolCalls: [{ id: "pause-noop", name: "noop", arguments: {} }],
+        ...response("partial answer"), stopReason: "length",
       }]);
       target = await SessionController.open({
         workspace: root, dataDir, model: "scripted",
         policy: { tetoEnabled: false, maxMainStepsPerActivation: 1 },
       }, { mainModel: pausedModel, tools: [noop], createRunId: () => "private-target" });
-      await target.submit({ inputId: "pause", text: "Pause at the step limit" });
+      await target.submit({ inputId: "pause", text: "Start the request" });
       await target.waitForIdle();
-      expect(target.snapshot().blocker).toBe("step-allowance-exhausted");
+      expect(target.snapshot().blocker).toBe("model-output-limit");
       const events: AnyEvent[] = [];
       target.subscribe((event) => { if (event.kind === "event") events.push(event.event); });
       await sendPrivateNote(root, dataDir, "lane", content);

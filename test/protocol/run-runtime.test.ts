@@ -588,8 +588,7 @@ describe("executeRun", () => {
         },
         {
           ...response("latest eligible group remains raw"),
-          stopReason: "toolUse",
-          toolCalls: [{ id: "restart-noop-3", name: "noop", arguments: {} }],
+          stopReason: "length",
         },
       ]),
       tools: [noopTool],

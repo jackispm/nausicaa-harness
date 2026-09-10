@@ -172,7 +172,7 @@ describe("Beta Capability MiniEval offline contract", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
-  it("completes resume across multiple resumable activations and validates its artifact", async () => {
+  it("recovers after the host interrupts a committed write and validates its artifact", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-beta-resume-complete-"));
     try {
       const config = {

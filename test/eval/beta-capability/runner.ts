@@ -351,7 +351,7 @@ export async function runBetaCapabilityBatch(options: BetaBatchRunOptions): Prom
                   }
                 : {}),
               auxiliaryMode: "none",
-              policy: { maxMainStepsPerActivation: manifest.limits.maxMainSteps, maxModelTokens: 20_000, tetoEnabled: false },
+              policy: { maxMainSteps: manifest.limits.maxMainSteps, maxModelTokens: 20_000, tetoEnabled: false },
               maxOutputTokens: Math.min(
                 manifest.limits.maxOutputTokens,
                 id === "fukai-compaction" ? 1_024 : BETA_CAPABILITY_MAX_OUTPUT_TOKENS,
@@ -436,40 +436,56 @@ async function runResumeCase(options: {
   signal: AbortSignal;
   trace: BetaToolTraceEntry[];
 }): Promise<Awaited<ReturnType<typeof executeRun>>> {
-  const first = await executeRun({
-    workspace: options.fixture.workspace,
-    dataDir: join(options.caseRoot, "state"),
-    model: options.modelName,
-    // The host owns the pause: maxMainStepsPerActivation=1 guarantees a
-    // resumable boundary after the first tool step. Do not ask the model to
-    // stop itself, otherwise this eval measures instruction-following rather
-    // than durable Run recovery.
-    message: "Begin this task by using write_file to write exactly 'resume-ready\\n' to resume.txt. The host will pause this activation after the first step; do not assume the task is complete.",
-    goal: options.fixture.goal,
-    allowWrite: true,
-    allowShell: false,
-    auxiliaryMode: "none",
-    policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
-    maxOutputTokens: Math.min(options.manifest.limits.maxOutputTokens, BETA_CAPABILITY_MAX_OUTPUT_TOKENS),
-    signal: options.signal,
-  }, { mainModel: options.model, tools: options.tools, createRunId: () => "resume-run", onEvent: () => undefined });
-  if (first.completed || first.blocker !== "resumable-boundary") {
-    throw new BetaCaseExecutionError("resume-boundary-not-reached");
+  const runId = "resume-run";
+  const pause = new AbortController();
+  const interruption = new Error("Host interrupted the resume fixture after its committed tool step");
+  let reachedBoundary = false;
+  let totalSteps = 0;
+  let totalUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+  try {
+    await executeRun({
+      workspace: options.fixture.workspace,
+      dataDir: join(options.caseRoot, "state"),
+      model: options.modelName,
+      // Interrupt after durable tool settlement. Scheduling slices no longer
+      // pause Main, and the model must not choose the recovery boundary.
+      message: "Begin this task by using write_file to write exactly 'resume-ready\\n' to resume.txt. The host will interrupt this activation after the first step; do not assume the task is complete.",
+      goal: options.fixture.goal,
+      allowWrite: true,
+      allowShell: false,
+      auxiliaryMode: "none",
+      policy: { maxMainSteps: options.manifest.limits.maxMainSteps, maxModelTokens: 20_000, tetoEnabled: false },
+      maxOutputTokens: Math.min(options.manifest.limits.maxOutputTokens, BETA_CAPABILITY_MAX_OUTPUT_TOKENS),
+      signal: AbortSignal.any([options.signal, pause.signal]),
+    }, {
+      mainModel: options.model, tools: options.tools, createRunId: () => runId,
+      onEvent: (event) => {
+        if (event.laneId !== "main") return;
+        if (event.type === "budget.charged") totalUsage = addUsage(totalUsage, event.payload.usage);
+        if (event.type !== "step.completed") return;
+        totalSteps += 1;
+        if (event.payload.hasToolCalls) {
+          reachedBoundary = true;
+          pause.abort(interruption);
+        }
+      },
+    });
+  } catch (error: unknown) {
+    if (error !== interruption || options.signal.aborted) throw error;
   }
+  if (!reachedBoundary) throw new BetaCaseExecutionError("resume-boundary-not-reached");
   if (!options.trace.some((entry) => entry.name === "write_file" && !entry.isError)) {
     throw new BetaCaseExecutionError("resume-write-not-observed");
   }
-  let latest = first;
-  let totalSteps = first.steps;
-  let totalUsage = first.usage;
+  let latest: Awaited<ReturnType<typeof executeRun>> | undefined;
   const maxResumeActivations = Math.max(1, options.manifest.limits.requestBudgetHint - 1);
   for (let activation = 0; activation < maxResumeActivations; activation += 1) {
-    if (latest.completed) break;
+    if (latest?.completed) break;
     const resumed = await executeRun({
       workspace: options.fixture.workspace,
       dataDir: join(options.caseRoot, "state"),
       model: options.modelName,
-      resumeRunId: first.runId,
+      resumeRunId: runId,
       message: "Continue this same Run. Read resume.txt and inspect its current state. If it is still pending, perform the next required edit; once it contains exactly resume-ready followed by complete on the next line, report the final state with no further tools. Do not change any other file.",
       goal: options.fixture.goal,
       allowWrite: true,
@@ -477,13 +493,13 @@ async function runResumeCase(options: {
       auxiliaryMode: "none",
       maxOutputTokens: Math.min(options.manifest.limits.maxOutputTokens, BETA_CAPABILITY_MAX_OUTPUT_TOKENS),
       signal: options.signal,
-    }, { mainModel: options.model, tools: options.tools, createRunId: () => first.runId, onEvent: () => undefined });
-    if (resumed.runId !== first.runId) throw new BetaCaseExecutionError("resume-run-id-changed");
+    }, { mainModel: options.model, tools: options.tools, createRunId: () => runId, onEvent: () => undefined });
+    if (resumed.runId !== runId) throw new BetaCaseExecutionError("resume-run-id-changed");
     latest = resumed;
     totalSteps += resumed.steps;
     totalUsage = addUsage(totalUsage, resumed.usage);
   }
-  if (!latest.completed) throw new BetaCaseExecutionError("resume-not-completed");
+  if (!latest?.completed) throw new BetaCaseExecutionError("resume-not-completed");
   return { ...latest, steps: totalSteps, usage: totalUsage };
 }
 

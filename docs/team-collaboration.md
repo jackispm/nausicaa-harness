@@ -4,18 +4,17 @@ This contract covers shared Team channels, A2G, reusable members, task reports,
 cursor history, and structured waiting, including current limitations and
 compatibility behavior.
 
-Status: Team v2 shared-channel MVP with resident follow-up assignment, cursor
-history, explicit close, and restart-safe claim recovery. Identity and Teto
-guidance was revised on 2026-09-10 for package version `0.1.4`. The
-member admission remains limited to 16 members per Team and compatible with one-shot
-callers; `team_assign` reuses an admitted member lane for later Tasks and
-`task_wait` reads the durable Task projection. Run reports are persisted and
-published to the task thread. Full artifact-derived change-set extraction and
+Status: Shared Team channels with incremental membership, reusable assignments,
+cursor history, explicit close, and restart-safe claim recovery. Member admission
+is limited to 16 members per Team. `team_assign` admits a new named member or
+assigns further work to an existing one; `task_wait` waits for a durable task
+result without spending model calls on polling. Initial and follow-up reports
+are persisted and published to the task thread. Full artifact-derived change-set extraction and
 a TUI task board remain follow-up work.
 
 The model-facing `team_create`, `team_assign`,
 and `team_reduce` tools do not accept per-member token, attempt, wall-clock,
-success-criteria, hard-constraint, or Team-deadline fields. The host keeps
+success-criteria, hard-constraint, Team-deadline, or `dependsOn` fields. The host keeps
 claim leases, cancellation, provider timeouts, and Run-level usage accounting.
 New tasks have no default aggregate token, duration, or model-call limit.
 Finite scheduling slices continue the same task instead of marking it partial.
@@ -34,7 +33,7 @@ There is no source revision or open-source license to attribute for this
 public-documentation reference; no Claude Code source is copied.
 
 The adopted collaboration behavior is one fixed lead, independent teammate
-contexts, a shared task board, dependency-aware assignment, direct permitted
+contexts, a shared task board, incremental assignment, direct permitted
 messages, durable boundary notifications, and lead-owned synthesis. Nausicaa
 keeps its existing Ledger, Inbox, task dispatch, and Mowe tool execution boundaries.
 Its coordinator adds durable settlement and recovery to the lane collaboration
@@ -134,9 +133,9 @@ its untrusted-data rule.
 
 | Tool | Meaning |
 |---|---|
-| `team_create` | Admit members and their task definitions; return stable identities, not completed work |
-| `team_assign` | Assign a later Task to an existing member lane without choosing execution budgets |
-| `task_wait` | Read an initial or follow-up task's durable status and result; this is a snapshot |
+| `team_create` | Create a Team and admit members whose work is ready to start |
+| `team_assign` | Assign ready work to a new or existing named member in the same Team |
+| `task_wait` | Wait for an initial or follow-up task's durable result; cancellation releases the wait |
 | `team_status` | Read a compact snapshot of durable member outcomes, join, reduction, and presentation state; not a wait operation |
 | `team_cancel` | Cancel unfinished Team work, preserve settled results, and fence later work |
 | `team_reduce` | Explicitly queue a read-only synthesis lane after join |
@@ -174,12 +173,6 @@ Canonical creation input uses flat task fields:
         "tools": ["read_file", "git_diff"],
         "allowNestedTeam": false
       }
-    },
-    {
-      "memberId": "compatibility",
-      "statement": "Check the security findings against existing clients",
-      "dependsOn": ["security"],
-      "required": true
     }
   ],
   "peerMessaging": "team-members"
@@ -190,22 +183,36 @@ The `task` wrapper shown in earlier design sketches is not an accepted tool
 argument. This keeps the current task input shape while improving membership
 names. The runtime can store structured task records internally.
 
-Creation accepts 1 through 16 members. All explicit identities and dependency
-references are validated before admission: duplicate names after normalization,
-unknown dependencies, self-dependencies, cycles, and unsupported fields fail
-before dispatch. Model-facing Team creation does not accept member budgets,
+Creation accepts 1 through 16 members, with the same total limit when adding
+members later. Names and capability grants are validated before admission.
+Only start work whose inputs exist. When later work needs an earlier result,
+the lead receives that result and supplies the useful parts in a new assignment:
+
+```json
+{
+  "teamId": "review",
+  "memberId": "compatibility",
+  "statement": "Check the security findings against existing clients",
+  "input": "Security review is complete. Inspect the reported authentication changes in src/auth.ts and verify compatibility with existing clients."
+}
+```
+
+This `team_assign` call adds `compatibility` if it is new, or reuses its lane if
+it already belongs to the Team. Existing members retain their permissions;
+`capabilities` can narrow a new member's inherited grant. No static dependency
+graph is required. Legacy durable dependency facts remain readable for recovery.
+Model-facing Team creation does not accept member budgets,
 success criteria, hard constraints, or Team deadlines. There are no implicit
 total task limits; cancellation, request timeouts, and ownership leases remain
-host responsibilities. Only members that are not referenced by another task may rely
-on generated names. A dependent task starts after its prerequisites succeed;
-partial or failed output cannot silently satisfy a success dependency.
+host responsibilities. Failed or partial work requires a lead decision before
+it is used as input to further work.
 
 Every newly admitted member and reducer carries a scoped SpawnContext, even
 without a custom host factory. It contains the actual permitted tool names,
 the host-authorized peer targets, and only explicitly supplied project and
-parent-summary references. The lead's private history is not copied. Prerequisite
-results enter dependent tasks as bounded, untrusted summaries and artifact
-references. Attached text has a shared byte limit rather than an unlimited
+parent-summary references. The lead's private history is not copied. Handoffs
+carry concise results and artifact references; shared Team history is paginated
+and loaded when needed. Attached text has a shared byte limit rather than an unlimited
 context allowance per reference.
 
 Reducer tools are restricted to explicitly classified Mowe `read`/`compute`
@@ -234,27 +241,39 @@ remain subject to `allowNestedTeam` and the depth limit.
 
 ### Resident follow-up Tasks
 
-`team_assign` is intentionally smaller than `team_create`: the lead supplies a
-Team, member, and statement (plus optional input). The host creates the
-internal TaskRequest, writes one `team.task.assigned` fact, and sends a
-new request to the same member lane. A member cannot have two active follow-up
+`team_assign` takes a Team, member name, statement, optional input, and optional
+capability narrowing for a new member. A new member is durably admitted into the
+existing group; the immutable original `team.created` fact is preserved. An
+existing member receives another Task on its own lane. A member cannot have two active follow-up
 Tasks. The assignment has a monotonically increasing `assignmentVersion`, so a
 late reply from an older Run cannot be accepted as the current Task.
 
 At the terminal boundary the host writes one `team.run.reported` fact with the
-Task result or failure. `team_status` exposes these reports under `tasks`, and
-`task_wait` returns the same compact state. The report wakes the lead once;
+Task result or failure, including initial tasks admitted by `team_create`.
+The same handoff is published in the shared task thread. `team_status` exposes
+the reports, and `task_wait` returns after its task has a durable outcome.
+The report wakes an idle lead;
 the member's full transcript remains private and can be inspected only through
 the existing lane history boundaries.
 
 `task_wait` also accepts the initial task IDs returned by `team_create`. These
 return the same member status, outcome, result, and failure as `team_status`.
-Its `waiting` flag follows durable task settlement; a completed lane status
-alone cannot make the task complete. Queries never start, retry, or consume work.
+A completed lane status alone cannot make the task complete. Waiting never
+starts, retries, or consumes work; it subscribes to runtime state changes and
+can be cancelled. `team_status` remains an immediate snapshot. If the lead has
+other ready work, it can continue that work or end the current turn for automatic
+report-driven continuation instead of calling `task_wait`.
+
+Members use these same read tools for their own Team and any nested Teams
+they lead. `task_wait` routes by Team ID and rejects waiting for the caller's
+own unfinished task. Permission to create nested Teams is independent of
+reading the member's shared task board.
 
 On restore, an assignment without a report is re-admitted idempotently and its
 member lane is rebuilt in dynamic-task mode. A reported assignment is never
-run a second time. Closing a Team fences new assignment and wakeup admission;
+run a second time. If its terminal notification or request acknowledgement is
+missing, recovery repairs the handoff from the verified report and wakes the
+lead after the message is durable. Closing a Team fences new assignment and wakeup admission;
 existing reports remain readable.
 
 ## Completion Is Several Different Facts
@@ -279,7 +298,8 @@ settled member through `team_assign`; members do not self-claim new tasks.
 Dynamic task-board editing remains a separate extension.
 
 Join collects outcomes at a declared boundary. It does not perform synthesis.
-The lead may inspect results and synthesize directly, or explicitly request reduction:
+The lead may assign a repair to the responsible member, request another review
+when useful, inspect results and synthesize directly, or request reduction:
 
 ```text
 team_create -> member work -> durable settlements -> automatic team.joined
@@ -288,7 +308,8 @@ team_create -> member work -> durable settlements -> automatic team.joined
   -> team_reduce -> durable team.reduced -> Lead review -> team_present -> Lead answer
 ```
 
-`team_present` is the lead's recorded decision, not proof that text has already
+`team_present` requires admitted work to have settled, including new members
+and follow-up assignments. It is the lead's recorded decision, not proof that text has already
 reached the user. Accepting a Team result does not rewrite failed or partial
 task outcomes. A notification is a delivery fact and cannot by itself settle a
 task, join a Team, or complete reduction.
@@ -311,7 +332,7 @@ task, join a Team, or complete reduction.
   limits. Expiry or shutdown must persist an explicit
   outcome; a short silent drain-and-stop is not Team completion.
 
-Team definitions, member identities, dependency edges, policies, and outcomes
+Team definitions, added member identities, legacy dependency edges, policies, and outcomes
 must reconstruct from durable facts after restart. Claims retain attempt and
 ownership information. A stale claimant or a late message must not overwrite
 a settled task or reopen cancelled work. Cancelling a Team preserves results
@@ -333,8 +354,11 @@ results as they arrive. Result and join notices use an ordinary model boundary,
 subject to any explicit host allowance. Deferred/next-turn
 messages do not force empty steps, and a recovered uncommitted claim is allowed
 to become deliverable before another model step is spent. The hook does not
-silently raise that allowance or create another model loop. Exhaustion leaves
-the lead incomplete rather than claiming the Team evidence was incorporated.
+silently raise an explicit legacy hard allowance. The default 24-step activation
+is a scheduling slice: the lead yields to the event loop, checks cancellation,
+and continues the same task and context. Slice exhaustion alone does not require
+the user to type `/resume`. Provider truncation, interruption, and unknown tool
+effects retain their explicit recovery boundaries.
 
 Members also check their mailbox before accepting a no-tool final response.
 An authorized message that arrived during that response gets another ordinary
@@ -382,8 +406,8 @@ Team terminology alone makes those behaviors identical.
 
 ## Deferred Extensions
 
-Member self-claim tools, dynamic dependency editing, `quorum`, and `any-success`
-are not implemented. Existing members can receive new work through `team_assign`.
+Member self-claim tools, `quorum`, and `any-success` are not implemented.
+The lead controls task order through incremental `team_assign` calls.
 Nested Team creation is available to an authorized member while its depth is
 below three. A nested member becomes that child Team's Lead; the parent Team
 remains responsible for its own report and the child Team remains responsible
@@ -391,7 +415,7 @@ for its own synthesis. At depth three the host omits `team_create` and rejects
 further admission. Nested Team state uses the same Ledger, Inbox, channel and
 recovery boundaries as its parent and is stopped recursively when the parent
 Team closes or is cancelled.
-Membership is declared at creation. A member completing its task remains
+Membership can grow while the Team is open. A member completing its task remains
 available for an explicit assignment while the Team is open; a message alone
 does not start a new task.
 

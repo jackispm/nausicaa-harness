@@ -1830,7 +1830,11 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
             appendNotice(
               event.payload.reason === "model-output-limit"
                 ? "The model reached its output limit. The partial answer is preserved; use /resume to continue."
-                : "Turn paused at a safe boundary. Use /resume or /stop.",
+                : event.payload.reason === "model-aborted"
+                  ? "The model response was interrupted. Use /resume to continue or /stop to end the Run."
+                  : event.payload.reason === "model-response-incomplete"
+                    ? "The model response ended without a complete result. Use /resume to continue or /stop to end the Run."
+                    : "Turn paused at a safe boundary. Use /resume or /stop.",
               "warning",
             );
           } else if (event.type === "turn.failed") {

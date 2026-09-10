@@ -59,7 +59,7 @@ const PI_L0_ORACLE = Object.freeze({
 });
 
 describe("Pi-compatible single-lane L0 oracle", () => {
-  it("fails every length-truncated tool call closed and continues the loop", async () => {
+  it("fails every length-truncated tool call closed and preserves its rejection on recovery", async () => {
     const store = new MemoryContentAddressedStore();
     const ledger = new MemoryLedger();
     let effectInvocations = 0;
@@ -81,7 +81,17 @@ describe("Pi-compatible single-lane L0 oracle", () => {
       },
     }]);
 
-    const result = await loop.run(runInput("pi-oracle-truncation"));
+    const { initialMessage, ...resumeInput } = runInput("pi-oracle-truncation");
+    const paused = await loop.run({ ...resumeInput, initialMessage });
+    expect(paused).toMatchObject({ completed: false, stopReason: "length" });
+    expect(model.requests).toHaveLength(1);
+    // Nausicaa requires explicit recovery; Pi's fail-closed result pairing still applies.
+    const result = await loop.run({
+      ...resumeInput,
+      startStep: 2,
+      conversationRefs: paused.conversationRefs,
+      upperWatermark: await ledger.watermark(),
+    });
     const toolResults = model.requests[1]?.messages.filter((message) => message.role === "tool") ?? [];
     const events = await ledger.read({ runId: "pi-oracle-truncation" });
 
@@ -315,9 +325,14 @@ describe("Pi-compatible single-lane L0 oracle", () => {
         response("first step", "toolUse", [
           { id: "resume-noop", name: "noop", arguments: {} },
         ]),
+        response("partial answer", "length"),
         (request) => {
-          expect(request.messages.filter((message) => message.role === "user")).toHaveLength(1);
-          expect(request.messages.filter((message) => message.role === "tool")).toHaveLength(1);
+          expect(request.messages.filter((message) => (
+            message.role === "user" && message.content === "Start"
+          ))).toHaveLength(1);
+          expect(request.messages.filter((message) => message.role === "tool"))
+            .toEqual([expect.objectContaining({ toolCallId: "resume-noop", isError: false })]);
+          expect(request.messages.at(-1)?.content).toContain("Continue exactly where it stopped");
           return response("resumed", "stop");
         },
       ]);
@@ -339,11 +354,14 @@ describe("Pi-compatible single-lane L0 oracle", () => {
         const submitted = await session.submit({ inputId: "resume-input", text: "Start" });
         await session.waitForIdle();
         expect(session.snapshot().status).toBe("idle");
+        expect(session.snapshot().blocker).toBe("model-output-limit");
+        expect(model.callCount).toBe(2);
         expect(submitted.turnId).toBeDefined();
         await session.resumeCurrent();
         await session.waitForIdle();
         const events = (await session.transcript());
-        expect(events.map((entry) => entry.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+        expect(events.map((entry) => entry.role))
+          .toEqual(["user", "assistant", "tool", "assistant", "assistant"]);
       } finally {
         await session.close();
       }
@@ -354,7 +372,7 @@ describe("Pi-compatible single-lane L0 oracle", () => {
         expect(durable.filter((event) => event.type === "turn.started")).toHaveLength(1);
         expect(durable.filter((event) => event.type === "turn.completed")).toHaveLength(1);
         expect(durable.filter((event) => event.type === "user.message")).toHaveLength(1);
-        expect(durable.filter((event) => event.type === "budget.charged")).toHaveLength(2);
+        expect(durable.filter((event) => event.type === "budget.charged")).toHaveLength(3);
       } finally {
         await ledger.close();
       }

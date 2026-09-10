@@ -34,6 +34,14 @@ export interface TeamDefinition {
   members: TeamMemberDefinition[];
 }
 
+/** Append-only membership admission; the original Team definition stays immutable. */
+export interface TeamMemberAddition {
+  teamId: string;
+  member: TeamMemberDefinition;
+  addedBy: LaneId;
+  operationId: string;
+}
+
 export interface TeamMemberSettlement {
   teamId: string;
   memberId: string;
@@ -82,6 +90,7 @@ export interface TeamRunReport {
   teamId: string;
   taskId: string;
   laneId: LaneId;
+  /** Zero identifies the member's initial task; follow-up versions start at one. */
   assignmentVersion: number;
   kind: TeamRunReportKind;
   summary: string;

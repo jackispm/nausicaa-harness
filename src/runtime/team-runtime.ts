@@ -28,7 +28,7 @@ import {
   WorkerLaneScheduler,
 } from "./worker-lane-scheduler.js";
 import { recoverRunTokenUsageByLane } from "./run-token-budget-recovery.js";
-import { createTeamBranchPolicy, TeamBranchExecutor } from "./team-branch-executor.js";
+import { createTeamBranchPolicy, TeamBranchExecutor, teamTaskReplyMessage } from "./team-branch-executor.js";
 import type { AgentTopologySnapshot } from "./agent-awareness.js";
 import type {
   TeamCloseRequest,
@@ -71,6 +71,8 @@ import {
   appendTeamChannelMessage,
   readTeamChannelHistory,
   teamChannelCursor,
+  publishTeamRunReport,
+  serializeTeamChannelWrite,
 } from "./team-channel.js";
 import {
   DEFAULT_SUBAGENT_MAX_DEPTH,
@@ -86,7 +88,7 @@ const MAX_TEAMS = 16;
 const MAX_BRANCHES_PER_TEAM = 16;
 const MAX_ID_LENGTH = 96;
 const NESTED_TEAM_TOOL_NAMES = [
-  "team_create", "team_assign", "task_wait", "team_status",
+  "team_create", "team_assign",
   "team_close", "team_cancel", "team_reduce", "team_present",
   "child_team_message", "child_team_history",
 ] as const;
@@ -203,6 +205,7 @@ export class TeamRuntime implements TeamControl {
   private deliveryCursor = 0;
   private lifecycleTail: Promise<void> = Promise.resolve();
   private stopped = false;
+  private readonly stateListeners = new Set<() => void>();
 
   constructor(options: TeamRuntimeOptions) {
     if (options.runId.trim().length === 0 || options.modelName.trim().length === 0) throw new TypeError("Team runtime runId and modelName must be non-empty");
@@ -229,6 +232,7 @@ export class TeamRuntime implements TeamControl {
         await runtime?.executor.stop();
       },
       ...(options.onWake === undefined ? {} : { onWake: options.onWake }),
+      onStateChange: () => this.notifyStateChange(),
     });
   }
 
@@ -267,7 +271,7 @@ export class TeamRuntime implements TeamControl {
       // a branch whose lane registration was interrupted.
       const durableDefinitions = new Map<string, PreparedTeamBranch[]>();
       for (const board of await this.lifecycle.boards()) {
-        const definition = board.definition;
+        const definition = currentTeamDefinition(board);
         if (definition === undefined) continue;
         if (board.lifecycleState === "closed") this.closedTeams.add(definition.teamId);
         this.durableDefinitions.set(definition.teamId, definition);
@@ -306,6 +310,7 @@ export class TeamRuntime implements TeamControl {
         this.teamDefinitions.set(teamId, definition);
       }
       await this.lifecycle.restore();
+      await this.repairReportedHandoffs();
       const registered = events
         .filter((event): event is Extract<AnyEvent, { type: "lane.registered" }> => (
           event.runId === this.runId
@@ -615,7 +620,7 @@ export class TeamRuntime implements TeamControl {
       const { branch, branchId, taskBudget, inputRef } = prepared;
       const board = (await this.lifecycle.boards()).find((item) => item.teamId === teamId);
       this.assertAdmissionActive(context.signal);
-      if (board?.cancellationRequested || board?.members.some((member) => member.memberId === branchId && member.terminal)) continue;
+      if (board?.lifecycleState === "closed" || board?.cancellationRequested || board?.members.some((member) => member.memberId === branchId && member.terminal)) continue;
       const goal = prepared.task?.goal ?? teamGoal(branch);
       const inputRefs = prepared.task?.inputRefs ?? (inputRef === undefined ? [] : [inputRef]);
       const admittedAt = taskAdmittedAt({
@@ -648,7 +653,7 @@ export class TeamRuntime implements TeamControl {
       const { branch, branchId, taskBudget, inputRef } = prepared;
       const laneId = `team:${teamId}:${branchId}`;
       const board = (await this.lifecycle.boards()).find((item) => item.teamId === teamId);
-      if (board?.cancellationRequested || (board?.members.some((member) => member.memberId === branchId && member.terminal && !member.registered))) {
+      if (board?.lifecycleState === "closed" || board?.cancellationRequested || (board?.members.some((member) => member.memberId === branchId && member.terminal && !member.registered))) {
         results.push({ branchId, laneId, status: "duplicate" });
         continue;
       }
@@ -737,10 +742,20 @@ export class TeamRuntime implements TeamControl {
       const board = (await this.lifecycle.boards()).find((item) => item.teamId === teamId);
       if (board === undefined) throw new Error(`Unknown Team ${teamId}`);
       if (board.lifecycleState === "closed" || board.cancellationRequested) throw new Error(`Team ${teamId} is closed`);
-      const member = board.members.find((candidate) => candidate.memberId === request.memberId || candidate.laneId === request.memberId);
-      if (member === undefined) throw new Error(`Unknown Team member ${request.memberId}`);
-      if (!member.terminal) throw new Error(`Team member ${member.memberId} still has an unfinished initial Task`);
       const events = await this.options.readEvents();
+      const memberId = normalizeSubagentName(request.memberId);
+      if (["main", "nausicaa", "teto"].includes(memberId)) throw new Error("Member name is reserved for a runtime role");
+      request = { ...request, memberId };
+      const addition = events.find((event): event is Extract<AnyEvent, { type: "team.member.added" }> => event.runId === this.runId
+        && event.type === "team.member.added" && event.payload.teamId === teamId
+        && event.payload.operationId === context.operationId && event.payload.addedBy === this.parentLaneId);
+      if (addition !== undefined) {
+        if (addition.payload.member.memberId !== memberId || !assignmentInputMatches(addition.payload.member.task, request)
+          || stableJson(addition.payload.member.capabilities ?? null) !== stableJson(request.capabilities ?? null)) {
+          throw new Error(`Team assignment operation ${context.operationId} was reused with different work`);
+        }
+        return this.admitAssignedMember(board, addition.payload.member, context, true);
+      }
       const dynamicEvents = events as unknown as Array<AnyEvent | TeamTaskAssignedEvent>;
       const byOperation = dynamicEvents.find((event): event is TeamTaskAssignedEvent => {
         const candidate = event as TeamTaskAssignedEvent;
@@ -748,7 +763,8 @@ export class TeamRuntime implements TeamControl {
           && candidate.payload.teamId === teamId && candidate.payload.operationId === context.operationId;
       });
       if (byOperation !== undefined) {
-        if (byOperation.payload.memberId !== member.memberId || byOperation.payload.task.goal.statement !== request.statement) {
+        if (byOperation.payload.memberId !== memberId || !assignmentInputMatches(byOperation.payload.task, request)
+          || (request.capabilities !== undefined && stableJson(request.capabilities) !== stableJson(board.members.find((member) => member.memberId === memberId)?.capabilities ?? null))) {
           throw new Error(`Team assignment operation ${context.operationId} was reused with different work`);
         }
         const existingRequest = this.inbox.snapshot().records.find((record) => (
@@ -778,13 +794,36 @@ export class TeamRuntime implements TeamControl {
           );
           this.branches.set(assignment.laneId, runtime);
           runtime.scheduler.enqueue();
-          this.options.onWake?.();
           return { teamId, taskId: assignment.taskId, memberId: assignment.memberId, laneId: assignment.laneId, assignmentVersion: assignment.assignmentVersion, status: "queued" };
         }
         return { teamId, taskId: byOperation.payload.taskId, memberId: byOperation.payload.memberId, laneId: byOperation.payload.laneId, assignmentVersion: byOperation.payload.assignmentVersion, status: "duplicate" };
       }
+      const member = board.members.find((candidate) => candidate.memberId === memberId);
+      if (member === undefined) {
+        assertSubagentSpawnAllowed(this.depth, this.maxDepth);
+        const normalized = normalizeTeamCreateRequest({ teamId, members: [{ memberId, statement: request.statement,
+          ...(request.input === undefined ? {} : { input: request.input }),
+          ...(request.capabilities === undefined ? {} : { capabilities: request.capabilities }) }] }).branches[0]!;
+        validateCapabilityGrant(normalized.capabilities, this.availableBranchTools());
+        const inputRef = request.input === undefined ? undefined : await this.store.put(request.input, "text/plain");
+        const task: TaskRequest = { type: "task.request", taskId: `${teamId}:${memberId}`,
+          goal: teamGoal(normalized), inputRefs: inputRef === undefined ? [] : [inputRef], budget: {} };
+        const laneId = `team:${teamId}:${memberId}`;
+        task.spawnContext = this.memberSpawnContext(teamId, memberId, laneId, task,
+          board.definition?.peerMessaging === "team-members" ? board.members.map((peer) => peer.laneId) : [], false, normalized.capabilities);
+        const definition: TeamMemberDefinition = { memberId, laneId, task, dependsOn: [], required: true,
+          ...(normalized.capabilities === undefined ? {} : { capabilities: normalized.capabilities }) };
+        await this.lifecycle.addMember({ teamId, member: definition, addedBy: this.parentLaneId, operationId: context.operationId },
+          () => this.assertAdmissionActive(context.signal));
+        const admittedBoard = (await this.lifecycle.boards()).find((item) => item.teamId === teamId)!;
+        return this.admitAssignedMember(admittedBoard, definition, context, false);
+      }
+      if (request.capabilities !== undefined && stableJson(request.capabilities) !== stableJson(member.capabilities ?? null)) {
+        throw new Error("An existing Team member's capability grant cannot be changed by assignment");
+      }
+      if (!member.terminal) throw new Error(`Team member ${member.memberId} still has an unfinished initial Task`);
       const active = (board.tasks ?? []).find((task) => task.memberId === member.memberId
-        && isOpenResidentTaskStatus(task.status));
+        && task.latestReport === undefined && isOpenResidentTaskStatus(task.status));
       if (active !== undefined) throw new Error(`Team member ${member.memberId} already has active task ${active.taskId}`);
       const previousVersions = dynamicEvents.filter((event): event is TeamTaskAssignedEvent => {
         const candidate = event as TeamTaskAssignedEvent;
@@ -806,11 +845,7 @@ export class TeamRuntime implements TeamControl {
         teamId, taskId, memberId: member.memberId, laneId: member.laneId,
         assignmentVersion, task, assignedBy: this.parentLaneId, operationId: context.operationId,
       };
-      await this.options.eventSink.append({
-        runId: this.runId, laneId: this.parentLaneId, type: "team.task.assigned", payload: assignment,
-        correlationId: `${this.runId}:team:${teamId}`, idempotencyKey: `${this.runId}:team:${teamId}:assign:${context.operationId}`,
-        visibility: "run", occurredAt: now.toISOString(),
-      } as never);
+      await this.lifecycle.assignTask(assignment, () => this.assertAdmissionActive(context.signal));
       const oldRuntime = this.branches.get(member.laneId);
       if (oldRuntime !== undefined) {
         await oldRuntime.scheduler.stop();
@@ -828,23 +863,63 @@ export class TeamRuntime implements TeamControl {
         events, taskBudget, task.goal, undefined, false, assignment);
       this.branches.set(member.laneId, runtime);
       runtime.scheduler.enqueue();
-      this.options.onWake?.();
       return { teamId, taskId, memberId: member.memberId, laneId: member.laneId, assignmentVersion, status: "queued" };
     });
   }
 
+  private async admitAssignedMember(board: TeamBoard, member: TeamMemberDefinition, context: ToolExecutionContext, duplicate: boolean): Promise<TeamAssignResult> {
+    const definition = currentTeamDefinition(board);
+    if (definition === undefined) throw new Error("Adding members requires a durable Team definition");
+    this.durableDefinitions.set(board.teamId, definition);
+    this.teamFingerprints.set(board.teamId, definition.fingerprint);
+    const prepared = prepareMemberDefinition(member);
+    const previous = this.teamDefinitions.get(board.teamId) ?? [];
+    if (!previous.some((candidate) => candidate.branchId === member.memberId)) this.teamDefinitions.set(board.teamId, [...previous, prepared]);
+    const result = await this.ensureBranches(board.teamId, [prepared], context, duplicate);
+    this.notifyStateChange();
+    return { teamId: board.teamId, taskId: member.task.taskId, memberId: member.memberId, laneId: member.laneId,
+      assignmentVersion: 0, status: duplicate ? "duplicate" : result[0]?.status ?? "queued" };
+  }
+
   async wait(request: TeamWaitRequest, context: ToolExecutionContext): Promise<unknown> {
-    this.assertAdmissionActive(context.signal);
+    while (true) {
+      this.assertAdmissionActive(context.signal);
+      let changed!: () => void;
+      const notification = new Promise<void>((resolve) => { changed = resolve; });
+      this.stateListeners.add(changed);
+      context.signal?.addEventListener("abort", changed, { once: true });
+      this.options.signal?.addEventListener("abort", changed, { once: true });
+      try {
+        // Subscribe before reading so a report committed during the read cannot
+        // strand this waiter. Lifecycle reconciliation never invokes a model.
+        await this.lifecycle.reconcile();
+        const state = await this.taskState(request, context);
+        this.assertAdmissionActive(context.signal);
+        if (!state.waiting) return state;
+        await notification;
+      } finally {
+        this.stateListeners.delete(changed);
+        context.signal?.removeEventListener("abort", changed);
+        this.options.signal?.removeEventListener("abort", changed);
+      }
+    }
+  }
+
+  private async taskState(request: TeamWaitRequest, context: ToolExecutionContext): Promise<Record<string, unknown> & { waiting: boolean }> {
     const teamId = normalizeId(request.teamId, "teamId");
     const board = (await this.lifecycle.boards()).find((item) => item.teamId === teamId);
     if (board === undefined) throw new Error(`Unknown Team ${teamId}`);
     this.assertTeamAccess(board, context);
+    const closed = board.lifecycleState === "closed" || board.cancellationRequested;
     const task = (board.tasks ?? []).find((candidate) => candidate.taskId === request.taskId);
     if (task === undefined) {
       // Initial tasks belong to the admitted member definition; later
       // assignments have their own task records and must not replace them.
       const member = board.members.find((candidate) => candidate.taskId === request.taskId);
       if (member === undefined) throw new Error(`Unknown Team task ${request.taskId}`);
+      if (!member.terminal && !closed && member.laneId === context.laneId) {
+        throw new Error("Cannot wait for the current task running in this lane");
+      }
       return {
         teamId, taskId: member.taskId, memberId: member.memberId, laneId: member.laneId,
         status: member.status, execution: member.execution, terminal: member.terminal,
@@ -852,14 +927,21 @@ export class TeamRuntime implements TeamControl {
         ...(member.result === undefined ? {} : { result: member.result }),
         ...(member.failure === undefined ? {} : { failure: member.failure }),
         ...(member.reason === undefined ? {} : { reason: member.reason }),
-        waiting: !member.terminal,
+        ...(member.latestReport === undefined ? {} : { report: member.latestReport }),
+        ...(!member.terminal && closed ? { status: "cancelled", terminal: true, reason: "Team closed or cancelled" } : {}),
+        waiting: !member.terminal && !closed,
       };
+    }
+    const waiting = !closed && task.latestReport === undefined && !["done", "failed", "cancelled", "review"].includes(task.status);
+    if (waiting && task.laneId === context.laneId) {
+      throw new Error("Cannot wait for the current task running in this lane");
     }
     return {
       teamId, taskId: task.taskId, memberId: task.memberId, laneId: task.laneId,
       assignmentVersion: task.assignmentVersion, status: task.status,
       ...(task.latestReport === undefined ? {} : { report: task.latestReport }),
-      waiting: !["done", "failed", "cancelled", "review"].includes(task.status),
+      ...(closed && task.latestReport === undefined ? { status: "cancelled" } : {}),
+      waiting,
     };
   }
 
@@ -890,38 +972,70 @@ export class TeamRuntime implements TeamControl {
       reportId: `${this.runId}:team:${teamId}:report:${assignment.taskId}`,
       runId: this.runId,
     };
-    // Publish the same durable handoff into the Team channel. The operation
-    // key makes a retry after a lost report append idempotent, and the task
-    // thread keeps the lead's default view compact.
-    const channelCandidate = appendTeamChannelMessage(await this.options.readEvents(), {
-      runId: this.runId,
-      laneId: assignment.laneId,
-      teamId,
-      channelId: "general",
-      threadId: `task:${assignment.taskId}`,
-      operationId: `${this.runId}:team:${teamId}:report:${assignment.taskId}:channel`,
-      fromLane: assignment.laneId,
-      body: `[${report.kind}] ${report.summary}`.slice(0, 8_192),
-      artifactRefs: report.artifactRefs,
-      causationId: input.request.messageId,
-      correlationId: `${this.runId}:team:${teamId}:task:${assignment.taskId}`,
-      visibility: "run",
-      occurredAt: this.clock.now().toISOString(),
-    });
-    await assertReportStillOwned();
-    if (!channelCandidate.duplicate) await this.options.eventSink.append(channelCandidate.event);
-    await assertReportStillOwned();
-    await this.options.eventSink.append({
-      runId: this.runId, laneId: assignment.laneId, type: "team.run.reported", payload: report,
-      correlationId: `${this.runId}:team:${teamId}:task:${assignment.taskId}`,
-      idempotencyKey: `${this.runId}:team:${teamId}:task:${assignment.taskId}:report`,
-      visibility: "run", occurredAt: this.clock.now().toISOString(),
-    } as never);
-    this.options.onWake?.();
+    await publishTeamRunReport({ ledger: this.options.eventSink, readEvents: this.options.readEvents,
+      report, occurredAt: this.clock.now().toISOString(), causationId: input.request.messageId,
+      assertOwned: assertReportStillOwned });
+    this.notifyStateChange();
+  }
+
+  /** Repair transport after settlement without ever reopening model execution. */
+  private async repairReportedHandoffs(): Promise<void> {
+    const events = await this.options.readEvents();
+    const consumed = new Set(projectCommittedBoundaryMessageIds(events, this.runId, this.parentLaneId));
+    for (const board of await this.lifecycle.boards()) {
+      if (board.lifecycleState === "closed" || board.cancellationRequested) continue;
+      const assignments = events as unknown as Array<AnyEvent | TeamTaskAssignedEvent>;
+      const reports = [
+        ...board.members.flatMap((member) => member.latestReport === undefined ? [] : [{
+          report: member.latestReport,
+          task: currentTeamDefinition(board)?.members.find((definition) => definition.memberId === member.memberId)?.task,
+        }]),
+        ...(board.tasks ?? []).flatMap((task) => task.latestReport === undefined ? [] : [{
+          report: task.latestReport,
+          task: assignments.find((event): event is TeamTaskAssignedEvent => event.runId === this.runId
+            && event.type === "team.task.assigned" && event.payload.teamId === board.teamId
+            && event.payload.taskId === task.taskId && event.payload.assignedBy === this.parentLaneId)?.payload.task,
+        }]),
+      ];
+      for (const { report, task } of reports) {
+        const payload = report.result ?? report.failure;
+        if (task === undefined || payload === undefined) continue;
+        const request = this.inbox.snapshot().records.find((record) => record.message.runId === this.runId
+          && record.message.from === this.parentLaneId && record.message.to === report.laneId
+          && record.message.payload.type === "task.request" && stableJson(record.message.payload) === stableJson(task));
+        if (request?.message.payload.type !== "task.request") continue;
+        this.assertAdmissionActive();
+        const reply = teamTaskReplyMessage({ ...request.message, payload: request.message.payload }, payload, this.clock.now().toISOString());
+        const previous = this.inbox.snapshot().records.find((record) => record.message.messageId === reply.messageId);
+        if (previous === undefined) await this.inbox.send(reply);
+        else if (stableJson(previous.message.payload) !== stableJson(payload)) throw new Error("Conflicting recovered Team terminal reply");
+        if (request.status === "pending") {
+          await this.inbox.claim(report.laneId, report.laneId, {
+            claimId: `${report.laneId}:report-recovery:${this.createId()}`, limit: 1, runId: this.runId,
+            messageIds: [request.message.messageId], types: ["task.request"],
+          });
+        }
+        const current = this.inbox.snapshot().records.find((record) => record.message.messageId === request.message.messageId);
+        if (current?.status === "claimed" && current.claim?.claimedBy === report.laneId) await this.inbox.handle(request.message.messageId, report.laneId);
+        const status = payload.type === "task.result" ? "completed" : "failed";
+        const scope = report.assignmentVersion === 0 ? "member" : `task:${report.taskId}`;
+        const statusKey = `${this.runId}:${report.laneId}:${scope}:status:${status}`;
+        if (!(board.tasks ?? []).some((task) => task.laneId === report.laneId && task.assignmentVersion > report.assignmentVersion)
+          && !events.some((event) => event.runId === this.runId && event.idempotencyKey === statusKey)) {
+          await this.options.eventSink.append({
+            runId: this.runId, laneId: report.laneId, type: "lane.status",
+            payload: { status, reason: `Team member finished ${report.taskId}: ${payload.type === "task.result" ? payload.status : "failed"}` },
+            correlationId: `${this.runId}:${report.laneId}`, idempotencyKey: statusKey,
+            visibility: "run", occurredAt: this.clock.now().toISOString(),
+          });
+        }
+        if (previous?.status !== "handled" && !consumed.has(reply.messageId)) this.options.onWake?.();
+      }
+    }
   }
 
   async message(request: TeamMessageRequest, context: ToolExecutionContext): Promise<TeamMessageResult> {
-    return this.enqueueLifecycle(async () => {
+    return this.enqueueLifecycle(() => serializeTeamChannelWrite(this.options.eventSink, async () => {
       this.assertAdmissionActive(context.signal);
       const teamId = normalizeId(request.teamId, "teamId");
       const channelId = normalizeChannelId(request.channelId);
@@ -963,7 +1077,7 @@ export class TeamRuntime implements TeamControl {
         }
       }
       return teamMessageResult(event, candidate.duplicate ? "duplicate" : "sent");
-    });
+    }));
   }
 
   async history(request: TeamHistoryRequest, context: ToolExecutionContext): Promise<TeamHistoryResult> {
@@ -1276,6 +1390,7 @@ export class TeamRuntime implements TeamControl {
   async stop(): Promise<void> {
     await this.enqueueLifecycle(async () => {
       this.stopped = true;
+      this.notifyStateChange();
       await this.lifecycle.close();
       await Promise.all([...this.nestedRuntimes.values()].map((runtime) => runtime.stop()));
       await Promise.all([...this.branches.values(), ...this.reducers.values()].map((branch) => branch.scheduler.stop()));
@@ -1327,6 +1442,9 @@ export class TeamRuntime implements TeamControl {
     const capabilityGrant = member?.capabilities
       ?? this.durableDefinitions.get(teamId)?.members.find((item) => item.laneId === laneId)?.capabilities;
     const taskContext = dynamicAssignment?.task ?? member?.task;
+    const declaredToolNames = taskContext?.spawnContext?.tools === undefined
+      ? undefined
+      : new Set(taskContext.spawnContext.tools.map((tool) => tool.name));
     // A normal Team member may become a nested Team Lead. The child runtime
     // shares this Run's Ledger/Inbox and parent token budget, but owns its own
     // Team namespace and lifecycle. Reducers remain read-only and cannot
@@ -1334,12 +1452,9 @@ export class TeamRuntime implements TeamControl {
     const nested = !reducer
       && capabilityGrant?.allowNestedTeam !== false
       && evaluateSubagentDepth(this.depth, this.maxDepth).allowed
-      ? this.ensureNestedRuntime(laneId, tokenBudget)
+      ? this.ensureNestedRuntime(laneId, tokenBudget, capabilityGrant, declaredToolNames)
       : undefined;
     const memberToolCatalog = this.memberTools(reducer, nested, capabilityGrant);
-    const declaredToolNames = taskContext?.spawnContext?.tools === undefined
-      ? undefined
-      : new Set(taskContext.spawnContext.tools.map((tool) => tool.name));
     const executor = new TeamBranchExecutor({
       inbox: this.inbox,
       eventSink: this.options.eventSink,
@@ -1352,8 +1467,12 @@ export class TeamRuntime implements TeamControl {
       ...(goal === undefined ? {} : { goal }),
       workspace: this.options.workspace,
       tools: memberToolCatalog.filter((tool) => declaredToolNames === undefined || declaredToolNames.has(tool.definition.name)),
-      ...(reducer ? {} : { parentTeamTools: [createTeamMessageTool(this), createTeamHistoryTool(this)] }),
+      ...(reducer ? {} : { parentTeamTools: [
+        createTeamMessageTool(this), createTeamHistoryTool(this),
+        ...this.memberReadTools(teamId, laneId, nested),
+      ] }),
       reducer,
+      onTaskSettled: () => this.options.onWake?.(),
       ...(dynamicAssignment === undefined ? {} : { residentTask: true, residentTaskId: dynamicAssignment.taskId }),
       runTokenBudget: tokenBudget,
       events,
@@ -1373,7 +1492,6 @@ export class TeamRuntime implements TeamControl {
           });
         },
         settleTask: (input) => this.lifecycle.settle(teamId, member, input.request, input.claim, input.payload, reducer),
-        onTaskSettled: () => this.options.onWake?.(),
         readTaskTerminal: async () => {
           const board = (await this.lifecycle.boards()).find((item) => item.teamId === teamId);
           const outcome = reducer ? board?.reduction : board?.members.find((item) => item.memberId === member.memberId && item.terminal);
@@ -1444,9 +1562,14 @@ export class TeamRuntime implements TeamControl {
    * runtimes intentionally share the host's persistence and model boundary;
    * only their parent lane and depth scope differ.
    */
-  private ensureNestedRuntime(parentLaneId: LaneId, tokenBudget: RunTokenBudget): TeamRuntime {
+  private ensureNestedRuntime(parentLaneId: LaneId, tokenBudget: RunTokenBudget, grant?: TeamCapabilityGrant, declaredTools?: ReadonlySet<string>): TeamRuntime {
+    const branchTools = () => this.memberTools(false, undefined, grant)
+      .filter((tool) => declaredTools === undefined || declaredTools.has(tool.definition.name));
     const existing = this.nestedRuntimes.get(parentLaneId);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+      existing.options.branchTools = branchTools;
+      return existing;
+    }
     const nested = new TeamRuntime({
       eventSink: this.options.eventSink,
       inbox: this.inbox,
@@ -1458,7 +1581,7 @@ export class TeamRuntime implements TeamControl {
       parentLaneId,
       depth: this.depth + 1,
       maxDepth: this.maxDepth,
-      branchTools: this.options.branchTools,
+      branchTools,
       runTokenBudget: tokenBudget,
       readEvents: this.options.readEvents,
       readWatermark: this.options.readWatermark,
@@ -1481,6 +1604,10 @@ export class TeamRuntime implements TeamControl {
     return result;
   }
 
+  private notifyStateChange(): void {
+    for (const listener of this.stateListeners) listener();
+  }
+
   private assertAdmissionActive(signal?: AbortSignal): void {
     if (this.stopped) throw new Error("Team runtime is stopped");
     if (signal?.aborted) throw signal.reason ?? new DOMException("Team admission cancelled", "AbortError");
@@ -1495,6 +1622,32 @@ export class TeamRuntime implements TeamControl {
     const activeTask = (board.tasks ?? []).some((task) => task.laneId === sender && !["done", "failed", "cancelled"].includes(task.status));
     if (member === undefined || (member.terminal && !activeTask)) throw new Error(`Lane ${publicLaneName(sender)} is not an active Team member`);
     return sender;
+  }
+
+  private memberReadTools(teamId: string, laneId: LaneId, nested?: TeamRuntime): AgentTool[] {
+    const readMembership = async (context: ToolExecutionContext): Promise<TeamBoard> => {
+      this.assertAdmissionActive(context.signal);
+      assertOwner(context, this.runId, laneId);
+      await this.lifecycle.reconcile();
+      const board = (await this.lifecycle.boards()).find((item) => item.teamId === teamId);
+      if (board === undefined) throw new Error(`Unknown Team ${teamId}`);
+      this.assertTeamAccess(board, { ...context, laneId });
+      if (board.lifecycleState === "closed" || board.cancellationRequested) throw new Error(`Team ${teamId} is closed`);
+      return board;
+    };
+    return [
+      createTeamStatusTool({ status: async (context) => {
+        const board = await readMembership(context);
+        const owned = nested === undefined ? [] : (await nested.status({ ...context, laneId })).teams;
+        return { teams: [board, ...owned] };
+      } }),
+      createTaskWaitTool({ wait: async (request, context) => {
+        await readMembership(context);
+        const runtime = normalizeId(request.teamId, "teamId") === teamId ? this : nested;
+        if (runtime === undefined) throw new Error(`Unknown Team ${request.teamId}`);
+        return runtime.wait(request, { ...context, laneId });
+      } }),
+    ];
   }
 
   private memberTools(reducer: boolean, nested?: TeamRuntime, grant?: TeamCapabilityGrant): readonly AgentTool[] {
@@ -1527,9 +1680,12 @@ export class TeamRuntime implements TeamControl {
     const tools = [
       ...capabilityEntriesFromTools(this.memberTools(reducer, undefined, grant)
         .filter((tool) => declared === undefined || declared.has(tool.definition.name))),
-      // Parent channel access comes from Team membership, not the host's
+      // Parent channel and task reads come from Team membership, not the host's
       // workspace-tool whitelist or permission to create a nested Team.
-      ...capabilityEntriesFromTools(reducer ? [] : [createTeamMessageTool(this), createTeamHistoryTool(this)]),
+      ...capabilityEntriesFromTools(reducer ? [] : [
+        createTeamMessageTool(this), createTeamHistoryTool(this),
+        createTeamStatusTool(this), createTaskWaitTool(this),
+      ]),
       ...["agent_awareness", "agent_message", ...(reducer ? [] : ["teto_start", "teto_stop", "teto_status", ...nestedNames])]
         .map((name) => ({
           name,
@@ -1580,8 +1736,6 @@ function createNestedTeamTools(runtime: TeamRuntime): AgentTool[] {
   return [
     createTeamTool(runtime),
     createTeamAssignTool(runtime),
-    createTaskWaitTool(runtime),
-    createTeamStatusTool(runtime),
     childMessage,
     childHistory,
     createTeamCloseTool(runtime),
@@ -1725,8 +1879,28 @@ function isOpenResidentTaskStatus(status: string): boolean {
 function isCollectedTeam(board: TeamBoard): boolean {
   if (board.lifecycleState === "closed" || board.joinState === "cancelled") return true;
   return board.joinSatisfied
+    && board.members.every((member) => member.terminal)
     && board.reductionState !== "running"
     && !(board.tasks ?? []).some((task) => isOpenResidentTaskStatus(task.status));
+}
+
+function currentTeamDefinition(board: TeamBoard): TeamDefinition | undefined {
+  return board.definition === undefined ? undefined : {
+    ...board.definition,
+    members: board.memberDefinitions ?? board.definition.members,
+  };
+}
+
+function prepareMemberDefinition(member: TeamMemberDefinition): PreparedTeamBranch {
+  const prepared = preparedBranchFromTask(member.memberId, member.task);
+  return { ...prepared, branch: { ...prepared.branch, dependsOn: member.dependsOn, required: member.required,
+    ...(member.capabilities === undefined ? {} : { capabilities: structuredClone(member.capabilities) }) } };
+}
+
+function assignmentInputMatches(task: TaskRequest, request: TeamAssignRequest): boolean {
+  return task.goal.statement === request.statement
+    && (request.input === undefined ? task.inputRefs.length === 0
+      : task.inputRefs.length === 1 && task.inputRefs[0]?.contentHash === sha256(request.input));
 }
 
 function validateBudget(value: TaskBudget): void {

@@ -48,11 +48,17 @@ Nausicaa (lane: nausicaa)
 Team 的主管由实际创建它的 lane 决定，负责汇总和判断结果。
 详见 [Team 协作合同](docs/team-collaboration.md)。
 
+团队可以逐步组建：`team_create` 只派发当前能开始的工作，之后用 `team_assign`
+给新成员或原成员派任务，并携带简短的结果与文件路径，不需要 `dependsOn`。
+成员每次任务的最终报告自动进入群里的任务线程；`team_message` 用于群协作，A2A 用于私信。
+`task_wait` 真正等待结果，`team_status` 才是即时查询。主管可以安排返工和复验，
+普通调度分段结束后会自动继续，不会仅因达到默认 24 步而要求手动恢复。
+
 主管无需为成员填写 token 预算、轮数或总时长限制。新任务也没有隐藏的“两轮结束”
 或“30 分钟截止”默认值。交互会话保持打开时，主管可以先结束当前轮次；成员继续工作，
 结果返回后主管自动继续协调。关闭会话或取消任务会停止相关工作。
 
-当前版本：`0.1.4` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
+当前版本：`0.1.5` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
 edge 集成仍在完善。
 
 ### 快速开始
@@ -197,6 +203,14 @@ full `laneId` returned by the tools for A2A messages. A Team's actual creating
 lane is its lead and owns synthesis and acceptance.
 See the [Team collaboration contract](docs/team-collaboration.md).
 
+Build Teams incrementally: `team_create` starts ready work, then `team_assign`
+adds a member or reuses an existing one with a concise handoff. No `dependsOn`
+graph is required. Every task's final report enters the shared task thread;
+`team_message` is for group coordination and A2A is private. `task_wait` waits
+for the result; `team_status` is an immediate snapshot. The lead can assign
+repairs and reviews and continues across ordinary scheduling slices without
+a manual resume at the default 24-step boundary.
+
 Members start with independent contexts and, by default, inherit the Team
 Lead's host-authorized workspace tool catalog. The lead can narrow a member
 with `members[].capabilities.tools` and allow or deny nested Team creation with
@@ -211,7 +225,7 @@ session, the lead may finish its current turn while members keep working;
 durable reports automatically resume coordination. Session closure or task
 cancellation stops the corresponding work.
 
-Current version: `0.1.4` beta. Core runtime contracts have offline test coverage;
+Current version: `0.1.5` beta. Core runtime contracts have offline test coverage;
 provider, daemon, RPC, and edge integrations are still evolving.
 
 ### Quick start

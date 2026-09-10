@@ -169,7 +169,7 @@ describe("Team completion boundary delivery", () => {
     let calls = 0;
     const f = await fixture(async () => {
       if (++calls === 1) return {
-        ...response("Ask Main before continuing"), stopReason: "tool_calls",
+        ...response("Ask Main before continuing"), stopReason: "toolUse",
         toolCalls: [{
           id: "ask-main", name: "agent_message",
           arguments: { target: "main", kind: "request", text: "Which target should I inspect?" },

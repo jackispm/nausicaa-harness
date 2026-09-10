@@ -67,6 +67,7 @@ export interface TeamBoardMember {
   acceptedMessageId?: string;
   result?: TaskResult;
   failure?: TaskFailed;
+  latestReport?: TeamRunReport & { reportId: string; runId: RunId };
   reason?: string;
   lastOffset: number;
   anomalies: string[];
@@ -93,6 +94,8 @@ export interface TeamBoard {
   leadLaneId: LaneId;
   coordinator: LaneId;
   definition?: TeamDefinition;
+  /** Current admission projection, including append-only member additions. */
+  memberDefinitions?: TeamMemberDefinition[];
   joinPolicy: TeamJoinPolicy;
   status: TeamBoardStatus;
   joinReady: boolean;
@@ -169,11 +172,13 @@ export function parseTeamLane(laneId: string): {
 
 interface DraftMember {
   definition: TeamMemberDefinition;
+  admittedOffset: number;
   request?: InboxRecord;
   registered: boolean;
   laneStatus?: LaneStatus;
   acceptedMessageId?: string;
   settlement?: TeamMemberSettlement;
+  latestReport?: TeamRunReport & { reportId: string; runId: RunId };
   terminalReplies: string[];
   lastOffset: number;
   anomalies: string[];
@@ -214,7 +219,7 @@ function newTeam(teamId: string, coordinator: LaneId): DraftTeam {
 
 function newMember(definition: TeamMemberDefinition, offset: number): DraftMember {
   return {
-    definition: structuredClone(definition), registered: false,
+    definition: structuredClone(definition), admittedOffset: offset, registered: false,
     terminalReplies: [], lastOffset: offset, anomalies: [],
   };
 }
@@ -242,6 +247,36 @@ function projectRunBoards(
       team.members.set(member.laneId, newMember(member, event.globalOffset));
     }
     teams.set(team.teamId, team);
+  }
+  const closedAdmissions = new Set<string>();
+  const admissionOperations = new Map<string, string>();
+  for (const event of events) {
+    if (event.type === "team.cancel.requested" || event.type === "team.closed") {
+      const team = teams.get(event.payload.teamId);
+      if (event.laneId === team?.coordinator) closedAdmissions.add(team.teamId);
+      continue;
+    }
+    if (event.type !== "team.member.added") continue;
+    const team = teams.get(event.payload.teamId);
+    if (team === undefined) continue;
+    const { member, operationId, addedBy } = event.payload;
+    if (event.laneId !== team.coordinator || addedBy !== team.coordinator
+      || event.globalOffset <= (team.definitionOffset ?? Infinity)
+      || closedAdmissions.has(team.teamId)) {
+      anomaly(team, "team.member.added has no authorized open Team admission");
+      continue;
+    }
+    const operationKey = `${team.teamId}:${operationId}`;
+    if (admissionOperations.has(operationKey) || team.members.has(member.laneId)
+      || [...team.members.values()].some((existing) => existing.definition.memberId === member.memberId
+        || existing.definition.task.taskId === member.task.taskId)
+      || member.laneId !== `team:${team.teamId}:${member.memberId}`
+      || team.members.size >= 16) {
+      anomaly(team, "team.member.added conflicts with an existing admission or membership limit");
+      continue;
+    }
+    admissionOperations.set(operationKey, member.memberId);
+    team.members.set(member.laneId, newMember(member, event.globalOffset));
   }
   const reducerLanes = new Set(events.flatMap((event) => {
     if (event.type !== "team.reduction.requested") return [];
@@ -275,6 +310,10 @@ function projectRunBoards(
       dependsOn: [], required: true,
     }, record.sentAtOffset);
     team.members.set(message.to, member);
+    if (record.sentAtOffset <= member.admittedOffset && team.definition !== undefined) {
+      anomaly(member, "task.request precedes member admission");
+      continue;
+    }
     // Follow-up requests are checked against assignments in timeline order.
     if (message.payload.taskId !== member.definition.task.taskId) continue;
     if (message.from !== team.coordinator) {
@@ -336,7 +375,7 @@ function projectRunBoards(
     }
     const parsed = parseTeamLane(event.laneId);
     const member = parsed === undefined ? undefined : teams.get(parsed.teamId)?.members.get(event.laneId);
-    if (member !== undefined) member.lastOffset = Math.max(member.lastOffset, event.globalOffset);
+    if (member !== undefined && event.globalOffset >= member.admittedOffset) member.lastOffset = Math.max(member.lastOffset, event.globalOffset);
     // A caller may supply a snapshot alongside a partial Ledger read. Unknown
     // claims cannot authenticate a settlement; their snapshot remains diagnostic.
     if (event.type === "message.sent" && event.payload.message.runId === runId) {
@@ -355,7 +394,7 @@ function projectRunBoards(
       }
     }
     if (event.type === "lane.registered" || event.type === "lane.status") {
-      if (member !== undefined) {
+      if (member !== undefined && event.globalOffset >= member.admittedOffset) {
         if (event.type === "lane.registered") member.registered = true;
         else member.laneStatus = event.payload.status;
         member.lastOffset = Math.max(member.lastOffset, event.globalOffset);
@@ -396,7 +435,9 @@ function applyDynamicTeamEvent(team: DraftTeam, event: DynamicTeamEvent): void {
       return;
     }
     const member = [...team.members.values()].find((candidate) => candidate.definition.memberId === assignment.memberId);
-    if (member === undefined || member.definition.laneId !== assignment.laneId) {
+    if (member === undefined || member.definition.laneId !== assignment.laneId
+      || member.admittedOffset >= event.globalOffset || member.settlement === undefined
+      || team.closed !== undefined || team.cancellationRequested) {
       anomaly(team, "team.task.assigned names an unknown member lane");
       return;
     }
@@ -412,11 +453,26 @@ function applyDynamicTeamEvent(team: DraftTeam, event: DynamicTeamEvent): void {
       return;
     }
     team.tasks.set(assignment.taskId, { assignment: structuredClone(assignment), assignedAt: event.occurredAt, status: "queued" });
+    team.presentationState = "pending";
     return;
   }
   const report = event.payload as TeamRunReport & { reportId: string; runId: string };
-  if (report.runId !== event.runId) {
+  if (report.runId !== event.runId || event.laneId !== report.laneId) {
     anomaly(team, "team.run.reported runId does not match its event envelope");
+    return;
+  }
+  if (report.assignmentVersion === 0) {
+    const member = team.members.get(report.laneId);
+    if (member === undefined || member.definition.task.taskId !== report.taskId
+      || member.settlement === undefined
+      || (report.result !== undefined && stableJson(report.result) !== stableJson(member.settlement.result ?? null))
+      || (report.failure !== undefined && member.settlement.failure !== undefined
+        && stableJson(report.failure) !== stableJson(member.settlement.failure))) {
+      anomaly(team, "initial team.run.reported does not match its member settlement");
+      return;
+    }
+    if (member.latestReport === undefined) member.latestReport = structuredClone(report);
+    else if (stableJson(member.latestReport) !== stableJson(report)) anomaly(team, "conflicting initial team.run.reported ignored");
     return;
   }
   const task = team.tasks.get(report.taskId);
@@ -425,10 +481,18 @@ function applyDynamicTeamEvent(team: DraftTeam, event: DynamicTeamEvent): void {
     anomaly(team, "team.run.reported does not match the current assignment");
     return;
   }
+  if (task.latestReport !== undefined) {
+    if (stableJson(task.latestReport) !== stableJson(report)) anomaly(team, "conflicting team.run.reported ignored");
+    return;
+  }
+  if (team.closed !== undefined || team.cancellationRequested) {
+    anomaly(team, "late team.run.reported after Team closure ignored");
+    return;
+  }
   task.latestReport = structuredClone(report);
-  task.status = report.kind === "ready-for-review" ? "review"
+  task.status = report.result !== undefined ? "review"
     : report.kind === "blocked" ? "blocked"
-      : report.kind === "failed" ? "failed" : report.result?.status === "completed" ? "done" : "waiting";
+      : report.kind === "failed" ? "failed" : "waiting";
 }
 
 function isTeamEvent(event: AnyEvent): event is TeamEvent {
@@ -438,6 +502,10 @@ function isTeamEvent(event: AnyEvent): event is TeamEvent {
 function applyTeamEvent(team: DraftTeam, event: TeamEvent, inbox: InboxProjector): void {
   team.lastOffset = Math.max(team.lastOffset, event.globalOffset);
   if (event.type === "team.created") return;
+  if (event.type === "team.member.added") {
+    if (team.members.get(event.payload.member.laneId)?.admittedOffset === event.globalOffset) team.presentationState = "pending";
+    return;
+  }
   if (team.definitionOffset !== undefined && event.globalOffset < team.definitionOffset) {
     anomaly(team, `${event.type} precedes Team admission`);
     return;
@@ -502,7 +570,9 @@ function applyTeamEvent(team: DraftTeam, event: TeamEvent, inbox: InboxProjector
       break;
     }
     case "team.presented":
-      if (team.joined === undefined || (team.reducer !== undefined && team.reduction === undefined)) {
+      if (team.joined === undefined || (team.reducer !== undefined && team.reduction === undefined)
+        || [...team.members.values()].some((member) => member.admittedOffset <= event.globalOffset && member.settlement === undefined)
+        || [...team.tasks.values()].some((task) => task.latestReport === undefined && task.status !== "cancelled")) {
         anomaly(team, "presentation requires a joined Team and a finished requested reduction");
       } else team.presentationState = event.payload.disposition;
       break;
@@ -645,7 +715,7 @@ function applyJoin(team: DraftTeam, event: Extract<AnyEvent, { type: "team.joine
     anomaly(team, "duplicate or conflicting team.joined ignored");
     return;
   }
-  const members = [...team.members.values()];
+  const members = [...team.members.values()].filter((member) => member.admittedOffset <= event.globalOffset);
   const settled = members.filter((member) => member.settlement !== undefined);
   const supplied = event.payload.memberOutcomes;
   const matching = supplied.length === settled.length
@@ -684,8 +754,11 @@ function finalizeTeam(runId: RunId, team: DraftTeam, inbox: InboxProjector, lega
   return {
     runId, teamId: team.teamId, coordinator: team.coordinator, leadLaneId: team.coordinator,
     ...(team.definition === undefined ? {} : { definition: structuredClone(team.definition) }),
+    memberDefinitions: [...team.members.values()].map((member) => structuredClone(member.definition)),
     joinPolicy: team.definition?.joinPolicy ?? legacyPolicy ?? "all-terminal",
-    status: team.cancelled ? "cancelled" : aggregateStatus(members, joinSatisfied),
+    status: team.cancelled ? "cancelled"
+      : [...team.tasks.values()].some((task) => task.latestReport === undefined && task.status !== "cancelled") ? "running"
+        : aggregateStatus(members, joinSatisfied && members.every((member) => member.terminal)),
     joinReady, joinSatisfied, joinState, cancellationRequested: team.cancellationRequested,
     reductionState, presentationState: team.presentationState,
     ...(team.reducer === undefined ? {} : { reducer: structuredClone(team.reducer) }),
@@ -739,6 +812,7 @@ function finalizeMember(team: DraftTeam, member: DraftMember, inbox: InboxProjec
     ...(member.acceptedMessageId === undefined ? {} : { acceptedMessageId: member.acceptedMessageId }),
     ...(settlement?.result === undefined ? {} : { result: structuredClone(settlement.result) }),
     ...(settlement?.failure === undefined ? {} : { failure: structuredClone(settlement.failure) }),
+    ...(member.latestReport === undefined ? {} : { latestReport: structuredClone(member.latestReport) }),
     ...(settlement?.reason === undefined ? {} : { reason: settlement.reason }),
     lastOffset: member.lastOffset, anomalies,
   };

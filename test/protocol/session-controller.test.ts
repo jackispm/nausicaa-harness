@@ -984,8 +984,7 @@ describe("SessionController", () => {
     const root = await temporaryRoot();
     const firstModel = new ScriptedModel([{
       ...response("inspect before interruption"),
-      toolCalls: [{ id: "plan-list", name: "list_files", arguments: { path: "." } }],
-      stopReason: "toolUse",
+      stopReason: "length",
     }]);
     const first = await SessionController.open({
       workspace: root,
@@ -1005,7 +1004,7 @@ describe("SessionController", () => {
       text: "Investigate this workspace",
     });
     await first.waitForIdle();
-    expect(first.snapshot().blocker).toBe("step-allowance-exhausted");
+    expect(first.snapshot().blocker).toBe("model-output-limit");
     const runId = first.snapshot().runId!;
     const turnId = admitted.turnId!;
     await first.close();
@@ -1091,8 +1090,7 @@ describe("SessionController", () => {
     }, {
       mainModel: new ScriptedModel([{
         ...response("inspect before legacy conversion"),
-        toolCalls: [{ id: "legacy-list", name: "list_files", arguments: { path: "." } }],
-        stopReason: "toolUse",
+        stopReason: "length",
       }]),
       createRunId: () => "legacy-boundary-run",
     });
@@ -2120,33 +2118,29 @@ describe("SessionController", () => {
     await reopened.close();
   });
 
-  it("waits at an activation allowance and resumes the same Turn", async () => {
+  it("continues across an activation allowance within the same Turn", async () => {
     const root = await temporaryRoot();
     const model = new ScriptedModel([{
       ...response("one step"),
       toolCalls: [{ id: "noop-1", name: "noop", arguments: {} }],
       stopReason: "toolUse",
-    }, response("done after resume")]);
+    }, response("done after the next slice")]);
     const events: SessionRuntimeEvent[] = [];
     const session = await openSession(root, model, "resume-turn", [noopTool], 1);
     session.subscribe((event) => events.push(event));
 
     const admitted = await session.submit({ inputId: "resume-input", text: "Take two steps" });
     await session.waitForIdle();
-    expect(session.snapshot().blocker).toBe("step-allowance-exhausted");
-    await session.resumeCurrent();
-    await session.waitForIdle();
+    expect(session.snapshot().blocker).toBeUndefined();
 
     const durable = durableEvents(events);
-    expect(durable.filter((event) => event.type === "turn.resumed")).toHaveLength(1);
+    expect(durable.filter((event) => event.type === "turn.resumed")).toHaveLength(0);
     expect(durable
       .filter((event) => event.type === "step.started")
       .map((event) => event.payload.step)).toEqual([1, 2]);
     expect(durable.find((event) => event.type === "turn.completed")?.turnId)
       .toBe(admitted.turnId);
     expect(mainLaneStatuses(durable)).toEqual([
-        "running",
-        "waiting",
         "running",
         "ready",
       ]);
@@ -2201,8 +2195,7 @@ describe("SessionController", () => {
     }, {
       mainModel: new ScriptedModel([{
         ...response("first committed step"),
-        toolCalls: [{ id: "crash-noop", name: "noop", arguments: {} }],
-        stopReason: "toolUse",
+        stopReason: "length",
       }]),
       tools: [noopTool],
       createRunId: () => "crash-window-run",
@@ -2330,8 +2323,7 @@ describe("SessionController", () => {
     const model = new ScriptedModel([
       {
         ...response("needs another step"),
-        toolCalls: [{ id: "waiting-noop", name: "noop", arguments: {} }],
-        stopReason: "toolUse",
+        stopReason: "length",
       },
       response("queued answer"),
     ]);
@@ -2339,7 +2331,7 @@ describe("SessionController", () => {
 
     await session.submit({ inputId: "waiting-input", text: "Wait" });
     await session.waitForIdle();
-    expect(session.snapshot().blocker).toBe("step-allowance-exhausted");
+    expect(session.snapshot().blocker).toBe("model-output-limit");
     await session.submit({ inputId: "queued-input", text: "Continue differently" });
     await session.cancel("abandon waiting Turn");
     await session.waitForIdle();
@@ -2401,8 +2393,7 @@ describe("SessionController", () => {
     const attachedImage = image("resumed-session-image");
     const firstModel = new ScriptedModel([{
       ...response("inspect another file"),
-      toolCalls: [{ id: "resume-image-noop", name: "noop", arguments: {} }],
-      stopReason: "toolUse",
+      stopReason: "length",
     }]);
     const first = await openSession(
       root,
@@ -2417,7 +2408,7 @@ describe("SessionController", () => {
       images: [attachedImage],
     });
     await first.waitForIdle();
-    expect(first.snapshot().blocker).toBe("step-allowance-exhausted");
+    expect(first.snapshot().blocker).toBe("model-output-limit");
     const runId = first.snapshot().runId!;
     await first.close();
 
@@ -2637,8 +2628,7 @@ describe("SessionController", () => {
       root,
       new ScriptedModel([{
         ...response("write started"),
-        toolCalls: [{ id: "initial-noop", name: "noop", arguments: {} }],
-        stopReason: "toolUse",
+        stopReason: "length",
       }]),
       "unknown-resume",
       [noopTool],
@@ -2648,7 +2638,7 @@ describe("SessionController", () => {
     await first.waitForIdle();
     const runId = first.snapshot().runId!;
     const turnId = admitted.turnId!;
-    expect(first.snapshot().blocker).toBe("step-allowance-exhausted");
+    expect(first.snapshot().blocker).toBe("model-output-limit");
     await first.close();
 
     const store = await FileContentAddressedStore.open(

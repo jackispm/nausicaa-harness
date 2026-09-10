@@ -2272,11 +2272,23 @@ describe("MainLoop", () => {
     });
 
     expect(executions).toBe(0);
-    expect(result).toMatchObject({ completed: true, finalText: "recovered" });
+    expect(result).toMatchObject({ completed: false, finalText: "partial tool call", stopReason: "length" });
+    expect(model.callCount).toBe(1);
     const events = await ledger.read({ runId: "truncated-tool-run" });
     expect(events.filter((event) => event.type === "tool.failed")).toHaveLength(1);
     expect(events.some((event) => event.type === "tool.admitted")).toBe(false);
     expect(events.some((event) => event.type === "tool.started")).toBe(false);
+    const resumed = await loop.run({
+      runId: "truncated-tool-run",
+      goal: { version: 1, statement: "Answer", successCriteria: [], hardConstraints: [] },
+      model: "demo",
+      workspace,
+      policy: policy(2),
+      startStep: 2,
+      conversationRefs: result.conversationRefs,
+      upperWatermark: await ledger.watermark(),
+    });
+    expect(resumed).toMatchObject({ completed: true, finalText: "recovered" });
     const retryContext = model.requests[1]?.messages.find((message) => message.role === "tool");
     expect(retryContext?.content).toContain("may be truncated");
   });

@@ -951,6 +951,7 @@ export const executeRun = async (
         artifactReadRefs: setup.artifactReadRefs,
         pressureEligibleConversationCount: setup.pressureEligibleConversationCount,
         maxOutputTokens: request.maxOutputTokens ?? DEFAULT_MAIN_OUTPUT_TOKENS,
+        continueAfterStepAllowance: true,
         sessionId,
         ...(tetoManifest === undefined ? {} : { laneCapabilityManifests: [tetoManifest] }),
         ...(request.signal === undefined ? {} : { signal: request.signal }),

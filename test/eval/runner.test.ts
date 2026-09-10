@@ -200,7 +200,7 @@ describe("Phase 2.4 evaluation runner", () => {
     });
   });
 
-  it("continues the same Run after an activation boundary without resetting budgets", async () => {
+  it("continues the same Run across scheduling slices without resetting budgets or requiring resume", async () => {
     const root = await temporaryRoot();
     const task = PREREGISTERED_MANIFEST.tasks.find((candidate) => (
       candidate.taskId === "goal-drift-intervention-001"
@@ -219,10 +219,14 @@ describe("Phase 2.4 evaluation runner", () => {
     expect(new Set(model.requests.map((request) => request.runId))).toEqual(new Set([record.runId]));
     expect(model.requests).toHaveLength(9);
     const ledger = await JsonlLedger.open(join(record.stateDir, "ledger.jsonl"));
-    const events = await ledger.read({ runId: record.runId });
-    expect(events.filter((event) => event.type === "run.resumed")).toHaveLength(1);
-    expect(events.filter((event) => event.type === "user.message")).toHaveLength(1);
-    await ledger.close();
+    try {
+      const events = await ledger.read({ runId: record.runId });
+      expect(events.filter((event) => event.type === "run.resumed")).toHaveLength(0);
+      expect(events.filter((event) => event.type === "user.message")).toHaveLength(1);
+      expect(events.filter((event) => event.type === "budget.charged")).toHaveLength(9);
+    } finally {
+      await ledger.close();
+    }
   });
 
   it("checkpoints raw evidence and detects any mutation", async () => {

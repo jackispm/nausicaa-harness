@@ -492,7 +492,7 @@ interface RunPolicyBase {
   fukaiCompaction?: FukaiCompactionPolicy;
 }
 
-/** New runs use an activation allowance; maxMainSteps is replay-only legacy data. */
+/** New runs use scheduling slices; an explicit legacy maxMainSteps stays a hard limit. */
 export type RunPolicy = RunPolicyBase & (
   | { maxMainStepsPerActivation: number; maxMainSteps?: never }
   | { maxMainSteps: number; maxMainStepsPerActivation?: never }

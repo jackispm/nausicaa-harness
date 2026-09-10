@@ -318,14 +318,14 @@ describe("Team completion boundaries", () => {
     }
   }, 15_000);
 
-  it("leaves one-shot incomplete when Team consumption would exceed the original Main step allowance", async () => {
+  it("preserves an explicit legacy hard step limit when Team consumption needs another step", async () => {
     const root = await temporaryDirectory();
     const events: AnyEvent[] = [];
     const main = new ScriptedModel([creationResponse(), response("Unverified early answer")]);
     const worker = new ScriptedModel([async () => { await delay(50); return response("Evidence after Main's final allowed step"); }]);
     const result = await executeRun({
       workspace: root, dataDir: join(root, "state"), model: "scripted-main", message: "Review evidence",
-      policy: { ...policy, maxMainStepsPerActivation: 2 },
+      policy: { tetoEnabled: false, workerEnabled: false, maxMainSteps: 2, maxModelTokens: 100_000 },
     }, {
       mainModel: main, workerModel: worker, tools: [], workerTools: [], clock,
       createRunId: () => "step-limited-team-completion", onEvent: (event) => { events.push(event); },

@@ -10,6 +10,52 @@ import type {
   Visibility,
 } from "../domain/types.js";
 import { sha256, stableJson } from "../ledger/hash.js";
+import type { Ledger } from "../ledger/index.js";
+import type { TeamRunReport } from "../domain/team.js";
+
+const channelWrites = new WeakMap<Ledger, Promise<void>>();
+
+/** Channel sequence allocation and report repair share the Ledger's writer scope. */
+export function serializeTeamChannelWrite<T>(ledger: Ledger, operation: () => Promise<T>): Promise<T> {
+  const result = (channelWrites.get(ledger) ?? Promise.resolve()).then(operation);
+  const tail = result.then(() => undefined, () => undefined);
+  channelWrites.set(ledger, tail);
+  void tail.then(() => { if (channelWrites.get(ledger) === tail) channelWrites.delete(ledger); });
+  return result;
+}
+
+/** Idempotent report publication also repairs a crash between its two facts. */
+export function publishTeamRunReport(input: {
+  ledger: Ledger;
+  readEvents: () => Promise<readonly AnyEvent[]>;
+  report: TeamRunReport & { reportId: string; runId: RunId };
+  occurredAt: string;
+  causationId?: string;
+  assertOwned?: () => void | Promise<void>;
+}): Promise<void> {
+  return serializeTeamChannelWrite(input.ledger, async () => {
+    const { report } = input;
+    await input.assertOwned?.();
+    const candidate = appendTeamChannelMessage(await input.readEvents(), {
+      runId: report.runId, laneId: report.laneId, teamId: report.teamId,
+      channelId: "general", threadId: `task:${report.taskId}`,
+      operationId: `${report.reportId}:channel`, fromLane: report.laneId,
+      body: `[${report.kind}] ${report.summary}`.slice(0, 8_192), artifactRefs: report.artifactRefs,
+      ...(input.causationId === undefined ? {} : { causationId: input.causationId }),
+      correlationId: `${report.runId}:team:${report.teamId}:task:${report.taskId}`,
+      visibility: "run", occurredAt: input.occurredAt,
+    });
+    await input.assertOwned?.();
+    if (!candidate.duplicate) await input.ledger.append(candidate.event);
+    await input.assertOwned?.();
+    await input.ledger.append({
+      runId: report.runId, laneId: report.laneId, type: "team.run.reported", payload: report,
+      correlationId: `${report.runId}:team:${report.teamId}:task:${report.taskId}`,
+      idempotencyKey: `${report.runId}:team:${report.teamId}:task:${report.taskId}:report`,
+      visibility: "run", occurredAt: input.occurredAt,
+    } as never);
+  });
+}
 
 export type TeamChannelEvent = Extract<AnyEvent, { type: "team.message.sent" }>;
 export type TeamChannelAppendEvent = AppendEvent<"team.message.sent">;

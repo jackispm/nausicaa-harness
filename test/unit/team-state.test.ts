@@ -166,8 +166,8 @@ describe("durable Team state", () => {
   });
 
   it("keeps resident assignments and reports separate from the original member settlement", () => {
-    const s = scenario();
-    s.append("team.created", s.definition);
+    const s = residentScenario();
+    const initial = s.board().members[0]!;
     const task = {
       type: "task.request" as const,
       taskId: "alpha:member-0:task-1",
@@ -181,6 +181,7 @@ describe("durable Team state", () => {
     expect(s.board().tasks).toMatchObject([{
       taskId: task.taskId, memberId: "member-0", assignmentVersion: 1, status: "queued",
     }]);
+    s.append("message.sent", { message: { ...s.residentRequest, payload: task } });
     s.append("team.run.reported" as never, {
       teamId: "alpha", taskId: task.taskId, laneId: "team:alpha:member-0", assignmentVersion: 1,
       kind: "ready-for-review", summary: "Follow-up complete", artifactRefs: [], openQuestions: [],
@@ -188,9 +189,10 @@ describe("durable Team state", () => {
         type: "task.result", taskId: task.taskId, status: "completed", summary: "Follow-up complete",
         evidenceRefs: [], artifactRefs: [], openQuestions: [], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
       }, reportId: "report-1", runId: "run-team",
-    } as never);
+    } as never, s.residentReply.from);
     expect(s.board().tasks?.[0]).toMatchObject({ status: "review", latestReport: { reportId: "report-1" } });
-    expect(s.board().members[0]?.terminal).toBe(false);
+    expect(s.board().members[0]).toMatchObject({ terminal: true, taskId: initial.taskId, outcome: initial.outcome, result: initial.result });
+    expect(s.board().anomalies).toEqual([]);
   });
 
   it("does not infer task success or join from an ended lane or a transport reply", () => {

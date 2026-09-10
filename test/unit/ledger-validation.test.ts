@@ -232,6 +232,8 @@ const crossRunReceipt = {
 
 const validPayloads = {
   "team.created": teamDefinition,
+  "team.member.added": { teamId: "team-1", member: { ...teamMember, task: { ...teamTask, taskId: "team-1:alpha" } },
+    addedBy: "main", operationId: "add-alpha" },
   "team.message.sent": {
     teamId: "team-1",
     channelId: "general",
@@ -564,6 +566,7 @@ const validPayloads = {
 
 const invalidPayloads = {
   "team.created": { ...teamDefinition, members: [{ ...teamMember, dependsOn: ["missing"] }] },
+  "team.member.added": { ...validPayloads["team.member.added"], member: { ...teamMember, laneId: "main" } },
   "team.message.sent": { ...validPayloads["team.message.sent"], sequence: 0 },
   "team.closed": { ...validPayloads["team.closed"], reason: "" },
   "team.member.settled": {

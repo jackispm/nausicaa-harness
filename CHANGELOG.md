@@ -4,6 +4,27 @@ All notable changes to Nausicaa are documented here.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-09-10
+
+- Replace model-facing dependency graphs with incremental Team assignment:
+  add new members when their work is ready and reuse the same members for
+  follow-up work, with concise handoffs and the original permission boundary.
+- Make `task_wait` wait on durable task events without repeated model calls.
+  Keep `team_status` as the immediate status query.
+- Continue the lead across default 24-step scheduling slices, retaining
+  cancellation, output truncation, and explicit legacy hard-limit recovery.
+  Reject tool calls from unsupported provider stop reasons before execution.
+- Publish initial task reports into the same shared threads as later reports.
+  Give members bounded group context and reserve A2A for private coordination.
+- Preserve actual tool grants through nested Teams and allow a new acceptance
+  decision after members complete reassigned work.
+- Wake the lead after terminal handoff commits and repair missing terminal
+  messages after restart without rerunning completed member work.
+- Route member status and waiting tools to the Team they belong to or manage,
+  including members without permission to create nested Teams.
+- Add a natural-language calendar/Todo live probe without prefilled tool
+  arguments or instructions telling the model how to wait.
+
 ## [0.1.4] - 2026-09-10
 
 - Remove model-controlled task budgets, attempt counts, deadlines, success

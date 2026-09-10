@@ -284,7 +284,7 @@ function teamMember(value: unknown, path: string): asserts value is TeamMemberDe
 }
 
 function teamCapabilityGrant(value: unknown, path: string): asserts value is TeamCapabilityGrant {
-  const grant = payloadObject(value, path, ["tools", "allowNestedTeam"]);
+  const grant = payloadObject(value, path, []);
   exactKeys(grant, ["tools", "allowNestedTeam"], path);
   if (grant.tools !== undefined) {
     if (!Array.isArray(grant.tools) || grant.tools.length > 64) invalid(`${path}.tools`, "an array of at most 64 tool names");
@@ -406,7 +406,7 @@ function teamRunReport(value: unknown, path: string): void {
   teamId(item.teamId, `${path}.teamId`);
   taskId(item.taskId, `${path}.taskId`);
   string(item.laneId, `${path}.laneId`, false);
-  integer(item.assignmentVersion, `${path}.assignmentVersion`, 1);
+  integer(item.assignmentVersion, `${path}.assignmentVersion`, 0);
   oneOf(item.kind, `${path}.kind`, ["checkpoint", "ready-for-review", "blocked", "failed"] as const);
   string(item.summary, `${path}.summary`, false);
   boundedArtifactRefs(item.artifactRefs, `${path}.artifactRefs`);
@@ -1271,6 +1271,29 @@ const payloadValidators = {
     }
   },
   "team.created": teamDefinition,
+  "team.member.added": (value, path) => {
+    const item = payloadObject(value, path, ["teamId", "member", "addedBy", "operationId"]);
+    exactKeys(item, ["teamId", "member", "addedBy", "operationId"], path);
+    teamId(item.teamId, `${path}.teamId`);
+    teamMember(item.member, `${path}.member`);
+    string(item.addedBy, `${path}.addedBy`, false);
+    string(item.operationId, `${path}.operationId`, false);
+    if (item.member.laneId !== `team:${item.teamId as string}:${item.member.memberId}`
+      || item.member.laneId === item.addedBy
+      || item.member.task.taskId !== `${item.teamId as string}:${item.member.memberId}`) {
+      invalid(`${path}.member`, "the host-issued member lane and initial task identity");
+    }
+    if (item.member.dependsOn.length > 0 || !item.member.required) {
+      invalid(`${path}.member`, "an immediately assigned required member without dependencies");
+    }
+    const spawn = item.member.task.spawnContext;
+    if (spawn !== undefined && (spawn.parent.laneId !== item.addedBy
+      || stableJson(spawn.goal) !== stableJson(item.member.task.goal)
+      || stableJson(spawn.inputRefs) !== stableJson(item.member.task.inputRefs)
+      || stableJson(spawn.budget) !== stableJson(item.member.task.budget))) {
+      invalid(`${path}.member.task.spawnContext`, "match the admitted lead and task");
+    }
+  },
   "team.member.settled": (value, path) => {
     const item = payloadObject(value, path, ["teamId", "memberId", "taskId", "outcome"]);
     exactKeys(item, ["teamId", "memberId", "taskId", "outcome", "requestMessageId", "result", "failure", "reason", "claimId", "attempt"], path);

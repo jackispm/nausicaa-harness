@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 
 import type {
   AnyEvent,
@@ -340,6 +341,8 @@ export interface MainLoopInput {
   correlationId?: string;
   /** Legacy one-shot completes the Run; interactive execution completes only its Turn. */
   completeRun?: boolean;
+  /** Host continuation across scheduling slices; legacy hard step limits still apply. */
+  continueAfterStepAllowance?: boolean;
   signal?: AbortSignal;
   /** Suppress Run/Turn completion facts for long-lived auxiliary lanes. */
   completionMode?: "run" | "turn" | "none";
@@ -489,9 +492,11 @@ export class MainLoop {
     const mainRequestTimeoutMs = input.policy.mainRequestTimeoutMs
       ?? DEFAULT_MAIN_REQUEST_TIMEOUT_MS;
     const allowance = mainStepAllowance(input.policy);
-    const finalStep = "maxMainStepsPerActivation" in input.policy
+    let finalStep = "maxMainStepsPerActivation" in input.policy
       ? startStep + allowance - 1
       : allowance;
+    const continueAfterAllowance = input.continueAfterStepAllowance === true
+      && "maxMainStepsPerActivation" in input.policy;
     const eventState = { watermark: input.upperWatermark ?? 0 };
     const conversationRefs = [...(input.conversationRefs ?? [])]
       .map((ref) => structuredClone(ref));
@@ -554,7 +559,14 @@ export class MainLoop {
       });
     }
 
-    for (let step = startStep; step <= finalStep; step += 1) {
+    for (let step = startStep; ; step += 1) {
+      if (step > finalStep) {
+        if (!continueAfterAllowance || (lastStopReason !== "toolUse" && lastStopReason !== "stop")) break;
+        // The slice ends after all tool results and consumption facts commit.
+        // Retain context and usage while queued lane work and cancellation run.
+        await yieldToEventLoop();
+        finalStep = step + allowance - 1;
+      }
       throwIfAborted(input.signal);
       if (
         input.policy.maxModelTokens !== undefined
@@ -1107,11 +1119,14 @@ export class MainLoop {
           requestId: requestEvent.eventId,
           messageRef: assistantRef,
         });
-        const blockedToolCallError = response.stopReason === "aborted"
-          ? "Tool call was not executed because the provider aborted this response."
-          : response.stopReason === "length"
-          ? "Tool call was not executed because the model response hit its output token limit; its arguments may be truncated. Re-issue the complete tool call."
-          : undefined;
+        const supportedStopReason = response.stopReason === "stop" || response.stopReason === "toolUse";
+        const blockedToolCallError = supportedStopReason
+          ? undefined
+          : response.stopReason === "aborted"
+            ? "Tool call was not executed because the provider aborted this response."
+            : response.stopReason === "length"
+              ? "Tool call was not executed because the model response hit its output token limit; its arguments may be truncated. Re-issue the complete tool call."
+              : "Tool call was not executed because the provider returned an unsupported stop reason.";
         const toolMessages = response.toolCalls.length === 0
           ? []
           : await this.executeTools(
@@ -1195,7 +1210,7 @@ export class MainLoop {
         });
 
         // Persist rejected tool results for resume, then end this activation.
-        if (response.stopReason === "aborted") break;
+        if (!supportedStopReason) break;
 
         if (response.toolCalls.length === 0 && response.stopReason === "stop") {
           const deferCompletion = await this.beforeCompletion?.();

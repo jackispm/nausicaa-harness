@@ -22,11 +22,16 @@ export const DEFAULT_RUN_POLICY: RunPolicy = {
 };
 
 export const resolveRunPolicy = (input: Partial<RunPolicy> = {}): RunPolicy => {
+  if (input.maxMainSteps !== undefined && input.maxMainStepsPerActivation !== undefined) {
+    throw new TypeError("Choose an activation allowance or a legacy hard step limit, not both");
+  }
   const allowance = input.maxMainStepsPerActivation
     ?? input.maxMainSteps
     ?? mainStepAllowance(DEFAULT_RUN_POLICY);
   const policy = {
-    maxMainStepsPerActivation: allowance,
+    ...(input.maxMainSteps !== undefined
+      ? { maxMainSteps: allowance }
+      : { maxMainStepsPerActivation: allowance }),
     ...(input.maxModelTokens === undefined
       ? {}
       : { maxModelTokens: input.maxModelTokens }),
