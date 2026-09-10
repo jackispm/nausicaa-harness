@@ -24,6 +24,8 @@ All notable changes to Nausicaa are documented here.
 - Preserve parent-Team group tools when reusing or recovering member lanes,
   including older task manifests that omitted those runtime capabilities.
   Keep workspace grants and nested-Team authorization separate.
+- Validate follow-up task transport against its own assignment so Team status
+  does not flag legitimate member reports as mismatched initial-task replies.
 - Use Nausicaa as the root public identity and named workers as Team members.
   Clarify Teto's auxiliary role and reserve unsolicited A2A for valuable advice
   about user intent and better solutions.

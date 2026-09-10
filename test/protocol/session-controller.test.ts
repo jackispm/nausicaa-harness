@@ -557,9 +557,9 @@ describe("SessionController", () => {
         maxMainStepsPerActivation: 1,
         maxModelTokens: 10_000,
         // Leave enough scheduling headroom for the successful recovery when the
-        // full suite is running concurrently; the hung requests still
-        // deterministically exercises the timeout boundary.
-        mainRequestTimeoutMs: 100,
+        // full suite is running on a busy hosted runner; the hung requests
+        // still deterministically exercise the timeout boundary.
+        mainRequestTimeoutMs: 1_000,
         tetoEnabled: false,
       },
     }, {

@@ -133,10 +133,16 @@ assignment was correctly rejected; a cancelled Team is not a reusable fixture
 for recovery validation. Separate protocol tests cover restored group access
 and preservation of workspace and nested-Team grants.
 
-The parent-channel fix was subsequently replayed against that saved event
-stream: the resident assignment now projects with no task or reply anomalies.
-This is an offline projection check, not a new provider call; the original
-paid run remains recorded as incomplete above.
+A separate, minimal Team probe passed all 15 checks after the channel fix:
+one member completed, the session closed normally, the same Run reopened,
+and the same member read group history, posted a group message, and returned
+a report that automatically woke the lead and was consumed. The record is
+`group-resume-ODiyr5/report.json`; its 16 additional calls cost $0.0327957608.
+Only the test provider wrapper serialized paid requests to stay within its
+conservative reservation guard, so this probe does not measure model-call
+concurrency. Replaying this probe's saved events after the status-projection
+fix produces no false task or reply anomalies, while the task remains in
+review. No additional provider calls were used for that projection check.
 
 The September 7-8 reliability review found and fixed status-context bloat,
 member completion missing already-arrived mail, recovery resetting attempt
