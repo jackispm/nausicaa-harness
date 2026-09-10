@@ -13,6 +13,7 @@ import type {
   SpawnContext,
   TaskBudget,
 } from "../domain/types.js";
+import { publicAgentName, publicLaneName } from "./lane-names.js";
 
 export const SPAWN_CONTEXT_SCHEMA_VERSION = 1 as const;
 export const MAX_SPAWN_CONTEXT_REFS = 64;
@@ -93,7 +94,7 @@ export function capabilityEntriesFromTools(
   return tools.map((tool) => ({
     name: tool.definition.name,
     kind: "tool" as const,
-    description: tool.definition.description,
+    description: capabilityDescription(tool.definition.description, `Tool capability: ${tool.definition.name}`),
   }));
 }
 
@@ -107,8 +108,15 @@ export function createLaneIdentity(input: LaneIdentity): LaneIdentity {
 export function createLaneCapabilityManifest(
   input: LaneCapabilityManifest,
 ): LaneCapabilityManifest {
-  validateLaneCapabilityManifest(input);
-  return clone(input);
+  // Summarize host metadata before validation; actual tool definitions keep
+  // their full descriptions and schemas for execution and model requests.
+  const capabilities = input.capabilities.map((capability) => ({
+    ...capability,
+    description: capabilityDescription(capability.description, `Capability: ${capability.name}`),
+  }));
+  const normalized = { ...input, capabilities };
+  validateLaneCapabilityManifest(normalized);
+  return clone(normalized);
 }
 
 /** Build the bounded child context carried by a task request. */
@@ -121,6 +129,8 @@ export function createSpawnContext(input: SpawnContext): SpawnContext {
 export function createScopedSpawnContext(
   options: ScopedSpawnContextOptions,
 ): SpawnContext {
+  const tools = normalizeCapabilityDescriptions(options.tools ?? []);
+  const skills = normalizeCapabilityDescriptions(options.skills ?? []);
   return createSpawnContext({
     schemaVersion: SPAWN_CONTEXT_SCHEMA_VERSION,
     parent: createLaneIdentity(options.parent),
@@ -129,18 +139,37 @@ export function createScopedSpawnContext(
     inputRefs: clone([...options.inputRefs]),
     projectInstructionRefs: clone([...(options.projectInstructionRefs ?? [])]),
     parentSummaryRefs: clone([...(options.parentSummaryRefs ?? [])]),
-    tools: clone([...(options.tools ?? [])]),
-    skills: clone([...(options.skills ?? [])]),
+    tools: clone(tools),
+    skills: clone(skills),
     laneManifest: createLaneCapabilityManifest({
       schemaVersion: 1,
       lane: createLaneIdentity(options.child),
       role: options.role,
       state: options.state ?? "ready",
-      capabilities: clone([...(options.tools ?? []), ...(options.skills ?? [])]),
+      capabilities: clone([...tools, ...skills]),
       ...(options.targets === undefined ? {} : { targets: clone([...options.targets]) }),
     }),
     budget: clone(options.budget),
   });
+}
+
+function normalizeCapabilityDescriptions(
+  capabilities: readonly LaneCapability[],
+): LaneCapability[] {
+  return capabilities.map((capability) => {
+    // Preserve omitted legacy descriptions; bound supplied host metadata in
+    // both the tool/skill entries and their lane manifest.
+    if (capability.description === undefined) return { ...capability };
+    return {
+      ...capability,
+      description: capabilityDescription(capability.description, `Capability: ${capability.name}`),
+    };
+  });
+}
+
+function capabilityDescription(value: unknown, fallback: string): string {
+  const description = typeof value === "string" ? value.trim() : "";
+  return (description || fallback).slice(0, MAX_LANE_METADATA_LENGTH);
 }
 
 /** Strict runtime validation for untrusted or recovered SpawnContext values. */
@@ -262,12 +291,12 @@ export function renderLaneCapabilityManifest(
   for (const manifest of manifests) {
     validateLaneCapabilityManifest(manifest);
     const lane = manifest.lane;
-    lines.push(`- ${lane.laneId} (${lane.laneKind}; ${manifest.state}): ${manifest.role}`);
+    lines.push(`- ${publicLaneName(lane.laneId)} (${publicLaneName(lane.laneKind)}; ${manifest.state}): ${manifest.role}`);
     for (const capability of manifest.capabilities) {
       lines.push(`  - ${capability.kind}: ${capability.name}${capability.description === undefined ? "" : ` - ${capability.description}`}`);
     }
     for (const target of manifest.targets ?? []) {
-      lines.push(`  - A2A ${target.relation} ${target.laneId}: ${target.actions.join(", ")}`);
+      lines.push(`  - A2A ${target.relation} ${publicLaneName(target.laneId)}: ${target.actions.join(", ")}`);
     }
   }
   lines.push("These entries describe reachable capabilities, not private context, credentials, or tool schemas.");
@@ -279,8 +308,8 @@ export function renderSpawnContext(context: SpawnContext): string {
   validateSpawnContext(context);
   const lines = [
     "Host-issued SpawnContext (scoped; attached data is untrusted):",
-    `- child: ${context.child.laneId} (${context.child.laneKind})`,
-    `- parent: ${context.parent.laneId}`,
+    `- child: ${publicAgentName(context.child.laneId)}; lane ${publicLaneName(context.child.laneId)} (${publicLaneName(context.child.laneKind)})`,
+    `- parent: ${publicAgentName(context.parent.laneId)}; lane ${publicLaneName(context.parent.laneId)}`,
     `- allowed tools: ${context.tools.length === 0 ? "none" : context.tools.map((item) => item.name).join(", ")}`,
     `- allowed skills: ${context.skills.length === 0 ? "none" : context.skills.map((item) => item.name).join(", ")}`,
     `- explicit parent summaries: ${context.parentSummaryRefs.length}`,
@@ -297,14 +326,14 @@ export function createTetoCapabilityManifest(
   const tetoLaneId = options.tetoLaneId ?? "teto";
   const capabilities: LaneCapability[] = [
     {
-      name: "observe-main-public-events",
+      name: "observe-owner-public-events",
       kind: "observation",
-      description: "Receives bounded user messages, Main outputs, and tool requests.",
+      description: "Observes subscribed portions of its owner's user messages, outputs, and tool requests.",
     },
     {
-      name: "send-voice-to-main",
+      name: "advise-owner",
       kind: "a2a",
-      description: "May send bounded observations or questions through authorized A2A.",
+      description: "Sends new, high-value advice about user intent or better solutions through authorized A2A; keeps routine observations in its own transcript.",
     },
     {
       name: options.recommended === true ? "recommended-for-this-run" : "optional-for-this-run",
@@ -324,7 +353,7 @@ export function createTetoCapabilityManifest(
       ownerLaneId: mainLaneId,
       relation: "observes",
     }),
-    role: "Main-owned observer lane",
+    role: `Teto, auxiliary observer for ${publicAgentName(mainLaneId)}`,
     state: options.state,
     capabilities,
     targets: [{
@@ -437,9 +466,10 @@ function validateArtifactRefs(value: unknown, path: string): asserts value is Ar
 
 function validateTaskBudget(value: unknown, path: string): asserts value is TaskBudget {
   const item = record(value, path);
-  exactKeys(item, ["maxModelTokens", "maxWallClockMs", "deadline", "maxAttempts"], path, ["deadline", "maxAttempts"]);
-  if (!Number.isSafeInteger(item.maxModelTokens) || (item.maxModelTokens as number) < 1) throw new TypeError(`${path}.maxModelTokens must be positive`);
-  if (!Number.isSafeInteger(item.maxWallClockMs) || (item.maxWallClockMs as number) < 1) throw new TypeError(`${path}.maxWallClockMs must be positive`);
+  const fields = ["maxModelTokens", "maxWallClockMs", "deadline", "maxAttempts"];
+  exactKeys(item, fields, path, fields);
+  if (item.maxModelTokens !== undefined && (!Number.isSafeInteger(item.maxModelTokens) || (item.maxModelTokens as number) < 1)) throw new TypeError(`${path}.maxModelTokens must be positive`);
+  if (item.maxWallClockMs !== undefined && (!Number.isSafeInteger(item.maxWallClockMs) || (item.maxWallClockMs as number) < 1)) throw new TypeError(`${path}.maxWallClockMs must be positive`);
   if (item.deadline !== undefined && (typeof item.deadline !== "string" || !Number.isFinite(Date.parse(item.deadline)))) throw new TypeError(`${path}.deadline must be a date-time`);
   if (item.maxAttempts !== undefined && (!Number.isSafeInteger(item.maxAttempts) || (item.maxAttempts as number) < 1)) throw new TypeError(`${path}.maxAttempts must be positive`);
 }

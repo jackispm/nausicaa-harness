@@ -38,6 +38,7 @@ export * from "./delegate-task-tool.js";
 export * from "./subagent-policy.js";
 export * from "./agent-awareness-tool.js";
 export * from "./team-tool.js";
+export * from "./team-channel.js";
 export * from "./team-runtime.js";
 export * from "./team-board.js";
 export * from "./team-branch-executor.js";

@@ -4,6 +4,27 @@ All notable changes to Nausicaa are documented here.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-09-10
+
+- Remove model-controlled task budgets, attempt counts, deadlines, success
+  criteria, and hard-constraint fields from delegation and Team tools. New
+  tasks have no implicit total token, duration, or model-call cap; cancellation,
+  provider timeouts, usage accounting, and explicit legacy host limits remain.
+- Keep Team members working after the interactive lead finishes a turn. Wake
+  the lead when durable reports arrive, including during execution cleanup and
+  after resume, without reviving cancelled or interrupted work.
+- Fix Team admission with the full workspace tool catalog: summarize capability
+  metadata to its declared bounds while retaining complete tool descriptions,
+  schemas, and permission checks for execution.
+- Add shared Team messages, cursor history, reusable member assignments, task
+  reports, and explicit close. Members inherit host-authorized tools unless
+  the lead narrows their grant; nested Teams remain limited to depth three.
+- Make `task_wait` accept the initial task IDs returned by `team_create` as
+  well as later assignments, using durable outcomes without restarting work.
+- Use Nausicaa as the root public identity and named workers as Team members.
+  Clarify Teto's auxiliary role and reserve unsolicited A2A for valuable advice
+  about user intent and better solutions.
+
 ## [0.1.3] - 2026-09-09
 
 - Start Teto automatically for new Runs. Explicit stops remain effective after

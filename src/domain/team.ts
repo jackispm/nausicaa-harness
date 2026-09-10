@@ -1,9 +1,17 @@
-import type { LaneId, TaskFailed, TaskRequest, TaskResult } from "./types.js";
+import type { ArtifactRef, LaneId, TaskFailed, TaskRequest, TaskResult } from "./types.js";
 
 export type TeamJoinPolicy = "all-terminal" | "deadline-best-effort";
 export type TeamMemberOutcome = "succeeded" | "partial" | "failed" | "cancelled" | "abandoned";
 export type TeamMemberExecution = "queued" | "claimed" | "running" | "terminal";
 export type TeamJoinState = "waiting" | "joined" | "deadline-settled" | "cancelled";
+
+/** Host-enforced capability narrowing for one Team member. */
+export interface TeamCapabilityGrant {
+  /** Omit to inherit every capability available to the creating lane. */
+  tools?: string[];
+  /** Omit to inherit the creating lane's nested-Team permission. */
+  allowNestedTeam?: boolean;
+}
 
 export interface TeamMemberDefinition {
   memberId: string;
@@ -11,6 +19,7 @@ export interface TeamMemberDefinition {
   task: TaskRequest;
   dependsOn: string[];
   required: boolean;
+  capabilities?: TeamCapabilityGrant;
 }
 
 /** The immutable admission record exists before any member is dispatched. */
@@ -19,7 +28,8 @@ export interface TeamDefinition {
   leadLaneId: LaneId;
   joinPolicy: TeamJoinPolicy;
   peerMessaging: "team-members" | "lead-only";
-  deadline: string;
+  /** Optional deadline retained for explicitly bounded host/legacy Teams. */
+  deadline?: string;
   fingerprint: string;
   members: TeamMemberDefinition[];
 }
@@ -49,6 +59,34 @@ export interface TeamJoined {
 
 export interface TeamReduction {
   outcome: TeamMemberOutcome;
+  result?: TaskResult;
+  failure?: TaskFailed;
+}
+
+/** A durable task assigned to an already admitted Team member. */
+export interface TeamTaskAssignment {
+  teamId: string;
+  taskId: string;
+  memberId: string;
+  laneId: LaneId;
+  assignmentVersion: number;
+  task: TaskRequest;
+  assignedBy: LaneId;
+  operationId: string;
+}
+
+export type TeamRunReportKind = "checkpoint" | "ready-for-review" | "blocked" | "failed";
+
+/** Compact host-produced handoff at a resident member Run boundary. */
+export interface TeamRunReport {
+  teamId: string;
+  taskId: string;
+  laneId: LaneId;
+  assignmentVersion: number;
+  kind: TeamRunReportKind;
+  summary: string;
+  artifactRefs: ArtifactRef[];
+  openQuestions: string[];
   result?: TaskResult;
   failure?: TaskFailed;
 }

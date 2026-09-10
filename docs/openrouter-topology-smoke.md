@@ -41,6 +41,7 @@ when any selected case fails or is skipped.
 | `workspace` | Read a synthetic checkout, write JSON, read it back | Correct file and answer; successful write and later read |
 | `worker` | Delegate subtotal computation, request the result in a second user turn | Worker read, completed task result, committed Main consumption |
 | `team-dag` | Two independent readers feed a dependent total calculator | Concurrent requests, definition before dispatch, dependency settlement order and context, join, Main acceptance |
+| `team-calendar` | Two builders write a week-calendar/Todo site; a dependent reviewer inspects it | Actual member writes, no implicit task limits, more than two calls per member, public review, lead turn completion followed by automatic report continuation, consumed results and acceptance |
 | `team-peer-reducer` | Members exchange checkout facts; optional reducer synthesizes | Correct numeric evidence sent after file reads and consumed in both directions, successful members, ordered reduction lifecycle, read-only reducer tools, Main acceptance |
 | `resume-fork` | Recall an unpredictable identifier after reopening, then modify the total in a fork | Current turns complete, inherited context, durable fork lineage, unchanged parent Ledger |
 | `teto` | Main opens an observer, requests a shipping reminder, reports amounts back | Labelled public observations, actual messaging tools, both directions consumed and visible in the hydrated transcript, no duplicate messages or self-addressed sends, token round trip |
@@ -90,7 +91,9 @@ Cancellation is last for this reason and may need a separately authorized batch.
 
 The suite does not yet exercise cross-Run A2A, member-owned Teto, observer skills,
 deadline-best-effort, daemon restart, arbitrary Team resume, streaming steering,
-or long-running topology scale. A single pass is not statistical reliability.
+or long-running topology scale. The calendar case checks file structure and
+JavaScript syntax; it does not substitute for browser interaction tests.
+A single pass is not statistical reliability.
 
 ## Offline Verification
 
@@ -105,10 +108,24 @@ as successful OpenRouter or multi-topology live runs.
 
 ## Recorded Review
 
+On September 10, the updated Worker probe passed. A calendar Team probe then
+passed all 14 collaboration checks: parallel member writes, prerequisite order,
+more than two calls per member, public review, automatic lead continuation,
+and committed result consumption. It used 28 provider calls and reported
+$0.1164986064. The reviewer identified a CSS/class integration defect that the
+lead disclosed but accepted; this run proves the collaboration path, not full
+website acceptance. An earlier attempt exhausted the smoke's 140,000-token Run
+guard; the outer test allowance is now 1,000,000 tokens and 24 steps per lead
+activation, with the same cost/request guards and no task-specific limits.
+Local report IDs: `2026-09-10T01-17-41-564Z-WpJFyF` and
+`2026-09-10T01-25-48-055Z-pGp5Qb`.
+
 The September 7-8 reliability review found and fixed status-context bloat,
 member completion missing already-arrived mail, recovery resetting attempt
-budgets, and empty reducer summaries. The peer probe explicitly grants the
-reducer six calls; the product default remains two.
+budgets, and empty reducer summaries. Those probes used the old per-task controls.
+As of 0.1.4, live prompts use the same compact tool contract as production, with
+no per-task budget arguments. The smoke's outer cost/request guards remain
+test-only controls.
 
 The latest Team probe completed reduction and Main acceptance with the correct
 total, but remains failed overall: one model used `grand_total` instead of the

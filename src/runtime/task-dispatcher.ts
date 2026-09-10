@@ -51,7 +51,7 @@ export interface TaskDispatcherOptions {
   createId?: () => string;
   /** Host-composed child context used when every dispatch shares one lane. */
   spawnContext?: SpawnContext;
-  /** Build a context after canonical task deadline/attempt defaults are known. */
+  /** Build a context after explicit host limits have been canonicalized. */
   spawnContextFactory?: (input: {
     taskId: string;
     from: LaneId;
@@ -330,20 +330,20 @@ function validateTaskBudget(budget: TaskBudget): void {
   if (budget === null || typeof budget !== "object" || Array.isArray(budget)) {
     throw new TypeError("budget must be an object");
   }
-  if (
+  if (budget.maxModelTokens !== undefined && (
     !Number.isSafeInteger(budget.maxModelTokens)
     || budget.maxModelTokens < 1
     || budget.maxModelTokens > MAX_TASK_MODEL_TOKENS
-  ) {
+  )) {
     throw new RangeError(
       `budget.maxModelTokens must be between 1 and ${MAX_TASK_MODEL_TOKENS}`,
     );
   }
-  if (
+  if (budget.maxWallClockMs !== undefined && (
     !Number.isSafeInteger(budget.maxWallClockMs)
     || budget.maxWallClockMs < 1
     || budget.maxWallClockMs > MAX_TASK_WALL_CLOCK_MS
-  ) {
+  )) {
     throw new RangeError(
       `budget.maxWallClockMs must be between 1 and ${MAX_TASK_WALL_CLOCK_MS}`,
     );
@@ -367,23 +367,31 @@ function canonicalTaskBudget(
   createdAt: string,
   existing: TaskBudget | undefined,
 ): TaskBudget {
-  const expectedDeadline = new Date(
-    Date.parse(createdAt) + requested.maxWallClockMs,
-  ).toISOString();
+  const expectedDeadline = requested.maxWallClockMs === undefined
+    ? undefined
+    : new Date(Date.parse(createdAt) + requested.maxWallClockMs).toISOString();
   if (existing === undefined) {
     if (
       requested.deadline !== undefined
+      && expectedDeadline !== undefined
       && Date.parse(requested.deadline) !== Date.parse(expectedDeadline)
     ) {
       throw new RangeError(
         "budget.deadline must equal createdAt plus budget.maxWallClockMs",
       );
     }
+    // An explicit deadline alone does not imply an attempt/token cap.
+    // Only legacy limit fields opt into compatibility defaults.
+    const hasLegacyLimits = requested.maxModelTokens !== undefined
+      || requested.maxWallClockMs !== undefined
+      || requested.maxAttempts !== undefined;
+    const maxAttempts = requested.maxAttempts ?? (hasLegacyLimits ? DEFAULT_TASK_MAX_ATTEMPTS : undefined);
+    const deadline = requested.deadline ?? expectedDeadline;
     return {
-      maxModelTokens: requested.maxModelTokens,
-      maxWallClockMs: requested.maxWallClockMs,
-      deadline: expectedDeadline,
-      maxAttempts: requested.maxAttempts ?? DEFAULT_TASK_MAX_ATTEMPTS,
+      ...(requested.maxModelTokens === undefined ? {} : { maxModelTokens: requested.maxModelTokens }),
+      ...(requested.maxWallClockMs === undefined ? {} : { maxWallClockMs: requested.maxWallClockMs }),
+      ...(deadline === undefined ? {} : { deadline }),
+      ...(maxAttempts === undefined ? {} : { maxAttempts }),
     };
   }
 
@@ -394,9 +402,11 @@ function canonicalTaskBudget(
       ? existing.deadline
       : requested.deadline;
   const maxAttempts = requested.maxAttempts ?? existing.maxAttempts;
+  const maxModelTokens = requested.maxModelTokens ?? existing.maxModelTokens;
+  const maxWallClockMs = requested.maxWallClockMs ?? existing.maxWallClockMs;
   return {
-    maxModelTokens: requested.maxModelTokens,
-    maxWallClockMs: requested.maxWallClockMs,
+    ...(maxModelTokens === undefined ? {} : { maxModelTokens }),
+    ...(maxWallClockMs === undefined ? {} : { maxWallClockMs }),
     ...(deadline === undefined ? {} : { deadline }),
     ...(maxAttempts === undefined ? {} : { maxAttempts }),
   };

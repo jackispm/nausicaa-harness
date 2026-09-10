@@ -38,10 +38,7 @@ describe("executeRun Worker lane", () => {
             name: "delegate_task",
             arguments: {
               taskId: "task-1",
-              statement: "Inspect the package metadata",
-              successCriteria: ["Return the package name"],
-              maxModelTokens: 200,
-              maxWallClockMs: 5_000,
+              statement: "Inspect the package metadata and return the package name",
             },
           }],
         };
@@ -204,10 +201,7 @@ describe("executeRun Worker lane", () => {
             name: "delegate_task",
             arguments: {
               taskId: `task-${name}`,
-              statement: `Inspect ${name} evidence`,
-              successCriteria: [`Return ${name} evidence`],
-              maxModelTokens: 200,
-              maxWallClockMs: 5_000,
+              statement: `Inspect and return ${name} evidence`,
             },
           })),
         };

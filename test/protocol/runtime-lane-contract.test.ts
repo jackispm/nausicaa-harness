@@ -132,7 +132,7 @@ describe("runtime lane contracts", () => {
     )).map((message) => JSON.parse(message.content.slice(header.length)));
     expect(observations).toContainEqual({
       type: "lane.observation",
-      source: { runId, laneId: "main", eventId: source!.eventId, eventType: "user.message" },
+      source: { runId, laneId: "nausicaa", eventId: source!.eventId, eventType: "user.message" },
       content: task,
     });
     expect(teto.requests[0]!.messages.some((message) => message.content === task)).toBe(false);

@@ -28,6 +28,30 @@ class MutableClock implements Clock {
 }
 
 describe("Worker durable task budgets", () => {
+  it("recovers an unlimited task after prolonged queue delay without adding legacy limits", async () => {
+    const fixture = await claimedFixture({});
+    await appendModelRequested(fixture, 1);
+    await appendBudgetCharged(fixture, 1, usage(3_000, 500));
+    await appendModelRequested(fixture, 2);
+    fixture.clock.advance(2 * 24 * 60 * 60 * 1_000);
+    let calls = 0;
+    const executor = fixture.executor(async (request) => {
+      calls += 1;
+      expect(request.maxOutputTokens).toBe(8_192);
+      return response("Completed after recovery", usage(1_000, 700));
+    });
+
+    await expect(executor.runOnce()).resolves.toMatchObject({
+      status: "completed",
+      usage: { input: 4_000, output: 1_200 },
+    });
+    expect(calls).toBe(1);
+    const events = await fixture.ledger.read({ runId: "run-1" });
+    expect(events.filter((event) => event.type === "budget.charged")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "model.requested").at(-1)?.idempotencyKey)
+      .toContain(":attempt:3:model:requested");
+  });
+
   it("does not spend a model attempt on a claim that crashed before model.requested", async () => {
     const fixture = await claimedFixture({
       maxModelTokens: 100,

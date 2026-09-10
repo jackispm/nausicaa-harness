@@ -1085,14 +1085,14 @@ function normalizeGoal(value: unknown, path: string): import("../domain/types.js
 function normalizeTaskBudget(value: unknown, path: string): import("../domain/types.js").TaskBudget {
   const item = plainObject(value, path);
   exactKeys(item, ["maxModelTokens", "maxWallClockMs", "deadline", "maxAttempts"], path);
-  if (!Number.isSafeInteger(item.maxModelTokens)
+  if (item.maxModelTokens !== undefined && (!Number.isSafeInteger(item.maxModelTokens)
     || (item.maxModelTokens as number) < 1
-    || (item.maxModelTokens as number) > MAX_TASK_MODEL_TOKENS) {
+    || (item.maxModelTokens as number) > MAX_TASK_MODEL_TOKENS)) {
     throw new CrossRunProtocolError(`${path}.maxModelTokens is outside its supported bound`);
   }
-  if (!Number.isSafeInteger(item.maxWallClockMs)
+  if (item.maxWallClockMs !== undefined && (!Number.isSafeInteger(item.maxWallClockMs)
     || (item.maxWallClockMs as number) < 1
-    || (item.maxWallClockMs as number) > MAX_TASK_WALL_CLOCK_MS) {
+    || (item.maxWallClockMs as number) > MAX_TASK_WALL_CLOCK_MS)) {
     throw new CrossRunProtocolError(`${path}.maxWallClockMs is outside its supported bound`);
   }
   if (item.maxAttempts !== undefined
@@ -1103,8 +1103,8 @@ function normalizeTaskBudget(value: unknown, path: string): import("../domain/ty
   }
   const deadline = item.deadline === undefined ? undefined : dateTime(item.deadline, `${path}.deadline`);
   return {
-    maxModelTokens: item.maxModelTokens as number,
-    maxWallClockMs: item.maxWallClockMs as number,
+    ...(item.maxModelTokens === undefined ? {} : { maxModelTokens: item.maxModelTokens as number }),
+    ...(item.maxWallClockMs === undefined ? {} : { maxWallClockMs: item.maxWallClockMs as number }),
     ...(deadline === undefined ? {} : { deadline }),
     ...(item.maxAttempts === undefined ? {} : { maxAttempts: item.maxAttempts as number }),
   };
@@ -1170,8 +1170,9 @@ function normalizeAdvice(value: unknown, path: string): import("../domain/types.
 
 function validateTaskDeadline(payload: CrossRunPayload, createdAt: string): void {
   if (payload.type !== "task.request" || payload.budget.deadline === undefined) return;
-  const expected = Date.parse(createdAt) + payload.budget.maxWallClockMs;
-  if (Date.parse(payload.budget.deadline) !== expected) {
+  const maxWallClockMs = payload.budget.maxWallClockMs;
+  const expected = maxWallClockMs === undefined ? undefined : Date.parse(createdAt) + maxWallClockMs;
+  if (expected !== undefined && Date.parse(payload.budget.deadline) !== expected) {
     throw new CrossRunProtocolError(
       "task budget deadline must equal createdAt plus maxWallClockMs",
     );

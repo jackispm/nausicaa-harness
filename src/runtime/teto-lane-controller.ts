@@ -15,6 +15,7 @@ import type { MainAfterStepContext, MainBeforeStepContext, MainBoundaryMessage }
 import { TetoLaneScheduler } from "./teto-lane-scheduler.js";
 import type { TetoControl, TetoControlResult, TetoControlStatus } from "./teto-control-tool.js";
 import { RunTokenBudget } from "./run-token-budget.js";
+import { publicAgentName, publicLaneName } from "./lane-names.js";
 
 const DEFAULT_MAIN_LANE = "main";
 const DEFAULT_TETO_LANE = "teto";
@@ -127,7 +128,7 @@ export class TetoLaneController implements TetoControl {
         type: "lane.status",
         payload: {
           status: "waiting",
-          reason: `Teto closed by ${requestedBy}`,
+          reason: `Teto closed by ${publicAgentName(requestedBy)}`,
           control: { action: "stop", requestedBy },
         },
         correlationId: `${this.runId}:${this.laneId}:lifecycle`,
@@ -233,7 +234,7 @@ export class TetoLaneController implements TetoControl {
         type: "lane.status",
         payload: {
           status: "ready",
-          reason: `Teto opened by ${requestedBy}`,
+          reason: `Teto opened by ${publicAgentName(requestedBy)}`,
           control: { action: "start", requestedBy },
         },
         correlationId: `${this.runId}:${this.laneId}:lifecycle`,
@@ -306,7 +307,7 @@ export class TetoLaneController implements TetoControl {
       type: "lane.status",
       payload: {
         status: "dormant",
-        reason: "Teto available; Main may open it with teto_start",
+        reason: `Teto available; ${publicAgentName(this.mainLaneId)} may open it with teto_start`,
       },
       correlationId: `${this.runId}:${this.laneId}:lifecycle`,
       idempotencyKey: `${this.runId}:${this.laneId}:status:dormant:available`,
@@ -320,7 +321,7 @@ export class TetoLaneController implements TetoControl {
 function assertOwner(context: ToolExecutionContext, runId: RunId, laneId: LaneId): void {
   if (context.runId !== runId) throw new Error("Teto capability is bound to another Run");
   if (context.laneId !== undefined && context.laneId !== laneId) {
-    throw new Error(`Teto capability is bound to lane ${laneId}`);
+    throw new Error(`Teto capability is bound to lane ${publicLaneName(laneId)}`);
   }
 }
 

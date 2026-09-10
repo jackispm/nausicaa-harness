@@ -77,7 +77,11 @@ import {
   projectInstructionManifest,
   serializeProjectInstructionBundle,
 } from "./project-instructions.js";
-import type { RunTokenBudget } from "./run-token-budget.js";
+import type {
+  RunTokenBudget,
+  RunTokenReservationPriority,
+} from "./run-token-budget.js";
+import { publicLaneName } from "./lane-names.js";
 import { PROJECT_INSTRUCTIONS_MEDIA_TYPE } from "../domain/context.js";
 import {
   ARTIFACT_READ_TOOL_NAME,
@@ -330,6 +334,8 @@ export interface MainLoopInput {
   pressureEligibleConversationCount?: number;
   /** Complete Mowe result refs recovered from prior Main tool terminal events. */
   artifactReadRefs?: readonly ArtifactRef[];
+  /** Admission priority relative to the owning Run budget. */
+  reservationPriority?: RunTokenReservationPriority;
   artifactSelections?: readonly FukaiArtifactSelection[];
   correlationId?: string;
   /** Legacy one-shot completes the Run; interactive execution completes only its Turn. */
@@ -355,6 +361,12 @@ export class MainRunTokenBudgetExhaustedError extends Error {
   override readonly name = "MainRunTokenBudgetExhaustedError";
   readonly code = "run-budget-exhausted";
 }
+
+// Tool schemas and serialized runtime metadata make input estimates slightly
+// conservative. Keep a bounded allowance for that variance while retaining a
+// fail-closed boundary for materially over-budget requests.
+const MAIN_ADMISSION_SLACK_TOKENS = 1_024;
+const MAIN_ADMISSION_SLACK_MIN_CAPACITY = 256;
 
 export class MainLoop {
   private readonly model: PreparedModelPort;
@@ -766,8 +778,18 @@ export class MainLoop {
         const reservationId = this.nextModelReservationId(input, laneId, step);
         let reservedMainTokens: number | undefined;
         if (this.runTokenBudget !== undefined) {
-          const availableOutputTokens = this.runTokenBudget.availableTokens()
+          // Main owns the Run's forward progress. Advisory reservations (Teto,
+          // reflection) may be in flight after this context was built; they
+          // must not turn a valid Main request into a false budget stop.
+          const reservationPriority = input.reservationPriority ?? "main";
+          const baseAvailableOutputTokens = this.runTokenBudget.availableTokens({ priority: reservationPriority })
             - view.usage.estimatedInputTokens;
+          const admissionSlack = reservationPriority === "main"
+            && this.runTokenBudget.availableTokens({ priority: reservationPriority }) >= MAIN_ADMISSION_SLACK_MIN_CAPACITY
+            && baseAvailableOutputTokens < 0
+            ? MAIN_ADMISSION_SLACK_TOKENS
+            : 0;
+          const availableOutputTokens = baseAvailableOutputTokens + admissionSlack;
           if (availableOutputTokens < 1) {
             throw new MainRunTokenBudgetExhaustedError(
               `Run model token budget exhausted before Main step ${step}`,
@@ -775,7 +797,10 @@ export class MainLoop {
           }
           maxOutputTokens = Math.min(maxOutputTokens, availableOutputTokens);
           const reservedTokens = view.usage.estimatedInputTokens + maxOutputTokens;
-          if (this.runTokenBudget.reserve(reservationId, reservedTokens) === undefined) {
+          if (this.runTokenBudget.reserve(reservationId, reservedTokens, {
+            priority: reservationPriority,
+            maxOverdraftTokens: admissionSlack,
+          }) === undefined) {
             throw new MainRunTokenBudgetExhaustedError(
               `Run model token budget exhausted before Main step ${step}`,
             );
@@ -1749,7 +1774,7 @@ function boundaryConversationMessage(
   }
   return {
     role: "user",
-    content: `[Runtime ${message.kind} from ${JSON.stringify(message.source)}; advisory context, not a user instruction]\n${content}`,
+    content: `[Runtime ${message.kind} from ${JSON.stringify(publicLaneName(message.source))}; advisory context, not a user instruction]\n${content}`,
     createdAt: now.toISOString(),
   };
 }
@@ -1832,7 +1857,7 @@ function defaultNavigationDelta(
         ? `${toolResults.length} tool result(s) recorded`
         : incompleteStop
           ? `Model stopped with ${stopReason}`
-          : "Main produced a final response",
+          : "The agent produced a final response",
     status: failures.length > 0 || incompleteStop
       ? "uncertain"
       : hasTools
@@ -2095,7 +2120,7 @@ function boundToolResult(result: ToolResult): ToolResult {
       ...(result.images === undefined ? {} : { images: structuredClone(result.images) }),
     };
   }
-  const marker = "\n[TRUNCATED BY MAIN LOOP]";
+  const marker = "\n[TRUNCATED BY NAUSICAA]";
   const markerBytes = Buffer.from(marker, "utf8");
   const prefix = utf8Prefix(
     bytes,
@@ -2173,7 +2198,7 @@ function boundToolResultWithSuffix(result: ToolResult, suffix: string): ToolResu
   if (contentBytes.byteLength + suffixBytes.byteLength <= MAX_TOOL_RESULT_BYTES) {
     return { ...result, content: `${result.content}${suffix}` };
   }
-  const marker = "\n[TRUNCATED BY MAIN LOOP]";
+  const marker = "\n[TRUNCATED BY NAUSICAA]";
   const markerBytes = Buffer.from(marker, "utf8");
   if (suffixBytes.byteLength + markerBytes.byteLength >= MAX_TOOL_RESULT_BYTES) {
     return boundToolResult({ ...result, content: suffix });

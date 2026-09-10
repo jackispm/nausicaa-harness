@@ -11,6 +11,7 @@ import type {
   AgentTopologyProjectionInput,
 } from "./agent-awareness.js";
 import { sanitizeAgentActivitySummary } from "./agent-awareness.js";
+import { assertSpawnContextMatchesTask } from "./lane-context.js";
 import type { DaemonHostSnapshot, DaemonRunSnapshot } from "./daemon-host.js";
 import type { DaemonWorkerDescriptor } from "./daemon-worker-protocol.js";
 import type {
@@ -312,6 +313,7 @@ function addRunSource(
     ...(source.runtimeBuildId === undefined ? {} : { runtimeBuildId: source.runtimeBuildId }),
   }, RECORD_PRIORITY.run);
 
+  const taskParents = scopedTeamParents(projection, scope);
   const laneIds = Object.keys(projection.lanes).sort(compareText);
   for (const laneId of laneIds) {
     const lane = projection.lanes[laneId];
@@ -348,7 +350,7 @@ function addRunSource(
     }, RECORD_PRIORITY.lane);
     const parentLane = role === "teto" && laneId.endsWith(":teto")
       ? laneId.slice(0, -":teto".length)
-      : "main";
+      : taskParents.get(laneId) ?? "main";
     const parentEndpoint = endpoint(scope, runId, parentLane);
     addEdge({
       source: parentEndpoint,
@@ -376,6 +378,43 @@ function addRunSource(
       }, edges);
     }
   }
+}
+
+function scopedTeamParents(projection: RunProjection, scope: Scope): Map<string, string> {
+  const parents = new Map<string, string>();
+  const conflicts = new Set<string>();
+  for (const { message } of projection.inbox) {
+    if (message.runId !== projection.run.runId || message.payload.type !== "task.request"
+      || message.routeId !== undefined || message.sourceEndpoint !== undefined || message.targetEndpoint !== undefined
+      || message.routeRelationship !== undefined || message.routeArtifacts !== undefined || message.from === message.to) continue;
+    const member = /^team:[^:]+:[^:]+$/u.test(message.to);
+    const reducer = /^team-reducer:[^:]+$/u.test(message.to);
+    if (!member && !reducer) continue;
+    const expectedTaskId = member ? message.to.slice("team:".length)
+      : `team:${message.to.slice("team-reducer:".length)}:reduction`;
+    const parent = projection.lanes[message.from];
+    const child = projection.lanes[message.to];
+    const context = message.payload.spawnContext;
+    if (message.payload.taskId !== expectedTaskId || context === undefined
+      || parent === undefined || child === undefined || !hasLaneActivation(parent) || !hasLaneActivation(child)
+      || child.kind !== (member ? "team" : "worker")) continue;
+    try {
+      assertSpawnContextMatchesTask(context, {
+        runId: projection.run.runId, from: message.from, to: message.to,
+        goal: message.payload.goal, inputRefs: message.payload.inputRefs, budget: message.payload.budget,
+      });
+    } catch {
+      continue;
+    }
+    if (context.parent.workspaceId !== scope.workspaceId || context.child.workspaceId !== scope.workspaceId
+      || context.parent.sessionId !== scope.sessionId || context.child.sessionId !== scope.sessionId
+      || context.child.laneKind !== child.kind || context.child.relation !== (member ? "member-of" : "delegates")) continue;
+    // Conflicting historical claims cannot move a lane under an arbitrary owner.
+    if (parents.has(message.to) && parents.get(message.to) !== message.from) conflicts.add(message.to);
+    parents.set(message.to, message.from);
+  }
+  for (const laneId of conflicts) parents.delete(laneId);
+  return parents;
 }
 
 function hasLaneActivation(lane: LaneView): boolean {
@@ -530,7 +569,7 @@ function addMainPlaceholder(
     endpoint: main,
     role: "main",
     state: "offline",
-    activitySummary: "main unavailable",
+    activitySummary: "Nausicaa unavailable",
     authorized: true,
     visible: true,
     lastSeen,
@@ -852,24 +891,25 @@ function roleForLane(laneId: string): string {
 }
 
 function activityForState(state: string, role: string): string {
+  const name = role === "main" ? "Nausicaa" : role;
   switch (state) {
-    case "active": return `${role} working`;
-    case "starting": return `${role} starting`;
-    case "waiting": return `${role} waiting for input`;
-    case "sleeping": return `${role} sleeping until wake`;
-    case "offline": return `${role} offline`;
-    case "terminal": return `${role} finished`;
+    case "active": return `${name} working`;
+    case "starting": return `${name} starting`;
+    case "waiting": return `${name} waiting for input`;
+    case "sleeping": return `${name} sleeping until wake`;
+    case "offline": return `${name} offline`;
+    case "terminal": return `${name} finished`;
     case "idle":
-    default: return `${role} idle`;
+    default: return `${name} idle`;
   }
 }
 
 function activityForHostRun(run: DaemonRunSnapshot): string {
-  if (run.state === "queued") return "main queued for wake";
-  if (run.state === "held") return "main held by daemon";
-  if (run.state === "failed") return "main daemon run failed";
-  if (run.pendingWakeCount > 0) return "main working with queued wake";
-  return "main working";
+  if (run.state === "queued") return "Nausicaa queued for wake";
+  if (run.state === "held") return "Nausicaa held by daemon";
+  if (run.state === "failed") return "Nausicaa daemon run failed";
+  if (run.pendingWakeCount > 0) return "Nausicaa working with queued wake";
+  return "Nausicaa working";
 }
 
 function safeSummary(value: string): string | undefined {

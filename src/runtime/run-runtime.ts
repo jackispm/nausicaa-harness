@@ -96,7 +96,7 @@ import {
 } from "./agent-awareness-tool.js";
 import { createTetoControlTools } from "./teto-control-tool.js";
 import { TeamRuntime } from "./team-runtime.js";
-import { createTeamCancelTool, createTeamPresentTool, createTeamReduceTool, createTeamStatusTool, createTeamTool } from "./team-tool.js";
+import { createTaskWaitTool, createTeamAssignTool, createTeamCancelTool, createTeamCloseTool, createTeamHistoryTool, createTeamMessageTool, createTeamPresentTool, createTeamReduceTool, createTeamStatusTool, createTeamTool } from "./team-tool.js";
 import { composeAgentMessageTools, createInRunAgentMessageTool } from "./in-run-agent-message-tool.js";
 import { projectRunAwareness } from "./run-awareness.js";
 import { ReflectionScheduler } from "./reflection-scheduler.js";
@@ -174,6 +174,8 @@ export interface RunExecutionDeps {
   tools?: readonly AgentTool[];
   /** Optional bounded read-only tools for Worker; defaults to the workspace set. */
   workerTools?: readonly AgentTool[];
+  /** Optional Team catalog. Omitted Teams inherit the Run's host-authorized workspace catalog. */
+  teamTools?: readonly AgentTool[];
   /** Optional provider seams for network-backed Main tools. */
   webFetchProvider?: WebFetchProvider;
   webSearchProvider?: WebSearchProvider;
@@ -620,9 +622,10 @@ export const executeRun = async (
     }
 
     const teamBranchModel = deps.workerModel ?? mainModel;
-    const teamBranchTools = deps.workerTools ?? createWorkspaceTools({
-      allowWrite: false,
-      allowShell: false,
+    const teamBranchTools = deps.teamTools ?? deps.workerTools ?? createWorkspaceTools({
+      allowWrite: request.allowWrite === true,
+      allowShell: request.allowShell === true,
+      allowNetwork: request.allowNetwork === true,
       allowImages: shouldAdvertiseImageTools(teamBranchModel, request.workerModel ?? request.model),
       protectedPaths: [resolve(request.dataDir)],
     });
@@ -691,7 +694,12 @@ export const executeRun = async (
         for (const tool of createTetoControlTools(scheduler)) pushRuntimeTool(tools, tool);
       }
       pushRuntimeTool(tools, createTeamTool(teamRuntime));
+      pushRuntimeTool(tools, createTeamAssignTool(teamRuntime));
+      pushRuntimeTool(tools, createTaskWaitTool(teamRuntime));
       pushRuntimeTool(tools, createTeamStatusTool(teamRuntime));
+      pushRuntimeTool(tools, createTeamMessageTool(teamRuntime));
+      pushRuntimeTool(tools, createTeamHistoryTool(teamRuntime));
+      pushRuntimeTool(tools, createTeamCloseTool(teamRuntime));
       pushRuntimeTool(tools, createTeamCancelTool(teamRuntime));
       pushRuntimeTool(tools, createTeamReduceTool(teamRuntime));
       pushRuntimeTool(tools, createTeamPresentTool(teamRuntime));
@@ -774,6 +782,7 @@ export const executeRun = async (
         tools: workerTools,
         runTokenBudget,
         clock,
+        ...(request.maxOutputTokens === undefined ? {} : { maxOutputTokens: request.maxOutputTokens }),
         ...(request.signal === undefined ? {} : { signal: request.signal }),
         readWatermark: () => sink.ledger.watermark(),
         readEvents: () => sink.ledger.read({ runId }),
@@ -970,7 +979,7 @@ export const executeRun = async (
           ? undefined
           : blocker === "model-output-limit"
             ? "Model output limit reached"
-            : "Main stopped at a resumable boundary",
+            : "Nausicaa stopped at a resumable boundary",
         `main:status:${result.completed ? "completed" : "waiting"}:${setup.startStep}`,
         clock,
       );
@@ -1165,7 +1174,7 @@ const createNewRun = async (
       "teto",
       "dormant",
       policy.tetoActivation === "manual"
-        ? "Teto available; Main may open it with teto_start"
+        ? "Teto available; Nausicaa may open it with teto_start"
         : undefined,
       "lane:teto:status:dormant",
       clock,

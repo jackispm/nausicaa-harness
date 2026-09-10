@@ -232,6 +232,18 @@ const crossRunReceipt = {
 
 const validPayloads = {
   "team.created": teamDefinition,
+  "team.message.sent": {
+    teamId: "team-1",
+    channelId: "general",
+    sequence: 1,
+    fromLane: "main",
+    threadId: "team-1:general:general",
+    body: "Progress update",
+    mentions: ["team:team-1:alpha"],
+    artifactRefs: [artifact],
+    operationId: "operation-team-message-1",
+  },
+  "team.closed": { teamId: "team-1", reason: "Finished", closedBy: "main" },
   "team.member.settled": {
     teamId: "team-1", memberId: "alpha", taskId: teamTask.taskId, outcome: "cancelled",
     requestMessageId: "team-request", claimId: "team-claim", attempt: 1, reason: "Cancelled by lead",
@@ -435,6 +447,11 @@ const validPayloads = {
   },
   "a2a.outbox.receipt": { receipt: crossRunReceipt },
   "message.claimed": { messageId: "message-1", claimedBy: "main" },
+  "message.reclaimed": {
+    messageId: "message-1", reclaimedBy: "main", previousClaimId: "claim-1",
+    previousClaimedBy: "worker-1", previousClaimedAt: "2026-09-07T08:00:00.000Z",
+    previousAttempt: 1, reason: "runtime-restart",
+  },
   "message.handled": { messageId: "message-1" },
   "teto.advice.generated": { advice, delivery: "shadow" },
   "advice.acknowledged": {
@@ -547,6 +564,8 @@ const validPayloads = {
 
 const invalidPayloads = {
   "team.created": { ...teamDefinition, members: [{ ...teamMember, dependsOn: ["missing"] }] },
+  "team.message.sent": { ...validPayloads["team.message.sent"], sequence: 0 },
+  "team.closed": { ...validPayloads["team.closed"], reason: "" },
   "team.member.settled": {
     ...validPayloads["team.member.settled"], outcome: "completed",
   },
@@ -711,6 +730,7 @@ const invalidPayloads = {
     receipt: { ...crossRunReceipt, receiptId: "forged-receipt" },
   },
   "message.claimed": { messageId: "", claimedBy: "main" },
+  "message.reclaimed": { messageId: "", reclaimedBy: "main", previousClaimId: "", previousClaimedBy: "", previousClaimedAt: "bad", previousAttempt: 0, reason: "" },
   "message.handled": { messageId: null },
   "teto.advice.generated": {
     advice: { ...advice, sourceLane: "worker" },
@@ -1289,6 +1309,17 @@ describe("event payload validation", () => {
         },
       },
     })).toThrow(/maxAttempts/);
+  });
+
+  it("persists tasks without limits while retaining explicit host limit validation", () => {
+    const task = { type: "task.request", taskId: "task-unlimited", goal, inputRefs: [], budget: {} };
+    const payload = { message: { ...message, payload: task } };
+    expect(() => validateEventPayload("message.sent", payload)).not.toThrow();
+    for (const budget of [{ maxModelTokens: 0 }, { maxWallClockMs: -1 }, { maxAttempts: 0 }]) {
+      expect(() => validateEventPayload("message.sent", {
+        message: { ...message, payload: { ...task, budget } },
+      })).toThrow(/budget/);
+    }
   });
 
   it("rejects a malformed payload with a valid content hash during replay", async () => {

@@ -45,8 +45,9 @@ function receiptFor(
   request: CrossRunSendRequest,
   status: CrossRunReceipt["status"] = "queued",
   diagnostic?: string,
+  targetEndpoint = target,
 ): CrossRunReceipt {
-  const routeId = createCrossRunRouteId(source, target, request.idempotencyKey);
+  const routeId = createCrossRunRouteId(source, targetEndpoint, request.idempotencyKey);
   return {
     protocolVersion: 1,
     receiptId: createCrossRunReceiptId(routeId, status),
@@ -54,7 +55,7 @@ function receiptFor(
     messageId: createCrossRunMessageId(routeId, request),
     idempotencyKey: request.idempotencyKey,
     source,
-    target,
+    target: targetEndpoint,
     relationship: "direct",
     status,
     recordedAt: "2026-08-31T00:00:00.000Z",
@@ -159,6 +160,10 @@ describe("agent_message tool", () => {
       },
     });
     expect(result.content).not.toContain(sender.proof.token);
+    expect(JSON.parse(result.content)).toMatchObject({
+      source: { ...source, laneId: "nausicaa" },
+      target,
+    });
     expect(tool.definition.name).toBe("agent_message");
     expect(tool.metadata).toMatchObject({
       effect: "external",
@@ -166,6 +171,44 @@ describe("agent_message tool", () => {
       deterministic: false,
       concurrencySafe: false,
     });
+  });
+
+  it("projects both root endpoints in receipts without changing the routed identity or receipt", async () => {
+    const destination = { ...target, laneId: "main" };
+    const canonicalReceipts: CrossRunReceipt[] = [];
+    const calls: Array<{ request: CrossRunSendRequest; sender: CrossRunSenderIdentity }> = [];
+    const tool = createAgentMessageTool({
+      router: {
+        send: async (request, authenticatedSender) => {
+          calls.push({ request, sender: authenticatedSender });
+          const receipt = receiptFor(request, "queued", undefined, destination);
+          canonicalReceipts.push(receipt);
+          return receipt;
+        },
+      },
+      sender,
+    });
+    const text = "Please inspect the main branch";
+    const result = await tool.execute({
+      target: { relationship: "direct", id: destination.sessionId }, text,
+    }, context);
+
+    expect(result.isError).toBe(false);
+    const output = JSON.parse(result.content) as CrossRunReceipt;
+    expect(output.source).toEqual({ ...source, laneId: "nausicaa" });
+    expect(output.target).toEqual({ ...destination, laneId: "nausicaa" });
+    expect(calls[0]).toMatchObject({
+      sender: { endpoint: source },
+      request: {
+        target: { relationship: "direct", id: destination.sessionId },
+        payload: { type: "message.inform", text },
+      },
+    });
+    expect(canonicalReceipts[0]).toMatchObject({ source, target: destination });
+    expect(output.routeId).toBe(canonicalReceipts[0]?.routeId);
+    expect(output.messageId).toBe(canonicalReceipts[0]?.messageId);
+    expect(source.laneId).toBe("main");
+    expect(destination.laneId).toBe("main");
   });
 
   it("rejects endpoint forgery, permission escalation, and scope reuse before routing", async () => {

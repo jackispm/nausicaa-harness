@@ -737,13 +737,8 @@ const naturalWorkerFactory: WorkerLiveModelFactory = ({ fixture, arm }) => {
         if (!delegated) {
           return response("", [toolCall(`delegate-${callId}`, "delegate_task", {
             taskId: "evidence-synthesis",
-            statement: "Synthesize the bounded evidence supplied by Main",
-            successCriteria: ["Return one grounded summary"],
-            hardConstraints: ["Do not invent facts"],
+            statement: "Synthesize the evidence supplied by Nausicaa into one grounded summary without inventing facts",
             input: fixture.message,
-            maxModelTokens: 500,
-            maxWallClockMs: 5_000,
-            maxAttempts: 1,
           })]);
         }
         if (!terminalNotice) {

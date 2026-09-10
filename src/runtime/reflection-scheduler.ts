@@ -33,7 +33,7 @@ const OBSERVATION_DEADLINE_MS = 30_000;
 const REFLECTION_SYSTEM_PROMPT = `You are the private Reflection lane.
 The mission and latest decision are the only inputs. No tools are available.
 Return exactly one minified JSON object: {"action":"silent"} or {"action":"revise","note":"<=12 words"}.
-A revise note is delivered to Main at the next boundary.`;
+A revise note is delivered to Nausicaa at the next boundary.`;
 
 export interface ReflectionSchedulerOptions {
   eventSink: EventSink;
@@ -153,7 +153,7 @@ export class ReflectionScheduler {
       this.pendingReflections.shift();
       return [{
         kind: "reflection",
-        source: "main-reflection",
+        source: "nausicaa-reflection",
         content: note,
         messageId,
       }];
@@ -256,7 +256,7 @@ export class ReflectionScheduler {
           this.laneId,
           decision.mainCallIndex,
         );
-        if (this.runTokenBudget.reserve(runReservationId, reservationTokens) === undefined) {
+        if (this.runTokenBudget.reserve(runReservationId, reservationTokens, { priority: "auxiliary" }) === undefined) {
           this.tokenGate.cancel(reservationId);
           this.cadence.skipPass(decision.mainCallIndex);
           wakePending = false;

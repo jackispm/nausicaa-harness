@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { A2AInbox } from "../../src/a2a/index.js";
 import type {
@@ -14,8 +14,10 @@ import type {
   ModelPort,
   ModelRequest,
   ModelResponse,
+  TaskBudget,
 } from "../../src/domain/index.js";
 import { estimateUserImageTokens } from "../../src/domain/images.js";
+import { DEFAULT_MAIN_REQUEST_TIMEOUT_MS } from "../../src/domain/types.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
 import { sha256, stableJson } from "../../src/ledger/hash.js";
 import { ScriptedModel } from "../../src/model/index.js";
@@ -36,7 +38,7 @@ const goal: Goal = {
 
 function taskMessage(
   inputRefs: ArtifactRef[],
-  budget: { maxModelTokens: number; maxWallClockMs: number } = {
+  budget: TaskBudget = {
     maxModelTokens: 500,
     maxWallClockMs: 5_000,
   },
@@ -67,12 +69,13 @@ function taskMessage(
 async function setup(
   model: ModelPort,
   input = "npm install",
-  budget?: { maxModelTokens: number; maxWallClockMs: number },
+  budget?: TaskBudget,
   runTokenBudget?: RunTokenBudget,
   options: {
     workspace?: string;
     tools?: readonly AgentTool[];
     signal?: AbortSignal;
+    maxOutputTokens?: number;
   } = {},
 ) {
   const clock: Clock = {
@@ -95,6 +98,7 @@ async function setup(
     ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
     ...(options.tools === undefined ? {} : { tools: options.tools }),
     ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.maxOutputTokens === undefined ? {} : { maxOutputTokens: options.maxOutputTokens }),
     ...(runTokenBudget === undefined ? {} : { runTokenBudget }),
     workerLaneId: "worker-1",
     clock,
@@ -109,6 +113,112 @@ async function setup(
 }
 
 describe("WorkerTaskExecutor", () => {
+  it("finishes an unbounded task after more than two model turns, four tools and 2000 tokens", async () => {
+    const readTool: AgentTool = {
+      definition: { name: "read_file", description: "Read evidence", parameters: { type: "object" } },
+      async execute() { return { content: "Evidence", isError: false }; },
+    };
+    const model = new ScriptedModel([
+      ...Array.from({ length: 5 }, (_, index) => ({
+        content: "",
+        toolCalls: [{ id: `read-${index}`, name: "read_file", arguments: {} }],
+        stopReason: "tool_calls" as const,
+        usage: { input: 600, output: 200, cacheRead: 0, cacheWrite: 0 },
+      })),
+      {
+        content: "Complete report with all five evidence sources",
+        toolCalls: [],
+        stopReason: "stop" as const,
+        usage: { input: 600, output: 200, cacheRead: 0, cacheWrite: 0 },
+      },
+    ]);
+    const { executor, ledger, inbox } = await setup(model, "input", {}, undefined, { tools: [readTool] });
+
+    await expect(executor.runOnce()).resolves.toMatchObject({
+      status: "completed",
+      usage: { input: 3_600, output: 1_200 },
+    });
+    expect(model.requests).toHaveLength(6);
+    expect(model.requests.every((request) => request.maxOutputTokens === 8_192)).toBe(true);
+    const events = await ledger.read({ runId: "run-1" });
+    expect(events.filter((event) => event.type === "tool.succeeded")).toHaveLength(5);
+    expect(events.filter((event) => event.type === "budget.charged")).toHaveLength(6);
+    const result = inbox.snapshot().records.find((record) => record.message.payload.type === "task.result");
+    expect(result?.message.payload).toMatchObject({ status: "completed", openQuestions: [] });
+  });
+
+  it("still times out one stalled model request without imposing a task deadline", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let notifyStarted!: () => void;
+      const started = new Promise<void>((resolve) => { notifyStarted = resolve; });
+      let signal: AbortSignal | undefined;
+      const model: ModelPort = {
+        async complete(request) {
+          signal = request.signal;
+          notifyStarted();
+          return new Promise<ModelResponse>(() => {});
+        },
+      };
+      const { executor, inbox } = await setup(model, "input", {});
+      const running = executor.runOnce();
+      await started;
+      await vi.advanceTimersByTimeAsync(DEFAULT_MAIN_REQUEST_TIMEOUT_MS);
+
+      await expect(running).resolves.toMatchObject({ status: "failed", reason: "Worker model request timed out" });
+      expect(signal?.aborted).toBe(true);
+      expect(inbox.snapshot().records.find((record) => record.message.payload.type === "task.failed")?.message.payload)
+        .toMatchObject({ retryable: true });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("honors a host per-request output limit while accounting larger cumulative usage", async () => {
+    const model = new ScriptedModel([{
+      content: "Complete report",
+      toolCalls: [],
+      stopReason: "stop",
+      usage: { input: 3_000, output: 700, cacheRead: 0, cacheWrite: 0 },
+    }]);
+    const { executor } = await setup(model, "input", {}, undefined, { maxOutputTokens: 1_024 });
+    await expect(executor.runOnce()).resolves.toMatchObject({ status: "completed", usage: { input: 3_000, output: 700 } });
+    expect(model.requests[0]?.maxOutputTokens).toBe(1_024);
+  });
+
+  it("renews the request timeout while a healthy task runs beyond five minutes", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let calls = 0;
+      const model: ModelPort = {
+        async complete() {
+          calls += 1;
+          await new Promise<void>((resolve) => setTimeout(resolve, 3 * 60 * 1_000));
+          return {
+            content: calls === 1 ? "" : "Finished the long task",
+            toolCalls: calls === 1 ? [{ id: "read", name: "read_file", arguments: {} }] : [],
+            stopReason: "stop",
+            usage: { input: 1_200, output: 200, cacheRead: 0, cacheWrite: 0 },
+          };
+        },
+      };
+      const tools: AgentTool[] = [{
+        definition: { name: "read_file", description: "Read evidence", parameters: { type: "object" } },
+        async execute() { return { content: "Evidence", isError: false }; },
+      }];
+      const { executor } = await setup(model, "input", {}, undefined, { tools });
+      const running = executor.runOnce();
+      await vi.advanceTimersByTimeAsync(6 * 60 * 1_000);
+
+      await expect(running).resolves.toMatchObject({ status: "completed", usage: { input: 2_400, output: 400 } });
+      expect(calls).toBe(2);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("admits Worker with a shared Run budget, narrows output, and settles actual usage", async () => {
     const runTokenBudget = new RunTokenBudget(400);
     const model = new ScriptedModel([{
@@ -787,7 +897,7 @@ describe("WorkerTaskExecutor", () => {
     });
   });
 
-  it("cancels an in-flight model on stop and ignores its late response", async () => {
+  it.each([{}, { maxModelTokens: 100, maxWallClockMs: 5_000 }])("cancels an in-flight model on stop and ignores its late response: %j", async (budget) => {
     let resolveModel: ((response: ModelResponse) => void) | undefined;
     const model: ModelPort = {
       complete: async () => new Promise<ModelResponse>((resolve) => {
@@ -795,10 +905,7 @@ describe("WorkerTaskExecutor", () => {
       }),
     };
     const runTokenBudget = new RunTokenBudget(400);
-    const { executor, inbox, ledger } = await setup(model, "input", {
-      maxModelTokens: 100,
-      maxWallClockMs: 5_000,
-    }, runTokenBudget);
+    const { executor, inbox, ledger } = await setup(model, "input", budget, runTokenBudget);
 
     const running = executor.runOnce();
     for (let attempt = 0; attempt < 20 && resolveModel === undefined; attempt += 1) {

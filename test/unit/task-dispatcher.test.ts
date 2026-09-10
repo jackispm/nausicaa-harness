@@ -126,6 +126,23 @@ describe("TaskDispatcher", () => {
     });
   });
 
+  it("preserves unlimited tasks during dispatch, restart and duplicate admission", async () => {
+    const admittedAt = "2026-08-27T12:00:00.000Z";
+    const clock = new MutableClock(new Date("2026-08-28T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
+    const request = { taskId: "unlimited-task", goal: baseGoal, budget: {} };
+    const dispatcher = new TaskDispatcher({ inbox, runId: "run-1", clock, admittedAt });
+
+    await expect(dispatcher.dispatch(request)).resolves.toMatchObject({ status: "queued" });
+    clock.advance(24 * 60 * 60 * 1_000);
+    const restarted = new TaskDispatcher({ inbox, runId: "run-1", clock, admittedAt });
+    await expect(restarted.dispatch(request)).resolves.toMatchObject({ status: "duplicate" });
+    expect(inbox.snapshot().records).toHaveLength(1);
+    const message = inbox.snapshot().records[0]!.message;
+    expect(message.createdAt).toBe(admittedAt);
+    expect(message.payload.type === "task.request" ? message.payload.budget : undefined).toEqual({});
+  });
+
   it("restores a Team task from its host admission time without extending the deadline", async () => {
     const admittedAt = "2026-08-27T12:00:00.000Z";
     const clock = new MutableClock(new Date("2026-08-27T12:00:05.000Z"));

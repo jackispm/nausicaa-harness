@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { Script } from "node:vm";
 
 import { createModels } from "@earendil-works/pi-ai";
 import { openrouterProvider } from "@earendil-works/pi-ai/providers/openrouter";
@@ -35,8 +36,7 @@ const live = new TopologyLiveModel(createOpenRouterModelPort({ models }), {
   maxOutputTokens: 2048, timeoutMs: 60_000,
   inputPrice: Math.max(price.input, price.cacheRead, price.cacheWrite), outputPrice: price.output,
 });
-const caseIds = ["workspace", "worker", "team-dag", "team-peer-reducer", "resume-fork", "teto", "team-cancel"] as const;
-const taskBudget = { maxModelTokens: 30000, maxWallClockMs: 120000, maxAttempts: 6 };
+const caseIds = ["workspace", "worker", "team-dag", "team-calendar", "team-peer-reducer", "resume-fork", "teto", "team-cancel"] as const;
 type CaseId = typeof caseIds[number];
 const selected = (process.env.NAUSICAA_TOPOLOGY_CASES ?? caseIds.join(",")).split(",");
 if (selected.length === 0 || new Set(selected).size !== selected.length
@@ -86,6 +86,7 @@ try {
       if (id === "workspace") await workspaceCase(f);
       else if (id === "worker") await workerCase(f);
       else if (id === "team-dag") await teamDagCase(f);
+      else if (id === "team-calendar") await teamCalendarCase(f);
       else if (id === "team-peer-reducer") await teamPeerCase(f);
       else if (id === "teto") await tetoCase(f);
       else if (id === "resume-fork") await resumeForkCase(f);
@@ -140,7 +141,7 @@ async function fixture(id: CaseId): Promise<Fixture> {
 }
 
 function policy(tetoEnabled = false) {
-  return { maxMainStepsPerActivation: 12, maxModelTokens: 140_000, mainRequestTimeoutMs: 65_000,
+  return { maxMainStepsPerActivation: 24, maxModelTokens: 1_000_000, mainRequestTimeoutMs: 65_000,
     tetoEnabled, tetoActivation: "manual" as const, tetoMaxOutputTokens: 1024 };
 }
 
@@ -210,7 +211,7 @@ async function workspaceCase(f: Fixture) {
 async function workerCase(f: Fixture) {
   const session = await openSession(f, { worker: true });
   try {
-    await turn(session, f, "Use delegate_task to ask a read-only Worker to read items.json and calculate the subtotal. Set taskId=checkout-items, maxModelTokens=18000, maxWallClockMs=90000, maxAttempts=4. Do not calculate it yourself and do not create a Team. After queuing, tell me it is queued; I will ask for the result next.");
+    await turn(session, f, "Use delegate_task to ask a read-only Worker to read items.json and calculate the subtotal. Set taskId=checkout-items. Do not calculate it yourself and do not create a Team. After queuing, tell me it is queued; I will ask for the result next.");
     await waitUntil(() => messages(f).some((message) => message.payload.type === "task.result"), 100_000);
     await turn(session, f, "Now use the Worker result delivered to you. What subtotal did the Worker find? Answer briefly and identify that it came from the Worker. Do not redelegate or open files yourself.");
     const result = messages(f).find((message) => message.payload.type === "task.result" && message.from === "worker");
@@ -224,10 +225,10 @@ async function workerCase(f: Fixture) {
 
 async function teamDagCase(f: Fixture) {
   const team = { teamId: "checkout", members: [
-    { memberId: "items", statement: "Read items.json with read_file. Calculate subtotal and count. Return the numbers with evidence. Do not open other files.", ...taskBudget },
-    { memberId: "policy", statement: "Read policy.json with read_file. Return shipping and discount amounts with evidence. Do not open other files.", ...taskBudget },
-    { memberId: "total", statement: "Using the supplied prerequisite results, compute checkout total = subtotal + shipping - discount. Do not read files or ask Main for inputs. Explain the three numbers and return the total.", dependsOn: ["items", "policy"], ...taskBudget },
-  ], joinPolicy: "all-terminal" };
+    { memberId: "items", statement: "Read items.json with read_file. Calculate subtotal and count. Return the numbers with evidence. Do not open other files." },
+    { memberId: "policy", statement: "Read policy.json with read_file. Return shipping and discount amounts with evidence. Do not open other files." },
+    { memberId: "total", statement: "Using the supplied prerequisite results, compute checkout total = subtotal + shipping - discount. Do not read files or ask Nausicaa for inputs. Explain the three numbers and return the total.", dependsOn: ["items", "policy"] },
+  ] };
   await oneShot(f, `Please solve the checkout task collaboratively. First call team_create with this definition: ${JSON.stringify(team)}. Main is the lead and must use member evidence, not read the files itself. Once the Team joins, synthesize the results, call team_present with accepted if supported by evidence, and answer in Chinese with the total. Do not create another Team or poll team_status repeatedly; the runtime delivers join at a normal completion boundary.`);
   const created = f.events.find((event) => event.type === "team.created");
   const requests = f.events.filter((event) => event.type === "message.sent" && event.payload.message.payload.type === "task.request");
@@ -243,11 +244,67 @@ async function teamDagCase(f: Fixture) {
   f.checks.correctAnswer = /46/.test(f.finalText);
 }
 
+async function teamCalendarCase(f: Fixture) {
+  const contract = "Build a minimal Chinese week calendar with Todo, no external dependencies. Shared DOM contract: buttons prev-week, next-week, today; heading week-label; div week-grid. app.js renders seven dates, highlights today, supports adding/checking/deleting todos per date and persists them with localStorage. index.html loads app.js with defer. Work only in this synthetic workspace; do not create other Teams or Teto.";
+  const team = { teamId: "calendar", members: [
+    { memberId: "ui", statement: `You own index.html only. ${contract} First read README.md; then write concise complete markup and inline responsive CSS; then read index.html back to verify it. Report the actual file and changes.` },
+    { memberId: "logic", statement: `You own app.js only. ${contract} First read README.md; then write concise complete browser JavaScript using the shared IDs; then read app.js back to verify it. Report the actual file and changes.` },
+    { memberId: "qa", dependsOn: ["ui", "logic"], statement: `You are the reviewer. ${contract} Read index.html first, then read app.js in a later tool call. Verify the IDs and required functionality against the real contents. Post your findings once with team_message to team calendar, including the marker CALENDAR-REVIEWED and the inspected file names. Then provide a short final report with any defects. Do not modify files.` },
+  ] };
+  const session = await openSession(f);
+  try {
+    await turn(session, f, `你好，帮我创建一个团队，做一个周日历 + Todo 的 HTML 网站。This is also an asynchronous Team test. Call team_create with exactly this definition: ${JSON.stringify(team)}. You lead and synthesize the reports; members write the files. After queuing, end your current turn with a brief accurate status. When member reports wake you, inspect available reports and continue coordination. Once all members succeed, call team_present accepted if evidence supports it and report index.html and app.js to the user. Do not create replacement Teams, write the files yourself, or poll team_status repeatedly. No reducer is needed.`);
+    const initialCompletion = f.events.find((event) => event.type === "turn.completed");
+    const initialResults = settlements(f);
+    f.checks.leadFinishesBeforeMembers = initialCompletion !== undefined
+      && (initialResults.length < 3 || initialResults.some((event) => event.globalOffset > initialCompletion.globalOffset));
+    await waitUntil(() => f.events.some((event) => event.type === "team.presented"
+      && event.payload.teamId === "calendar"), 180_000);
+    await session.waitForIdle();
+    const created = f.events.find((event) => event.type === "team.created" && event.payload.teamId === "calendar");
+    const tasks = messages(f).filter((message) => message.payload.type === "task.request"
+      && message.to.startsWith("team:calendar:"));
+    f.checks.teamCreated = created !== undefined && tasks.length === 3;
+    f.checks.noImplicitTaskLimits = created?.type === "team.created" && created.payload.deadline === undefined && tasks.length === 3
+      && tasks.every((message) => message.payload.type === "task.request" && Object.keys(message.payload.budget).length === 0);
+    f.checks.membersSucceeded = settlements(f).filter((event) => event.payload.teamId === "calendar"
+      && event.payload.outcome === "succeeded").length === 3;
+    f.checks.parallelBuilders = overlapping(f, "team:calendar:ui", "team:calendar:logic");
+    f.checks.membersWriteFiles = ["ui", "logic"].every((member) =>
+      ["write_file", "apply_patch", "edit_file"].some((name) => toolSucceeded(f, `team:calendar:${member}`, name)));
+    f.checks.moreThanTwoMemberCalls = ["ui", "logic", "qa"].every((member) =>
+      live.calls.filter((call) => call.runId === f.runId && call.laneId === `team:calendar:${member}`).length > 2);
+    const reviewer = f.events.find((event) => event.type === "model.requested" && event.laneId === "team:calendar:qa");
+    const builders = settlements(f).filter((event) => event.payload.teamId === "calendar" && event.payload.memberId !== "qa");
+    f.checks.reviewAfterBuilders = reviewer !== undefined && builders.length === 2
+      && builders.every((event) => event.globalOffset < reviewer.globalOffset);
+    f.checks.publicReview = f.events.some((event) => event.type === "team.message.sent"
+      && event.payload.fromLane === "team:calendar:qa" && event.payload.body.includes("CALENDAR-REVIEWED"));
+    f.checks.automaticContinuation = f.events.some((event) => event.type === "input.admitted"
+      && event.payload.inputId.startsWith("team-report-"));
+    const results = messages(f).filter((message) => message.payload.type === "task.result"
+      && message.from.startsWith("team:calendar:"));
+    f.checks.allResultsConsumed = results.length === 3 && results.every((message) => consumed(f, "main", message.messageId));
+    f.checks.accepted = f.events.some((event) => event.type === "team.presented"
+      && event.payload.teamId === "calendar" && event.payload.disposition === "accepted");
+    const html = await readFile(join(f.workspace, "index.html"), "utf8");
+    const script = await readFile(join(f.workspace, "app.js"), "utf8");
+    new Script(script, { filename: "app.js" }); // Parse only; do not execute generated browser code in Node.
+    f.checks.artifactStructure = ["prev-week", "next-week", "today", "week-label", "week-grid"]
+      .every((id) => html.includes(`id="${id}"`) || html.includes(`id='${id}'`))
+      && /<script\b[^>]*src=["'](?:\.\/)?app\.js["']/iu.test(html)
+      && script.includes("localStorage");
+    f.checks.scriptParses = true;
+    const transcript = await session.transcript();
+    f.finalText = transcript.findLast((entry) => entry.role === "assistant")?.content ?? "";
+  } finally { await session.close(); }
+}
+
 async function teamPeerCase(f: Fixture) {
-  const member = (memberId: string, peer: string, file: string) => ({ memberId, ...taskBudget,
-    statement: `First call agent_message to team:exchange:${peer} with a short request to exchange checkout evidence. Next read ${file} with read_file. Then send your findings to team:exchange:${peer} with agent_message: its text must be a JSON object with type="checkout.evidence" and numeric ${memberId === "items" ? "subtotal" : "shipping and discount"} fields computed from the file. Include any received peer facts in your final report to Main. Work only on ${file}; do not poll repeatedly or start Teto. You have six steps.` });
+  const member = (memberId: string, peer: string, file: string) => ({ memberId,
+    statement: `First call agent_message to team:exchange:${peer} with a short request to exchange checkout evidence. Next read ${file} with read_file. Then send your findings to team:exchange:${peer} with agent_message: its text must be a JSON object with type="checkout.evidence" and numeric ${memberId === "items" ? "subtotal" : "shipping and discount"} fields computed from the file. Include any received peer facts in your final report to Nausicaa. Work only on ${file}; do not poll repeatedly or start Teto.` });
   const team = { teamId: "exchange", peerMessaging: "team-members", members: [member("items", "policy", "items.json"), member("policy", "items", "policy.json")] };
-  await oneShot(f, `Create this team via team_create using the exact member statements: ${JSON.stringify(team)}. Members should exchange evidence directly. After join, explicitly call team_reduce with teamId=exchange, maxModelTokens=24000, maxWallClockMs=90000, maxAttempts=6, statement="Synthesize the supplied member evidence into checkout subtotal, shipping, discount, total; no file mutation. Prefer the supplied results over re-reading source files." Once reduction completes, check it and call team_present accepted if correct. Then answer briefly in Chinese. Main must not read or compute from files itself. After team_create and team_reduce, if no other work is needed, return a short waiting sentence with no tool calls: that is the completion boundary where the runtime waits and supplies the result to your next step. Do not call team_status to wait.`);
+  await oneShot(f, `Create this team via team_create using the exact member statements: ${JSON.stringify(team)}. Members should exchange evidence directly. After join, explicitly call team_reduce with teamId=exchange, statement="Synthesize the supplied member evidence into checkout subtotal, shipping, discount, total; no file mutation. Prefer the supplied results over re-reading source files." Once reduction completes, check it and call team_present accepted if correct. Then answer briefly in Chinese. Nausicaa must not read or compute from files itself. After team_create and team_reduce, if no other work is needed, return a short waiting sentence with no tool calls: that is the completion boundary where the runtime waits and supplies the result to your next step. Do not call team_status to wait.`);
   const directions = [["items", "policy"], ["policy", "items"]] as const;
   for (const [sender, target] of directions) {
     const expected: Record<string, number> = sender === "items" ? { subtotal: 44 } : { shipping: 6, discount: 4 };
@@ -337,7 +394,7 @@ async function resumeForkCase(f: Fixture) {
 async function cancelCase(f: Fixture) {
   f.checks.runCompleted = false;
   try {
-    await oneShot(f, `This is a cancellation smoke, not a checkout computation. First call team_create with ${JSON.stringify({ teamId: "cancelled", members: [{ memberId: "reader", statement: "Read README.md, then items.json, then policy.json in separate steps, then report a total.", ...taskBudget }] })}. On your very next step call team_cancel with teamId=cancelled and reason='User cancelled the synthetic exercise'. Then read team_status once and report that unfinished work was cancelled, without claiming it succeeded. Do not create another team.`);
+    await oneShot(f, `This is a cancellation smoke, not a checkout computation. First call team_create with ${JSON.stringify({ teamId: "cancelled", members: [{ memberId: "reader", statement: "Read README.md, then items.json, then policy.json in separate steps, then report a total." }] })}. On your very next step call team_cancel with teamId=cancelled and reason='User cancelled the synthetic exercise'. Then read team_status once and report that unfinished work was cancelled, without claiming it succeeded. Do not create another team.`);
   } finally {
     Object.assign(f.checks, teamCancellationChecks(f.events, f.runId, "cancelled"));
   }

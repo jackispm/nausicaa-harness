@@ -14,6 +14,7 @@ import type {
   LaneStatus,
   NavigationDelta,
   InputId,
+  OperationId,
   RunId,
   RunPolicy,
   CacheOutcome,
@@ -35,6 +36,8 @@ import type {
   TeamJoined,
   TeamMemberDefinition,
   TeamMemberSettlement,
+  TeamRunReport,
+  TeamTaskAssignment,
   TeamReduction,
 } from "./team.js";
 
@@ -126,6 +129,20 @@ export interface EventPayloadMap {
   "team.reduction.requested": { teamId: string; reducer: TeamMemberDefinition };
   "team.reduced": { teamId: string } & TeamReduction;
   "team.presented": { teamId: string; disposition: "accepted" | "rejected"; summaryRef?: ArtifactRef };
+  /** One append-only public message in a Team channel. */
+  "team.message.sent": {
+    teamId: string;
+    channelId: string;
+    sequence: number;
+    fromLane: LaneId;
+    threadId?: string;
+    body: string;
+    mentions: LaneId[];
+    artifactRefs: ArtifactRef[];
+    operationId: OperationId;
+  };
+  /** Explicitly fences future Team admission and wakeups. */
+  "team.closed": { teamId: string; reason: string; closedBy: LaneId };
   "step.started": { step: number };
   "step.completed": {
     step: number;
@@ -335,6 +352,16 @@ export interface EventPayloadMap {
   };
   "a2a.outbox.receipt": { receipt: CrossRunReceipt };
   "message.claimed": { messageId: string; claimedBy: LaneId };
+  /** A host reclaimed an unfinished delivery after the owning runtime stopped. */
+  "message.reclaimed": {
+    messageId: string;
+    reclaimedBy: LaneId;
+    previousClaimId: string;
+    previousClaimedBy: LaneId;
+    previousClaimedAt: string;
+    previousAttempt: number;
+    reason: string;
+  };
   "message.handled": { messageId: string };
   "teto.advice.generated": {
     advice: Advice;
@@ -474,6 +501,7 @@ export interface EventPayloadMap {
   };
 }
 
+export type TeamEventType = "team.task.assigned" | "team.run.reported";
 export type EventType = keyof EventPayloadMap;
 
 export interface EventEnvelope<K extends EventType = EventType> {

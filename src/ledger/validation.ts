@@ -37,7 +37,7 @@ import {
   validateLaneCapabilityManifest,
   validateSpawnContext,
 } from "../runtime/lane-context.js";
-import type { TeamDefinition, TeamMemberDefinition } from "../domain/team.js";
+import type { TeamCapabilityGrant, TeamDefinition, TeamMemberDefinition } from "../domain/team.js";
 
 type PayloadValidator = (value: unknown, path: string) => void;
 
@@ -212,13 +212,17 @@ function taskId(value: unknown, path: string): void {
 
 function taskBudget(value: unknown, path: string): void {
   const item = record(value, path);
-  integer(item.maxModelTokens, `${path}.maxModelTokens`, 1);
-  if ((item.maxModelTokens as number) > MAX_TASK_MODEL_TOKENS) {
-    invalid(`${path}.maxModelTokens`, `at most ${MAX_TASK_MODEL_TOKENS}`);
+  if (item.maxModelTokens !== undefined) {
+    integer(item.maxModelTokens, `${path}.maxModelTokens`, 1);
+    if ((item.maxModelTokens as number) > MAX_TASK_MODEL_TOKENS) {
+      invalid(`${path}.maxModelTokens`, `at most ${MAX_TASK_MODEL_TOKENS}`);
+    }
   }
-  integer(item.maxWallClockMs, `${path}.maxWallClockMs`, 1);
-  if ((item.maxWallClockMs as number) > MAX_TASK_WALL_CLOCK_MS) {
-    invalid(`${path}.maxWallClockMs`, `at most ${MAX_TASK_WALL_CLOCK_MS}`);
+  if (item.maxWallClockMs !== undefined) {
+    integer(item.maxWallClockMs, `${path}.maxWallClockMs`, 1);
+    if ((item.maxWallClockMs as number) > MAX_TASK_WALL_CLOCK_MS) {
+      invalid(`${path}.maxWallClockMs`, `at most ${MAX_TASK_WALL_CLOCK_MS}`);
+    }
   }
   if (item.deadline !== undefined) {
     dateTime(item.deadline, `${path}.deadline`);
@@ -247,11 +251,12 @@ function teamId(value: unknown, path: string): asserts value is string {
 
 function teamMember(value: unknown, path: string): asserts value is TeamMemberDefinition {
   const member = payloadObject(value, path, ["memberId", "laneId", "task", "dependsOn", "required"]);
-  exactKeys(member, ["memberId", "laneId", "task", "dependsOn", "required"], path);
+  exactKeys(member, ["memberId", "laneId", "task", "dependsOn", "required", "capabilities"], path);
   teamId(member.memberId, `${path}.memberId`);
   string(member.laneId, `${path}.laneId`, false);
   if ((member.laneId as string).length > 256) invalid(`${path}.laneId`, "at most 256 characters");
   boolean(member.required, `${path}.required`);
+  if (member.capabilities !== undefined) teamCapabilityGrant(member.capabilities, `${path}.capabilities`);
   if (!Array.isArray(member.dependsOn) || member.dependsOn.length > 16) {
     invalid(`${path}.dependsOn`, "an array of at most 16 member IDs");
   }
@@ -278,16 +283,35 @@ function teamMember(value: unknown, path: string): asserts value is TeamMemberDe
   }
 }
 
+function teamCapabilityGrant(value: unknown, path: string): asserts value is TeamCapabilityGrant {
+  const grant = payloadObject(value, path, ["tools", "allowNestedTeam"]);
+  exactKeys(grant, ["tools", "allowNestedTeam"], path);
+  if (grant.tools !== undefined) {
+    if (!Array.isArray(grant.tools) || grant.tools.length > 64) invalid(`${path}.tools`, "an array of at most 64 tool names");
+    const names = new Set<string>();
+    grant.tools.forEach((tool, index) => {
+      string(tool, `${path}.tools[${index}]`, false);
+      if (!/^[a-z][a-z0-9_:-]{0,127}$/u.test(tool as string)) invalid(`${path}.tools[${index}]`, "a valid tool name");
+      if (names.has(tool as string)) invalid(`${path}.tools[${index}]`, "a unique tool name");
+      names.add(tool as string);
+    });
+  }
+  if (grant.allowNestedTeam !== undefined) boolean(grant.allowNestedTeam, `${path}.allowNestedTeam`);
+}
+
 function teamDefinition(value: unknown, path: string): asserts value is TeamDefinition {
   const item = payloadObject(value, path, [
-    "teamId", "leadLaneId", "joinPolicy", "peerMessaging", "deadline", "fingerprint", "members",
+    "teamId", "leadLaneId", "joinPolicy", "peerMessaging", "fingerprint", "members",
   ]);
   exactKeys(item, ["teamId", "leadLaneId", "joinPolicy", "peerMessaging", "deadline", "fingerprint", "members"], path);
   teamId(item.teamId, `${path}.teamId`);
   string(item.leadLaneId, `${path}.leadLaneId`, false);
   oneOf(item.joinPolicy, `${path}.joinPolicy`, ["all-terminal", "deadline-best-effort"] as const);
   oneOf(item.peerMessaging, `${path}.peerMessaging`, ["team-members", "lead-only"] as const);
-  dateTime(item.deadline, `${path}.deadline`);
+  if (item.deadline !== undefined) dateTime(item.deadline, `${path}.deadline`);
+  if (item.joinPolicy === "deadline-best-effort" && item.deadline === undefined) {
+    invalid(`${path}.deadline`, "a deadline for deadline-best-effort joins");
+  }
   string(item.fingerprint, `${path}.fingerprint`, false);
   if ((item.fingerprint as string).length > 256) invalid(`${path}.fingerprint`, "at most 256 characters");
   if (!Array.isArray(item.members) || item.members.length === 0 || item.members.length > 16) {
@@ -357,6 +381,43 @@ function teamOutcome(item: Record<string, unknown>, path: string): void {
       invalid(path, "a failure without a successful or partial result");
     }
   }
+}
+
+function taskRequestPayload(value: unknown, path: string): void {
+  const task = payloadObject(value, path, ["type", "taskId", "goal", "inputRefs", "budget"]);
+  exactKeys(task, ["type", "taskId", "goal", "inputRefs", "budget", "spawnContext"], path);
+  oneOf(task.type, `${path}.type`, ["task.request"] as const);
+  taskId(task.taskId, `${path}.taskId`);
+  goal(task.goal, `${path}.goal`);
+  boundedArtifactRefs(task.inputRefs, `${path}.inputRefs`);
+  taskBudget(task.budget, `${path}.budget`);
+  if (task.spawnContext !== undefined) validateSpawnContext(task.spawnContext);
+}
+
+function teamRunReport(value: unknown, path: string): void {
+  const item = payloadObject(value, path, [
+    "teamId", "taskId", "laneId", "assignmentVersion", "kind", "summary",
+    "artifactRefs", "openQuestions",
+  ]);
+  exactKeys(item, [
+    "teamId", "taskId", "laneId", "assignmentVersion", "kind", "summary",
+    "artifactRefs", "openQuestions", "result", "failure",
+  ], path);
+  teamId(item.teamId, `${path}.teamId`);
+  taskId(item.taskId, `${path}.taskId`);
+  string(item.laneId, `${path}.laneId`, false);
+  integer(item.assignmentVersion, `${path}.assignmentVersion`, 1);
+  oneOf(item.kind, `${path}.kind`, ["checkpoint", "ready-for-review", "blocked", "failed"] as const);
+  string(item.summary, `${path}.summary`, false);
+  boundedArtifactRefs(item.artifactRefs, `${path}.artifactRefs`);
+  stringArray(item.openQuestions, `${path}.openQuestions`);
+  if (item.result !== undefined) {
+    teamOutcome({ taskId: item.taskId, outcome: (item.result as Record<string, unknown>).status === "partial" ? "partial" : "succeeded", result: item.result }, `${path}.result`);
+  }
+  if (item.failure !== undefined) {
+    teamOutcome({ taskId: item.taskId, outcome: "failed", failure: item.failure }, `${path}.failure`);
+  }
+  if (item.result !== undefined && item.failure !== undefined) invalid(path, "at most one of result or failure");
 }
 
 function runPolicy(value: unknown, path: string): asserts value is RunPolicy {
@@ -912,7 +973,7 @@ function a2aMessage(value: unknown, path: string): asserts value is A2AMessage {
       {
         const budget = payload.budget as TaskBudget;
         const deadline = budget.deadline;
-        if (deadline !== undefined) {
+        if (deadline !== undefined && budget.maxWallClockMs !== undefined) {
           const expectedDeadline = Date.parse(item.createdAt as string)
             + budget.maxWallClockMs;
           if (Date.parse(deadline) !== expectedDeadline) {
@@ -1284,6 +1345,82 @@ const payloadValidators = {
     teamId(item.teamId, `${path}.teamId`);
     oneOf(item.disposition, `${path}.disposition`, ["accepted", "rejected"] as const);
     if (item.summaryRef !== undefined) artifactRef(item.summaryRef, `${path}.summaryRef`);
+  },
+  "team.task.assigned": (value, path) => {
+    const item = payloadObject(value, path, [
+      "teamId", "taskId", "memberId", "laneId", "assignmentVersion", "task", "assignedBy",
+      "operationId",
+    ]);
+    exactKeys(item, [
+      "teamId", "taskId", "memberId", "laneId", "assignmentVersion", "task", "assignedBy",
+      "operationId",
+    ], path);
+    teamId(item.teamId, `${path}.teamId`);
+    taskId(item.taskId, `${path}.taskId`);
+    teamId(item.memberId, `${path}.memberId`);
+    string(item.laneId, `${path}.laneId`, false);
+    integer(item.assignmentVersion, `${path}.assignmentVersion`, 1);
+    taskRequestPayload(item.task, `${path}.task`);
+    if ((item.task as Record<string, unknown>).taskId !== item.taskId) {
+      invalid(`${path}.task.taskId`, "equal to taskId");
+    }
+    string(item.assignedBy, `${path}.assignedBy`, false);
+    string(item.operationId, `${path}.operationId`, false);
+  },
+  "team.run.reported": (value, path) => {
+    const item = payloadObject(value, path, [
+      "teamId", "taskId", "laneId", "assignmentVersion", "kind", "summary",
+      "artifactRefs", "openQuestions", "reportId", "runId",
+    ]);
+    exactKeys(item, [
+      "teamId", "taskId", "laneId", "assignmentVersion", "kind", "summary",
+      "artifactRefs", "openQuestions", "result", "failure", "reportId", "runId",
+    ], path);
+    teamRunReport({
+      teamId: item.teamId, taskId: item.taskId, laneId: item.laneId,
+      assignmentVersion: item.assignmentVersion, kind: item.kind, summary: item.summary,
+      artifactRefs: item.artifactRefs, openQuestions: item.openQuestions,
+      ...(item.result === undefined ? {} : { result: item.result }),
+      ...(item.failure === undefined ? {} : { failure: item.failure }),
+    }, path);
+    string(item.reportId, `${path}.reportId`, false);
+    string(item.runId, `${path}.runId`, false);
+  },
+  "team.message.sent": (value, path) => {
+    const item = payloadObject(value, path, [
+      "teamId", "channelId", "sequence", "fromLane", "threadId", "body",
+      "mentions", "artifactRefs", "operationId",
+    ]);
+    teamId(item.teamId, `${path}.teamId`);
+    string(item.channelId, `${path}.channelId`, false);
+    integer(item.sequence, `${path}.sequence`, 1);
+    string(item.fromLane, `${path}.fromLane`, false);
+    if (item.threadId !== undefined) string(item.threadId, `${path}.threadId`, false);
+    string(item.body, `${path}.body`, false);
+    if ((item.body as string).length > 8_192) invalid(`${path}.body`, "at most 8192 characters");
+    if (!Array.isArray(item.mentions) || item.mentions.length > 16) {
+      invalid(`${path}.mentions`, "an array of at most 16 lane ids");
+    }
+    const mentions = new Set<string>();
+    for (const [index, mention] of (item.mentions as unknown[]).entries()) {
+      string(mention, `${path}.mentions[${index}]`, false);
+      if (mentions.has(mention as string)) invalid(`${path}.mentions[${index}]`, "unique mentions");
+      mentions.add(mention as string);
+    }
+    if (!Array.isArray(item.artifactRefs) || item.artifactRefs.length > 32) {
+      invalid(`${path}.artifactRefs`, "an array of at most 32 artifact refs");
+    }
+    for (const [index, ref] of (item.artifactRefs as unknown[]).entries()) {
+      artifactRef(ref, `${path}.artifactRefs[${index}]`);
+    }
+    string(item.operationId, `${path}.operationId`, false);
+  },
+  "team.closed": (value, path) => {
+    const item = payloadObject(value, path, ["teamId", "reason", "closedBy"]);
+    exactKeys(item, ["teamId", "reason", "closedBy"], path);
+    teamId(item.teamId, `${path}.teamId`);
+    string(item.reason, `${path}.reason`, false);
+    string(item.closedBy, `${path}.closedBy`, false);
   },
   "step.started": (value, path) => {
     const item = payloadObject(value, path, ["step"]);
@@ -1776,6 +1913,23 @@ const payloadValidators = {
     string(item.messageId, `${path}.messageId`, false);
     string(item.claimedBy, `${path}.claimedBy`, false);
   },
+  "message.reclaimed": (value, path) => {
+    const item = payloadObject(value, path, [
+      "messageId", "reclaimedBy", "previousClaimId", "previousClaimedBy",
+      "previousClaimedAt", "previousAttempt", "reason",
+    ]);
+    exactKeys(item, [
+      "messageId", "reclaimedBy", "previousClaimId", "previousClaimedBy",
+      "previousClaimedAt", "previousAttempt", "reason",
+    ], path);
+    string(item.messageId, `${path}.messageId`, false);
+    string(item.reclaimedBy, `${path}.reclaimedBy`, false);
+    string(item.previousClaimId, `${path}.previousClaimId`, false);
+    string(item.previousClaimedBy, `${path}.previousClaimedBy`, false);
+    dateTime(item.previousClaimedAt, `${path}.previousClaimedAt`);
+    integer(item.previousAttempt, `${path}.previousAttempt`, 1);
+    string(item.reason, `${path}.reason`, false);
+  },
   "message.handled": (value, path) => {
     const item = payloadObject(value, path, ["messageId"]);
     string(item.messageId, `${path}.messageId`, false);
@@ -2111,13 +2265,13 @@ const payloadValidators = {
       }
     }
   },
-} satisfies Record<EventType, PayloadValidator>;
+} satisfies Record<EventType, PayloadValidator> & Record<"team.task.assigned" | "team.run.reported", PayloadValidator>;
 
-export const eventTypes = new Set<EventType>(
-  Object.keys(payloadValidators) as EventType[],
+export const eventTypes = new Set<string>(
+  Object.keys(payloadValidators),
 );
 
-export function validateEventPayload(type: EventType, value: unknown): void {
+export function validateEventPayload(type: EventType | "team.task.assigned" | "team.run.reported", value: unknown): void {
   payloadValidators[type](value, `payload(${type})`);
 }
 

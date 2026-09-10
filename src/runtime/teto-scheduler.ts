@@ -311,7 +311,7 @@ export class TetoScheduler {
           this.tetoLaneId,
           decision.mainCallIndex,
         );
-        if (this.runTokenBudget.reserve(runReservationId, reservationTokens) === undefined) {
+        if (this.runTokenBudget.reserve(runReservationId, reservationTokens, { priority: "auxiliary" }) === undefined) {
           this.tokenGate.cancel(reservationId);
           this.cadence.skipPass(decision.mainCallIndex);
           wakePending = false;

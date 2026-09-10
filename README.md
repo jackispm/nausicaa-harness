@@ -18,11 +18,13 @@
 ## 中文说明
 
 Nausicaa 让模型在不同职责、上下文和节奏的 Lane 之间协作，按任务组织动态拓扑。
-Agent 的对外身份是 **Nausicaa**；`main`、Team member、Worker 是运行角色和通信地址。
+根 Agent 的对外身份是 **Nausicaa**，本 Run 内的公开 A2A 地址为 `nausicaa`。
+团队成员使用自己的名字；辅助观察者的身份是 **Teto**。
 
-- **Teto**：独立的感知与思考 Lane，默认开启，观察主 Agent 的公开行为并提供
-  第二视角。主 Agent 可通过已授权的控制工具关闭或重新开启；
-  Teto 的观察与反馈权限独立于主 Agent 的执行权限。
+- **Teto**：默认开启的辅助观察 Lane，只观察订阅到的部分行为，关注用户意图偏离
+  和可改进的方案；默认不打扰所属 Agent，仅在新的高价值建议能影响
+  下一步决策时主动通过 A2A 提醒。
+  所属 Agent 可通过已授权的控制工具关闭或重新开启 Teto。
 - **Lane**：每个 Agent 都是可寻址、可恢复、拥有独立上下文和生命周期的执行单位。
 - **多拓扑**：主 Agent、Teto、Worker、Team member 以及跨 Run A2A 可以按任务自然组合；
   Team member 也可以按需开启自己的 Teto。
@@ -30,15 +32,27 @@ Agent 的对外身份是 **Nausicaa**；`main`、Team member、Worker 是运行�
   不可妥协的事实。
 
 ```text
-Nausicaa (primary lane: main)
-|- observes Teto
-|- delegates Team:research
-|  `- observes Teto
-|- delegates Worker:tests
-`- A2A -> another Run
+Nausicaa (lane: nausicaa)
+|- Teto (observes Nausicaa)
+|- Team research (lead: Nausicaa)
+|  |- researcher
+|  |  `- Teto (observes researcher)
+|  `- reviewer
+|- worker 1 (delegated task)
+`- A2A <-> another Run
 ```
 
-当前版本：`0.1.3` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
+创建团队时，主管可用 `members[].memberId` 命名成员，例如 `researcher`、`reviewer`。
+未命名的成员默认使用 `worker-1`、`worker-2` 等标识，显示为 `worker 1`、`worker 2`。
+不同团队可以重名，发 A2A 消息时应使用工具返回的完整 `laneId`。
+Team 的主管由实际创建它的 lane 决定，负责汇总和判断结果。
+详见 [Team 协作合同](docs/team-collaboration.md)。
+
+主管无需为成员填写 token 预算、轮数或总时长限制。新任务也没有隐藏的“两轮结束”
+或“30 分钟截止”默认值。交互会话保持打开时，主管可以先结束当前轮次；成员继续工作，
+结果返回后主管自动继续协调。关闭会话或取消任务会停止相关工作。
+
+当前版本：`0.1.4` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
 edge 集成仍在完善。
 
 ### 快速开始
@@ -67,7 +81,7 @@ Ctrl+Left/Right 切页时保留搜索、选择和 MCP 草稿；聊天内容暂�
   切到 All 浏览完整目录。未选择模型时，登录成功会打开对应服务商的模型列表。
 - `/thinking [level|default]`（别名 `/effort`）选择当前模型支持的思考强度。
   每档附有说明，选择后模型旁显示 `模型名 • medium` 等标记。
-  设置随当前会话保存，从下一次 Main 请求生效，不修改 Teto 或 Worker；
+  设置随当前会话保存，从下一次 Nausicaa 请求生效，不修改 Teto 或 Worker；
   `default` 使用服务商默认值，不把所有模型的默认值假定为 medium。
 - `/logout [provider]` 移除本地保存的凭据，不会删除环境变量中的密钥。
 
@@ -111,6 +125,15 @@ CLI：`--print` 单次回答，`--json` 输出事件，`--continue` 恢复最近
 创建新 Run 时可用 `nausicaa --main-only` 或配置 `tetoEnabled: false` 禁用 Teto。
 Worker 默认可按需委派，`--no-worker` 可禁用。
 
+Teto 订阅 `user.message`、`assistant.message` 和 `tool.requested` 的公开投影，
+因此看到的是部分行为，不是所属 Agent 的完整上下文。它辅助检查是否偏离用户意图，
+以及当前方案是否存在明显不足或更好的做法。所属 Agent 可以是根
+Nausicaa，也可以是有自己名字的团队成员。
+
+Teto 默认对所属 Agent 保持沉默，但可以在自己的对话记录中记下简短观察。
+只有新的高价值建议时，它才主动发 A2A；直接收到 A2A 协作请求时，可以作实质性答复。
+订阅内容是观察资料，不是交给 Teto 执行的用户任务。
+
 内置 `codebase-map`、`task-plan`、`code-review` 三个 Skill，项目或配置来源的同名 Skill 优先。
 默认发现项目内 `.agents/skills`、`.pi/skills`、`skills`；不会自动扫描
 `~/.agents/skills` 或 `~/.codex/skills`。添加项目 Skill 时可使用
@@ -139,14 +162,16 @@ npm link
 ## English
 
 Nausicaa lets models collaborate across Lanes with different roles, contexts,
-and cadences, organizing their topology around the task. The Agent's public
-identity is **Nausicaa**; `main`, Team member, and Worker describe runtime roles
-and addresses.
+and cadences, organizing their topology around the task. The root Agent's public
+identity is **Nausicaa**, with the public in-Run A2A address `nausicaa`. Team members
+use their own names; the auxiliary observer's identity is **Teto**.
 
-- **Teto**: an independent sensing and thinking Lane enabled by default. It
-  observes the primary Agent's public behavior and offers a second perspective.
-  The primary Agent may stop or restart it through the authorized controls;
-  Teto's observation and feedback permissions are separate from the primary Agent's execution authority.
+- **Teto**: an auxiliary observer enabled by default. It follows subscribed
+  portions of its owner's activity, watching for intent drift and improvements
+  to the current solution. It is quiet toward its owner
+  by default, sending unsolicited A2A advice only when new, high-value guidance
+  could affect the next decision. Its owner may stop or restart it
+  through the authorized controls.
 - **Lane**: an addressable, resumable execution unit with its own context and
   lifecycle.
 - **Multi-topology**: the primary Agent, Teto, Worker, Team members, and cross-Run
@@ -155,15 +180,38 @@ and addresses.
   non-negotiable facts of identity, authority, durability, and recovery.
 
 ```text
-Nausicaa (primary lane: main)
-|- observes Teto
-|- delegates Team:research
-|  `- observes Teto
-|- delegates Worker:tests
-`- A2A -> another Run
+Nausicaa (lane: nausicaa)
+|- Teto (observes Nausicaa)
+|- Team research (lead: Nausicaa)
+|  |- researcher
+|  |  `- Teto (observes researcher)
+|  `- reviewer
+|- worker 1 (delegated task)
+`- A2A <-> another Run
 ```
 
-Current version: `0.1.3` beta. Core runtime contracts have offline test coverage;
+The lead can name members through `members[].memberId`, for example `researcher`
+or `reviewer`. Unnamed members receive IDs such as `worker-1` and `worker-2`,
+displayed as `worker 1` and `worker 2`. Names may repeat across Teams; use the
+full `laneId` returned by the tools for A2A messages. A Team's actual creating
+lane is its lead and owns synthesis and acceptance.
+See the [Team collaboration contract](docs/team-collaboration.md).
+
+Members start with independent contexts and, by default, inherit the Team
+Lead's host-authorized workspace tool catalog. The lead can narrow a member
+with `members[].capabilities.tools` and allow or deny nested Team creation with
+`members[].capabilities.allowNestedTeam`; these are enforced permissions, not
+prompt text. Nested Teams are limited to depth three. A member uses
+`team_message` for its parent Team channel and `child_team_message` for a
+nested Team channel.
+
+The lead does not assign token, call-count, or duration budgets to members. New
+tasks also have no implicit two-call or 30-minute cutoff. In an open interactive
+session, the lead may finish its current turn while members keep working;
+durable reports automatically resume coordination. Session closure or task
+cancellation stops the corresponding work.
+
+Current version: `0.1.4` beta. Core runtime contracts have offline test coverage;
 provider, daemon, RPC, and edge integrations are still evolving.
 
 ### Quick start
@@ -197,7 +245,7 @@ searches, selections, or MCP drafts. The conversation is hidden until you leave.
   selected, successful login opens that provider's models.
 - `/thinking [level|default]` (alias `/effort`) selects a level supported by the
   current model, with descriptions for each level and a `model • medium` label
-  after selection. It persists with this session and applies to the next Main
+  after selection. It persists with this session and applies to the next Nausicaa
   request, without changing Teto or Worker. `default` retains the provider default;
   it does not assume every model defaults to medium.
 - `/logout [provider]` removes a saved credential without changing environment keys.
@@ -245,6 +293,18 @@ restarts or resumes. Plan mode retains its read-only boundary and omits these
 controls. To disable Teto when creating a Run, use `nausicaa --main-only` or set
 `tetoEnabled: false`. Worker delegation is available on demand by default;
 `--no-worker` disables it.
+
+Teto receives public projections of subscribed `user.message`, `assistant.message`,
+and `tool.requested` events, giving it a partial view of its owner's activity.
+It watches for deviations from user intent and improvements to the current
+solution. Its owner can be the root Nausicaa
+or a Team member with its own name.
+
+Teto stays quiet toward its owner by default and may keep brief observations
+in its own transcript. It sends unsolicited A2A advice only when it has new,
+high-value guidance. It may also give substantive replies to direct A2A
+coordination requests. Subscribed content is observation material, not
+a user task assigned to Teto.
 
 Three Skills are bundled: `codebase-map`, `task-plan`, and `code-review`.
 Same-name project or configured Skills take precedence. Discovery includes

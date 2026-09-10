@@ -557,7 +557,7 @@ export class LedgerState {
       }
     }
 
-    if (event.type === "message.claimed" || event.type === "message.handled") {
+    if (event.type === "message.claimed" || event.type === "message.reclaimed" || event.type === "message.handled") {
       const messageId = event.payload.messageId;
       const scope = messageScope(event.runId, messageId);
       if (!this.#sentMessages.has(scope)) {
@@ -568,6 +568,11 @@ export class LedgerState {
       if (event.type === "message.claimed" && event.payload.claimedBy !== event.laneId) {
         throw new LedgerCorruptionError(
           `Claim for ${messageId} must be emitted by its claiming lane`,
+        );
+      }
+      if (event.type === "message.reclaimed" && event.payload.reclaimedBy !== event.laneId) {
+        throw new LedgerCorruptionError(
+          `Reclaim for ${messageId} must be emitted by its reclaiming lane`,
         );
       }
     }

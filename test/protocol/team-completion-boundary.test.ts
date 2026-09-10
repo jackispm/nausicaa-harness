@@ -34,7 +34,7 @@ function creationResponse(): ModelResponse {
     ...response("Starting evidence review"), stopReason: "toolUse",
     toolCalls: [{
       id: "create-team", name: "team_create",
-      arguments: { teamId: "review", members: [{ memberId: "evidence", statement: "Inspect the evidence", maxModelTokens: 12_000, maxWallClockMs: 5_000, maxAttempts: 2 }] },
+      arguments: { teamId: "review", members: [{ memberId: "evidence", statement: "Inspect the evidence" }] },
     }],
   };
 }
@@ -47,7 +47,7 @@ function completionModels(events: readonly AnyEvent[]) {
       const text = request.messages.map((message) => message.content).join("\n");
       expect(text).toContain("Delayed member evidence: checked authentication");
       expect(text).toContain("Team review joined");
-      expect(events.some((event) => event.type === "run.completed" || event.type === "turn.completed")).toBe(false);
+      expect(events.some((event) => event.type === "run.completed")).toBe(false);
       return {
         ...response("Accepting the reviewed evidence"), stopReason: "toolUse",
         toolCalls: [{ id: "accept-team", name: "team_present", arguments: { teamId: "review", disposition: "accepted" } }],
@@ -61,7 +61,7 @@ function completionModels(events: readonly AnyEvent[]) {
       memberRequests.push(request);
       expect(request.messages.map((message) => message.content).join("\n")).not.toContain("PRIVATE-MAIN-CONTEXT");
       await delay(650);
-      expect(events.some((event) => event.type === "run.completed" || event.type === "turn.completed")).toBe(false);
+      expect(events.some((event) => event.type === "run.completed")).toBe(false);
       return response("Delayed member evidence: checked authentication");
     },
   };
@@ -72,6 +72,12 @@ async function temporaryDirectory(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "nausicaa-team-completion-"));
   temporaryDirectories.push(directory);
   return directory;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => { resolve = complete; });
+  return { promise, resolve };
 }
 
 describe("Team completion boundaries", () => {
@@ -94,7 +100,7 @@ describe("Team completion boundaries", () => {
     assertCompletionOrder(events, "run.completed");
   }, 15_000);
 
-  it("interactive Main consumes Team results before completing its current turn", async () => {
+  it("interactive Main can finish while Team work continues and resumes after a member report", async () => {
     const root = await temporaryDirectory();
     const events: AnyEvent[] = [];
     const models = completionModels(events);
@@ -108,11 +114,201 @@ describe("Team completion boundaries", () => {
     try {
       await session.submit({ inputId: "review-input", text: "PRIVATE-MAIN-CONTEXT: coordinate this review" });
       await session.waitForIdle();
+      // The interactive Turn is complete while the member remains live. Its
+      // durable report later schedules a fresh Main continuation.
+      expect(models.main.requests).toHaveLength(2);
+      expect(events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+      await delay(800);
+      await session.waitForIdle();
       expect(models.main.requests).toHaveLength(4);
       expect(models.memberRequests).toHaveLength(1);
-      assertCompletionOrder(events, "turn.completed");
+      expect(events.filter((event) => event.type === "turn.completed")).toHaveLength(2);
+      expect(events.some((event) => event.type === "team.joined")).toBe(true);
+      expect(events.some((event) => event.type === "team.presented")).toBe(true);
       expect(events.some((event) => event.type === "run.completed")).toBe(false);
     } finally {
+      await session.close();
+    }
+  }, 15_000);
+
+  it("does not wake a cancelled Main Turn when a fenced member settles late", async () => {
+    const root = await temporaryDirectory();
+    let markWorkerStarted: (() => void) | undefined;
+    const workerStarted = new Promise<void>((resolve) => { markWorkerStarted = resolve; });
+    let releaseWorker: ((value: ModelResponse) => void) | undefined;
+    const worker: ModelPort = {
+      async complete() {
+        markWorkerStarted?.();
+        return new Promise<ModelResponse>((resolve) => { releaseWorker = resolve; });
+      },
+    };
+    const main = new ScriptedModel([
+      creationResponse(),
+      response("The Team is still working"),
+      response("A cancelled Team must not restart this Turn"),
+    ]);
+    const events: AnyEvent[] = [];
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted-main",
+      workerModel: "scripted-member",
+      policy,
+    }, {
+      mainModel: main,
+      workerModel: worker,
+      tools: [],
+      workerTools: [],
+      clock,
+      createRunId: () => "cancelled-team-wake",
+    });
+    session.subscribe((event) => { if (event.kind === "event") events.push(event.event); });
+    try {
+      await session.submit({ inputId: "cancelled-team-input", text: "Start a Team" });
+      await workerStarted;
+      await session.waitForIdle();
+      expect(main.requests).toHaveLength(2);
+
+      await session.cancel("stop the Team");
+      // Resolve a provider that ignored the cancellation signal. The branch
+      // is fenced, so its late result must not schedule a fresh Main Turn.
+      releaseWorker?.(response("late result after cancellation"));
+      await delay(100);
+      await session.waitForIdle();
+
+      expect(main.requests).toHaveLength(2);
+      expect(events.some((event) => event.type === "team.cancelled")).toBe(true);
+      expect(events.filter((event) => event.type === "input.admitted" && event.payload.inputId.startsWith("team-report-"))).toHaveLength(0);
+    } finally {
+      await session.close();
+    }
+  }, 15_000);
+
+  it("coalesces ten staggered member reports across an idle lead, a busy continuation, and completion cleanup", async () => {
+    const root = await temporaryDirectory();
+    const events: AnyEvent[] = [];
+    const memberIds = Array.from({ length: 10 }, (_, index) => `worker-${index + 1}`);
+    const memberGates = new Map(memberIds.map((memberId) => [memberId, deferred<ModelResponse>()]));
+    const memberReports = new Map(memberIds.map((memberId) => [memberId, deferred<void>()]));
+    const allMembersStarted = deferred<void>();
+    const firstContinuationStarted = deferred<void>();
+    const finishBusyRequest = deferred<void>();
+    const startedMembers = new Set<string>();
+    const mainRequests: ModelRequest[] = [];
+    let completedMainTurns = 0;
+    let lastReportSawMainRunning = false;
+    const worker: ModelPort = {
+      async complete(request) {
+        const memberId = request.laneId.split(":").at(-1)!;
+        const gate = memberGates.get(memberId);
+        if (gate === undefined) throw new Error(`Unexpected member lane ${request.laneId}`);
+        startedMembers.add(memberId);
+        if (startedMembers.size === memberIds.length) allMembersStarted.resolve();
+        return gate.promise;
+      },
+    };
+    const main: ModelPort = {
+      async complete(request) {
+        mainRequests.push(request);
+        if (mainRequests.length === 1) {
+          return {
+            ...response("Start ten independent inspections"),
+            stopReason: "toolUse",
+            toolCalls: [{
+              id: "create-ten-members",
+              name: "team_create",
+              arguments: {
+                teamId: "staggered",
+                members: memberIds.map((memberId) => ({ memberId, statement: `Inspect ${memberId}` })),
+              },
+            }],
+          };
+        }
+        if (mainRequests.length === 2) return response("Lead work complete; members continue asynchronously");
+        if (mainRequests.length === 3) {
+          firstContinuationStarted.resolve();
+          await finishBusyRequest.promise;
+        }
+        return response("Reviewed the available member reports");
+      },
+    };
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted-main",
+      workerModel: "scripted-member",
+      policy: { tetoEnabled: false, workerEnabled: false, maxMainStepsPerActivation: 5 },
+    }, {
+      mainModel: main,
+      workerModel: worker,
+      tools: [],
+      workerTools: [],
+      clock,
+      createRunId: () => "staggered-team-wake",
+      async commitExecutionLease(operation) {
+        const result = await operation();
+        const event = result as AnyEvent;
+        if (event.type === "turn.completed" && event.laneId === "main") {
+          completedMainTurns += 1;
+          if (completedMainTurns === 2) {
+            // The completion is durable, but its caller still owns Main's
+            // execution slot. Deliver the last report inside this window.
+            memberGates.get("worker-10")!.resolve(response("Evidence from worker-10"));
+            await memberReports.get("worker-10")!.promise;
+          }
+        }
+        return result;
+      },
+    });
+    session.subscribe((event) => {
+      if (event.kind !== "event") return;
+      events.push(event.event);
+      if (event.event.type === "message.sent" && event.event.payload.message.payload.type === "task.result") {
+        const memberId = event.event.payload.message.from.split(":").at(-1)!;
+        if (memberId === "worker-10") lastReportSawMainRunning = session.snapshot().status === "running";
+        memberReports.get(memberId)?.resolve();
+      }
+    });
+    try {
+      await session.submit({ inputId: "staggered-input", text: "Coordinate ten independent inspections" });
+      await allMembersStarted.promise;
+      await session.waitForIdle();
+      expect(mainRequests).toHaveLength(2);
+      expect(session.snapshot().status).toBe("idle");
+
+      for (const memberId of ["worker-1", "worker-2", "worker-3"]) {
+        memberGates.get(memberId)!.resolve(response(`Evidence from ${memberId}`));
+      }
+      await firstContinuationStarted.promise;
+      for (const memberId of ["worker-8", "worker-5", "worker-9", "worker-4", "worker-7", "worker-6"]) {
+        memberGates.get(memberId)!.resolve(response(`Evidence from ${memberId}`));
+        await memberReports.get(memberId)!.promise;
+      }
+      expect(session.snapshot().status).toBe("running");
+      finishBusyRequest.resolve();
+      await session.waitForIdle();
+
+      const results = events.filter((event) => event.type === "message.sent" && event.payload.message.payload.type === "task.result");
+      expect(results).toHaveLength(10);
+      const committedMessageIds = events.flatMap((event) => event.type === "step.completed" && event.laneId === "main"
+        ? event.payload.boundaryMessageIds ?? [] : []);
+      for (const event of results) {
+        if (event.type !== "message.sent") throw new Error("Expected a result message");
+        expect(committedMessageIds.filter((messageId) => messageId === event.payload.message.messageId)).toHaveLength(1);
+      }
+      expect(lastReportSawMainRunning).toBe(true);
+      expect(events.filter((event) => event.type === "team.member.settled" && event.payload.outcome === "succeeded")).toHaveLength(10);
+      expect(events.filter((event) => event.type === "input.admitted" && event.payload.inputId.startsWith("team-report-"))).toHaveLength(2);
+      expect(events.filter((event) => event.type === "turn.completed")).toHaveLength(3);
+      expect(events.some((event) => event.type === "turn.failed" || event.type === "turn.waiting")).toBe(false);
+      expect(session.snapshot().status).toBe("idle");
+      const settledRequests = mainRequests.length;
+      await delay(50);
+      await session.waitForIdle();
+      expect(mainRequests).toHaveLength(settledRequests);
+    } finally {
+      finishBusyRequest.resolve();
+      for (const gate of memberGates.values()) gate.resolve(response("test cleanup"));
       await session.close();
     }
   }, 15_000);

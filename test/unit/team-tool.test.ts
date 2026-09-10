@@ -7,10 +7,15 @@ import { assertSupportedSchema, validateArguments } from "../../src/mowe/admissi
 import type { TeamBoard } from "../../src/runtime/team-board.js";
 import {
   createTeamCancelTool,
+  createTeamAssignTool,
+  createTeamCloseTool,
+  createTeamHistoryTool,
+  createTeamMessageTool,
   createTeamPresentTool,
   createTeamReduceTool,
   createTeamStatusTool,
   createTeamTool,
+  createTaskWaitTool,
   normalizeTeamCreateRequest,
   type TeamControl,
   type TeamCreateRequest,
@@ -59,15 +64,46 @@ function statusBoard(): TeamBoard {
     definition: { teamId: "review", leadLaneId: "main", joinPolicy: "all-terminal", peerMessaging: "team-members",
       deadline: budget.deadline, fingerprint: "fingerprint-review", members: [definition] },
     joinPolicy: "all-terminal", status: "running", joinReady: false, joinSatisfied: false, joinState: "waiting",
-    cancellationRequested: false, reductionState: "not-started", presentationState: "pending",
+    cancellationRequested: false, lifecycleState: "open", reductionState: "not-started", presentationState: "pending",
     members: [member], branches: [member], anomalies: [], lastOffset: 42,
   };
 }
 
 describe("Team tool creation contract", () => {
+  it("keeps public channel, history, and close operations small and bounded", async () => {
+    const message = vi.fn(async () => ({
+      status: "sent" as const, messageId: "event-1", teamId: "review", channelId: "general",
+      sequence: 1, fromLane: "main", body: "hello", mentions: [], artifactRefs: [], cursor: "tc1-cursor",
+    }));
+    const history = vi.fn(async () => ({ teamId: "review", channelId: "general", messages: [], hasMore: false }));
+    const close = vi.fn(async () => ({ teamId: "review", status: "closed" as const }));
+    const control: TeamControl = { create: vi.fn(async () => ({ teamId: "review", branches: [] })), message, history, close };
+    const messageTool = createTeamMessageTool(control);
+    const historyTool = createTeamHistoryTool(control);
+    const closeTool = createTeamCloseTool(control);
+    expect((await messageTool.execute({ teamId: "review", body: "hello", mentions: ["security"] }, context)).isError).toBe(false);
+    expect(message).toHaveBeenCalledWith(expect.objectContaining({ teamId: "review", body: "hello", mentions: ["security"] }), context);
+    expect((await historyTool.execute({ teamId: "review", limit: 64 }, context)).isError).toBe(false);
+    expect((await closeTool.execute({ teamId: "review", reason: "done" }, context)).isError).toBe(false);
+    expect(() => messageTool.definition.parameters?.properties?.body).not.toBeUndefined();
+  });
+
+  it("exposes resident assignment and wait without model-owned budgets", async () => {
+    const assign = vi.fn(async () => ({ teamId: "review", taskId: "review:security:task-1", memberId: "security", laneId: "team:review:security", assignmentVersion: 1, status: "queued" as const }));
+    const wait = vi.fn(async () => ({ teamId: "review", taskId: "review:security:task-1", status: "waiting", waiting: true }));
+    const control: TeamControl = { create: vi.fn(async () => ({ teamId: "review", branches: [] })), assign, wait };
+    const assignTool = createTeamAssignTool(control);
+    const waitTool = createTaskWaitTool(control);
+    expect(validateArguments(assignTool, { teamId: "review", memberId: "security", statement: "Continue review" }).ok).toBe(true);
+    expect(validateArguments(assignTool, { teamId: "review", memberId: "security", statement: "Continue review", maxModelTokens: 1 }).ok).toBe(false);
+    expect((await assignTool.execute({ teamId: "review", memberId: "security", statement: "Continue review" }, context)).isError).toBe(false);
+    expect((await waitTool.execute({ teamId: "review", taskId: "review:security:task-1" }, context)).isError).toBe(false);
+    expect(assign).toHaveBeenCalledWith({ teamId: "review", memberId: "security", statement: "Continue review" }, context);
+  });
+
   it("canonicalizes members and legacy branches to the same bounded request", async () => {
     const { tool, create } = setup();
-    const common = { statement: "Inspect auth", successCriteria: ["Report evidence"], maxModelTokens: 1_000 };
+    const common = { statement: "Inspect auth" };
     const canonical = { teamId: "review", members: [{ memberId: "Security", ...common }] };
     const legacy = { teamId: "review", branches: [{ branchId: "security", ...common }] };
 
@@ -82,6 +118,7 @@ describe("Team tool creation contract", () => {
         memberId: "security",
         branchId: "security",
         ...common,
+        successCriteria: [],
         hardConstraints: [],
         dependsOn: [],
         required: true,
@@ -136,8 +173,24 @@ describe("Team tool creation contract", () => {
     expect(validateArguments(tool, { branches: [{ statement: "Inspect auth" }] }).ok).toBe(true);
     expect(validateArguments(tool, { members: [{ statement: "Inspect auth", tools: ["bash"] }] }).ok).toBe(false);
     expect(validateArguments(tool, { members: [{ statement: "Inspect auth", maxAttempts: MAX_TASK_ATTEMPTS + 1 }] }).ok).toBe(false);
-    expect(tool.definition.description).toMatch(/Main remains Team Lead/);
+    expect(tool.definition.description).toMatch(/You remain Team Lead/);
     expect(tool.definition.description).toMatch(/partial.*not success/);
+  });
+
+  it("accepts an explicit capability narrowing grant", () => {
+    const normalized = normalizeTeamCreateRequest({
+      members: [{
+        memberId: "reviewer",
+        statement: "Review the change",
+        capabilities: { tools: ["read_file"], allowNestedTeam: false },
+      }],
+    });
+    expect(normalized.branches[0]?.capabilities).toEqual({
+      tools: ["read_file"], allowNestedTeam: false,
+    });
+    expect(() => normalizeTeamCreateRequest({
+      members: [{ memberId: "reviewer", statement: "Review", capabilities: { tools: ["bad tool"] } }],
+    })).toThrow(/tool name/);
   });
 
   it.each([
@@ -171,27 +224,26 @@ describe("Team tool creation contract", () => {
     ["invalid join policy", { members: [{ statement: "A" }], joinPolicy: "any-success" }, "joinPolicy"],
     ["null join policy", { members: [{ statement: "A" }], joinPolicy: null }, "joinPolicy"],
     ["invalid messaging policy", { members: [{ statement: "A" }], peerMessaging: "everyone" }, "peerMessaging"],
-    ["missing deadline", { members: [{ statement: "A" }], joinPolicy: "deadline-best-effort" }, "requires an absolute deadline"],
-    ["relative deadline", { members: [{ statement: "A" }], deadline: "in 1 minute" }, "absolute ISO"],
-    ["timezone-free deadline", { members: [{ statement: "A" }], deadline: "2026-09-07T12:00:00" }, "timezone"],
-    ["invalid calendar date", { members: [{ statement: "A" }], deadline: "2026-02-30T12:00:00Z" }, "calendar date"],
     ["empty statement", { members: [{ statement: " " }] }, "non-empty"],
     ["oversized statement", { members: [{ statement: "a".repeat(4_097) }] }, "4096"],
-    ["oversized criteria", { members: [{ statement: "A", successCriteria: Array.from({ length: 65 }, () => "x") }] }, "64 items"],
     ["oversized member id", { members: [{ memberId: "a".repeat(65), statement: "A" }] }, "64 characters"],
     ["reserved member id", { members: [{ memberId: "broadcast", statement: "A" }] }, "reserved"],
-    ["invalid budget", { members: [{ statement: "A", maxModelTokens: 0 }] }, "positive integer"],
-    ["fractional budget", { members: [{ statement: "A", maxWallClockMs: 1.5 }] }, "positive integer"],
-    ["oversized token budget", { members: [{ statement: "A", maxModelTokens: MAX_TASK_MODEL_TOKENS + 1 }] }, "maxModelTokens"],
-    ["oversized time budget", { members: [{ statement: "A", maxWallClockMs: MAX_TASK_WALL_CLOCK_MS + 1 }] }, "maxWallClockMs"],
-    ["oversized attempt budget", { members: [{ statement: "A", maxAttempts: MAX_TASK_ATTEMPTS + 1 }] }, "maxAttempts"],
+    ["reserved root role", { members: [{ memberId: "Nausicaa", statement: "A" }] }, "reserved"],
+    ["reserved legacy root role", { members: [{ memberId: "main", statement: "A" }] }, "reserved"],
+    ["reserved observer role", { members: [{ memberId: "teto", statement: "A" }] }, "reserved"],
+    ["removed success criteria", { members: [{ statement: "A", successCriteria: ["Report evidence"] }] }, "not supported"],
+    ["removed model token budget", { members: [{ statement: "A", maxModelTokens: 1_000 }] }, "not supported"],
+    ["removed wall clock budget", { members: [{ statement: "A", maxWallClockMs: 1_000 }] }, "not supported"],
+    ["removed attempt budget", { members: [{ statement: "A", maxAttempts: 1 }] }, "not supported"],
+    ["removed Team deadline", { members: [{ statement: "A" }], deadline: "2026-09-07T12:00:00Z" }, "not supported"],
+    ["removed join policy", { members: [{ statement: "A" }], joinPolicy: "all-terminal" }, "not supported"],
   ])("rejects %s before host side effects", async (_name, request, expected) => {
     const { tool, create } = setup();
     const result = await tool.execute(request as Record<string, unknown>, context);
     expect(result.isError).toBe(true);
     expect(result.content).toContain(expected);
     expect(create).not.toHaveBeenCalled();
-    expect(() => normalizeTeamCreateRequest(request)).toThrow(expected);
+    if (expected !== "not supported") expect(() => normalizeTeamCreateRequest(request)).toThrow(expected);
   });
 });
 
@@ -240,7 +292,7 @@ describe("Team lifecycle tools", () => {
     const { control } = setup({ reduce, present });
     const reduceTool = createTeamReduceTool(control);
     const presentTool = createTeamPresentTool(control);
-    const request = { teamId: "review", statement: "Resolve conflicting findings", maxModelTokens: 2_000, maxWallClockMs: 10_000, maxAttempts: 4 };
+    const request = { teamId: "review", statement: "Resolve conflicting findings" };
     expect(() => assertSupportedSchema(reduceTool.definition.parameters)).not.toThrow();
     expect(() => assertSupportedSchema(presentTool.definition.parameters)).not.toThrow();
     expect(validateArguments(reduceTool, request).ok).toBe(true);
@@ -251,12 +303,12 @@ describe("Team lifecycle tools", () => {
     expect(present).toHaveBeenCalledWith({ teamId: "review", disposition: "rejected" }, context);
   });
 
-  it.each([0, -1, 1.5, MAX_TASK_ATTEMPTS + 1, "3", null])("rejects an invalid reducer attempt allowance before dispatch: %j", async (maxAttempts) => {
+  it("rejects removed reducer budget controls before dispatch", async () => {
     const reduce = vi.fn();
     const { control } = setup({ reduce });
     const tool = createTeamReduceTool(control);
-    expect(validateArguments(tool, { teamId: "review", maxAttempts }).ok).toBe(false);
-    expect((await tool.execute({ teamId: "review", maxAttempts }, context)).isError).toBe(true);
+    expect(validateArguments(tool, { teamId: "review", maxAttempts: 1 }).ok).toBe(false);
+    expect((await tool.execute({ teamId: "review", maxAttempts: 1 }, context)).isError).toBe(true);
     expect(reduce).not.toHaveBeenCalled();
   });
 
@@ -318,14 +370,14 @@ describe("Team lifecycle tools", () => {
     const parsed = JSON.parse(response.content);
     const status = shape === "envelope" ? parsed.teams[0] : parsed[0];
     expect(status).toMatchObject({
-      runId: "run-1", teamId: "review", leadLaneId: "main", joinPolicy: "all-terminal",
+      runId: "run-1", teamId: "review", leadLaneId: "nausicaa", leadName: "Nausicaa", joinPolicy: "all-terminal",
       deadline: board.definition!.deadline, peerMessaging: "team-members",
       status: "running", joinReady: false, joinSatisfied: false, joinState: "waiting",
       cancellationRequested: false, reductionState: "running", presentationState: "pending", lastOffset: 42,
-      members: [{ memberId: "security", laneId: "team:review:security", taskId: "review:security",
+      members: [{ memberId: "security", name: "security", laneId: "team:review:security", taskId: "review:security",
         statement: "Inspect auth", status: "running", execution: "running", laneStatus: "running", terminal: false,
         registered: true, attempt: 1, dependsOn: [], required: true, anomalies: [] }],
-      reducer: { memberId: "reducer", laneId: "team:review:reducer", taskId: "review:reducer", statement: "Inspect auth" },
+      reducer: { memberId: "reducer", name: "reducer", laneId: "team:review:reducer", taskId: "review:reducer", statement: "Inspect auth" },
     });
     for (const field of ["definition", "branches"]) expect(status).not.toHaveProperty(field);
     for (const field of ["branchId", "lease", "requestMessageId", "acceptedMessageId"]) {
@@ -386,8 +438,8 @@ describe("Team lifecycle tools", () => {
     const response = await createTeamStatusTool(control).execute({}, context);
     expect(response.isError).toBe(false);
     const status = JSON.parse(response.content).teams[0];
-    expect(status).toMatchObject({ teamId: "legacy", leadLaneId: "main", status: "queued", members: [
-      { memberId: "reader", laneId: "team:legacy:reader", taskId: "legacy:reader", status: "queued", terminal: false },
+    expect(status).toMatchObject({ teamId: "legacy", leadLaneId: "nausicaa", leadName: "Nausicaa", status: "queued", members: [
+      { memberId: "reader", name: "reader", laneId: "team:legacy:reader", taskId: "legacy:reader", status: "queued", terminal: false },
     ] });
     expect(status).not.toHaveProperty("branches");
     expect(legacy).not.toHaveProperty("members");

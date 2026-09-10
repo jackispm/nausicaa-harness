@@ -673,9 +673,7 @@ describe("Teto and Team lane architecture", () => {
       branchId: "feature-api-v2",
       laneId: "team:names:feature-api-v2",
     });
-    expect(created.branches[1]?.branchId).toMatch(
-      /^subagent-inspect-generated-naming-a1b2c3d4-[a-f0-9]{8}$/u,
-    );
+    expect(created.members?.[1]).toMatchObject({ memberId: "worker-1", name: "worker 1", laneId: "team:names:worker-1" });
     await team.stop();
   });
 

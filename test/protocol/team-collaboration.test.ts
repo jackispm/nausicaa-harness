@@ -10,7 +10,7 @@ import { annotateTool } from "../../src/mowe/catalog.js";
 import { createScopedSpawnContext } from "../../src/runtime/lane-context.js";
 import { RunTokenBudget } from "../../src/runtime/run-token-budget.js";
 import { TeamRuntime, type TeamRuntimeOptions } from "../../src/runtime/team-runtime.js";
-import type { TeamCreateRequest } from "../../src/runtime/team-tool.js";
+import { createTaskWaitTool, type TeamCreateRequest } from "../../src/runtime/team-tool.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
 
 const RUN_ID = "team-collaboration-run";
@@ -63,6 +63,8 @@ function fixture(options: {
   tools?: readonly AgentTool[];
   onWake?: () => void;
   spawnContext?: TeamRuntimeOptions["spawnContext"];
+  parentLaneId?: string;
+  policy?: RunPolicy;
 } = {}) {
   const clock = options.clock ?? new ManualClock();
   const ledger = options.ledger ?? new MemoryLedger({ clock });
@@ -72,12 +74,13 @@ function fixture(options: {
   let sequence = 0;
   const team = new TeamRuntime({
     eventSink: ledger, inbox, store, model, modelName: "scripted-team", runId: RUN_ID,
-    workspace: process.cwd(), branchTools: options.tools ?? [], policy, clock,
+    workspace: process.cwd(), branchTools: options.tools ?? [], policy: options.policy ?? policy, clock,
     runTokenBudget: new RunTokenBudget(100_000), createId: () => `collaboration-${++sequence}`,
     readEvents: () => ledger.read({ runId: RUN_ID }), readWatermark: () => ledger.watermark(),
     readAwareness: () => ({ version: 1, generatedAt: clock.now().toISOString(), availability: "fresh", nodes: [], edges: [], roots: [], truncated: false }),
     ...(options.onWake === undefined ? {} : { onWake: options.onWake }),
     ...(options.spawnContext === undefined ? {} : { spawnContext: options.spawnContext }),
+    ...(options.parentLaneId === undefined ? {} : { parentLaneId: options.parentLaneId }),
   });
   runtimes.add(team);
   return { team, model, ledger, store, inbox, clock };
@@ -104,13 +107,147 @@ function member(memberId: string, overrides: Record<string, unknown> = {}) {
 }
 
 describe("durable Team collaboration", () => {
+  it("runs new members, follow-up assignments and reducers beyond old time and step caps", async () => {
+    const clock = new ManualClock();
+    const tool = annotateTool({
+      definition: { name: "read_evidence", description: "Read evidence", parameters: { type: "object", properties: {}, additionalProperties: false } },
+      async execute() { return { content: "Verified evidence for the long task", isError: false }; },
+    }, { effect: "read" });
+    const model = new RecordingModel((request, call) => {
+      clock.advance(3 * 60 * 1_000);
+      const taskCall = (call - 1) % 11 + 1;
+      if (taskCall < 11) {
+        return { ...response("", "toolUse"), toolCalls: [{ id: `read-${call}`, name: "read_evidence", arguments: {} }] };
+      }
+      expect(request.messages.some((message) => message.role === "tool" && message.content.includes("Verified evidence"))).toBe(true);
+      return response(`Completed long task on ${request.laneId}`);
+    });
+    const { team, ledger, inbox } = fixture({ model, clock, tools: [tool], policy: { ...policy, mainRequestTimeoutMs: 5 * 60 * 1_000 } });
+    await team.create({ teamId: "unlimited", members: [{ memberId: "researcher", statement: "Investigate the large task" }] }, context);
+    await team.drain();
+    const created = (await ledger.read({ runId: RUN_ID })).find((event) => event.type === "team.created")!;
+    expect(created.payload).not.toHaveProperty("deadline");
+    expect(created.payload.members[0]?.task.budget).toEqual({});
+    expect(created.payload.members[0]?.task.spawnContext?.budget).toEqual({});
+    expect((await board(team, "unlimited")).members[0]?.outcome).toBe("succeeded");
+
+    const assigned = await team.assign({ teamId: "unlimited", memberId: "researcher", statement: "Continue the large task" }, {
+      ...context, operationId: "unlimited-follow-up",
+    });
+    await team.drain();
+    expect(await team.wait({ teamId: "unlimited", taskId: assigned.taskId }, context)).toMatchObject({ status: "review" });
+    const assignment = inbox.snapshot().records.find((record) => record.message.payload.type === "task.request"
+      && record.message.payload.taskId === assigned.taskId)?.message.payload;
+    expect(assignment?.type === "task.request" ? assignment.budget : undefined).toEqual({});
+
+    await team.reduce({ teamId: "unlimited" }, context);
+    await team.drain();
+    const state = await board(team, "unlimited");
+    expect(state.reducer?.task.budget).toEqual({});
+    expect(state.reduction).toMatchObject({ outcome: "succeeded", result: { usage: { input: 110, output: 44 } } });
+    expect(model.requests).toHaveLength(33);
+    const events = await ledger.read({ runId: RUN_ID });
+    expect(events.filter((event) => event.type === "model.completed")).toHaveLength(33);
+    expect(events.filter((event) => event.type === "user.message" && event.laneId === "team:unlimited:researcher")).toHaveLength(2);
+    expect(events.some((event) => event.type === "team.member.settled" && event.payload.outcome === "abandoned")).toBe(false);
+  });
+
+  it("restores an unlimited Team after a long admission delay without inventing a deadline", async () => {
+    const clock = new ManualClock();
+    const ledger = new FailFirstTaskDispatchLedger(clock);
+    const original = fixture({ ledger, clock });
+    await expect(original.team.create({ teamId: "unlimited-recovery", members: [{ memberId: "researcher", statement: "Finish after restart" }] }, context))
+      .rejects.toThrow("injected dispatch crash");
+    await original.team.stop();
+    clock.advance(2 * 24 * 60 * 60 * 1_000);
+    const recovered = fixture({ ledger, clock, store: original.store, inbox: A2AInbox.rehydrate(await ledger.read(), { sink: ledger, clock }) });
+    await recovered.team.restore();
+    await recovered.team.drain();
+    const state = await board(recovered.team, "unlimited-recovery");
+    expect(state.definition).not.toHaveProperty("deadline");
+    expect(state.members[0]).toMatchObject({ budget: {}, outcome: "succeeded" });
+    expect(recovered.model.requests).toHaveLength(1);
+  });
+
+  it.each(["length", "aborted"])("does not continue a %s provider outcome at an activation boundary", async (stopReason) => {
+    const execute = vi.fn(async () => ({ content: "Evidence", isError: false }));
+    const tool = annotateTool({
+      definition: { name: "read_evidence", description: "Read evidence", parameters: { type: "object", properties: {}, additionalProperties: false } },
+      execute,
+    }, { effect: "read" });
+    const model = new RecordingModel((_request, call) => ({
+      ...response("Unfinished evidence report", call === 3 ? stopReason : "toolUse"),
+      toolCalls: [{ id: `read-${call}`, name: "read_evidence", arguments: {} }],
+    }));
+    const { team } = fixture({ model, tools: [tool] });
+    await team.create({ teamId: "stopped-provider", members: [{ memberId: "researcher", statement: "Inspect evidence" }] }, context);
+    await team.drain();
+    expect(model.requests).toHaveLength(3);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect((await board(team, "stopped-provider")).members[0]?.outcome).toBe("partial");
+  });
+
+  it("supplies a bounded fallback when an inherited tool has an empty description", async () => {
+    const emptyDescriptionTool: AgentTool = {
+      definition: { name: "empty_description", description: "", parameters: { type: "object" } },
+      async execute() { return { content: "ok", isError: false }; },
+    };
+    const { team, model } = fixture({ tools: [emptyDescriptionTool] });
+    await team.create({ teamId: "empty-description", members: [{ memberId: "worker", statement: "Inspect the workspace" }] }, context);
+    await team.drain();
+    const member = model.requests.find((request) => request.laneId === "team:empty-description:worker");
+    expect(member).toBeDefined();
+    expect(member?.systemPrompt).toContain("You are worker, a Team member");
+  });
+
+  it("persists a bounded public channel with idempotent sends and an explicit close", async () => {
+    const { team, ledger } = fixture();
+    await team.create({ teamId: "channel-review", members: [member("writer")] }, context);
+
+    const first = await team.message({ teamId: "channel-review", body: "Started the review" }, {
+      ...context, operationId: "channel-message-1",
+    });
+    const memberMessage = await team.message({ teamId: "channel-review", body: "Writer lane is ready", threadId: "task:writer" }, {
+      ...context, laneId: "team:channel-review:writer", operationId: "channel-message-member-1",
+    });
+    expect(memberMessage.fromLane).toBe("team:channel-review:writer");
+    const duplicate = await team.message({ teamId: "channel-review", body: "Started the review" }, {
+      ...context, operationId: "channel-message-1",
+    });
+    expect(first.status).toBe("sent");
+    expect(duplicate).toMatchObject({ status: "duplicate", messageId: first.messageId, sequence: 1 });
+
+    const second = await team.message({ teamId: "channel-review", body: "Ready for review", threadId: "task:writer" }, {
+      ...context, operationId: "channel-message-2",
+    });
+    const history = await team.history({ teamId: "channel-review", threadId: "channel-review:general:general", limit: 1 }, context);
+    expect(history.messages.map((message) => message.body)).toEqual(["Started the review"]);
+    expect(history.hasMore).toBe(false);
+    const taskHistory = await team.history({ teamId: "channel-review", threadId: "task:writer", limit: 1 }, context);
+    expect(taskHistory.messages.map((message) => message.body)).toEqual(["Writer lane is ready"]);
+    expect(taskHistory.hasMore).toBe(true);
+    if (taskHistory.nextCursor === undefined) throw new Error("Expected a next history cursor");
+    const next = await team.history({ teamId: "channel-review", after: taskHistory.nextCursor }, context);
+    expect(next.messages.map((message) => message.body)).toEqual(["Ready for review"]);
+    expect(second.threadId).toBe("task:writer");
+
+    await team.close({ teamId: "channel-review", reason: "Review archived" }, {
+      ...context, operationId: "channel-close-1",
+    });
+    expect((await board(team, "channel-review")).lifecycleState).toBe("closed");
+    await expect(team.message({ teamId: "channel-review", body: "late" }, {
+      ...context, operationId: "channel-message-late",
+    })).rejects.toThrow(/closed/);
+    expect((await ledger.read({ runId: RUN_ID })).filter((event) => event.type === "team.message.sent")).toHaveLength(3);
+  });
+
   it("creates canonical members after one durable definition while preserving exact legacy identity objects", async () => {
     const onWake = vi.fn();
     const { team, ledger, model } = fixture({ onWake });
     const result = await team.create({ teamId: "review", members: [member("security"), member("compatibility")] }, context);
     expect(result.members).toEqual([
-      { memberId: "security", taskId: "review:security", laneId: "team:review:security", status: "queued" },
-      { memberId: "compatibility", taskId: "review:compatibility", laneId: "team:review:compatibility", status: "queued" },
+      { memberId: "security", name: "security", taskId: "review:security", laneId: "team:review:security", status: "queued" },
+      { memberId: "compatibility", name: "compatibility", taskId: "review:compatibility", laneId: "team:review:compatibility", status: "queued" },
     ]);
     expect(result.branches).toEqual([
       { branchId: "security", laneId: "team:review:security", status: "queued" },
@@ -130,8 +267,260 @@ describe("durable Team collaboration", () => {
     expect(events.filter((event) => event.type === "team.joined")).toHaveLength(1);
     expect(onWake).toHaveBeenCalled();
     const notices = await team.beforeMainStep({ step: 1 });
-    expect(notices.some((notice) => notice.content.includes("Main is the Team Lead"))).toBe(true);
+    expect(notices.some((notice) => notice.content.includes("You are the Team Lead"))).toBe(true);
     expect(events.some((event) => event.laneId === "main" && (event.type === "user.message" || event.type === "assistant.message"))).toBe(false);
+  });
+
+  it("reads initial queued and running task IDs from team_create without scheduling or writing", async () => {
+    const entered = deferred<void>();
+    const release = deferred<ModelResponse>();
+    const model = new RecordingModel((request) => {
+      if (request.laneId.endsWith(":ui")) { entered.resolve(); return release.promise; }
+      return response("Calendar logic checked");
+    });
+    const { team, ledger, inbox } = fixture({ model });
+    const created = await team.create({ teamId: "calendar", members: [
+      { memberId: "ui", statement: "Prepare the calendar layout" },
+      { memberId: "logic", statement: "Check the calendar logic", dependsOn: ["ui"] },
+    ] }, context);
+    await entered.promise;
+    const uiTask = created.members!.find((item) => item.memberId === "ui")!;
+    const logicTask = created.members!.find((item) => item.memberId === "logic")!;
+    const waitTool = createTaskWaitTool(team);
+    const eventsBefore = await ledger.read({ runId: RUN_ID });
+    const inboxBefore = inbox.snapshot();
+    const callsBefore = model.requests.length;
+    try {
+      for (const [task, status] of [[uiTask, "running"], [logicTask, "queued"]] as const) {
+        const result = await waitTool.execute({ teamId: created.teamId, taskId: task.taskId }, context);
+        expect(result.isError).toBe(false);
+        expect(JSON.parse(result.content)).toMatchObject({
+          teamId: created.teamId, taskId: task.taskId, memberId: task.memberId, laneId: task.laneId,
+          status, terminal: false, waiting: true,
+        });
+      }
+      expect(await ledger.read({ runId: RUN_ID })).toEqual(eventsBefore);
+      expect(inbox.snapshot()).toEqual(inboxBefore);
+      expect(model.requests).toHaveLength(callsBefore);
+    } finally {
+      release.resolve(response("Calendar layout checked"));
+    }
+    await team.drain();
+    expect(await team.wait({ teamId: created.teamId, taskId: uiTask.taskId }, context)).toMatchObject({
+      status: "completed", outcome: "succeeded", terminal: true, waiting: false,
+      result: { taskId: uiTask.taskId, status: "completed", summary: "Calendar layout checked" },
+    });
+    expect(await team.wait({ teamId: created.teamId, taskId: logicTask.taskId }, context)).toMatchObject({
+      status: "completed", outcome: "succeeded", terminal: true, waiting: false,
+      result: { taskId: logicTask.taskId, summary: "Calendar logic checked" },
+    });
+  });
+
+  it("rejects unknown or foreign task IDs without changing either Team", async () => {
+    const { team, ledger, inbox, model } = fixture();
+    await team.create({ teamId: "calendar", members: [{ memberId: "ui", statement: "Prepare calendar" }] }, context);
+    await team.create({ teamId: "other", members: [{ memberId: "ui", statement: "Prepare other work" }] }, context);
+    await team.drain();
+    const eventsBefore = await ledger.read({ runId: RUN_ID });
+    const inboxBefore = inbox.snapshot();
+    const callsBefore = model.requests.length;
+    for (const taskId of ["ui", "calendar:missing", "calendar:ui:task-1", "other:ui", "team:calendar:ui"]) {
+      await expect(team.wait({ teamId: "calendar", taskId }, context)).rejects.toThrow(`Unknown Team task ${taskId}`);
+    }
+    await expect(team.wait({ teamId: "missing", taskId: "calendar:ui" }, context)).rejects.toThrow("Unknown Team missing");
+    await expect(team.wait({ teamId: "calendar", taskId: "calendar:ui" }, { ...context, runId: "foreign" }))
+      .rejects.toThrow("another Run");
+    await expect(team.wait({ teamId: "calendar", taskId: "calendar:ui" }, { ...context, laneId: "team:other:ui" }))
+      .rejects.toThrow("not an active Team member");
+    expect(await ledger.read({ runId: RUN_ID })).toEqual(eventsBefore);
+    expect(inbox.snapshot()).toEqual(inboxBefore);
+    expect(model.requests).toHaveLength(callsBefore);
+  });
+
+  it("reuses a settled member lane for a follow-up Task and reports it without copying the transcript", async () => {
+    const { team, ledger, model } = fixture();
+    await team.create({ teamId: "resident", members: [member("researcher")] }, context);
+    await team.drain();
+    const initialStatus = await team.wait({ teamId: "resident", taskId: "resident:researcher" }, context);
+    const before = model.requests.length;
+    const assigned = await team.assign({ teamId: "resident", memberId: "researcher", statement: "Continue with the compatibility check", input: "Use the newly supplied compatibility matrix" }, {
+      ...context, operationId: "resident-assign-1",
+    });
+    expect(assigned).toMatchObject({ taskId: "resident:researcher:task-1", assignmentVersion: 1, status: "queued" });
+    await team.drain();
+    expect(model.requests.length).toBe(before + 1);
+    expect(model.requests.at(-1)?.laneId).toBe("team:resident:researcher");
+    expect(model.requests.at(-1)?.messages.map((message) => message.content).join("\n")).toContain("Continue with the compatibility check");
+    expect(model.requests.at(-1)?.messages.map((message) => message.content).join("\n")).toContain("Use the newly supplied compatibility matrix");
+    const status = await team.wait({ teamId: "resident", taskId: assigned.taskId }, context);
+    expect(status).toMatchObject({
+      taskId: assigned.taskId, assignmentVersion: 1, status: "review", waiting: false,
+      report: { kind: "ready-for-review", result: { taskId: assigned.taskId } },
+    });
+    expect(await team.wait({ teamId: "resident", taskId: "resident:researcher" }, context)).toEqual(initialStatus);
+    const events = await ledger.read({ runId: RUN_ID });
+    expect(events.some((event) => (event as unknown as { type?: string }).type === "team.task.assigned")).toBe(true);
+    expect(events.some((event) => (event as unknown as { type?: string }).type === "team.run.reported")).toBe(true);
+    const duplicate = await team.assign({ teamId: "resident", memberId: "researcher", statement: "Continue with the compatibility check", input: "Use the newly supplied compatibility matrix" }, {
+      ...context, operationId: "resident-assign-1",
+    });
+    expect(duplicate.status).toBe("duplicate");
+    const history = await team.history({ teamId: "resident", threadId: `task:${assigned.taskId}` }, context);
+    expect(history.messages).toHaveLength(1);
+    expect(history.messages[0]?.body).toContain("ready-for-review");
+
+    const next = await team.assign({ teamId: "resident", memberId: "researcher", statement: "Check the final integration" }, {
+      ...context, operationId: "resident-assign-2",
+    });
+    await team.drain();
+    expect(next.assignmentVersion).toBe(2);
+    expect(model.requests).toHaveLength(before + 2);
+  });
+
+  it("rebuilds an unreported resident assignment after a restart", async () => {
+    const original = fixture();
+    await original.team.create({ teamId: "resident-recovery", members: [member("researcher")] }, context);
+    await original.team.drain();
+    await original.team.assign({ teamId: "resident-recovery", memberId: "researcher", statement: "Continue after restart" }, {
+      ...context, operationId: "resident-recovery-assign",
+    });
+    await original.team.stop();
+    const recoveredInbox = A2AInbox.rehydrate(await original.ledger.read(), { sink: original.ledger, clock: original.clock });
+    const recovered = fixture({ ledger: original.ledger, inbox: recoveredInbox, store: original.store, clock: original.clock });
+    await recovered.team.restore();
+    await recovered.team.drain();
+    expect(recovered.model.requests.some((request) => request.laneId === "team:resident-recovery:researcher")).toBe(true);
+    expect(await recovered.team.wait({ teamId: "resident-recovery", taskId: "resident-recovery:researcher:task-1" }, context)).toMatchObject({ status: "review" });
+  });
+
+  it("repairs an assignment whose task dispatch failed without accepting changed work", async () => {
+    const clock = new ManualClock();
+    const ledger = new FailResidentTaskDispatchLedger(clock);
+    const { team, model } = fixture({ ledger, clock });
+    await team.create({ teamId: "dispatch-repair", members: [member("researcher")] }, context);
+    await team.drain();
+    const request = { teamId: "dispatch-repair", memberId: "researcher", statement: "Run the second task" };
+    const assignmentContext = { ...context, operationId: "dispatch-repair-assign" };
+    await expect(team.assign(request, assignmentContext)).rejects.toThrow("injected resident dispatch crash");
+    await expect(team.assign({ ...request, statement: "Different work" }, assignmentContext)).rejects.toThrow("different work");
+    expect(await team.assign(request, assignmentContext)).toMatchObject({ status: "queued", assignmentVersion: 1 });
+    await team.drain();
+    expect(model.requests).toHaveLength(2);
+    expect(await team.wait({ teamId: request.teamId, taskId: "dispatch-repair:researcher:task-1" }, context)).toMatchObject({ status: "review" });
+  });
+
+  it("fences an active resident task when the Team is closed", async () => {
+    const entered = deferred<void>();
+    const release = deferred<ModelResponse>();
+    let residentSignal: AbortSignal | undefined;
+    const model = new RecordingModel((request, call) => {
+      if (call === 1) return response("Initial task finished");
+      residentSignal = request.signal;
+      entered.resolve();
+      return release.promise;
+    });
+    const { team, ledger } = fixture({ model });
+    await team.create({ teamId: "close-resident", members: [member("researcher")] }, context);
+    await team.drain();
+    await team.assign({ teamId: "close-resident", memberId: "researcher", statement: "Long second task" }, {
+      ...context, operationId: "close-resident-assign",
+    });
+    await entered.promise;
+    expect(await team.wait({ teamId: "close-resident", taskId: "close-resident:researcher:task-1" }, context)).toMatchObject({ status: "running" });
+    await team.close({ teamId: "close-resident" }, context);
+    expect(residentSignal?.aborted).toBe(true);
+    const closedOffset = await ledger.watermark();
+    release.resolve(response("Late result must not be reported"));
+    await team.drain();
+    expect((await ledger.read({ runId: RUN_ID, afterOffset: closedOffset })).some((event) => (event as unknown as { type: string }).type === "team.run.reported")).toBe(false);
+    await expect(team.reduce({ teamId: "close-resident" }, context)).rejects.toThrow("Reduction requires");
+  });
+
+  it("assigns readable worker names around explicit names and preserves them through retry and recovery", async () => {
+    const original = fixture();
+    const request: TeamCreateRequest = { teamId: "named", members: [
+      { statement: "Inspect source" },
+      member("worker-1"),
+      member("worker-3"),
+      { statement: "Inspect tests" },
+      member("researcher"),
+      { statement: "Inspect documentation" },
+    ] };
+    const created = await original.team.create(request, context);
+    const ids = ["worker-2", "worker-1", "worker-3", "worker-4", "researcher", "worker-5"];
+    const names = ["worker 2", "worker 1", "worker 3", "worker 4", "researcher", "worker 5"];
+    expect(created.members?.map((item) => item.memberId)).toEqual(ids);
+    expect(created.members?.map((item) => item.name)).toEqual(names);
+    expect(created.members?.map((item) => item.laneId)).toEqual(ids.map((id) => `team:named:${id}`));
+    await original.team.drain();
+    for (const [index, id] of ids.entries()) {
+      const modelRequest = original.model.requests.find((item) => item.laneId === `team:named:${id}`)!;
+      expect(modelRequest.systemPrompt).toMatch(new RegExp(`^You are ${names[index]}, a Team member`));
+      expect(modelRequest.systemPrompt).toContain("Team Lead, Nausicaa (lane nausicaa)");
+      expect(modelRequest.messages.map((item) => item.content).join("\n"))
+        .toContain('"laneId":"nausicaa","relation":"owns"');
+    }
+    const duplicate = await original.team.create(request, context);
+    expect(duplicate.members).toEqual(created.members?.map((item) => ({ ...item, status: "duplicate" })));
+    await original.team.stop();
+    const restoredInbox = A2AInbox.rehydrate(await original.ledger.read(), { sink: original.ledger, clock: original.clock });
+    const recovered = fixture({ ...original, inbox: restoredInbox });
+    await recovered.team.restore();
+    const replayed = await recovered.team.create(request, context);
+    expect(replayed.members?.toSorted((left, right) => left.memberId.localeCompare(right.memberId)))
+      .toEqual(duplicate.members?.toSorted((left, right) => left.memberId.localeCompare(right.memberId)));
+    expect(original.model.requests).toHaveLength(ids.length);
+    expect((await original.ledger.read()).filter((event) => event.type === "team.created")).toHaveLength(1);
+  });
+
+  it("identifies a nested Team's actual lead and each member without assigning the root identity", async () => {
+    const parentLaneId = "team:outer:worker-7";
+    const caller = { ...context, laneId: parentLaneId };
+    const { team, model } = fixture({ parentLaneId });
+    await team.create({ teamId: "nested", members: [member("reviewer")] }, caller);
+    await team.drain();
+    const request = model.requests.find((item) => item.laneId === "team:nested:reviewer")!;
+    expect(request.systemPrompt).toMatch(/^You are reviewer, a Team member/);
+    expect(request.systemPrompt).toContain("Team Lead, worker 7 (lane team:outer:worker-7)");
+    expect(request.systemPrompt).not.toContain("You are Nausicaa");
+    expect(request.systemPrompt).not.toContain("Team Lead, Nausicaa");
+    expect(request.messages.map((item) => item.content).join("\n"))
+      .toContain('"laneId":"team:outer:worker-7","relation":"owns"');
+    await team.reduce({ teamId: "nested" }, caller);
+    await team.drain();
+    const reduction = model.requests.find((item) => item.laneId === "team-reducer:nested")!;
+    expect(reduction.systemPrompt).toMatch(/^You are reducer, the explicitly requested read-only Team reducer/);
+    expect(reduction.systemPrompt).toContain("Team Lead, worker 7 (lane team:outer:worker-7)");
+    expect(reduction.messages.map((item) => item.content).join("\n"))
+      .toContain("Synthesize the Team results for worker 7, the Team Lead");
+  });
+
+  it("enforces a lead's capability narrowing and keeps the outer Team channel for a member", async () => {
+    const readTool: AgentTool = {
+      definition: { name: "read_file", description: "read", parameters: { type: "object", additionalProperties: false } },
+      async execute() { return { content: "read", isError: false }; },
+    };
+    const writeTool: AgentTool = {
+      definition: { name: "write_file", description: "write", parameters: { type: "object", additionalProperties: false } },
+      async execute() { return { content: "write", isError: false }; },
+    };
+    const { team, model } = fixture({ tools: [readTool, writeTool] });
+    await team.create({
+      teamId: "narrowed",
+      members: [{
+        memberId: "reviewer",
+        statement: "Review without mutation",
+        capabilities: { tools: ["read_file"], allowNestedTeam: false },
+      }],
+    }, context);
+    await team.drain();
+    const request = model.requests.find((item) => item.laneId === "team:narrowed:reviewer");
+    expect(request).toBeDefined();
+    const names = request!.tools.map((tool) => tool.name);
+    expect(names).toContain("read_file");
+    expect(names).not.toContain("write_file");
+    expect(names).not.toContain("team_create");
+    expect(names).toContain("team_message");
   });
 
   it("retains succeeded, partial, and failed outcomes as distinct facts at join", async () => {
@@ -149,6 +538,15 @@ describe("durable Team collaboration", () => {
     expect(state.members.every((item) => item.execution === "terminal" && item.terminal)).toBe(true);
     expect(state.members.find((item) => item.memberId === "partial")?.result?.status).toBe("partial");
     expect(state.members.find((item) => item.memberId === "failed")?.failure?.reason).toContain("Evidence source unavailable");
+    const eventsBeforeWait = await ledger.read({ runId: RUN_ID });
+    for (const initial of state.members) {
+      expect(await team.wait({ teamId: "review", taskId: initial.taskId }, context)).toMatchObject({
+        taskId: initial.taskId, status: initial.status, outcome: initial.outcome, terminal: true, waiting: false,
+        ...(initial.result === undefined ? {} : { result: initial.result }),
+        ...(initial.failure === undefined ? {} : { failure: initial.failure }),
+      });
+    }
+    expect(await ledger.read({ runId: RUN_ID })).toEqual(eventsBeforeWait);
     const settlements = (await ledger.read({ runId: RUN_ID })).filter((event) => event.type === "team.member.settled");
     expect(settlements).toHaveLength(3);
     await team.present({ teamId: "review", disposition: "rejected" }, context);
@@ -331,9 +729,13 @@ describe("durable Team collaboration", () => {
       correlationId: RUN_ID, idempotencyKey: "status-without-settlement", visibility: "run", occurredAt: original.clock.now().toISOString(),
     });
     expect(await board(original.team)).toMatchObject({ joinSatisfied: false, members: [{ terminal: false }] });
+    expect(await original.team.wait({ teamId: "review", taskId: "review:slow" }, context))
+      .toMatchObject({ status: "unknown", terminal: false, waiting: true });
     await original.team.cancel({ teamId: "review", reason: "Lead cancelled the review" }, context);
     const state = await board(original.team);
     expect(state).toMatchObject({ joinState: "cancelled", cancellationRequested: true, members: [{ outcome: "cancelled", terminal: true }] });
+    expect(await original.team.wait({ teamId: "review", taskId: "review:slow" }, context))
+      .toMatchObject({ status: "cancelled", outcome: "cancelled", terminal: true, waiting: false, reason: "Lead cancelled the review" });
     const watermark = await original.ledger.watermark();
     release.resolve(response("Late completion must not win"));
     await original.team.drain();
@@ -490,10 +892,11 @@ describe("durable Team collaboration", () => {
   });
 
   it.each([
-    { maxAttempts: undefined, content: "", expectedCalls: 2 },
-    { maxAttempts: undefined, content: " \n\t", expectedCalls: 2 },
+    { maxAttempts: undefined, content: "", expectedCalls: 3 },
+    { maxAttempts: undefined, content: " \n\t", expectedCalls: 3 },
+    { maxAttempts: 2, content: "", expectedCalls: 2 },
     { maxAttempts: 3, content: "", expectedCalls: 3 },
-  ])("preserves the reducer default and durably applies an explicit attempt allowance: %j", async ({ maxAttempts, content, expectedCalls }) => {
+  ])("keeps reducers unlimited by default and honors explicit host attempts: %j", async ({ maxAttempts, content, expectedCalls }) => {
     const tool = annotateTool({
       definition: { name: "read_evidence", description: "Read evidence", parameters: { type: "object", properties: {}, additionalProperties: false } },
       execute: vi.fn(async () => ({ content: "Verified subtotal 44, shipping 6, discount 4", isError: false })),
@@ -510,10 +913,10 @@ describe("durable Team collaboration", () => {
     await team.drain();
 
     const state = await board(team);
-    expect(state.reducer?.task.budget.maxAttempts).toBe(maxAttempts ?? 2);
-    expect(state.reducer?.task.spawnContext?.budget.maxAttempts).toBe(maxAttempts ?? 2);
+    expect(state.reducer?.task.budget.maxAttempts).toBe(maxAttempts);
+    expect(state.reducer?.task.spawnContext?.budget.maxAttempts).toBe(maxAttempts);
     expect(model.requests.filter((request) => request.laneId.startsWith("team-reducer:"))).toHaveLength(expectedCalls);
-    if (maxAttempts === undefined) {
+    if (maxAttempts === 2) {
       expect(state.reduction).toMatchObject({ outcome: "failed", failure: {
         reason: expect.stringContaining("step budget exhausted without a non-empty report"), retryable: false,
         evidenceRefs: state.reducer!.task.inputRefs.map((ref) => ref.contentHash),
@@ -525,7 +928,7 @@ describe("durable Team collaboration", () => {
     }
     const events = await ledger.read({ runId: RUN_ID });
     expect(events.filter((event) => event.type === "team.reduced")).toHaveLength(1);
-    expect(events.find((event) => event.type === "team.reduction.requested")?.payload.reducer.task.budget.maxAttempts).toBe(maxAttempts ?? 2);
+    expect(events.find((event) => event.type === "team.reduction.requested")?.payload.reducer.task.budget.maxAttempts).toBe(maxAttempts);
   });
 
   it.each([0, 1.5, MAX_TASK_ATTEMPTS + 1])("rejects an invalid direct reducer attempt allowance before admission: %j", async (maxAttempts) => {
@@ -629,7 +1032,7 @@ describe("durable Team collaboration", () => {
     expect(await team.messageTargets("team:review:a")).toEqual(["main"]);
     expect(await team.messageTargets("team:other:a")).toEqual([]);
     expect(await team.messageTargets("main")).toEqual(["team:review:a", "team:review:b"]);
-    await expect(team.cancel({ teamId: "review" }, { ...context, laneId: "team:review:a" })).rejects.toThrow("bound to lane main");
+    await expect(team.cancel({ teamId: "review" }, { ...context, laneId: "team:review:a" })).rejects.toThrow("bound to lane nausicaa");
     await expect(team.present({ teamId: "review", disposition: "accepted" }, context)).rejects.toThrow("must join");
     const forbidden = await team.createMessageTool().execute({ target: "team:other:a", text: "must not cross membership" }, context);
     expect(forbidden.isError).toBe(true);
@@ -659,6 +1062,21 @@ class FailFirstTaskResultLedger extends MemoryLedger {
     if (!this.failed && input.type === "message.sent" && "message" in input.payload && input.payload.message.payload.type === "task.result") {
       this.failed = true;
       throw new Error("injected result transport loss");
+    }
+    return super.append(input);
+  }
+}
+
+class FailResidentTaskDispatchLedger extends MemoryLedger {
+  private failed = false;
+  constructor(clock: ManualClock) { super({ clock }); }
+
+  override async append<K extends EventType>(input: AppendEvent<K>) {
+    if (!this.failed && input.type === "message.sent" && "message" in input.payload
+      && input.payload.message.payload.type === "task.request"
+      && input.payload.message.payload.taskId.endsWith(":task-1")) {
+      this.failed = true;
+      throw new Error("injected resident dispatch crash");
     }
     return super.append(input);
   }

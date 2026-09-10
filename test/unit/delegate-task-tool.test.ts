@@ -2,14 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import { A2AInbox } from "../../src/a2a/index.js";
 import type { ToolExecutionContext } from "../../src/domain/index.js";
-import { MAX_TASK_MODEL_TOKENS, MAX_TASK_WALL_CLOCK_MS } from "../../src/domain/index.js";
 import { TaskDispatcher } from "../../src/runtime/index.js";
-import {
-  createDelegateTaskTool,
-  DEFAULT_DELEGATED_ATTEMPTS,
-  DEFAULT_DELEGATED_MODEL_TOKENS,
-  DEFAULT_DELEGATED_WALL_CLOCK_MS,
-} from "../../src/runtime/index.js";
+import { createDelegateTaskTool } from "../../src/runtime/index.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
 
 const context: ToolExecutionContext = {
@@ -38,25 +32,21 @@ function deferred<T>() {
 }
 
 describe("delegate_task tool", () => {
-  it("exposes an optional-budget async delegation contract", () => {
+  it("exposes asynchronous delegation without model-controlled execution limits", () => {
     const { tool } = setup();
     expect(tool.definition.parameters.required).toEqual(["statement"]);
+    expect(Object.keys(tool.definition.parameters.properties ?? {})).toEqual(["taskId", "statement", "input"]);
     expect(tool.definition.description).toMatch(/asynchronously/i);
     expect(tool.definition.description).toMatch(/read-only workspace tools/i);
     expect(tool.definition.description).not.toMatch(/continue other work/i);
   });
 
-  it("stores optional input and queues a bounded task request", async () => {
+  it("stores optional input and queues a task without synthetic limits", async () => {
     const { inbox, store, tool } = setup();
     const result = await tool.execute({
       taskId: "task-1",
       statement: "Find the install command",
-      successCriteria: ["Return a command"],
-      hardConstraints: ["Do not modify files"],
       input: "package metadata",
-      maxModelTokens: 500,
-      maxWallClockMs: 30_000,
-      maxAttempts: 3,
     }, context);
 
     expect(result.isError).toBe(false);
@@ -69,11 +59,7 @@ describe("delegate_task tool", () => {
       type: "task.request",
       taskId: "task-1",
       goal: { statement: "Find the install command" },
-      budget: {
-        maxModelTokens: 500,
-        maxWallClockMs: 30_000,
-        maxAttempts: 3,
-      },
+      budget: {},
     });
     const refs = message?.payload.type === "task.request" ? message.payload.inputRefs : [];
     expect(refs).toHaveLength(1);
@@ -179,9 +165,11 @@ describe("delegate_task tool", () => {
     { taskId: "invalid\0task" },
     { taskId: "x".repeat(129) },
     { statement: "invalid\0goal" },
-    { maxAttempts: 9 },
-    { maxModelTokens: MAX_TASK_MODEL_TOKENS + 1 },
-    { maxWallClockMs: MAX_TASK_WALL_CLOCK_MS + 1 },
+    { maxAttempts: 2 },
+    { maxModelTokens: 2_000 },
+    { maxWallClockMs: 30_000 },
+    { successCriteria: ["Return a command"] },
+    { hardConstraints: ["Do not modify files"] },
   ])("validates task fields before input persistence: %j", async (invalid) => {
     const { inbox, store, tool } = setup();
     const result = await tool.execute({ statement: "Inspect input", input: "Do not persist", ...invalid }, context);
@@ -191,7 +179,7 @@ describe("delegate_task tool", () => {
     expect(inbox.snapshot().records).toEqual([]);
   });
 
-  it("uses conservative runtime defaults when budget fields are omitted", async () => {
+  it("does not add a token, time or model call limit to new requests", async () => {
     const { inbox, tool } = setup();
     const result = await tool.execute({
       statement: "Summarize the supplied context",
@@ -203,12 +191,9 @@ describe("delegate_task tool", () => {
       type: "task.request",
       inputRefs: [],
       goal: { successCriteria: [], hardConstraints: [] },
-      budget: {
-        maxModelTokens: DEFAULT_DELEGATED_MODEL_TOKENS,
-        maxWallClockMs: DEFAULT_DELEGATED_WALL_CLOCK_MS,
-        maxAttempts: DEFAULT_DELEGATED_ATTEMPTS,
-      },
+      budget: {},
     });
+    expect(message?.payload.type === "task.request" ? message.payload.budget : undefined).toEqual({});
   });
 
   it("rejects overlarge input without sending a task", async () => {
@@ -216,8 +201,6 @@ describe("delegate_task tool", () => {
     const result = await tool.execute({
       statement: "Inspect input",
       input: "too large",
-      maxModelTokens: 100,
-      maxWallClockMs: 1_000,
     }, context);
 
     expect(result.isError).toBe(true);
@@ -225,13 +208,11 @@ describe("delegate_task tool", () => {
     expect(inbox.snapshot().records).toEqual([]);
   });
 
-  it("rejects a Worker attempt budget beyond the protocol bound", async () => {
+  it("rejects unsupported limits even when called without schema validation", async () => {
     const { inbox, tool } = setup();
     const result = await tool.execute({
       statement: "Inspect input",
-      maxModelTokens: 100,
-      maxWallClockMs: 1_000,
-      maxAttempts: 9,
+      maxAttempts: 2,
     }, context);
 
     expect(result.isError).toBe(true);

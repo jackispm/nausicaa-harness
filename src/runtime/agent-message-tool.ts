@@ -18,6 +18,7 @@ import {
   normalizeTarget,
 } from "../a2a/cross-run-contract.js";
 import type { CrossRunRouter } from "../a2a/cross-run-router.js";
+import { publicLaneName } from "./lane-names.js";
 
 const TOOL_NAME = "agent_message";
 const TOOL_VERSION = "1";
@@ -518,7 +519,7 @@ function endpointReceipt(endpoint: CrossRunEndpoint): CrossRunEndpoint {
     workspaceId: endpoint.workspaceId,
     sessionId: endpoint.sessionId,
     runId: endpoint.runId,
-    laneId: endpoint.laneId,
+    laneId: publicLaneName(endpoint.laneId),
   };
 }
 

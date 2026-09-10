@@ -4,7 +4,11 @@ import { createHash } from "node:crypto";
  * Keep recursive delegation shallow by default. A caller may opt into a
  * deeper tree, but the host still enforces this absolute bound.
  */
-export const DEFAULT_SUBAGENT_MAX_DEPTH = 1;
+/**
+ * Team members may create nested Teams, but the topology stays shallow enough
+ * to remain inspectable and to bound scheduler/recovery fan-out.
+ */
+export const DEFAULT_SUBAGENT_MAX_DEPTH = 3;
 export const MAX_SUBAGENT_DEPTH = 64;
 
 /** Agent-message selectors are deliberately short, portable ASCII slugs. */

@@ -188,7 +188,7 @@ describe("Team completion boundary delivery", () => {
         target: MEMBER, replyTo: question!.messageId, text: "Inspect the API boundary",
       }, { ...context, operationId: "reply-to-member" });
       expect(reply.isError).toBe(false);
-      expect(JSON.parse(reply.content)).toMatchObject({ status: "queued", from: "main", to: MEMBER });
+      expect(JSON.parse(reply.content)).toMatchObject({ status: "queued", from: "nausicaa", to: MEMBER });
     } finally {
       release.resolve(response());
       await f.team.stop();

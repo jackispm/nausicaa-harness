@@ -97,7 +97,8 @@ The live probes exposed further issues and informed focused regressions:
   exceeding the task allowance. Budget-exhausted mail is not marked consumed.
 - A reducer exhausting its allowance on tools could produce an illegal empty
   partial summary. Empty/whitespace reports now fail with an explicit reason.
-  `team_reduce` accepts a bounded optional `maxAttempts`; its default stays 2.
+  The model-facing `team_reduce` no longer accepts execution limits; the
+  host-owned reducer safety bound remains 2 attempts for compatibility.
 - The live evaluator could mistake a consumed greeting for consumed evidence.
   It now requires correctly scoped numeric JSON, a prior successful read,
   and the exact evidence ID in a later committed recipient step. Cancellation

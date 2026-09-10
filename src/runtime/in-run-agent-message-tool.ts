@@ -5,6 +5,7 @@ import type { AgentTool, ToolExecutionContext, ToolResult } from "../domain/port
 import type { A2AMessage, DeliveryMode, LaneId, Visibility } from "../domain/types.js";
 import { annotateTool } from "../mowe/catalog.js";
 import type { MoweAgentTool } from "../mowe/types.js";
+import { publicLaneName, resolveLaneTarget } from "./lane-names.js";
 
 const TOOL_NAME = "agent_message";
 const MAX_TEXT_LENGTH = 8_192;
@@ -103,7 +104,7 @@ export function createInRunAgentMessageTool(
             type: "string",
             minLength: 1,
             maxLength: MAX_ID_LENGTH,
-            description: "Host-authorized in-Run recipient. Omit only when the host supplied a fixed recipient.",
+            description: "Host-authorized in-Run recipient, such as nausicaa or teto. Omit only when the host supplied a fixed recipient.",
           },
           kind: {
             type: "string",
@@ -151,14 +152,15 @@ export function createInRunAgentMessageTool(
       boundedId(context.operationId, "operationId");
       const text = boundedText(arguments_.text);
       const kind = normalizeKind(arguments_.kind);
-      const target = boundedId(arguments_.target === undefined ? fixedTo : arguments_.target, "target");
+      const requestedTarget = boundedId(arguments_.target === undefined ? fixedTo : arguments_.target, "target");
       const { message, result } = await runInboxAdmission(inbox, async () => {
         const targets = resolveTargets === undefined ? [fixedTo] : await resolveTargets();
         if (!Array.isArray(targets) || targets.some((value) => typeof value !== "string")) {
           throw new TypeError("resolveTargets must return lane IDs");
         }
+        const target = resolveLaneTarget(requestedTarget, targets);
         if (!targets.includes(target)) {
-          throw new Error(`target ${target} is not authorized for this lane`);
+          throw new Error(`target ${publicLaneName(target)} is not authorized for this lane`);
         }
         const replyTo = arguments_.replyTo === undefined
           ? undefined
@@ -192,11 +194,11 @@ export function createInRunAgentMessageTool(
             && (message.expiresAt === undefined || Date.parse(message.expiresAt) > admissionTime.getTime()));
           const outgoing = pending.filter(({ message }) => message.from === from).length;
           if (outgoing >= maxPendingMessages) {
-            throw new InRunMessageBackpressureError(`Lane ${from} has reached its pending message limit (${outgoing}/${maxPendingMessages})`);
+            throw new InRunMessageBackpressureError(`Lane ${publicLaneName(from)} has reached its pending message limit (${outgoing}/${maxPendingMessages})`);
           }
           const incoming = pending.filter(({ message }) => message.to === target).length;
           if (incoming >= MAX_PENDING_MESSAGES) {
-            throw new InRunMessageBackpressureError(`Lane ${target} has reached its Inbox message limit (${incoming}/${MAX_PENDING_MESSAGES})`);
+            throw new InRunMessageBackpressureError(`Lane ${publicLaneName(target)} has reached its Inbox message limit (${incoming}/${MAX_PENDING_MESSAGES})`);
           }
         }
         const createdAtDate = existing === undefined ? admissionTime : new Date(existing.createdAt);
@@ -238,8 +240,8 @@ export function createInRunAgentMessageTool(
         content: JSON.stringify({
           status: result.status,
           messageId: result.messageId,
-          from,
-          to: target,
+          from: publicLaneName(message.from),
+          to: publicLaneName(message.to),
           kind,
           ...(wakePending ? { wakePending: true } : {}),
         }),

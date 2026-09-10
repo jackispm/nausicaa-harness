@@ -104,6 +104,8 @@ export class MessageExpiredError extends A2AProtocolError {
 
 export class InboxProjector {
   private records = new Map<string, InboxRecord>();
+  /** Claim attempts survive a reclaim while the public record is pending. */
+  private attempts = new Map<string, number>();
   private idempotency = new Map<string, string>();
   private appliedEventIds = new Set<string>();
   private offset = 0;
@@ -114,6 +116,7 @@ export class InboxProjector {
 
   rehydrate(events: readonly AnyEvent[]): void {
     this.records = new Map();
+    this.attempts = new Map();
     this.idempotency = new Map();
     this.appliedEventIds = new Set();
     this.offset = 0;
@@ -133,6 +136,9 @@ export class InboxProjector {
         break;
       case "message.claimed":
         this.applyClaimed(event);
+        break;
+      case "message.reclaimed":
+        this.applyReclaimed(event);
         break;
       case "message.handled":
         this.applyHandled(event);
@@ -206,6 +212,7 @@ export class InboxProjector {
       sentAtOffset: event.globalOffset,
       sentAt: event.occurredAt,
     });
+    this.attempts.set(message.messageId, 0);
     this.idempotency.set(scope, message.messageId);
   }
 
@@ -230,11 +237,13 @@ export class InboxProjector {
       return;
     }
     record.status = "claimed";
+    const attempt = (this.attempts.get(record.message.messageId) ?? record.claim?.attempt ?? 0) + 1;
+    this.attempts.set(record.message.messageId, attempt);
     record.claim = {
       claimId: claimIdFromEvent(event),
       claimedBy: event.payload.claimedBy,
       claimedAt: event.occurredAt,
-      attempt: (record.claim?.attempt ?? 0) + 1,
+      attempt,
     };
   }
 
@@ -262,6 +271,36 @@ export class InboxProjector {
     }
     record.status = "handled";
     record.handledAt = event.occurredAt;
+  }
+
+  private applyReclaimed(event: Extract<AnyEvent, { type: "message.reclaimed" }>): void {
+    const record = this.records.get(event.payload.messageId);
+    if (record === undefined) {
+      throw new A2AProtocolError(`Reclaim references unknown message ${event.payload.messageId}`);
+    }
+    if (event.runId !== record.message.runId) {
+      throw new A2AProtocolError(`Reclaim for ${event.payload.messageId} belongs to another Run`);
+    }
+    if (event.laneId !== event.payload.reclaimedBy) {
+      throw new A2AProtocolError(`Reclaim for ${event.payload.messageId} is not emitted by its reclaiming lane`);
+    }
+    if (record.status === "handled") {
+      throw new A2AProtocolError(`Cannot reclaim handled message ${event.payload.messageId}`);
+    }
+    const claim = record.claim;
+    if (record.status !== "claimed" || claim === undefined) {
+      throw new A2AProtocolError(`Reclaim references an unclaimed message ${event.payload.messageId}`);
+    }
+    if (
+      claim.claimId !== event.payload.previousClaimId
+      || claim.claimedBy !== event.payload.previousClaimedBy
+      || claim.claimedAt !== event.payload.previousClaimedAt
+      || claim.attempt !== event.payload.previousAttempt
+    ) {
+      throw new A2AProtocolError(`Reclaim for ${event.payload.messageId} does not match its current claim`);
+    }
+    record.status = "pending";
+    delete record.claim;
   }
 
   private applyAcknowledged(
@@ -447,6 +486,40 @@ export class A2AInbox {
     options: ClaimOptions = {},
   ): Promise<InboxRecord[]> {
     return this.runExclusive(() => this.claimCommand(to, claimedBy, options));
+  }
+
+  /** Reopen an unfinished delivery during runtime recovery. */
+  reclaim(messageId: string, reclaimedBy: LaneId, reason = "runtime-restart"): Promise<InboxRecord> {
+    return this.runExclusive(() => this.reclaimCommand(messageId, reclaimedBy, reason));
+  }
+
+  private async reclaimCommand(messageId: string, reclaimedBy: LaneId, reason: string): Promise<InboxRecord> {
+    nonEmpty(messageId, "messageId");
+    nonEmpty(reclaimedBy, "reclaimedBy");
+    nonEmpty(reason, "reason");
+    const record = this.requireRecord(messageId);
+    if (record.status === "handled") return record;
+    if (record.status !== "claimed" || record.claim === undefined) return record;
+    const claim = record.claim;
+    await this.append({
+      runId: record.message.runId,
+      laneId: reclaimedBy,
+      type: "message.reclaimed",
+      payload: {
+        messageId,
+        reclaimedBy,
+        previousClaimId: claim.claimId,
+        previousClaimedBy: claim.claimedBy,
+        previousClaimedAt: claim.claimedAt,
+        previousAttempt: claim.attempt,
+        reason,
+      },
+      causationId: messageId,
+      correlationId: record.message.correlationId,
+      idempotencyKey: `a2a:reclaim:${messageId}:${claim.claimId}`,
+      visibility: record.message.visibility,
+    });
+    return this.requireRecord(messageId);
   }
 
   private async claimCommand(
@@ -797,9 +870,11 @@ function validateMessage(message: A2AMessage): void {
       }
     }
     if (message.payload.budget.deadline !== undefined) {
-      const expectedDeadline = Date.parse(message.createdAt)
-        + message.payload.budget.maxWallClockMs;
-      if (Date.parse(message.payload.budget.deadline) !== expectedDeadline) {
+      const maxWallClockMs = message.payload.budget.maxWallClockMs;
+      const expectedDeadline = maxWallClockMs === undefined
+        ? undefined
+        : Date.parse(message.createdAt) + maxWallClockMs;
+      if (expectedDeadline !== undefined && Date.parse(message.payload.budget.deadline) !== expectedDeadline) {
         throw new A2AProtocolError(
           "task budget deadline must equal createdAt plus maxWallClockMs",
         );
@@ -846,31 +921,39 @@ function validateGoal(goal: Goal): void {
 
 function validateTaskBudget(budget: TaskBudget): void {
   if (!isRecord(budget)) throw new A2AProtocolError("task budget must be an object");
-  if (
-    !Number.isSafeInteger(budget.maxModelTokens)
-    || budget.maxModelTokens < 1
-    || budget.maxModelTokens > MAX_TASK_MODEL_TOKENS
-  ) {
+  const maxModelTokens = (budget as Record<string, unknown>).maxModelTokens;
+  const maxWallClockMs = (budget as Record<string, unknown>).maxWallClockMs;
+  const maxAttempts = (budget as Record<string, unknown>).maxAttempts;
+  const deadline = (budget as Record<string, unknown>).deadline;
+  if (maxModelTokens !== undefined && (
+    typeof maxModelTokens !== "number"
+    || !Number.isSafeInteger(maxModelTokens)
+    || maxModelTokens < 1
+    || maxModelTokens > MAX_TASK_MODEL_TOKENS
+  )) {
     throw new A2AProtocolError(
       `task budget maxModelTokens must be between 1 and ${MAX_TASK_MODEL_TOKENS}`,
     );
   }
-  if (
-    !Number.isSafeInteger(budget.maxWallClockMs)
-    || budget.maxWallClockMs < 1
-    || budget.maxWallClockMs > MAX_TASK_WALL_CLOCK_MS
-  ) {
+  if (maxWallClockMs !== undefined && (
+    typeof maxWallClockMs !== "number"
+    || !Number.isSafeInteger(maxWallClockMs)
+    || maxWallClockMs < 1
+    || maxWallClockMs > MAX_TASK_WALL_CLOCK_MS
+  )) {
     throw new A2AProtocolError(
       `task budget maxWallClockMs must be between 1 and ${MAX_TASK_WALL_CLOCK_MS}`,
     );
   }
-  if (budget.deadline !== undefined) {
-    validDate(budget.deadline, "task budget deadline");
+  if (deadline !== undefined) {
+    if (typeof deadline !== "string") throw new A2AProtocolError("task budget deadline must be a date-time");
+    validDate(deadline, "task budget deadline");
   }
-  if (budget.maxAttempts !== undefined && (
-    !Number.isSafeInteger(budget.maxAttempts)
-    || budget.maxAttempts < 1
-    || budget.maxAttempts > MAX_TASK_ATTEMPTS
+  if (maxAttempts !== undefined && (
+    typeof maxAttempts !== "number"
+    || !Number.isSafeInteger(maxAttempts)
+    || maxAttempts < 1
+    || maxAttempts > MAX_TASK_ATTEMPTS
   )) {
     throw new A2AProtocolError(
       `task budget maxAttempts must be between 1 and ${MAX_TASK_ATTEMPTS}`,

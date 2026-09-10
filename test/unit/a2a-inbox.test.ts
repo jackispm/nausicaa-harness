@@ -257,6 +257,23 @@ describe("A2AInbox", () => {
     });
   });
 
+  it("durably reclaims an unhandled claim without waiting for its lease", async () => {
+    const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
+    const ledger = new MemoryLedger({ clock });
+    const inbox = new A2AInbox({ sink: ledger, clock, claimLeaseMs: 30_000 });
+    await inbox.send(taskMessage({ type: "task.accept", taskId: "recover-me" }, {
+      messageId: "recover-me", idempotencyKey: "recover-me",
+    }));
+    await inbox.claim("worker-1", "worker-1", { claimId: "old-claim" });
+    const reclaimed = await inbox.reclaim("recover-me", "main", "runtime-restart");
+    expect(reclaimed.status).toBe("pending");
+    expect(reclaimed.claim).toBeUndefined();
+    const next = await inbox.claim("worker-1", "worker-1", { claimId: "new-claim" });
+    expect(next[0]?.claim).toMatchObject({ claimId: "new-claim", attempt: 2 });
+    expect((await ledger.read()).some((event) => event.type === "message.reclaimed")).toBe(true);
+    expect(projectInbox((await ledger.read())).records.find((record) => record.message.messageId === "recover-me")?.status).toBe("claimed");
+  });
+
   it("reports the next matching claimable delay without mutating the Inbox", async () => {
     const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
     const inbox = new A2AInbox({ clock, claimLeaseMs: 1_000 });

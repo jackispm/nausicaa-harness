@@ -6,6 +6,16 @@ export interface RunTokenReservation {
   status: "reserved" | "settled";
 }
 
+/** Admission priority for concurrent model calls in one Run. */
+export type RunTokenReservationPriority = "main" | "auxiliary";
+
+export interface RunTokenReservationOptions {
+  /** Main work may borrow capacity held by an advisory lane. */
+  priority?: RunTokenReservationPriority;
+  /** Bounded admission slack for a primary request's input estimate. */
+  maxOverdraftTokens?: number;
+}
+
 export interface RunTokenSettlement {
   id: string;
   reservedTokens: number;
@@ -41,7 +51,10 @@ export class RunTokenBudget {
   readonly maxTokens: number | undefined;
   private usedTokens: number;
   private reservedTokens = 0;
-  private readonly reservations = new Map<string, number>();
+  private readonly reservations = new Map<string, {
+    tokens: number;
+    priority: RunTokenReservationPriority;
+  }>();
   private readonly settlements = new Map<string, RunTokenSettlement>();
   private readonly parent: RunTokenBudget | undefined;
   private readonly parentReservationPrefix: string | undefined;
@@ -62,16 +75,30 @@ export class RunTokenBudget {
     this.usedTokens = usedTokens;
   }
 
-  availableTokens(): number {
+  availableTokens(options: RunTokenReservationOptions = {}): number {
     // Keep the numeric API stable for callers that size a provider request,
     // while an omitted max remains genuinely unbounded in reserve().
     if (this.maxTokens === undefined) return Number.MAX_SAFE_INTEGER;
-    return Math.max(0, this.maxTokens - this.usedTokens - this.reservedTokens);
+    const reserved = options.priority === "main"
+      ? this.reservedTokens - [...this.reservations.values()]
+        .filter((reservation) => reservation.priority === "auxiliary")
+        .reduce((total, reservation) => total + reservation.tokens, 0)
+      : this.reservedTokens;
+    return Math.max(0, this.maxTokens - this.usedTokens - reserved);
   }
 
-  reserve(id: string, tokens: number): RunTokenReservation | undefined {
+  reserve(
+    id: string,
+    tokens: number,
+    options: RunTokenReservationOptions = {},
+  ): RunTokenReservation | undefined {
     reservationId(id);
     positiveInteger(tokens, "reservation tokens");
+    const priority = options.priority ?? "main";
+    const maxOverdraftTokens = options.maxOverdraftTokens ?? 0;
+    if (!Number.isSafeInteger(maxOverdraftTokens) || maxOverdraftTokens < 0) {
+      throw new TypeError("maxOverdraftTokens must be a non-negative integer");
+    }
 
     const settled = this.settlements.get(id);
     if (settled !== undefined) {
@@ -83,18 +110,24 @@ export class RunTokenBudget {
 
     const existing = this.reservations.get(id);
     if (existing !== undefined) {
-      if (existing !== tokens) {
+      if (existing.tokens !== tokens) {
         throw new Error(`Token reservation ${id} was reused with a different size`);
       }
       return { id, tokens, status: "reserved" };
     }
-    if (this.maxTokens !== undefined && tokens > this.availableTokens()) return undefined;
+    if (
+      this.maxTokens !== undefined
+      && tokens > this.availableTokens({ priority }) + maxOverdraftTokens
+    ) return undefined;
     const parentId = this.parentReservationId(id);
-    if (parentId !== undefined && this.parent?.reserve(parentId, tokens) === undefined) {
+    if (
+      parentId !== undefined
+      && this.parent?.reserve(parentId, tokens, { priority }) === undefined
+    ) {
       return undefined;
     }
 
-    this.reservations.set(id, tokens);
+    this.reservations.set(id, { tokens, priority });
     this.reservedTokens = safeAdd(this.reservedTokens, tokens, "reserved token total");
     return { id, tokens, status: "reserved" };
   }
@@ -110,10 +143,11 @@ export class RunTokenBudget {
       return { ...settled };
     }
 
-    const reservedTokens = this.reservations.get(id);
-    if (reservedTokens === undefined) {
+    const reservation = this.reservations.get(id);
+    if (reservation === undefined) {
       throw new Error(`Unknown token reservation: ${id}`);
     }
+    const reservedTokens = reservation.tokens;
     const parentId = this.parentReservationId(id);
     if (parentId !== undefined) this.parent?.settle(parentId, actualTokens);
     const nextUsedTokens = safeAdd(this.usedTokens, actualTokens, "used token total");
@@ -168,8 +202,9 @@ export class RunTokenBudget {
 
   cancel(id: string): void {
     reservationId(id);
-    const reserved = this.reservations.get(id);
-    if (reserved === undefined) return;
+    const reservation = this.reservations.get(id);
+    if (reservation === undefined) return;
+    const reserved = reservation.tokens;
     const parentId = this.parentReservationId(id);
     if (parentId !== undefined) this.parent?.cancel(parentId);
     this.reservations.delete(id);
@@ -183,7 +218,7 @@ export class RunTokenBudget {
       reservedTokens: this.reservedTokens,
       availableTokens: this.availableTokens(),
       reservations: [...this.reservations]
-        .map(([id, tokens]) => ({ id, tokens }))
+        .map(([id, reservation]) => ({ id, tokens: reservation.tokens }))
         .sort((left, right) => left.id.localeCompare(right.id)),
       settlements: [...this.settlements.values()]
         .map((settlement) => ({ ...settlement }))

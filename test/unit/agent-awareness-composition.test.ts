@@ -6,6 +6,7 @@ import type { TeamMemberDefinition } from "../../src/domain/team.js";
 import type { A2AMessage, TaskRequest } from "../../src/domain/types.js";
 import { MemoryLedger, projectRun } from "../../src/ledger/index.js";
 import { projectAgentTopology } from "../../src/runtime/agent-awareness.js";
+import { createScopedSpawnContext } from "../../src/runtime/lane-context.js";
 import {
   composeAgentAwarenessProjectionInput,
   type AgentAwarenessCompositionOptions,
@@ -45,6 +46,19 @@ function message(payload: A2AMessage["payload"], to = "worker"): A2AMessage {
     idempotencyKey: `message:${payload.type}:${to}`,
     visibility: "run", priority: 0, delivery: "next-step", payload,
   };
+}
+
+function scopedTeamMessage(to: string, from: string): A2AMessage {
+  const reducer = to.startsWith("team-reducer:");
+  const task = taskRequest(reducer ? `team:${to.slice("team-reducer:".length)}:reduction` : to.slice("team:".length));
+  const scope = { workspaceId: "repo", sessionId: "session-a", runId: "activation-run" };
+  task.spawnContext = createScopedSpawnContext({
+    parent: { ...scope, laneId: from, laneKind: from === "main" ? "main" : "team" },
+    child: { ...scope, laneId: to, laneKind: reducer ? "worker" : "team", parentLaneId: from, ownerLaneId: from,
+      relation: reducer ? "delegates" : "member-of" },
+    goal: task.goal, inputRefs: task.inputRefs, budget: task.budget, role: "Team task lane",
+  });
+  return { ...message(task, to), from };
 }
 
 async function availableLanes(): Promise<MemoryLedger> {
@@ -127,6 +141,32 @@ function descriptor(runId: string, fencingToken: number, publishedAt = now): Dae
 }
 
 describe("agent awareness runtime composition", () => {
+  it("names generated status summaries Nausicaa while retaining canonical identities and task wording", () => {
+    const snapshot = projectAgentTopology(composeAgentAwarenessProjectionInput({
+      workspaceId: "repo", sessionId: "session-a", now,
+      runs: [{
+        projection: projection("working-run", { main: lane("main", "running") }),
+        state: "active",
+      }, {
+        projection: projection("task-run", { main: lane("main", "running") }),
+        activitySummary: "Inspect main.ts on the main branch",
+      }],
+      host: {
+        status: "running", ownerId: "daemon-owner", queuedRuns: 1, runningRuns: 0, attachedClients: 1,
+        runs: [{ runId: "queued-run", state: "queued", pendingWakeCount: 1 }],
+      },
+    }));
+
+    expect(snapshot.nodes.find((node) => node.endpoint.runId === "working-run")).toMatchObject({
+      endpoint: { laneId: "main" }, role: "main", activitySummary: "Nausicaa working",
+    });
+    expect(snapshot.nodes.find((node) => node.endpoint.runId === "queued-run")).toMatchObject({
+      endpoint: { laneId: "main" }, role: "main", activitySummary: "Nausicaa queued for wake",
+    });
+    expect(snapshot.nodes.find((node) => node.endpoint.runId === "task-run")?.activitySummary)
+      .toBe("Inspect main.ts on the main branch");
+  });
+
   it("propagates build identity from the owning session or Run without copying it into other sessions", () => {
     const input = composeAgentAwarenessProjectionInput({
       workspaceId: "repo", sessionId: "session-a", now,
@@ -280,6 +320,70 @@ describe("agent awareness runtime composition", () => {
         target: snapshot.nodes.find((node) => node.endpoint.laneId === "team:review:b")?.key,
       }),
     ]);
+  });
+
+  it("attaches nested Team members and reducers to their admitted lead while Teto follows its owner", async () => {
+    const ledger = await availableLanes();
+    const lead = "team:outer:worker-1";
+    const member = "team:nested:reviewer";
+    const reducer = "team-reducer:nested";
+    for (const [laneId, parent] of [[lead, "main"], [member, lead], [reducer, lead]] as const) {
+      await ledger.append(event("lane.registered", { kind: laneId === reducer ? "worker" : "team" }, laneId));
+      await ledger.append(event("message.sent", { message: scopedTeamMessage(laneId, parent) }, parent));
+    }
+    const observer = `${member}:teto`;
+    await ledger.append(event("lane.registered", { kind: "intent-navigator" }, observer));
+    await ledger.append(event("lane.status", { status: "ready", control: { action: "start", requestedBy: member } }, observer));
+
+    const snapshot = await activationSnapshot(ledger);
+    const ids = new Map(snapshot.nodes.map((node) => [node.key, node.endpoint.laneId]));
+    const edges = snapshot.edges.map((edge) => ({ source: ids.get(edge.source), target: ids.get(edge.target), relation: edge.relation }));
+    expect(edges).toEqual(expect.arrayContaining([
+      { source: "main", target: lead, relation: "parent" },
+      { source: lead, target: member, relation: "parent" },
+      { source: lead, target: reducer, relation: "parent" },
+      { source: lead, target: reducer, relation: "delegates" },
+      { source: member, target: observer, relation: "parent" },
+      { source: observer, target: member, relation: "observer" },
+    ]));
+    expect(edges.some((edge) => edge.source === "main" && [member, reducer, observer].includes(edge.target ?? ""))).toBe(false);
+  });
+
+  it.each([
+    "other-run", "routed", "unknown-parent", "missing-context", "foreign-workspace", "foreign-session", "wrong-task", "wrong-owner", "conflicting-parents",
+  ])("keeps the fallback owner for a Team task with %s evidence", (problem) => {
+    const lead = "team:outer:worker-1";
+    const peer = "team:outer:worker-2";
+    const member = "team:nested:reviewer";
+    const run = projection("activation-run", {
+      main: lane("main", "running"),
+      [lead]: { ...lane(lead, "running"), kind: "team" },
+      [peer]: { ...lane(peer, "running"), kind: "team" },
+      [member]: { ...lane(member, "running"), kind: "team" },
+    });
+    const request = scopedTeamMessage(member, lead);
+    if (request.payload.type !== "task.request") throw new Error("Expected a task fixture");
+    const context = request.payload.spawnContext!;
+    if (problem === "other-run") request.runId = "foreign-run";
+    if (problem === "routed") request.routeId = "cross-run-route";
+    if (problem === "unknown-parent") request.from = "team:unknown:lead";
+    if (problem === "missing-context") delete request.payload.spawnContext;
+    if (problem === "foreign-workspace") context.parent.workspaceId = context.child.workspaceId = "foreign-workspace";
+    if (problem === "foreign-session") context.parent.sessionId = context.child.sessionId = "foreign-session";
+    if (problem === "wrong-task") request.payload.taskId = "unrelated-task";
+    if (problem === "wrong-owner") context.child.ownerLaneId = peer;
+    run.inbox.push({ message: request, status: "handled", sentAtOffset: 5 });
+    if (problem === "conflicting-parents") run.inbox.push({ message: scopedTeamMessage(member, peer), status: "handled", sentAtOffset: 6 });
+    const original = structuredClone(run);
+
+    const snapshot = projectAgentTopology(composeAgentAwarenessProjectionInput({
+      workspaceId: "repo", sessionId: "session-a", now, runs: [{ projection: run }],
+    }));
+    const root = snapshot.nodes.find((node) => node.endpoint.laneId === "main")!;
+    const child = snapshot.nodes.find((node) => node.endpoint.laneId === member)!;
+    expect(snapshot.edges.filter((edge) => edge.target === child.key && edge.relation === "parent"))
+      .toEqual([{ source: root.key, target: child.key, relation: "parent" }]);
+    expect(run).toEqual(original);
   });
 
   it.each([

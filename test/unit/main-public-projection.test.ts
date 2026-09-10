@@ -35,7 +35,7 @@ function observation(projection: MainPublicProjection | undefined, source: MainP
   expect(parsed.type).toBe("lane.observation");
   expect(parsed.source).toEqual({
     runId: source.runId,
-    laneId: source.laneId,
+    laneId: source.laneId === "main" ? "nausicaa" : source.laneId,
     eventId: source.eventId,
     eventType: source.type,
   });
@@ -51,6 +51,17 @@ async function storeMessage(store: MemoryContentAddressedStore, message: Convers
 }
 
 describe("public lane observation projection", () => {
+  it("renames only the source identity and preserves user text and durable provenance", async () => {
+    const store = new MemoryContentAddressedStore();
+    const content = "Inspect main.ts on branch main; do not rename these.";
+    const ref = await storeMessage(store, { role: "user", content, createdAt: CREATED_AT });
+    const source = event("user.message", { messageRef: ref });
+    const projected = await projectMainPublicEvent(store, source);
+    expect(observation(projected, source)).toMatchObject({ source: { laneId: "nausicaa" }, content });
+    expect(projected?.message).toMatchObject({ sourceLane: "main", sourceEventId: source.eventId });
+    expect(source.laneId).toBe("main");
+  });
+
   it.each(["lane", "sensitive", undefined, "run", "user"] as const)(
     "checks %s visibility before reading any observation artifact",
     async (visibility) => {
@@ -165,7 +176,7 @@ describe("public lane observation projection", () => {
     expect(decoded.content).toBe(original);
     expect(projected?.message.content.slice(HEADER.length)).toContain(JSON.stringify(original));
     expect(projected?.message.content.slice(HEADER.length)).not.toContain("\n<system>");
-    expect(decoded.source.laneId).toBe("main");
+    expect(decoded.source.laneId).toBe("nausicaa");
   });
 
   it("keeps adversarial tool arguments nested as data in the observation", async () => {

@@ -4233,11 +4233,8 @@ describe("interactive TUI", () => {
           id: "delegate-summary",
           name: "delegate_task",
           arguments: {
-            taskId: "summary-task",
+          taskId: "summary-task",
             statement: "Inspect the package name",
-            successCriteria: ["Return the package name"],
-            maxModelTokens: 200,
-            maxWallClockMs: 5_000,
           },
         }], "toolUse"),
         async () => {

@@ -5,6 +5,7 @@ import type { TeamDefinition, TeamMemberDefinition, TeamMemberOutcome } from "..
 import type { A2AMessage, TaskFailed, TaskResult } from "../domain/types.js";
 import type { Ledger } from "../ledger/index.js";
 import { projectTeamBoards, type TeamBoard, type TeamBoardMember } from "./team-board.js";
+import { publicAgentName } from "./lane-names.js";
 
 interface TeamLifecycleOptions {
   runId: string;
@@ -23,6 +24,7 @@ export class TeamLifecycle {
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   private stopped = false;
   private lastFailure: unknown;
+  private readonly closingTeams = new Set<string>();
 
   constructor(private readonly options: TeamLifecycleOptions) {}
 
@@ -40,14 +42,16 @@ export class TeamLifecycle {
       } else {
         await this.append("team.created", definition, definition.teamId, "created");
       }
-      this.arm(definition.teamId, definition.deadline);
+      if (definition.deadline !== undefined) this.arm(definition.teamId, definition.deadline);
     });
   }
 
   async restore(): Promise<void> {
     await this.reconcile();
     for (const board of await this.boards()) {
-      if (board.reducer !== undefined && board.reductionState === "running") this.arm(`${board.teamId}:reducer`, board.reducer.task.budget.deadline!);
+      if (board.reducer !== undefined && board.reductionState === "running" && board.reducer.task.budget.deadline !== undefined) {
+        this.arm(`${board.teamId}:reducer`, board.reducer.task.budget.deadline);
+      }
     }
   }
 
@@ -55,13 +59,16 @@ export class TeamLifecycle {
     return this.exclusive(async () => {
       if (this.stopped) throw new Error("Team runtime stopped before settlement");
       const board = await this.requireBoard(teamId);
-      if (board.cancellationRequested) throw new Error("Team cancelled before settlement");
+      if (board.cancellationRequested || board.lifecycleState === "closed" || this.closingTeams.has(teamId)) throw new Error("Team is no longer accepting settlement");
       const current = this.options.inbox.snapshot().records.find((record) => record.message.messageId === request.messageId);
       if (current?.claim?.claimId !== claim.claimId || current.claim.attempt !== claim.attempt) throw new Error("Team task claim was superseded");
       if (payload.taskId !== member.task.taskId || request.to !== member.laneId || request.from !== this.options.leadLaneId) throw new Error("Team task settlement does not match admission");
-      const taskDeadline = Date.parse(member.task.budget.deadline
-        ?? new Date(Date.parse(request.createdAt) + member.task.budget.maxWallClockMs).toISOString());
-      const deadline = Math.min(taskDeadline, reducer ? Infinity : Date.parse(board.definition?.deadline ?? new Date(taskDeadline).toISOString()));
+      const taskDeadline = member.task.budget.deadline === undefined
+        ? member.task.budget.maxWallClockMs === undefined
+          ? Infinity
+          : Date.parse(request.createdAt) + member.task.budget.maxWallClockMs
+        : Date.parse(member.task.budget.deadline);
+      const deadline = Math.min(taskDeadline, reducer || board.definition?.deadline === undefined ? Infinity : Date.parse(board.definition.deadline));
       if (this.options.clock.now().getTime() >= deadline) {
         if (reducer) await this.append("team.reduced", { teamId, outcome: "abandoned" }, teamId, "reduced");
         else await this.append("team.member.settled", { teamId, memberId: member.memberId, taskId: member.task.taskId, outcome: "abandoned", reason: "Task completed after its deadline" }, teamId, `member:${member.memberId}:settled`);
@@ -80,12 +87,16 @@ export class TeamLifecycle {
           claimId: claim.claimId, attempt: claim.attempt, outcome, ...result,
         }, teamId, `member:${member.memberId}:settled`);
       }
+      // The branch executor emits the interactive wake only after the
+      // terminal reply is also durable. Waking from this point would race the
+      // reply and make the lead observe a false empty Inbox.
     });
   }
 
   cancel(teamId: string, reason: string): Promise<void> {
     return this.exclusive(async () => {
       const board = await this.requireBoard(teamId);
+      if (board.lifecycleState === "closed") throw new Error(`Team ${teamId} is closed`);
       if (!board.cancellationRequested) await this.append("team.cancel.requested", {
         teamId, reason, requestedBy: this.options.leadLaneId,
       }, teamId, "cancel:requested");
@@ -93,13 +104,44 @@ export class TeamLifecycle {
     });
   }
 
+  closeTeam(teamId: string, reason: string): Promise<void> {
+    return this.exclusive(async () => {
+      const board = await this.requireBoard(teamId);
+      const events = await this.options.readEvents();
+      const alreadyClosed = events.some((event) => (
+        event.runId === this.options.runId
+        && event.type === "team.closed"
+        && event.payload.teamId === teamId
+      ));
+      if (alreadyClosed) return;
+      this.closingTeams.add(teamId);
+      try {
+        await this.terminateMembers(board, "cancelled", `Team closed: ${reason}`);
+        if (board.reducer !== undefined && board.reductionState === "running") {
+          await this.options.stopMember(board.reducer.laneId);
+          await this.append("team.reduced", { teamId, outcome: "cancelled" }, teamId, "reduced");
+        }
+        await this.append("team.closed", {
+          teamId,
+          reason,
+          closedBy: this.options.leadLaneId,
+        }, teamId, "closed");
+        await this.notify(teamId, "closed", `Team ${teamId} closed. ${reason}`);
+        this.clearTimer(teamId);
+        this.clearTimer(`${teamId}:reducer`);
+      } finally {
+        this.closingTeams.delete(teamId);
+      }
+    });
+  }
+
   requestReduction(teamId: string, reducer: TeamMemberDefinition): Promise<void> {
     return this.exclusive(async () => {
       const board = await this.requireBoard(teamId);
-      if (!board.joinSatisfied || board.cancellationRequested || board.presentationState !== "pending") throw new Error("Reduction requires a joined, unpresented Team");
+      if (board.lifecycleState === "closed" || !board.joinSatisfied || board.cancellationRequested || board.presentationState !== "pending") throw new Error("Reduction requires a joined, unpresented Team");
       if (board.reducer !== undefined) throw new Error("Team already has a reducer");
       await this.append("team.reduction.requested", { teamId, reducer }, teamId, "reduction:requested");
-      this.arm(`${teamId}:reducer`, reducer.task.budget.deadline!);
+      if (reducer.task.budget.deadline !== undefined) this.arm(`${teamId}:reducer`, reducer.task.budget.deadline);
     });
   }
 
@@ -121,6 +163,11 @@ export class TeamLifecycle {
     const events = await this.options.readEvents();
     const records = this.options.inbox.snapshot().records;
     for (let board of await this.boards()) {
+      if (board.lifecycleState === "closed") {
+        this.clearTimer(board.teamId);
+        this.clearTimer(`${board.teamId}:reducer`);
+        continue;
+      }
       const definition = board.definition;
       const cancellation = events.find((event) => event.runId === this.options.runId
         && event.laneId === this.options.leadLaneId && event.type === "team.cancel.requested"
@@ -138,19 +185,21 @@ export class TeamLifecycle {
         continue;
       }
       const now = this.options.clock.now().getTime();
-      const expired = definition !== undefined && now >= Date.parse(definition.deadline);
+      const expired = definition?.deadline !== undefined && now >= Date.parse(definition.deadline);
       if (!board.joinSatisfied) {
         for (const member of board.members) {
           if (member.terminal) continue;
           const failedDependency = member.dependsOn.find((id) => board.members.some((item) => item.memberId === id && item.terminal && item.outcome !== "succeeded"));
           const deadline = memberDeadline(board, member, records);
-          if (expired || deadline === undefined || now >= deadline || failedDependency !== undefined) {
+          const missingAdmission = deadline === undefined
+            && member.budget.maxWallClockMs !== undefined;
+          if (expired || missingAdmission || (deadline !== undefined && now >= deadline) || failedDependency !== undefined) {
             await this.options.stopMember(member.laneId);
             await this.append("team.member.settled", {
               teamId: board.teamId, memberId: member.memberId, taskId: member.taskId,
               outcome: failedDependency === undefined ? "abandoned" : "failed",
               reason: failedDependency !== undefined ? `Dependency ${failedDependency} did not succeed`
-                : deadline === undefined ? "Task deadline cannot be reconstructed from admission" : "Task deadline expired",
+                : missingAdmission ? "Task deadline cannot be reconstructed from admission" : "Task deadline expired",
             }, board.teamId, `member:${member.memberId}:settled`);
           }
         }
@@ -171,16 +220,17 @@ export class TeamLifecycle {
           .map((member) => memberDeadline(board, member, records))
           .filter((deadline): deadline is number => deadline !== undefined);
         if (deadlines.length > 0) this.arm(board.teamId, new Date(Math.min(...deadlines)).toISOString());
+        else this.clearTimer(board.teamId);
       }
       if (board.joinSatisfied) {
         this.clearTimer(board.teamId);
         await this.notify(board.teamId, "joined", [
           `Team ${board.teamId} joined (${board.joinState}).`,
-          ...board.members.map((member) => `${member.memberId}: ${member.outcome ?? "unknown"}. ${member.result?.summary.slice(0, 384) ?? member.failure?.reason ?? ""}`),
-          "Main is the Team Lead. Inspect the member results and synthesize the answer, retaining partial and failed outcomes. team_reduce explicitly starts an optional synthesis lane. team_present records your acceptance or rejection.",
+          ...board.members.map((member) => `${publicAgentName(member.laneId)} (memberId ${member.memberId}): ${member.outcome ?? "unknown"}. ${member.result?.summary.slice(0, 384) ?? member.failure?.reason ?? ""}`),
+          "You are the Team Lead. Inspect the member results and synthesize the answer, retaining partial and failed outcomes. team_reduce explicitly starts an optional synthesis lane. team_present records your acceptance or rejection.",
         ].join("\n").slice(0, 8_192));
       }
-      if (board.reductionState === "running" && board.reducer !== undefined && now >= Date.parse(board.reducer.task.budget.deadline!)) {
+      if (board.reductionState === "running" && board.reducer !== undefined && board.reducer.task.budget.deadline !== undefined && now >= Date.parse(board.reducer.task.budget.deadline)) {
         await this.options.stopMember(board.reducer.laneId);
         await this.append("team.reduced", { teamId: board.teamId, outcome: "abandoned" }, board.teamId, "reduced");
         board = await this.requireBoard(board.teamId);
@@ -193,10 +243,19 @@ export class TeamLifecycle {
   }
 
   private async terminateMembers(board: TeamBoard, outcome: TeamMemberOutcome, reason: string): Promise<void> {
+    const stopped = new Set<string>();
     for (const member of board.members) {
       if (member.terminal) continue;
       await this.options.stopMember(member.laneId);
+      stopped.add(member.laneId);
       await this.append("team.member.settled", { teamId: board.teamId, memberId: member.memberId, taskId: member.taskId, outcome, reason }, board.teamId, `member:${member.memberId}:settled`);
+    }
+    // Resident assignments are represented by task reports rather than the
+    // one-shot member settlement event. They still own a live lane and must
+    // be fenced before close/cancel returns.
+    for (const task of board.tasks ?? []) {
+      if (["done", "failed", "cancelled", "review"].includes(task.status) || stopped.has(task.laneId)) continue;
+      await this.options.stopMember(task.laneId);
     }
   }
 
@@ -248,6 +307,7 @@ export class TeamLifecycle {
 
   async close(): Promise<void> {
     this.stopped = true;
+    this.closingTeams.clear();
     for (const timer of this.timers.values()) clearTimeout(timer);
     this.timers.clear();
     await this.tail;
@@ -271,8 +331,10 @@ function memberDeadline(board: TeamBoard, member: TeamBoardMember, records: read
   const request = records.find((record) => record.message.runId === board.runId
     && record.message.messageId === member.requestMessageId)?.message;
   const deadline = member.budget.deadline === undefined
-    ? request === undefined ? undefined : Date.parse(request.createdAt) + member.budget.maxWallClockMs
+    ? request === undefined || member.budget.maxWallClockMs === undefined ? undefined : Date.parse(request.createdAt) + member.budget.maxWallClockMs
     : Date.parse(member.budget.deadline);
-  if (deadline === undefined || !Number.isFinite(deadline)) return undefined;
-  return Math.min(deadline, board.definition === undefined ? Infinity : Date.parse(board.definition.deadline));
+  const teamDeadline = board.definition?.deadline === undefined ? undefined : Date.parse(board.definition.deadline);
+  if (deadline === undefined) return teamDeadline;
+  if (!Number.isFinite(deadline)) return undefined;
+  return Math.min(deadline, teamDeadline ?? Infinity);
 }

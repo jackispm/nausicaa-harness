@@ -633,6 +633,14 @@ export function projectRun(events: readonly AnyEvent[], runId: RunId): RunProjec
         }
         break;
       }
+      case "message.reclaimed": {
+        const item = inboxById.get(event.payload.messageId);
+        if (item !== undefined && item.status !== "handled") {
+          item.status = "pending";
+          delete item.claimedBy;
+        }
+        break;
+      }
       case "message.handled": {
         const item = inboxById.get(event.payload.messageId);
         if (item !== undefined) {

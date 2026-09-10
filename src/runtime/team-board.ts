@@ -10,6 +10,8 @@ import type {
   TeamMemberExecution,
   TeamMemberOutcome,
   TeamMemberSettlement,
+  TeamRunReport,
+  TeamTaskAssignment,
   TeamReduction,
 } from "../domain/team.js";
 import type {
@@ -52,6 +54,7 @@ export interface TeamBoardMember {
   budget: TaskBudget;
   dependsOn: string[];
   required: boolean;
+  capabilities?: import("../domain/team.js").TeamCapabilityGrant;
   registered: boolean;
   laneStatus?: LaneStatus;
   execution: TeamMemberExecution;
@@ -67,6 +70,19 @@ export interface TeamBoardMember {
   reason?: string;
   lastOffset: number;
   anomalies: string[];
+}
+
+export type TeamTaskStatus = "queued" | "running" | "waiting" | "blocked" | "review" | "done" | "failed" | "cancelled" | "unknown";
+
+export interface TeamBoardTask {
+  taskId: string;
+  memberId: string;
+  laneId: LaneId;
+  assignmentVersion: number;
+  statement: string;
+  status: TeamTaskStatus;
+  assignedAt: string;
+  latestReport?: TeamRunReport & { reportId: string; runId: RunId };
 }
 
 export type TeamBoardBranch = TeamBoardMember;
@@ -85,9 +101,13 @@ export interface TeamBoard {
   cancellationRequested: boolean;
   reductionState: "not-started" | "running" | "completed" | "failed";
   presentationState: "pending" | "accepted" | "rejected";
+  lifecycleState: "open" | "closed";
+  closedReason?: string;
   reducer?: TeamMemberDefinition;
   reduction?: TeamReduction;
   members: TeamBoardMember[];
+  /** Durable tasks assigned after Team creation, including their latest handoff. */
+  tasks?: TeamBoardTask[];
   /** Compatibility alias of members. */
   branches: TeamBoardMember[];
   anomalies: string[];
@@ -165,20 +185,29 @@ interface DraftTeam {
   definition?: TeamDefinition;
   definitionOffset?: number;
   members: Map<LaneId, DraftMember>;
+  tasks: Map<string, DraftTask>;
   cancellationRequested: boolean;
   cancelled: boolean;
   joined?: TeamJoined;
   reducer?: TeamMemberDefinition;
   reduction?: TeamReduction;
   presentationState: TeamBoard["presentationState"];
+  closed?: { reason: string; closedBy: LaneId };
   lastOffset: number;
   anomalies: string[];
+}
+
+interface DraftTask {
+  assignment: TeamTaskAssignment;
+  assignedAt: string;
+  latestReport?: TeamRunReport & { reportId: string; runId: RunId };
+  status: TeamTaskStatus;
 }
 
 function newTeam(teamId: string, coordinator: LaneId): DraftTeam {
   return {
     teamId, coordinator, members: new Map(), cancellationRequested: false,
-    cancelled: false, presentationState: "pending", lastOffset: 0, anomalies: [],
+    tasks: new Map(), cancelled: false, presentationState: "pending", lastOffset: 0, anomalies: [],
   };
 }
 
@@ -296,6 +325,12 @@ function projectRunBoards(
       continue;
     }
     const event = entry.event;
+    const dynamic = dynamicTeamEvent(event);
+    if (dynamic !== undefined) {
+      const team = teams.get(dynamic.payload.teamId);
+      if (team !== undefined) applyDynamicTeamEvent(team, dynamic);
+      continue;
+    }
     const parsed = parseTeamLane(event.laneId);
     const member = parsed === undefined ? undefined : teams.get(parsed.teamId)?.members.get(event.laneId);
     if (member !== undefined) member.lastOffset = Math.max(member.lastOffset, event.globalOffset);
@@ -306,6 +341,15 @@ function projectRunBoards(
       applyReply(teams, recordFromEvent(event));
     } else if (event.type === "message.claimed" || event.type === "message.handled") {
       if (inbox.get(event.payload.messageId) !== undefined) inbox.apply(event);
+      if (event.type === "message.claimed") {
+        const message = inbox.get(event.payload.messageId)?.message;
+        if (message?.payload.type === "task.request") {
+          for (const candidate of teams.values()) {
+            const task = (candidate.tasks ?? new Map()).get(message.payload.taskId);
+            if (task !== undefined && task.status === "queued") task.status = "running";
+          }
+        }
+      }
     }
     if (event.type === "lane.registered" || event.type === "lane.status") {
       if (member !== undefined) {
@@ -324,6 +368,65 @@ function projectRunBoards(
 }
 
 type TeamEvent = Extract<AnyEvent, { type: `team.${string}` }>;
+
+type DynamicTeamEvent = {
+  runId: RunId;
+  laneId: LaneId;
+  globalOffset: number;
+  occurredAt: string;
+  type: "team.task.assigned" | "team.run.reported";
+  payload: TeamTaskAssignment | (TeamRunReport & { reportId: string; runId: RunId });
+};
+
+function dynamicTeamEvent(event: AnyEvent): DynamicTeamEvent | undefined {
+  const candidate = event as unknown as { type?: string };
+  if (candidate.type !== "team.task.assigned" && candidate.type !== "team.run.reported") return undefined;
+  return event as unknown as DynamicTeamEvent;
+}
+
+function applyDynamicTeamEvent(team: DraftTeam, event: DynamicTeamEvent): void {
+  team.lastOffset = Math.max(team.lastOffset, event.globalOffset);
+  if (event.type === "team.task.assigned") {
+    const assignment = event.payload as TeamTaskAssignment;
+    if (assignment.assignedBy !== team.coordinator || event.laneId !== team.coordinator) {
+      anomaly(team, "team.task.assigned has an unauthorized assigner");
+      return;
+    }
+    const member = [...team.members.values()].find((candidate) => candidate.definition.memberId === assignment.memberId);
+    if (member === undefined || member.definition.laneId !== assignment.laneId) {
+      anomaly(team, "team.task.assigned names an unknown member lane");
+      return;
+    }
+    const previous = team.tasks.get(assignment.taskId);
+    if (previous !== undefined) {
+      if (stableJson(previous.assignment) !== stableJson(assignment)) anomaly(team, "conflicting team.task.assigned ignored");
+      return;
+    }
+    const active = [...team.tasks.values()].find((task) => task.assignment.memberId === assignment.memberId
+      && ["queued", "running", "waiting", "blocked"].includes(task.status));
+    if (active !== undefined) {
+      anomaly(team, `member ${assignment.memberId} has a concurrent active task`);
+      return;
+    }
+    team.tasks.set(assignment.taskId, { assignment: structuredClone(assignment), assignedAt: event.occurredAt, status: "queued" });
+    return;
+  }
+  const report = event.payload as TeamRunReport & { reportId: string; runId: string };
+  if (report.runId !== event.runId) {
+    anomaly(team, "team.run.reported runId does not match its event envelope");
+    return;
+  }
+  const task = team.tasks.get(report.taskId);
+  if (task === undefined || task.assignment.laneId !== report.laneId
+    || task.assignment.assignmentVersion !== report.assignmentVersion) {
+    anomaly(team, "team.run.reported does not match the current assignment");
+    return;
+  }
+  task.latestReport = structuredClone(report);
+  task.status = report.kind === "ready-for-review" ? "review"
+    : report.kind === "blocked" ? "blocked"
+      : report.kind === "failed" ? "failed" : report.result?.status === "completed" ? "done" : "waiting";
+}
 
 function isTeamEvent(event: AnyEvent): event is TeamEvent {
   return event.type.startsWith("team.");
@@ -345,6 +448,13 @@ function applyTeamEvent(team: DraftTeam, event: TeamEvent, inbox: InboxProjector
     applySettlement(team, member, event, inbox);
     return;
   }
+  if (event.type === "team.message.sent") {
+    const senderIsMember = [...team.members.values()].some((member) => member.definition.laneId === event.payload.fromLane);
+    if (event.payload.fromLane !== team.coordinator && !senderIsMember) {
+      anomaly(team, "team.message.sent has an unauthorized sender");
+    }
+    return;
+  }
   if (event.laneId !== team.coordinator) {
     anomaly(team, `${event.type} was not emitted by the Team lead`);
     return;
@@ -358,7 +468,10 @@ function applyTeamEvent(team: DraftTeam, event: TeamEvent, inbox: InboxProjector
     case "team.cancelled":
       if (!team.cancellationRequested || [...team.members.values()].some((member) => member.settlement === undefined)) {
         anomaly(team, "team.cancelled has no cancellation request or unsettled members");
-      } else team.cancelled = true;
+      } else {
+        team.cancelled = true;
+        cancelOpenResidentTasks(team);
+      }
       break;
     case "team.joined":
       applyJoin(team, event);
@@ -390,6 +503,23 @@ function applyTeamEvent(team: DraftTeam, event: TeamEvent, inbox: InboxProjector
         anomaly(team, "presentation requires a joined Team and a finished requested reduction");
       } else team.presentationState = event.payload.disposition;
       break;
+    case "team.closed":
+      if (event.payload.closedBy !== team.coordinator) {
+        anomaly(team, "team.closed has an unauthorized closer");
+      } else if (team.closed !== undefined) {
+        anomaly(team, "duplicate team.closed ignored");
+      } else {
+        team.closed = { reason: event.payload.reason, closedBy: event.payload.closedBy };
+        cancelOpenResidentTasks(team);
+      }
+      break;
+  }
+}
+
+function cancelOpenResidentTasks(team: DraftTeam): void {
+  for (const task of team.tasks.values()) {
+    if (["done", "failed", "cancelled", "review"].includes(task.status)) continue;
+    task.status = "cancelled";
   }
 }
 
@@ -496,6 +626,7 @@ function applyJoin(team: DraftTeam, event: Extract<AnyEvent, { type: "team.joine
   const requiredReady = members.every((member) => !member.definition.required || member.settlement !== undefined);
   const deadlineReady = event.payload.reason !== "deadline-best-effort"
     || (team.definition?.joinPolicy === "deadline-best-effort"
+      && team.definition.deadline !== undefined
       && Date.parse(event.occurredAt) >= Date.parse(team.definition.deadline)
       && settled.length === members.length);
   if (team.cancellationRequested || !requiredReady || !deadlineReady || !matching) {
@@ -528,6 +659,18 @@ function finalizeTeam(runId: RunId, team: DraftTeam, inbox: InboxProjector, lega
     ...(team.reducer === undefined ? {} : { reducer: structuredClone(team.reducer) }),
     ...(team.reduction === undefined ? {} : { reduction: structuredClone(team.reduction) }),
     members, branches: members,
+    tasks: [...team.tasks.values()].sort((left, right) => compareText(left.assignment.taskId, right.assignment.taskId)).map((task) => ({
+      taskId: task.assignment.taskId,
+      memberId: task.assignment.memberId,
+      laneId: task.assignment.laneId,
+      assignmentVersion: task.assignment.assignmentVersion,
+      statement: task.assignment.task.goal.statement,
+      status: task.status,
+      assignedAt: task.assignedAt,
+      ...(task.latestReport === undefined ? {} : { latestReport: structuredClone(task.latestReport) }),
+    })),
+    lifecycleState: team.closed === undefined ? "open" : "closed",
+    ...(team.closed === undefined ? {} : { closedReason: team.closed.reason }),
     anomalies: [...new Set([...team.anomalies, ...members.flatMap((member) => member.anomalies)])],
     lastOffset: Math.max(team.lastOffset, ...members.map((member) => member.lastOffset), 0),
   };
@@ -554,6 +697,7 @@ function finalizeMember(team: DraftTeam, member: DraftMember, inbox: InboxProjec
     requestMessageId: requestId ?? "", coordinator: team.coordinator,
     goal: structuredClone(definition.task.goal), inputRefs: structuredClone(definition.task.inputRefs),
     budget: structuredClone(definition.task.budget), dependsOn: [...definition.dependsOn], required: definition.required,
+    ...(definition.capabilities === undefined ? {} : { capabilities: structuredClone(definition.capabilities) }),
     registered: member.registered,
     ...(laneStatus === undefined ? {} : { laneStatus }),
     execution, status, terminal,

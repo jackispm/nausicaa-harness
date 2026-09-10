@@ -66,6 +66,107 @@ function mailbox(inbox: A2AInbox, overrides: Partial<ConstructorParameters<typeo
 }
 
 describe("in-Run agent_message", () => {
+  it.each(["nausicaa", "main"])("routes %s to the canonical owner and preserves retries across aliases", async (target) => {
+    const { inbox, ledger, clock } = setup();
+    const tool = createInRunAgentMessageTool({ inbox, runId, now: clock.now });
+    const tetoContext = { ...context, laneId: "teto" };
+    const text = "Check the user's requested main branch before continuing";
+    const first = await tool.execute({ target, text }, tetoContext);
+    const retry = await tool.execute({ target: target === "main" ? "nausicaa" : "main", text }, tetoContext);
+
+    expect(first.isError).toBe(false);
+    expect(retry.isError).toBe(false);
+    expect(JSON.parse(first.content)).toMatchObject({ status: "queued", from: "teto", to: "nausicaa" });
+    expect(JSON.parse(retry.content)).toMatchObject({
+      status: "duplicate", messageId: JSON.parse(first.content).messageId, to: "nausicaa",
+    });
+    expect(inbox.snapshot().records).toHaveLength(1);
+    expect(inbox.snapshot().records[0]?.message).toMatchObject({
+      from: "teto", to: "main", payload: { type: "message.inform", text },
+    });
+    const sent = (await ledger.read({ runId })).filter((event) => event.type === "message.sent");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.payload.message.to).toBe("main");
+  });
+
+  it("rechecks the owner's grant before accepting a public-name retry", async () => {
+    const { inbox, ledger, clock } = setup();
+    let targets = ["main"];
+    const tool = createInRunAgentMessageTool({
+      inbox, runId, from: memberA, resolveTargets: () => targets, now: clock.now,
+    });
+    const arguments_ = { target: "nausicaa", text: "The current approach misses a requirement" };
+    expect((await tool.execute(arguments_, context)).isError).toBe(false);
+    const admitted = await ledger.read({ runId });
+
+    targets = [memberB];
+    const deniedRetry = await tool.execute(arguments_, context);
+    const deniedNewSend = await tool.execute(arguments_, { ...context, operationId: "operation-2" });
+    for (const result of [deniedRetry, deniedNewSend]) {
+      expect(result.isError).toBe(true);
+      expect(JSON.parse(result.content).error).toContain("target nausicaa is not authorized");
+    }
+    expect(await ledger.read({ runId })).toEqual(admitted);
+    expect(inbox.snapshot().records).toHaveLength(1);
+  });
+
+  it("checks replies against the canonical owner's original message", async () => {
+    const { inbox, clock } = setup();
+    await inbox.send(message("owner-question", {
+      from: "main", to: memberA, payload: { type: "question.ask", question: "Is the approach sound?" },
+    }));
+    await inbox.send(message("peer-question", { from: memberB, to: memberA }));
+    await inbox.send(message("other-owner-question", { from: "main", to: memberB }));
+    const tool = createInRunAgentMessageTool({ inbox, runId, from: memberA, to: "main", now: clock.now });
+    const result = await tool.execute({ target: "nausicaa", text: "One requirement is missing", replyTo: "owner-question" }, context);
+
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content)).toMatchObject({ from: memberA, to: "nausicaa" });
+    expect(inbox.snapshot().records.find((record) => record.message.messageId === JSON.parse(result.content).messageId)?.message).toMatchObject({
+      from: memberA, to: "main", replyTo: "owner-question",
+    });
+    for (const replyTo of ["peer-question", "other-owner-question"]) {
+      const rejected = await tool.execute({ target: "nausicaa", text: "Not my owner's question", replyTo }, {
+        ...context, operationId: `reply:${replyTo}`,
+      });
+      expect(rejected.isError).toBe(true);
+      expect(JSON.parse(rejected.content).error).toContain("replyTo must reference a message from this recipient");
+    }
+    expect(inbox.snapshot().records).toHaveLength(4);
+  });
+
+  it("keeps a nested Teto bound to its actual Team owner", async () => {
+    const { inbox, clock } = setup();
+    const observer = `${memberA}:teto`;
+    const tool = createInRunAgentMessageTool({ inbox, runId, from: observer, to: memberA, now: clock.now });
+    const observerContext = { ...context, laneId: observer };
+    for (const target of ["nausicaa", "main"]) {
+      expect((await tool.execute({ target, text: "Do not route this to the root" }, observerContext)).isError).toBe(true);
+    }
+    expect(inbox.snapshot().records).toEqual([]);
+
+    const result = await tool.execute({ target: memberA, text: "Your repeated search has returned no new evidence" }, observerContext);
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content)).toMatchObject({ from: observer, to: memberA });
+    expect(inbox.snapshot().records[0]?.message).toMatchObject({ from: observer, to: memberA });
+  });
+
+  it("projects the root sender name without changing the identity used by the host", async () => {
+    const { inbox, clock } = setup();
+    const onMessage = vi.fn();
+    const tool = createInRunAgentMessageTool({
+      inbox, runId, from: "main", to: memberA, now: clock.now, onMessage,
+    });
+    const text = "Inspect main.ts and report evidence";
+    const result = await tool.execute({ text }, { ...context, laneId: "main" });
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content)).toMatchObject({ from: "nausicaa", to: memberA });
+    expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({
+      from: "main", to: memberA, payload: { type: "message.inform", text },
+    }));
+    expect(inbox.snapshot().records[0]?.message.from).toBe("main");
+  });
+
   it("preserves the host-fixed Teto text call and refuses another target", async () => {
     const { inbox, clock } = setup();
     const tool = createInRunAgentMessageTool({ inbox, runId, now: clock.now });

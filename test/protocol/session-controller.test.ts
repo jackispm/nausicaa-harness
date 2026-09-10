@@ -1176,9 +1176,6 @@ describe("SessionController", () => {
           arguments: {
             taskId: "task-1",
             statement: "Inspect the package metadata",
-            successCriteria: ["Return the package name"],
-            maxModelTokens: 200,
-            maxWallClockMs: 5_000,
           },
         }],
         stopReason: "toolUse",
@@ -1302,8 +1299,6 @@ describe("SessionController", () => {
           arguments: {
             taskId: "cross-turn-task",
             statement: "Inspect the package name",
-            maxModelTokens: 100,
-            maxWallClockMs: 5_000,
           },
         }],
         stopReason: "toolUse",
@@ -1386,8 +1381,6 @@ describe("SessionController", () => {
           arguments: {
             taskId: "close-task",
             statement: "Inspect the package name",
-            maxModelTokens: 100,
-            maxWallClockMs: 5_000,
           },
         }],
         stopReason: "toolUse",

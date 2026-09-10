@@ -304,7 +304,7 @@ describe("ReflectionScheduler", () => {
     await expect(scheduler.beforeMainStep()).resolves.toEqual([]);
     await expect(scheduler.beforeMainStep()).resolves.toEqual([{
       kind: "reflection",
-      source: "main-reflection",
+      source: "nausicaa-reflection",
       content: "Check the package entry point",
       messageId: "run-1:reflection:2",
     }]);
@@ -355,7 +355,7 @@ describe("ReflectionScheduler", () => {
     await expect(scheduler.beforeMainStep()).resolves.toEqual([]);
     await expect(scheduler.beforeMainStep()).resolves.toEqual([{
       kind: "reflection",
-      source: "main-reflection",
+      source: "nausicaa-reflection",
       content: "Deliver the later observation",
       messageId: "run-1:reflection:6",
     }]);

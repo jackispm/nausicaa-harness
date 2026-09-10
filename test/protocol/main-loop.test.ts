@@ -2772,7 +2772,7 @@ describe("MainLoop", () => {
     expect(durable.content).toContain("Full tool result stored as artifact");
 
     const visibleTool = scripted.requests[1]?.messages.find((message) => message.role === "tool");
-    expect(visibleTool?.content).toContain("[TRUNCATED BY MAIN LOOP]");
+    expect(visibleTool?.content).toContain("[TRUNCATED BY NAUSICAA]");
     expect(Buffer.byteLength(visibleTool?.content ?? "", "utf8")).toBeLessThanOrEqual(256 * 1024);
     expect(visibleTool?.content).toBe(durable.content);
     expect(succeeded.payload.contextRef?.id).toBe(succeeded.payload.resultRef.id);

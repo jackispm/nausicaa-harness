@@ -29,10 +29,10 @@ export function createTetoControlTools(control: TetoControl): readonly AgentTool
   const start: AgentTool = {
     definition: {
       name: "teto_start",
-      description: "Start or restart your Teto observer. Reuses an active lane; the reason explains why to enable observation.",
+      description: "Start or restart Teto, your auxiliary observer of subscribed activity. Teto assists this lane and sends new, high-value advice through agent_message. Reuses an active lane.",
       parameters: {
         type: "object",
-        properties: { reason: { type: "string", description: "Why a second thinking line is useful" } },
+        properties: { reason: { type: "string", description: "Why auxiliary observation is useful" } },
         additionalProperties: false,
       },
     },
@@ -43,7 +43,7 @@ export function createTetoControlTools(control: TetoControl): readonly AgentTool
   const stop: AgentTool = {
     definition: {
       name: "teto_stop",
-      description: "Stop this lane's active Teto feedback lane. The lane can be opened again later and keeps its durable transcript.",
+      description: "Stop this lane's active Teto auxiliary observer. The lane can be opened again later and keeps its durable transcript.",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
     async execute(_arguments_, context): Promise<ToolResult> {
@@ -53,7 +53,7 @@ export function createTetoControlTools(control: TetoControl): readonly AgentTool
   const status: AgentTool = {
     definition: {
       name: "teto_status",
-      description: "Read whether this lane has an available or active Teto feedback lane.",
+      description: "Read whether this lane has an available or active Teto auxiliary observer.",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
     async execute(_arguments_, context): Promise<ToolResult> {

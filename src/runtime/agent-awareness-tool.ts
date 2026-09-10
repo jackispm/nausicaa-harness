@@ -1,12 +1,13 @@
 import type { AgentTool, ToolExecutionContext, ToolResult } from "../domain/ports.js";
 import type { CrossRunEndpoint } from "../domain/types.js";
-import { normalizeEndpoint } from "../a2a/cross-run-contract.js";
+import { endpointKey, normalizeEndpoint } from "../a2a/cross-run-contract.js";
 import {
   redactAgentEndpoint,
   redactAgentTopologySnapshot,
   type AgentTopologySnapshot,
 } from "./agent-awareness.js";
 import { annotateTool } from "../mowe/catalog.js";
+import { publicAgentName, publicLaneEndpoint, publicLaneName } from "./lane-names.js";
 
 export interface AgentAwarenessToolOptions {
   /** Host-owned read; the tool never retains a registry or transcript. */
@@ -27,7 +28,7 @@ export type AgentAwarenessReader = AgentAwarenessToolOptions["read"];
 export function createAgentAwarenessTool(options: AgentAwarenessToolOptions): AgentTool {
   if (typeof options.read !== "function") throw new TypeError("awareness read must be a function");
   const self = options.self === undefined ? undefined : normalizeEndpoint(options.self, "awareness.self");
-  const publicSelf = self === undefined ? null : redactAgentEndpoint(self);
+  const publicSelf = self === undefined ? null : publicLaneEndpoint(redactAgentEndpoint(self));
   const tool: AgentTool = {
     definition: {
       name: "agent_awareness",
@@ -52,15 +53,15 @@ export function createAgentAwarenessTool(options: AgentAwarenessToolOptions): Ag
         return {
           content: JSON.stringify({
             self: publicSelf,
-            snapshot,
+            snapshot: publicTopology(snapshot),
             guidance: {
-              identity: "self is your host-bound endpoint, even if absent from the snapshot. Match its full workspaceId/sessionId/runId/laneId to identify yourself. If self is null, your identity was not supplied; do not guess it from a Main or Teto node.",
+              identity: "self is your host-bound endpoint, even if absent from the snapshot. Match its full workspaceId/sessionId/runId/laneId to identify yourself. If self is null, your identity was not supplied; do not guess it from a Nausicaa or Teto node.",
               liveOnly: "The snapshot excludes offline and terminal lanes. Group nodes by endpoint.sessionId to distinguish sessions.",
-              discovery: "This is a bounded point-in-time observation. Missing nodes do not prove an agent does not exist. A different sessionId identifies another session; its Main and Teto are not your own lanes.",
-              messaging: "Visibility does not grant permission to send. A target lane ID string such as 'teto' addresses your own Run only. When the host provides cross-Run agent_message, use a selector such as {relationship:'direct',id:'session-id'} for another reachable session's Main. Visible Teto or Team nodes in another session are not automatically direct message targets; the router validates reachability and permissions.",
+              discovery: "This is a bounded point-in-time observation. Missing nodes do not prove an agent does not exist. A different sessionId identifies another session; its Nausicaa and Teto are not your own lanes.",
+              messaging: "Visibility does not grant permission to send. A target lane ID string such as 'teto' addresses your own Run only. When the host provides cross-Run agent_message, use a selector such as {relationship:'direct',id:'session-id'} for another reachable session's Nausicaa. Visible Teto or Team nodes in another session are not automatically direct message targets; the router validates reachability and permissions.",
               taskSummary: "Use node.activitySummary as the bounded host-provided task/status summary; it is not a private transcript.",
-              teto: "Teto is an optional feedback lane. Each parent lane may have at most one active Teto.",
-              team: "Team members are independent task lanes; Main is the Team Lead and default synthesizer. A member may open its own Teto. Historical Run forks are not Team members.",
+              teto: "Teto is an auxiliary observer of its owner's subscribed activity. It keeps routine observations in its own transcript and sends new, high-value advice through agent_message. Each parent lane may have at most one active Teto.",
+              team: "Team members have their own names and independent contexts. The lane that creates a Team is its Team Lead and default synthesizer; only the root agent is Nausicaa. Nested Teams report to their actual creating lane. Creating a Team or opening Teto requires the corresponding authorized tools. Use endpoint.laneId for A2A addressing; names can repeat across Teams. Historical Run forks are not Team members.",
             },
           }),
           isError: false,
@@ -84,6 +85,22 @@ export function createAgentAwarenessTool(options: AgentAwarenessToolOptions): Ag
     inputKinds: ["json"],
     outputKinds: ["json", "text"],
   });
+}
+
+function publicTopology(snapshot: AgentTopologySnapshot): unknown {
+  const keys = new Map(snapshot.nodes.map((node) => [node.key, endpointKey(publicLaneEndpoint(node.endpoint))]));
+  return {
+    ...snapshot,
+    nodes: snapshot.nodes.map((node) => ({
+      ...node,
+      key: keys.get(node.key)!,
+      endpoint: publicLaneEndpoint(node.endpoint),
+      name: publicAgentName(node.endpoint.laneId),
+      role: publicLaneName(node.role),
+    })),
+    edges: snapshot.edges.map((edge) => ({ ...edge, source: keys.get(edge.source)!, target: keys.get(edge.target)! })),
+    roots: snapshot.roots.map((key) => keys.get(key)!),
+  };
 }
 
 function liveAgentTopologySnapshot(snapshot: AgentTopologySnapshot): AgentTopologySnapshot {

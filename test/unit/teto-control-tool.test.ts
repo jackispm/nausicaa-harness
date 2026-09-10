@@ -23,9 +23,9 @@ describe("Teto control tools", () => {
   it("describes observer lifecycle controls concisely", () => {
     const tools = createTetoControlTools(control());
     const description = tools[0]!.definition.description;
-    expect(description).toContain("Start or restart your Teto observer");
+    expect(description).toContain("Start or restart Teto, your auxiliary observer of subscribed activity");
     expect(description).toContain("Reuses an active lane");
-    expect(description).toContain("reason explains why to enable observation");
+    expect(description).toContain("sends new, high-value advice through agent_message");
     expect(() => createLaneCapabilityManifest({
       schemaVersion: 1,
       lane: { workspaceId: "workspace", sessionId: "session", runId: "run", laneId: "main", laneKind: "main" },
@@ -40,7 +40,7 @@ describe("Teto control tools", () => {
     expect(tools.map((tool) => tool.definition.name)).toEqual(["teto_start", "teto_stop", "teto_status"]);
     expect(tools[0]!.definition.parameters).toEqual({
       type: "object",
-      properties: { reason: { type: "string", description: "Why a second thinking line is useful" } },
+      properties: { reason: { type: "string", description: "Why auxiliary observation is useful" } },
       additionalProperties: false,
     });
     for (const tool of tools.slice(0, 2)) {

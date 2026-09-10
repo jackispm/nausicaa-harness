@@ -35,8 +35,9 @@ describe("executeRun Cross-Run A2A composition", () => {
         if (result?.role !== "tool") throw new Error("Missing awareness result");
         expect(result.isError).toBe(false);
         const output = JSON.parse(result.content);
-        expect(output.self).toEqual(self);
-        expect(output.snapshot.nodes.find((node: { endpoint: CrossRunEndpoint }) => node.endpoint.laneId === "main")?.endpoint).toEqual(self);
+        const publicSelf = { ...self, laneId: "nausicaa" };
+        expect(output.self).toEqual(publicSelf);
+        expect(output.snapshot.nodes.find((node: { endpoint: CrossRunEndpoint }) => node.endpoint.laneId === "nausicaa")?.endpoint).toEqual(publicSelf);
         expect(result.content).not.toContain("private-host-proof");
         return response("identity confirmed");
       },

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { endpointKey } from "../../src/a2a/cross-run-contract.js";
 import type { ToolExecutionContext } from "../../src/domain/ports.js";
 import type { CrossRunEndpoint } from "../../src/domain/types.js";
 import { createAgentAwarenessTool } from "../../src/runtime/agent-awareness-tool.js";
@@ -51,13 +52,13 @@ describe("agent awareness tool", () => {
     expect(output.snapshot.nodes[0]?.activitySummary).toBe("coordinating the request");
     expect(output.guidance.liveOnly).toMatch(/terminal/iu);
     expect(output.guidance.taskSummary).toMatch(/activitySummary/iu);
-    expect(output.guidance.team).toContain("Main is the Team Lead and default synthesizer");
+    expect(output.guidance.team).toMatch(/creat\w*.*Team Lead/iu);
     expect(output.guidance.team).toContain("Run forks are not Team members");
   });
 
   it("keeps host-bound self explicit when only another session is discovered", async () => {
     const self = endpoint("my-run", "main");
-    const expectedSelf = { ...self };
+    const expectedSelf = { ...self, laneId: "nausicaa" };
     const otherMain = { ...endpoint("other-run", "main"), sessionId: "other-session" };
     const otherTeto = { ...otherMain, laneId: "teto" };
     const snapshot = projectAgentTopology({
@@ -80,9 +81,11 @@ describe("agent awareness tool", () => {
 
     expect(result.isError).toBe(false);
     expect(output.self).toEqual(expectedSelf);
-    expect(output.snapshot.nodes.map((node) => node.endpoint)).toEqual([otherMain, otherTeto]);
+    expect(output.snapshot.nodes.map((node) => node.endpoint)).toEqual([
+      { ...otherMain, laneId: "nausicaa" }, otherTeto,
+    ]);
     expect(output.guidance.identity).toContain("even if absent from the snapshot");
-    expect(output.guidance.discovery).toContain("its Main and Teto are not your own lanes");
+    expect(output.guidance.discovery).toContain("its Nausicaa and Teto are not your own lanes");
     expect(output.guidance.discovery).toContain("Missing nodes do not prove an agent does not exist");
     expect(output.guidance.messaging).toContain("Visibility does not grant permission");
     expect(output.guidance.messaging).toContain("your own Run only");
@@ -90,9 +93,60 @@ describe("agent awareness tool", () => {
     expect(output.guidance.messaging).toContain("not automatically direct message targets");
   });
 
+  it("returns matching self, graph addresses, and readable names while preserving the host snapshot", async () => {
+    const self = endpoint("my-run", "main");
+    const worker = endpoint("my-run", "worker");
+    const secondWorker = endpoint("my-run", "team:research:worker-2");
+    const reviewer = endpoint("my-run", "team:research:reviewer");
+    const snapshot = projectAgentTopology({
+      now,
+      records: [self, worker, secondWorker, reviewer].map((endpoint) => ({
+        endpoint, state: "running", lastSeen: now,
+        activitySummary: "Review main.ts on the main branch",
+      })),
+      edges: [worker, secondWorker, reviewer].map((target) => ({
+        source: self, target, relation: "parent",
+      })),
+    });
+    const original = structuredClone(snapshot);
+    const tool = createAgentAwarenessTool({ self, read: () => snapshot });
+    const result = await tool.execute({}, {
+      runId: self.runId, laneId: "main", workspace: "/workspace", operationId: "inspect",
+    });
+    const output = JSON.parse(result.content) as {
+      self: CrossRunEndpoint;
+      snapshot: Omit<typeof snapshot, "nodes"> & {
+        nodes: (typeof snapshot.nodes[number] & { name: string })[];
+      };
+    };
+
+    expect(result.isError).toBe(false);
+    expect(output.self).toEqual({ ...self, laneId: "nausicaa" });
+    const selfKey = endpointKey(output.self);
+    const root = output.snapshot.nodes.find((node) => node.key === selfKey);
+    expect(root).toMatchObject({ endpoint: output.self, name: "Nausicaa", role: "nausicaa" });
+    expect(output.snapshot.roots).toEqual([selfKey]);
+    expect(output.snapshot.edges).toHaveLength(3);
+    const keys = new Set(output.snapshot.nodes.map((node) => node.key));
+    for (const edge of output.snapshot.edges) {
+      expect(edge.source).toBe(selfKey);
+      expect(keys.has(edge.target)).toBe(true);
+    }
+    expect([...keys]).not.toContain(endpointKey(self));
+    expect(output.snapshot.nodes.map((node) => [node.endpoint.laneId, node.name])).toEqual(expect.arrayContaining([
+      ["worker", "worker 1"],
+      ["team:research:worker-2", "worker 2"],
+      ["team:research:reviewer", "reviewer"],
+    ]));
+    expect(output.snapshot.nodes.every((node) => node.activitySummary === "Review main.ts on the main branch")).toBe(true);
+    expect(snapshot).toEqual(original);
+    expect(self.laneId).toBe("main");
+  });
+
   it.each([
     { runId: "another-run", laneId: "main" },
     { runId: "my-run", laneId: "teto" },
+    { runId: "my-run", laneId: "nausicaa" },
   ])("rejects use by a different bound caller: $runId/$laneId", async (caller) => {
     const read = vi.fn(() => projectAgentTopology({ now, records: [] }));
     const tool = createAgentAwarenessTool({ self: endpoint("my-run", "main"), read });
@@ -120,7 +174,7 @@ describe("agent awareness tool", () => {
     expect(result.isError).toBe(false);
     expect(result.content).not.toContain("/Users/private/project");
     expect(JSON.parse(result.content).self).toEqual({
-      ...endpoint("my-run", "main"), workspaceId: "[path]",
+      ...endpoint("my-run", "nausicaa"), workspaceId: "[path]",
     });
   });
 });

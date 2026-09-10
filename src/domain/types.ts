@@ -367,11 +367,12 @@ export type AuxiliaryMode = "none" | "teto" | "reflection";
 export type TetoActivationMode = "automatic" | "manual";
 
 export interface TaskBudget {
-  maxModelTokens: number;
-  maxWallClockMs: number;
-  /** Absolute task deadline. Legacy task messages may omit this field. */
+  /** Optional host limits for legacy tasks. An empty object has no task limit. */
+  maxModelTokens?: number;
+  maxWallClockMs?: number;
+  /** Absolute task deadline, when the host supplied a wall-clock limit. */
   deadline?: string;
-  /** Maximum provider attempts. Legacy task messages default conservatively. */
+  /** Maximum provider calls; omitted for new unbounded tasks. */
   maxAttempts?: number;
 }
 
@@ -394,7 +395,7 @@ export interface SpawnContext {
   budget: TaskBudget;
 }
 
-/** Hard protocol bounds keep delegated work finite even for untrusted senders. */
+/** Validation bounds for explicitly supplied legacy host limits. */
 export const MAX_TASK_MODEL_TOKENS = 1_000_000;
 export const MAX_TASK_WALL_CLOCK_MS = 30 * 60 * 1_000;
 export const DEFAULT_TASK_MAX_ATTEMPTS = 2;

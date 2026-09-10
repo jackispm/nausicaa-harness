@@ -101,6 +101,34 @@ describe("durable Team state", () => {
     expect(board.definition).not.toBe(s.definition);
   });
 
+  it("keeps resident assignments and reports separate from the original member settlement", () => {
+    const s = scenario();
+    s.append("team.created", s.definition);
+    const task = {
+      type: "task.request" as const,
+      taskId: "alpha:member-0:task-1",
+      goal: { version: 1, statement: "Continue the review", successCriteria: [], hardConstraints: [] },
+      inputRefs: [], budget: { maxModelTokens: 100, maxWallClockMs: 60_000, deadline },
+    };
+    s.append("team.task.assigned" as never, {
+      teamId: "alpha", taskId: task.taskId, memberId: "member-0", laneId: "team:alpha:member-0",
+      assignmentVersion: 1, task, assignedBy: "main", operationId: "assign-1",
+    } as never);
+    expect(s.board().tasks).toMatchObject([{
+      taskId: task.taskId, memberId: "member-0", assignmentVersion: 1, status: "queued",
+    }]);
+    s.append("team.run.reported" as never, {
+      teamId: "alpha", taskId: task.taskId, laneId: "team:alpha:member-0", assignmentVersion: 1,
+      kind: "ready-for-review", summary: "Follow-up complete", artifactRefs: [], openQuestions: [],
+      result: {
+        type: "task.result", taskId: task.taskId, status: "completed", summary: "Follow-up complete",
+        evidenceRefs: [], artifactRefs: [], openQuestions: [], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+      }, reportId: "report-1", runId: "run-team",
+    } as never);
+    expect(s.board().tasks?.[0]).toMatchObject({ status: "review", latestReport: { reportId: "report-1" } });
+    expect(s.board().members[0]?.terminal).toBe(false);
+  });
+
   it("does not infer task success or join from an ended lane or a transport reply", () => {
     const s = scenario();
     s.append("team.created", s.definition);

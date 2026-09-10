@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 
 import { A2AInbox } from "../a2a/index.js";
 import { annotateTool } from "../mowe/catalog.js";
+import { publicLaneName } from "./lane-names.js";
 import type {
   AnyEvent,
   AppendEvent,
@@ -135,7 +136,7 @@ import {
 import { createGoalTools } from "./goal-tool.js";
 import { createTetoControlTools } from "./teto-control-tool.js";
 import { TeamRuntime } from "./team-runtime.js";
-import { createTeamCancelTool, createTeamPresentTool, createTeamReduceTool, createTeamStatusTool, createTeamTool } from "./team-tool.js";
+import { createTaskWaitTool, createTeamAssignTool, createTeamCancelTool, createTeamCloseTool, createTeamHistoryTool, createTeamMessageTool, createTeamPresentTool, createTeamReduceTool, createTeamStatusTool, createTeamTool } from "./team-tool.js";
 import { composeAgentMessageTools, createInRunAgentMessageTool } from "./in-run-agent-message-tool.js";
 import { projectRunAwareness } from "./run-awareness.js";
 import { createDelegateTaskTool } from "./delegate-task-tool.js";
@@ -484,6 +485,8 @@ export interface SessionControllerDeps {
   tools?: readonly AgentTool[];
   /** Optional bounded read-only tools for Worker; defaults to the workspace set. */
   workerTools?: readonly AgentTool[];
+  /** Optional Team catalog. Omitted Teams inherit the current host-authorized workspace catalog. */
+  teamTools?: readonly AgentTool[];
   /** Optional provider seams for network-backed Main tools. */
   webFetchProvider?: WebFetchProvider;
   webSearchProvider?: WebSearchProvider;
@@ -601,6 +604,18 @@ export class SessionController {
     previousExecution: Promise<void> | undefined;
     contextKind: GoalContextKind;
   } | undefined;
+  private teamContinuationTimer: ReturnType<typeof setTimeout> | undefined;
+  private teamContinuationPending: {
+    promise: Promise<void>;
+    resolve: () => void;
+  } | undefined;
+  /**
+   * A Team report can arrive while the Main execution is winding down. Keep
+   * the wake intent until that execution has released its slot; otherwise the
+   * callback observes `active`/`execution` and the report would wait forever
+   * for another external event.
+   */
+  private teamWakeRequested = false;
   /** In-memory steering for host edits made while a Main Turn is running. */
   private readonly pendingGoalSteering = new Map<string, MainBoundaryMessage[]>();
   /** Goal context that missed a safe boundary and must reach the next Goal Turn. */
@@ -2288,12 +2303,13 @@ export class SessionController {
     while (true) {
       const execution = this.execution;
       const continuation = this.goalContinuationPending?.promise;
-      if (execution === undefined && continuation === undefined) return;
-      if (execution !== undefined && continuation !== undefined) {
-        await Promise.all([execution, continuation]);
-      } else {
-        await (execution ?? continuation);
-      }
+      const teamContinuation = this.teamContinuationPending?.promise;
+      if (execution === undefined && continuation === undefined && teamContinuation === undefined) return;
+      await Promise.all([
+        ...(execution === undefined ? [] : [execution]),
+        ...(continuation === undefined ? [] : [continuation]),
+        ...(teamContinuation === undefined ? [] : [teamContinuation]),
+      ]);
     }
   }
 
@@ -2326,6 +2342,14 @@ export class SessionController {
       this.goalContinuationPending?.resolve();
       this.goalContinuationPending = undefined;
     }
+    if (this.teamContinuationTimer !== undefined) {
+      clearTimeout(this.teamContinuationTimer);
+      this.teamContinuationTimer = undefined;
+    }
+    const pendingTeamContinuation = this.teamContinuationPending;
+    this.teamContinuationPending = undefined;
+    pendingTeamContinuation?.resolve();
+    this.teamWakeRequested = false;
     const closePromise = this.runAdmission(async () => {
       await this.cancelSideQuestion();
       const execution = this.execution;
@@ -2399,6 +2423,10 @@ export class SessionController {
     this.status = "idle";
     this.publishState();
     this.scheduleGoalContinuation();
+    // A report may have been persisted while this Session was offline. The
+    // Team runtime restores its Inbox before this point, so use the same wake
+    // path as a live settlement instead of requiring a new user input.
+    this.wakeForTeamResult(candidate);
   }
 
   private async assertRunPathAbsent(runId: string): Promise<void> {
@@ -2512,7 +2540,7 @@ export class SessionController {
           type: "lane.status",
           payload: {
             status: "dormant",
-            reason: "Forked Runs start with Teto dormant until the next Main boundary",
+            reason: "Forked Runs start with Teto dormant until the next Nausicaa boundary",
           },
           correlationId: `run:${childRunId}`,
           idempotencyKey: "lane:teto:status:dormant",
@@ -2652,7 +2680,7 @@ export class SessionController {
           payload: {
             status: "dormant",
             ...(this.policy.tetoActivation === "manual"
-              ? { reason: "Teto available; Main may open it with teto_start" }
+              ? { reason: "Teto available; Nausicaa may open it with teto_start" }
               : {}),
           },
           correlationId: `run:${runId}`,
@@ -2784,6 +2812,7 @@ export class SessionController {
       tools: workerTools,
       runTokenBudget: attached.tokenBudget,
       clock: this.clock,
+      maxOutputTokens: this.maxOutputTokens,
       readWatermark: () => attached.ledger.watermark(),
       readEvents: () => attached.ledger.read({ runId: attached.runId }),
     });
@@ -2862,12 +2891,16 @@ export class SessionController {
     const branchModel = this.deps.workerModel
       ?? this.deps.mainModel
       ?? createBuiltinModelPort();
-    const branchTools = this.deps.workerTools ?? createWorkspaceTools({
-      allowWrite: false,
-      allowShell: false,
+    const branchTools = this.deps.teamTools ?? this.deps.workerTools ?? (() => createWorkspaceTools({
+      allowWrite: this.writeAllowed,
+      allowShell: this.shellAllowed,
+      allowNetwork: this.networkAllowed,
       allowImages: shouldAdvertiseImageTools(branchModel, this.workerModel),
+      ...(this.deps.webFetchProvider === undefined ? {} : { webFetchProvider: this.deps.webFetchProvider }),
+      ...(this.deps.webSearchProvider === undefined ? {} : { webSearchProvider: this.deps.webSearchProvider }),
       protectedPaths: [this.dataDir],
-    });
+    }));
+    const currentBranchTools = (): readonly AgentTool[] => typeof branchTools === "function" ? branchTools() : branchTools;
     attached.team = new TeamRuntime({
       eventSink: attached.sink,
       inbox,
@@ -2897,6 +2930,11 @@ export class SessionController {
               this.deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
           }
         : {}),
+      asyncCompletion: true,
+      // A Team can outlive an idle Main Turn. When a durable member report
+      // arrives, resume a waiting Turn through the normal admission boundary;
+      // an active Turn already observes the same report in beforeMainStep.
+      onWake: () => this.wakeForTeamResult(attached),
       spawnContext: ({ teamId, branchId, laneId, goal, inputRefs, budget }) => createSpawnContext({
         schemaVersion: 1,
         parent: {
@@ -2921,7 +2959,7 @@ export class SessionController {
         inputRefs: [...inputRefs],
         projectInstructionRefs: [],
         parentSummaryRefs: [],
-        tools: capabilityEntriesFromTools(branchTools),
+        tools: capabilityEntriesFromTools(currentBranchTools()),
         skills: [],
         laneManifest: createLaneCapabilityManifest({
           schemaVersion: 1,
@@ -2937,7 +2975,7 @@ export class SessionController {
           },
           role: `Team member ${teamId}/${branchId}`,
           state: "ready",
-          capabilities: capabilityEntriesFromTools(branchTools),
+          capabilities: capabilityEntriesFromTools(currentBranchTools()),
           targets: [{
             laneId: "main",
             relation: "owns",
@@ -2948,6 +2986,113 @@ export class SessionController {
       }),
     });
     await attached.team.restore();
+  }
+
+  private wakeForTeamResult(attached: AttachedRun): void {
+    if (
+      this.attached !== attached
+      || this.closing
+      || this.status === "closed"
+      || this.status === "detached"
+    ) return;
+    this.teamWakeRequested = true;
+    // The active Turn's beforeMainStep hook will consume any report that is
+    // ready at a safe boundary. The intent remains set for the narrow race
+    // where the report lands after that hook but before execution cleanup.
+    if (this.active !== undefined || this.execution !== undefined) return;
+    if (this.teamContinuationPending !== undefined) return;
+    let resolvePending!: () => void;
+    const pending = {
+      promise: new Promise<void>((resolve) => { resolvePending = resolve; }),
+      resolve: resolvePending,
+    };
+    this.teamContinuationPending = pending;
+    this.teamContinuationTimer = setTimeout(() => {
+      this.teamContinuationTimer = undefined;
+      void this.runAdmission(async () => {
+        if (
+          this.attached !== attached
+          || this.closing
+          || this.active !== undefined
+          || this.execution !== undefined
+        ) return;
+        let events = await attached.ledger.read({ runId: attached.runId });
+        const projection = projectRun(events, attached.runId);
+        // Team lane events are projected onto legacy turn state for
+        // compatibility. Inspect the explicit Main boundary event instead of
+        // allowing those events to make a completed Main Turn look active.
+        const latestMainBoundary = [...events].reverse().find((event) => (
+          event.laneId === "main"
+          && ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted", "turn.waiting"].includes(event.type)
+        ));
+        // Only a normally completed interactive Turn may be resumed by an
+        // asynchronous Team report. Cancellation, an interrupted process,
+        // an explicit waiting boundary, and provider failure all require the
+        // operator's explicit recovery path.
+        if (latestMainBoundary === undefined || latestMainBoundary.type !== "turn.completed") {
+          this.teamWakeRequested = false;
+          return;
+        }
+        if (blockingReason(events) !== undefined || projectPendingAdmissions(events).length > 0) return;
+        const canWake = attached.team !== undefined && await attached.team.beforeMainCompletion();
+        if (!canWake) {
+          this.teamWakeRequested = false;
+          return;
+        }
+        // Shutdown or a user cancellation can begin while the Team inbox is
+        // being reconciled. Re-check the attachment before creating a new
+        // Main input so a late callback cannot resurrect a closing Session.
+        if (
+          this.attached !== attached
+          || this.closing
+          || this.status === "closed"
+          || this.status === "detached"
+          || this.active !== undefined
+          || this.execution !== undefined
+        ) return;
+        if (projection.run.status === "completed" || projection.run.status === "failed") {
+          await attached.sink.append({
+            runId: attached.runId,
+            laneId: "main",
+            type: "run.resumed",
+            payload: { fromOffset: projection.run.lastOffset, reason: "new-turn" },
+            correlationId: `run:${attached.runId}`,
+            idempotencyKey: `${attached.runId}:resumed:team-report:${await attached.ledger.watermark()}`,
+            visibility: "run",
+            occurredAt: this.clock.now().toISOString(),
+          });
+          events = attached.sink.cachedEvents;
+        }
+        const messageRef = await attached.store.put(stableJson({
+          role: "user",
+          content: "A Team member report is ready. Review the Team messages and continue the user's task.",
+          createdAt: this.clock.now().toISOString(),
+        } satisfies ConversationMessage), MESSAGE_MEDIA_TYPE);
+        const inputId = `team-report-${attached.runId}-${await attached.ledger.watermark()}`;
+        const admitted = await attached.sink.append({
+          runId: attached.runId,
+          laneId: "main",
+          type: "input.admitted",
+          payload: { inputId, messageRef, delivery: "new-turn", sequence: nextInputSequence(events) },
+          correlationId: `team:${attached.runId}:report`,
+          idempotencyKey: `${attached.runId}:input:${inputId}:admitted`,
+          visibility: "run",
+          occurredAt: this.clock.now().toISOString(),
+        });
+        const promoted = await this.promotePending({ event: admitted, continuation: true }, "team-report");
+        // This wake has now become a durable input. A later report may set the
+        // flag again while the continuation is active; the completion path
+        // will re-check the Inbox before scheduling another one.
+        this.teamWakeRequested = false;
+        if (promoted !== undefined) this.startExecution(promoted);
+      }).catch((error: unknown) => {
+        if (this.status !== "closed") this.publishFailure(error);
+      }).finally(() => {
+        resolvePending();
+        if (this.teamContinuationPending === pending) this.teamContinuationPending = undefined;
+      });
+    }, 0);
+    this.teamContinuationTimer.unref?.();
   }
 
   private async openAttachment(runId: string): Promise<AttachedRun> {
@@ -3126,7 +3271,7 @@ export class SessionController {
       this.active !== undefined
       || (this.execution !== undefined && this.execution !== replacingExecution)
     ) {
-      throw new SessionProtocolError("A Main Turn is already active");
+      throw new SessionProtocolError("A Nausicaa Turn is already active");
     }
     const controller = new AbortController();
     this.active = { ...turn, controller };
@@ -3152,7 +3297,16 @@ export class SessionController {
         } catch (error: unknown) {
           if (this.status !== "closed") this.publishFailure(error);
         } finally {
-          if (this.execution === execution) this.execution = undefined;
+          if (this.execution === execution) {
+            this.execution = undefined;
+            // A Team settlement may have landed after the final Main safe
+            // boundary. Retry the wake only after this execution has released
+            // its slot so the continuation can be promoted safely.
+            const attached = this.attached;
+            if (attached !== undefined && this.teamWakeRequested) {
+              this.wakeForTeamResult(attached);
+            }
+          }
         }
       });
     this.execution = execution;
@@ -3306,7 +3460,12 @@ export class SessionController {
       }
       if (attached.team !== undefined) {
         pushSessionRuntimeTool(tools, createTeamTool(attached.team));
+        pushSessionRuntimeTool(tools, createTeamAssignTool(attached.team));
+        pushSessionRuntimeTool(tools, createTaskWaitTool(attached.team));
         pushSessionRuntimeTool(tools, createTeamStatusTool(attached.team));
+        pushSessionRuntimeTool(tools, createTeamMessageTool(attached.team));
+        pushSessionRuntimeTool(tools, createTeamHistoryTool(attached.team));
+        pushSessionRuntimeTool(tools, createTeamCloseTool(attached.team));
         pushSessionRuntimeTool(tools, createTeamCancelTool(attached.team));
         pushSessionRuntimeTool(tools, createTeamReduceTool(attached.team));
         pushSessionRuntimeTool(tools, createTeamPresentTool(attached.team));
@@ -3973,6 +4132,7 @@ export class SessionController {
     const attached = this.attached;
     this.stopExternalObservation();
     this.attached = undefined;
+    this.teamWakeRequested = false;
     this.active = undefined;
     this.execution = undefined;
     if (attached !== undefined) {
@@ -3988,6 +4148,7 @@ export class SessionController {
     const attached = this.attached;
     this.stopExternalObservation();
     this.attached = undefined;
+    this.teamWakeRequested = false;
     this.active = undefined;
     this.execution = undefined;
     if (attached !== undefined) {
@@ -5948,7 +6109,7 @@ function externalA2AEndpointLabel(endpoint: {
   runId: string;
   laneId: string;
 }): string {
-  return [endpoint.workspaceId, endpoint.sessionId, endpoint.runId, endpoint.laneId]
+  return [endpoint.workspaceId, endpoint.sessionId, endpoint.runId, publicLaneName(endpoint.laneId)]
     .map((value) => sanitizeExternalA2AText(value, 512))
     .join("/");
 }

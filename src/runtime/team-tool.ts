@@ -1,8 +1,10 @@
 import type { AgentTool, JsonSchema, ToolExecutionContext, ToolResult } from "../domain/ports.js";
-import type { Goal } from "../domain/types.js";
+import type { ArtifactRef, Goal, LaneId } from "../domain/types.js";
+import type { TeamCapabilityGrant } from "../domain/team.js";
 import { MAX_TASK_ATTEMPTS, MAX_TASK_MODEL_TOKENS, MAX_TASK_WALL_CLOCK_MS } from "../domain/types.js";
 import { annotateTool } from "../mowe/catalog.js";
 import { MAX_SUBAGENT_NAME_LENGTH, normalizeSubagentName } from "./subagent-policy.js";
+import { publicAgentName, publicLaneName } from "./lane-names.js";
 
 export interface TeamMemberRequest {
   memberId?: string;
@@ -17,6 +19,8 @@ export interface TeamMemberRequest {
   maxAttempts?: number;
   dependsOn?: string[];
   required?: boolean;
+  /** Optional host-enforced narrowing of the creating lane's capabilities. */
+  capabilities?: TeamCapabilityGrant;
 }
 
 export type TeamBranchRequest = TeamMemberRequest;
@@ -45,6 +49,7 @@ export interface TeamCreateResult {
   /** Optional on older host controls; current coordinators return both collections. */
   members?: readonly {
     memberId: string;
+    name?: string;
     taskId: string;
     laneId: string;
     status: "queued" | "duplicate";
@@ -74,15 +79,133 @@ export interface TeamPresentRequest {
   disposition: "accepted" | "rejected";
 }
 
+export interface TeamMessageRequest {
+  teamId: string;
+  channelId?: string;
+  threadId?: string;
+  body: string;
+  mentions?: LaneId[];
+  artifactRefs?: ArtifactRef[];
+}
+
+export interface TeamChannelMessage {
+  messageId: string;
+  teamId: string;
+  channelId: string;
+  sequence: number;
+  fromLane: LaneId;
+  threadId?: string;
+  body: string;
+  mentions: LaneId[];
+  artifactRefs: ArtifactRef[];
+  cursor: string;
+}
+
+export interface TeamMessageResult extends TeamChannelMessage {
+  status: "sent" | "duplicate";
+}
+
+export interface TeamHistoryRequest {
+  teamId: string;
+  channelId?: string;
+  threadId?: string;
+  after?: string;
+  limit?: number;
+}
+
+export interface TeamHistoryResult {
+  teamId: string;
+  channelId: string;
+  messages: TeamChannelMessage[];
+  nextCursor?: string;
+  hasMore: boolean;
+}
+
+export interface TeamCloseRequest {
+  teamId: string;
+  reason?: string;
+}
+
+export interface TeamAssignRequest {
+  teamId: string;
+  memberId: string;
+  statement: string;
+  input?: string;
+}
+
+export interface TeamAssignResult {
+  teamId: string;
+  taskId: string;
+  memberId: string;
+  laneId: string;
+  assignmentVersion: number;
+  status: "queued" | "duplicate";
+}
+
+export interface TeamWaitRequest {
+  teamId: string;
+  taskId: string;
+}
+
 export interface TeamControl {
   create(
     request: TeamCreateRequest,
     context: ToolExecutionContext,
   ): Promise<TeamCreateResult>;
   status?(context: ToolExecutionContext): unknown | Promise<unknown>;
+  message?(request: TeamMessageRequest, context: ToolExecutionContext): TeamMessageResult | Promise<TeamMessageResult>;
+  history?(request: TeamHistoryRequest, context: ToolExecutionContext): TeamHistoryResult | Promise<TeamHistoryResult>;
+  close?(request: TeamCloseRequest, context: ToolExecutionContext): unknown | Promise<unknown>;
+  assign?(request: TeamAssignRequest, context: ToolExecutionContext): TeamAssignResult | Promise<TeamAssignResult>;
+  wait?(request: TeamWaitRequest, context: ToolExecutionContext): unknown | Promise<unknown>;
   cancel?(request: TeamCancelRequest, context: ToolExecutionContext): unknown | Promise<unknown>;
   reduce?(request: TeamReduceRequest, context: ToolExecutionContext): unknown | Promise<unknown>;
   present?(request: TeamPresentRequest, context: ToolExecutionContext): unknown | Promise<unknown>;
+}
+
+/** Assign a subsequent Task to a resident member lane. */
+export function createTeamAssignTool(control: TeamControl): AgentTool {
+  if (control === null || typeof control !== "object" || typeof control.assign !== "function") {
+    throw new TypeError("Team assign control must provide assign");
+  }
+  return createTeamCommand(
+    "team_assign",
+    "Assign one new Task to an existing Team member. The member keeps its lane and context boundary, while the Task gets a new durable assignment version. Use team_status to inspect the result; do not include budgets or synthetic success criteria.",
+    {
+      teamId: teamIdSchema,
+      memberId: memberIdSchema,
+      statement: boundedText,
+      input: boundedText,
+    },
+    ["teamId", "memberId", "statement"],
+    (arguments_, context) => {
+      exactKeys(arguments_, ["teamId", "memberId", "statement", "input"], "arguments");
+      const input = optionalString(arguments_.input, "input");
+      return control.assign!({
+        teamId: normalizeTeamId(arguments_.teamId),
+        memberId: memberIdentity(arguments_.memberId, "memberId"),
+        statement: boundedBody(arguments_.statement),
+        ...(input === undefined ? {} : { input }),
+      }, context);
+    },
+  );
+}
+
+/** Read the durable state of one resident Task and yield a wake-friendly result. */
+export function createTaskWaitTool(control: TeamControl): AgentTool {
+  if (control === null || typeof control !== "object" || typeof control.wait !== "function") {
+    throw new TypeError("Task wait control must provide wait");
+  }
+  return createTeamCommand(
+    "task_wait",
+    "Read one Team Task's durable state. A running task is reported as waiting and will wake the Team Lead when a new report arrives; this operation does not copy the member transcript into the Lead context.",
+    { teamId: teamIdSchema, taskId: { type: "string", minLength: 1, maxLength: 128 } },
+    ["teamId", "taskId"],
+    (arguments_, context) => {
+      exactKeys(arguments_, ["teamId", "taskId"], "arguments");
+      return control.wait!({ teamId: normalizeTeamId(arguments_.teamId), taskId: requiredString(arguments_.taskId, "taskId") }, context);
+    },
+  );
 }
 
 /** Main-facing read-only capability for the durable Team board projection. */
@@ -93,7 +216,7 @@ export function createTeamStatusTool(control: TeamControl): AgentTool {
   const tool: AgentTool = {
     definition: {
       name: "team_status",
-      description: "Read a compact snapshot of durable Team members, outcomes, join, reduction, and Main acceptance in this Run. Join follows the declared policy automatically; it collects terminal outcomes, including partial or failed work, without proving success or completing Main's synthesis. This is a snapshot, not a wait operation.",
+      description: "Read a compact snapshot of durable Team members, names, outcomes, join, reduction, and Team Lead acceptance in this Run. Use returned laneId values for A2A; names may repeat across Teams. Join collects terminal outcomes, including partial or failed work, without proving success or completing the Lead's synthesis. This is a snapshot, not a wait operation.",
       parameters: {
         type: "object",
         properties: {},
@@ -128,6 +251,88 @@ export function createTeamStatusTool(control: TeamControl): AgentTool {
   });
 }
 
+/** Main-facing append-only Team channel message capability. */
+export function createTeamMessageTool(control: TeamControl): AgentTool {
+  if (control === null || typeof control !== "object" || typeof control.message !== "function") {
+    throw new TypeError("Team message control must provide message");
+  }
+  return createTeamCommand(
+    "team_message",
+    "Post one public message to a Team channel or task thread. Messages are durable and visible to authorized members, but ordinary messages do not wake every member. Use agent_message for private A2A.",
+    {
+      teamId: teamIdSchema,
+      channelId: { type: "string", minLength: 1, maxLength: 96, default: "general" },
+      threadId: { type: "string", minLength: 1, maxLength: 160 },
+      body: { type: "string", minLength: 1, maxLength: 8_192 },
+      mentions: { type: "array", maxItems: MAX_MEMBERS, items: memberIdSchema },
+      artifactRefs: { type: "array", maxItems: 32, items: { type: "object" } },
+    },
+    ["teamId", "body"],
+    (arguments_, context) => {
+      exactKeys(arguments_, ["teamId", "channelId", "threadId", "body", "mentions", "artifactRefs"], "arguments");
+      const mentions = stringArray(arguments_.mentions, "mentions", MAX_MEMBERS).map((value, index) => memberIdentity(value, `mentions[${index}]`));
+      if (new Set(mentions).size !== mentions.length) throw new TypeError("mentions must contain unique member ids");
+      const artifactRefs = parseArtifactRefs(arguments_.artifactRefs);
+      return control.message!({
+        teamId: normalizeTeamId(arguments_.teamId),
+        ...(arguments_.channelId === undefined ? {} : { channelId: requiredString(arguments_.channelId, "channelId") }),
+        ...(arguments_.threadId === undefined ? {} : { threadId: requiredString(arguments_.threadId, "threadId") }),
+        body: boundedBody(arguments_.body),
+        ...(mentions.length === 0 ? {} : { mentions }),
+        ...(artifactRefs.length === 0 ? {} : { artifactRefs }),
+      }, context);
+    },
+  );
+}
+
+/** Main-facing bounded Team channel history capability. */
+export function createTeamHistoryTool(control: TeamControl): AgentTool {
+  if (control === null || typeof control !== "object" || typeof control.history !== "function") {
+    throw new TypeError("Team history control must provide history");
+  }
+  return createTeamCommand(
+    "team_history",
+    "Read a bounded page of Team channel history by an opaque cursor. Reading history does not mark unread events consumed; use the returned nextCursor for the next page.",
+    {
+      teamId: teamIdSchema,
+      channelId: { type: "string", minLength: 1, maxLength: 96, default: "general" },
+      threadId: { type: "string", minLength: 1, maxLength: 160 },
+      after: { type: "string", minLength: 1, maxLength: 256 },
+      limit: { type: "integer", minimum: 1, maximum: 64, default: 32 },
+    },
+    ["teamId"],
+    (arguments_, context) => {
+      exactKeys(arguments_, ["teamId", "channelId", "threadId", "after", "limit"], "arguments");
+      const limit = arguments_.limit === undefined ? undefined : positiveInteger(arguments_.limit, "limit", 64);
+      return control.history!({
+        teamId: normalizeTeamId(arguments_.teamId),
+        ...(arguments_.channelId === undefined ? {} : { channelId: requiredString(arguments_.channelId, "channelId") }),
+        ...(arguments_.threadId === undefined ? {} : { threadId: requiredString(arguments_.threadId, "threadId") }),
+        ...(arguments_.after === undefined ? {} : { after: requiredString(arguments_.after, "after") }),
+        ...(limit === undefined ? {} : { limit }),
+      }, context);
+    },
+  );
+}
+
+/** Explicitly close a resident Team; cancellation remains a separate operation. */
+export function createTeamCloseTool(control: TeamControl): AgentTool {
+  if (control === null || typeof control !== "object" || typeof control.close !== "function") {
+    throw new TypeError("Team close control must provide close");
+  }
+  return createTeamCommand(
+    "team_close",
+    "Close a Team explicitly. New assignments and wakeups are fenced; settled reports remain available for inspection.",
+    { teamId: teamIdSchema, reason: boundedText },
+    ["teamId"],
+    (arguments_, context) => {
+      exactKeys(arguments_, ["teamId", "reason"], "arguments");
+      const reason = optionalString(arguments_.reason, "reason");
+      return control.close!({ teamId: normalizeTeamId(arguments_.teamId), ...(reason === undefined ? {} : { reason }) }, context);
+    },
+  );
+}
+
 // Keep the host board intact; model status excludes admission context and compatibility duplicates.
 function modelTeamStatus(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(modelTeamBoard);
@@ -144,15 +349,27 @@ function modelTeamBoard(value: unknown): unknown {
   // Older hosts may expose an opaque status payload instead of Team boards.
   if (members === undefined) return value;
   const definition = isStatusRecord(value.definition) ? value.definition : undefined;
+  const leadLaneId = value.leadLaneId ?? value.coordinator;
   return {
     ...statusFields(value, [
-      "runId", "teamId", "status", "joinPolicy", "joinReady", "joinSatisfied", "joinState",
-      "cancellationRequested", "reductionState", "reduction", "presentationState", "anomalies", "lastOffset",
+    "runId", "teamId", "status", "joinPolicy", "joinReady", "joinSatisfied", "joinState",
+      "cancellationRequested", "lifecycleState", "closedReason", "reductionState", "reduction", "presentationState", "anomalies", "lastOffset",
     ]),
-    leadLaneId: value.leadLaneId ?? value.coordinator,
+    leadLaneId: typeof leadLaneId === "string" ? publicLaneName(leadLaneId) : leadLaneId,
+    ...(typeof leadLaneId === "string" ? { leadName: publicAgentName(leadLaneId) } : {}),
     ...(definition === undefined ? {} : statusFields(definition, ["deadline", "peerMessaging"])),
     members: members.map(modelTeamMember),
+    ...(Array.isArray(value.tasks) ? { tasks: value.tasks.map(modelTeamTask) } : {}),
     ...(value.reducer === undefined ? {} : { reducer: modelTeamReducer(value.reducer) }),
+  };
+}
+
+function modelTeamTask(value: unknown): unknown {
+  if (!isStatusRecord(value)) return value;
+  const report = isStatusRecord(value.latestReport) ? value.latestReport : undefined;
+  return {
+    ...statusFields(value, ["taskId", "memberId", "laneId", "assignmentVersion", "statement", "status", "assignedAt"]),
+    ...(report === undefined ? {} : { latestReport: statusFields(report, ["reportId", "runId", "kind", "summary", "artifactRefs", "openQuestions", "result", "failure"]) }),
   };
 }
 
@@ -165,6 +382,7 @@ function modelTeamMember(value: unknown): unknown {
       "dependsOn", "required", "attempt", "result", "failure", "reason", "anomalies", "lastOffset",
     ]),
     memberId: value.memberId ?? value.branchId,
+    ...(typeof value.laneId === "string" ? { name: publicAgentName(value.laneId) } : {}),
     ...(goal === undefined ? {} : { statement: goal.statement }),
   };
 }
@@ -175,6 +393,7 @@ function modelTeamReducer(value: unknown): unknown {
   const goal = task !== undefined && isStatusRecord(task.goal) ? task.goal : undefined;
   return {
     ...statusFields(value, ["memberId", "laneId", "dependsOn", "required"]),
+    ...(typeof value.laneId === "string" ? { name: publicAgentName(value.laneId) } : {}),
     ...(task === undefined ? {} : { taskId: task.taskId }),
     ...(goal === undefined ? {} : { statement: goal.statement }),
   };
@@ -196,8 +415,22 @@ const MAX_TEAM_ID_LENGTH = 96;
 const boundedText = { type: "string", minLength: 1, maxLength: MAX_STRING_LENGTH };
 const teamIdSchema = { type: "string", minLength: 1, maxLength: MAX_TEAM_ID_LENGTH };
 const memberIdSchema = { type: "string", minLength: 1, maxLength: MAX_SUBAGENT_NAME_LENGTH };
-const modelTokenSchema = { type: "integer", minimum: 1, maximum: MAX_TASK_MODEL_TOKENS };
-const wallClockSchema = { type: "integer", minimum: 1, maximum: MAX_TASK_WALL_CLOCK_MS };
+const capabilityGrantSchema = {
+  type: "object",
+  properties: {
+    tools: {
+      type: "array",
+      maxItems: 64,
+      items: { type: "string", minLength: 1, maxLength: 128 },
+      description: "Optional allowlist narrowing the tools inherited from the Team Lead; omitted inherits the host-authorized catalog",
+    },
+    allowNestedTeam: {
+      type: "boolean",
+      description: "Whether this member may create a nested Team; omitted inherits the Team Lead's permission",
+    },
+  },
+  additionalProperties: false,
+};
 
 function memberSchema(): Record<string, unknown> {
   return {
@@ -207,17 +440,13 @@ function memberSchema(): Record<string, unknown> {
     items: {
       type: "object",
       properties: {
-        memberId: { ...memberIdSchema, description: "Stable member id; required when another member depends on this task" },
+        memberId: { ...memberIdSchema, description: "Member name and stable ID chosen by you, e.g. researcher or reviewer; normalized for routing. Defaults to worker-1, worker-2, etc. (displayed as worker 1, worker 2). Required when another member depends on this task. Names are unique within this Team; runtime role names are reserved." },
         branchId: { ...memberIdSchema, deprecated: true, description: "Compatibility alias for memberId" },
         statement: { ...boundedText, description: "This member's objective" },
-        successCriteria: { type: "array", maxItems: MAX_CRITERIA, items: boundedText },
-        hardConstraints: { type: "array", maxItems: MAX_CRITERIA, items: boundedText },
         input: boundedText,
-        maxModelTokens: modelTokenSchema,
-        maxWallClockMs: wallClockSchema,
-        maxAttempts: { type: "integer", minimum: 1, maximum: MAX_TASK_ATTEMPTS },
         dependsOn: { type: "array", maxItems: MAX_MEMBERS - 1, items: memberIdSchema, description: "Member ids whose tasks must succeed before this task can start" },
         required: { type: "boolean", default: true, description: "Whether this member is required at the Team join boundary" },
+        capabilities: capabilityGrantSchema,
       },
       required: ["statement"],
       additionalProperties: false,
@@ -233,7 +462,7 @@ export function createTeamTool(control: TeamControl): AgentTool {
   const tool: AgentTool = {
     definition: {
       name: "team_create",
-      description: "Create a bounded Team of independent Teammate lanes with tasks and optional dependencies. Supply members; branches is a compatibility alias, and exactly one is required. Results and join notifications arrive asynchronously at Main boundaries. Main remains Team Lead and synthesizes the results; partial or failed outcomes are not success.",
+      description: "Create independent Team lanes. Members use fresh contexts and run in parallel unless dependsOn requires a prior durable result. Name members with members[].memberId (otherwise worker 1, worker 2, etc.); they receive the host-authorized tool catalog, optionally narrowed by capabilities. Use returned laneId values for A2A. Results arrive asynchronously. You remain Team Lead and synthesize them; partial or failed outcomes are not success. Supply members or legacy branches.",
       parameters: {
         type: "object",
         properties: {
@@ -247,8 +476,6 @@ export function createTeamTool(control: TeamControl): AgentTool {
             deprecated: true,
             description: "Legacy members alias with identical fields and validation; never supply both",
           },
-          joinPolicy: { type: "string", enum: ["all-terminal", "deadline-best-effort"], default: "all-terminal" },
-          deadline: { ...boundedText, description: "Absolute ISO timestamp with timezone; required for deadline-best-effort" },
           peerMessaging: { type: "string", enum: ["team-members", "lead-only"], default: "team-members" },
         },
         additionalProperties: false,
@@ -286,7 +513,7 @@ export function createTeamCancelTool(control: TeamControl): AgentTool {
   }
   return createTeamCommand(
     "team_cancel",
-    "Cancel a Team's unfinished work and persist cancellation. Completed outcomes remain available; late member results cannot reopen cancelled work. Main still owns the final response.",
+    "Cancel a Team's unfinished work and persist cancellation. Completed outcomes remain available; late member results cannot reopen cancelled work. You remain responsible for the final response as Team Lead.",
     { teamId: teamIdSchema, reason: boundedText },
     ["teamId"],
     (arguments_, context) => {
@@ -306,19 +533,15 @@ export function createTeamReduceTool(control: TeamControl): AgentTool {
   }
   return createTeamCommand(
     "team_reduce",
-    "Explicitly schedule an optional, bounded read-only Reducer lane after the Team joins. Use it when synthesis benefits from another lane; Main is the default synthesizer and must accept or reject the reduction before presenting the final answer.",
-    { teamId: teamIdSchema, statement: boundedText, maxModelTokens: modelTokenSchema, maxWallClockMs: wallClockSchema,
-      maxAttempts: { type: "integer", minimum: 1, maximum: MAX_TASK_ATTEMPTS, description: "Maximum model calls, including tool steps; defaults to 2" } },
+    "Explicitly schedule an optional, bounded read-only Reducer lane after the Team joins. Use it when synthesis benefits from another lane; you are the default synthesizer as Team Lead and must accept or reject the reduction before presenting the final answer.",
+    { teamId: teamIdSchema, statement: boundedText },
     ["teamId"],
     (arguments_, context) => {
-      exactKeys(arguments_, ["teamId", "statement", "maxModelTokens", "maxWallClockMs", "maxAttempts"], "arguments");
+      exactKeys(arguments_, ["teamId", "statement"], "arguments");
       const statement = optionalString(arguments_.statement, "statement");
       return control.reduce!({
         teamId: normalizeTeamId(arguments_.teamId),
         ...(statement === undefined ? {} : { statement }),
-        ...(arguments_.maxModelTokens === undefined ? {} : { maxModelTokens: positiveInteger(arguments_.maxModelTokens, "maxModelTokens", MAX_TASK_MODEL_TOKENS) }),
-        ...(arguments_.maxWallClockMs === undefined ? {} : { maxWallClockMs: positiveInteger(arguments_.maxWallClockMs, "maxWallClockMs", MAX_TASK_WALL_CLOCK_MS) }),
-        ...(arguments_.maxAttempts === undefined ? {} : { maxAttempts: positiveInteger(arguments_.maxAttempts, "maxAttempts", MAX_TASK_ATTEMPTS) }),
       }, context);
     },
   );
@@ -330,7 +553,7 @@ export function createTeamPresentTool(control: TeamControl): AgentTool {
   }
   return createTeamCommand(
     "team_present",
-    "Record Main's acceptance or rejection of joined Team results after any requested reduction has settled. This records the Lead's decision; Main still writes the user-facing synthesis, and acceptance does not turn partial or failed tasks into successful ones.",
+    "Record your acceptance or rejection of joined Team results after any requested reduction has settled. This records your decision as Team Lead; you still write the final synthesis, and acceptance does not turn partial or failed tasks into successful ones.",
     { teamId: teamIdSchema, disposition: { type: "string", enum: ["accepted", "rejected"] } },
     ["teamId", "disposition"],
     (arguments_, context) => {
@@ -407,11 +630,29 @@ export function normalizeTeamCreateRequest(value: unknown): NormalizedTeamCreate
   };
 }
 
-export const parseTeamRequest = normalizeTeamCreateRequest;
+/** Parse only the compact, model-facing Team creation contract. Host code may
+ * still use normalizeTeamCreateRequest for recovered or explicitly controlled
+ * internal requests, but model calls cannot choose task budgets or deadlines.
+ */
+export function parseTeamRequest(value: unknown): NormalizedTeamCreateRequest {
+  const arguments_ = object(value, "arguments");
+  exactKeys(arguments_, ["teamId", "members", "branches", "peerMessaging"], "arguments");
+  const hasMembers = Object.hasOwn(arguments_, "members");
+  const hasBranches = Object.hasOwn(arguments_, "branches");
+  if (hasMembers === hasBranches) throw new TypeError("Supply exactly one of members or branches");
+  const collectionField = hasMembers ? "members" : "branches";
+  const collection = arguments_[collectionField];
+  if (!Array.isArray(collection)) throw new TypeError(`${collectionField} must be an array`);
+  for (const [index, member] of collection.entries()) {
+    const item = object(member, `${collectionField}[${index}]`);
+    exactKeys(item, ["memberId", "branchId", "statement", "input", "dependsOn", "required", "capabilities"], `${collectionField}[${index}]`);
+  }
+  return normalizeTeamCreateRequest(arguments_);
+}
 
 function parseMember(value: unknown, path: string): NormalizedTeamCreateRequest["branches"][number] {
   const item = object(value, path);
-  exactKeys(item, ["memberId", "branchId", "statement", "successCriteria", "hardConstraints", "input", "maxModelTokens", "maxWallClockMs", "maxAttempts", "dependsOn", "required"], path);
+  exactKeys(item, ["memberId", "branchId", "statement", "successCriteria", "hardConstraints", "input", "maxModelTokens", "maxWallClockMs", "maxAttempts", "dependsOn", "required", "capabilities"], path);
   const statement = requiredString(item.statement, `${path}.statement`);
   const memberId = item.memberId === undefined ? undefined : memberIdentity(item.memberId, `${path}.memberId`);
   const legacyId = item.branchId === undefined ? undefined : memberIdentity(item.branchId, `${path}.branchId`);
@@ -423,6 +664,7 @@ function parseMember(value: unknown, path: string): NormalizedTeamCreateRequest[
   const dependsOn = stringArray(item.dependsOn, `${path}.dependsOn`, MAX_MEMBERS - 1)
     .map((dependency, index) => memberIdentity(dependency, `${path}.dependsOn[${index}]`));
   if (new Set(dependsOn).size !== dependsOn.length) throw new TypeError(`${path}.dependsOn contains duplicate members`);
+  const capabilities = parseCapabilityGrant(item.capabilities, `${path}.capabilities`);
   return {
     ...(branchId === undefined ? {} : { memberId: branchId, branchId }),
     statement,
@@ -434,6 +676,28 @@ function parseMember(value: unknown, path: string): NormalizedTeamCreateRequest[
     ...(item.maxAttempts === undefined ? {} : { maxAttempts: positiveInteger(item.maxAttempts, `${path}.maxAttempts`, MAX_TASK_ATTEMPTS) }),
     dependsOn,
     required: item.required ?? true,
+    ...(capabilities === undefined ? {} : { capabilities }),
+  };
+}
+
+function parseCapabilityGrant(value: unknown, path: string): TeamCapabilityGrant | undefined {
+  if (value === undefined) return undefined;
+  const item = object(value, path);
+  exactKeys(item, ["tools", "allowNestedTeam"], path);
+  const tools = item.tools === undefined ? undefined : stringArray(item.tools, `${path}.tools`, 64)
+    .map((tool, index) => {
+      const name = tool.trim();
+      if (!/^[a-z][a-z0-9_:-]{0,127}$/u.test(name)) throw new TypeError(`${path}.tools[${index}] must be a tool name`);
+      return name;
+    });
+  if (tools !== undefined && new Set(tools).size !== tools.length) throw new TypeError(`${path}.tools must contain unique names`);
+  if (item.allowNestedTeam !== undefined && typeof item.allowNestedTeam !== "boolean") {
+    throw new TypeError(`${path}.allowNestedTeam must be a boolean`);
+  }
+  if (tools === undefined && item.allowNestedTeam === undefined) return {};
+  return {
+    ...(tools === undefined ? {} : { tools }),
+    ...(item.allowNestedTeam === undefined ? {} : { allowNestedTeam: item.allowNestedTeam }),
   };
 }
 
@@ -483,7 +747,11 @@ function normalizeTeamId(value: unknown): string {
 function memberIdentity(value: unknown, field: string): string {
   const id = requiredString(value, field);
   if (id.length > MAX_SUBAGENT_NAME_LENGTH) throw new RangeError(`${field} exceeds ${MAX_SUBAGENT_NAME_LENGTH} characters`);
-  return normalizeSubagentName(id);
+  const normalized = normalizeSubagentName(id);
+  if (normalized === "main" || normalized === "nausicaa" || normalized === "teto") {
+    throw new TypeError(`${field} is reserved for a runtime role`);
+  }
+  return normalized;
 }
 
 function oneOf<T extends string>(value: unknown, options: readonly T[], field: string): T {
@@ -509,6 +777,28 @@ function requiredString(value: unknown, field: string): string {
 
 function optionalString(value: unknown, field: string): string | undefined {
   return value === undefined ? undefined : requiredString(value, field);
+}
+
+function boundedBody(value: unknown): string {
+  const body = requiredString(value, "body");
+  if (body.length > 8_192) throw new RangeError("body exceeds 8192 characters");
+  return body;
+}
+
+function parseArtifactRefs(value: unknown): ArtifactRef[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 32) throw new TypeError("artifactRefs must contain at most 32 refs");
+  return value.map((candidate, index) => {
+    const item = object(candidate, `artifactRefs[${index}]`);
+    exactKeys(item, ["id", "contentHash", "mediaType", "byteLength"], `artifactRefs[${index}]`);
+    const id = requiredString(item.id, `artifactRefs[${index}].id`);
+    const contentHash = requiredString(item.contentHash, `artifactRefs[${index}].contentHash`);
+    const mediaType = requiredString(item.mediaType, `artifactRefs[${index}].mediaType`);
+    if (!Number.isSafeInteger(item.byteLength) || (item.byteLength as number) < 0) {
+      throw new TypeError(`artifactRefs[${index}].byteLength must be a non-negative integer`);
+    }
+    return { id, contentHash, mediaType, byteLength: item.byteLength as number };
+  });
 }
 
 function stringArray(value: unknown, field: string, maxItems = MAX_CRITERIA): string[] {
