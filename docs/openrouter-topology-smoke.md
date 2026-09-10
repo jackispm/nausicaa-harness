@@ -120,6 +120,19 @@ activation, with the same cost/request guards and no task-specific limits.
 Local report IDs: `2026-09-10T01-17-41-564Z-WpJFyF` and
 `2026-09-10T01-25-48-055Z-pGp5Qb`.
 
+A follow-up restored that same session and reused its `ui` and `qa` members.
+The UI member repaired the actual CSS, then QA read both files and reported
+PASS. The probe used 16 calls and $0.0853241356, but did not pass end to end:
+the restored QA lacked its `team_message` tool, and the smoke's concurrent
+cost-reservation guard stopped the final lead turn before it consumed QA's
+report. The guard belongs to the paid-test runner, not the member task policy.
+The reviewed record is `followup-eHCrAm/reviewed-report.json`; it distinguishes
+the successful file repair and reports from the incomplete final handoff.
+The timed-out probe then explicitly cancelled its Team during cleanup. A later
+assignment was correctly rejected; a cancelled Team is not a reusable fixture
+for recovery validation. Separate protocol tests cover restored group access
+and preservation of workspace and nested-Team grants.
+
 The September 7-8 reliability review found and fixed status-context bloat,
 member completion missing already-arrived mail, recovery resetting attempt
 budgets, and empty reducer summaries. Those probes used the old per-task controls.

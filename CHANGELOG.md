@@ -21,6 +21,9 @@ All notable changes to Nausicaa are documented here.
   the lead narrows their grant; nested Teams remain limited to depth three.
 - Make `task_wait` accept the initial task IDs returned by `team_create` as
   well as later assignments, using durable outcomes without restarting work.
+- Preserve parent-Team group tools when reusing or recovering member lanes,
+  including older task manifests that omitted those runtime capabilities.
+  Keep workspace grants and nested-Team authorization separate.
 - Use Nausicaa as the root public identity and named workers as Team members.
   Clarify Teto's auxiliary role and reserve unsolicited A2A for valuable advice
   about user intent and better solutions.

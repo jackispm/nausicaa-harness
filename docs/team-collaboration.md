@@ -226,6 +226,12 @@ permissions, not prompt instructions, and the same grant is restored from the
 durable Team definition. The root host still decides whether the inherited
 catalog includes writes, shell, network, or other external effects.
 
+Parent-Team `team_message` and `team_history` are member communication
+capabilities, separate from that workspace grant. They remain available after
+reuse and recovery, including for older task manifests that omitted them;
+membership, cancellation, and close checks still apply. Nested-Team controls
+remain subject to `allowNestedTeam` and the depth limit.
+
 ### Resident follow-up Tasks
 
 `team_assign` is intentionally smaller than `team_create`: the lead supplies a

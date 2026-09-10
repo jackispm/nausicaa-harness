@@ -3,11 +3,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { A2AInbox } from "../../src/a2a/inbox.js";
 import type { AppendEvent, EventType } from "../../src/domain/events.js";
 import type { AgentTool, ModelPort, ModelRequest, ModelResponse, ToolExecutionContext } from "../../src/domain/ports.js";
+import type { TeamTaskAssignment } from "../../src/domain/team.js";
 import type { RunPolicy } from "../../src/domain/types.js";
 import { MAX_TASK_ATTEMPTS } from "../../src/domain/types.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
 import { annotateTool } from "../../src/mowe/catalog.js";
-import { createScopedSpawnContext } from "../../src/runtime/lane-context.js";
+import { capabilityEntriesFromTools, createScopedSpawnContext } from "../../src/runtime/lane-context.js";
 import { RunTokenBudget } from "../../src/runtime/run-token-budget.js";
 import { TeamRuntime, type TeamRuntimeOptions } from "../../src/runtime/team-runtime.js";
 import { createTaskWaitTool, type TeamCreateRequest } from "../../src/runtime/team-tool.js";
@@ -104,6 +105,33 @@ function deferred<T>() {
 
 function member(memberId: string, overrides: Record<string, unknown> = {}) {
   return { memberId, statement: `Inspect ${memberId}`, maxModelTokens: 12_000, maxWallClockMs: 10_000, maxAttempts: 3, ...overrides };
+}
+
+function workspaceCatalog() {
+  const tools: AgentTool[] = ["read_file", "write_file", "bash"].map((name) => ({
+    definition: { name, description: name, parameters: { type: "object" } },
+    execute: vi.fn(async () => ({ content: name, isError: false })),
+  }));
+  const spawnContext: TeamRuntimeOptions["spawnContext"] = ({ laneId, goal, inputRefs, budget }) => createScopedSpawnContext({
+    parent: { workspaceId: "workspace", sessionId: "session", runId: RUN_ID, laneId: "main", laneKind: "main" },
+    child: { workspaceId: "workspace", sessionId: "session", runId: RUN_ID, laneId, laneKind: "team", parentLaneId: "main", ownerLaneId: "main", relation: "member-of" },
+    goal, inputRefs, budget, tools: capabilityEntriesFromTools(tools), role: "Member",
+  });
+  return { tools, spawnContext };
+}
+
+function parentChannelModel(teamId: string) {
+  return new RecordingModel((_request, call) => {
+    if (call === 1) return {
+      ...response("", "tool_calls"),
+      toolCalls: [{ id: "parent-message", name: "team_message", arguments: { teamId, body: "Parent Team channel is available" } }],
+    };
+    if (call === 2) return {
+      ...response("", "tool_calls"),
+      toolCalls: [{ id: "parent-history", name: "team_history", arguments: { teamId } }],
+    };
+    return response("Parent Team communication verified");
+  });
 }
 
 describe("durable Team collaboration", () => {
@@ -521,6 +549,109 @@ describe("durable Team collaboration", () => {
     expect(names).not.toContain("write_file");
     expect(names).not.toContain("team_create");
     expect(names).toContain("team_message");
+  });
+
+  it.each([true, false])("preserves parent channels and narrowed tools across restored follow-ups (nested=%s)", async (allowNestedTeam) => {
+    const catalog = workspaceCatalog();
+    const teamId = "channel-recovery";
+    const original = fixture({ ...catalog, model: parentChannelModel(teamId) });
+    await original.team.create({ teamId, members: [{
+      memberId: "reviewer", statement: "Review the workspace",
+      capabilities: { tools: ["read_file"], allowNestedTeam },
+    }] }, context);
+    await original.team.drain();
+    const initialContext = (await board(original.team, teamId)).definition!.members[0]!.task.spawnContext!;
+    expect(original.model.requests[0]!.tools.map((tool) => tool.name).toSorted())
+      .toEqual(initialContext.tools.map((tool) => tool.name).toSorted());
+    expect(initialContext.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining(["team_message", "team_history"]));
+    await original.team.stop();
+
+    const recovered = fixture({
+      ...original, ...catalog, model: parentChannelModel(teamId),
+      inbox: A2AInbox.rehydrate(await original.ledger.read(), { sink: original.ledger, clock: original.clock }),
+    });
+    await recovered.team.restore();
+    const start = await recovered.ledger.watermark();
+    const assigned = await recovered.team.assign({ teamId, memberId: "reviewer", statement: "Continue the review" }, {
+      ...context, operationId: "channel-follow-up",
+    });
+    await recovered.team.drain();
+    expect(await recovered.team.wait({ teamId, taskId: assigned.taskId }, context)).toMatchObject({ status: "review" });
+    const events = await recovered.ledger.read({ afterOffset: start });
+    const assignment = events.find((event) => (event as { type: string }).type === "team.task.assigned") as unknown as { payload: TeamTaskAssignment };
+    const names = recovered.model.requests[0]!.tools.map((tool) => tool.name);
+    expect(names.toSorted()).toEqual(assignment.payload.task.spawnContext!.tools.map((tool) => tool.name).toSorted());
+    expect(names).toEqual(expect.arrayContaining(["read_file", "team_message", "team_history"]));
+    expect(new Set(names).size).toBe(names.length);
+    expect(names).not.toContain("write_file");
+    expect(names).not.toContain("bash");
+    for (const name of ["team_create", "child_team_message", "child_team_history"]) expect(names.includes(name)).toBe(allowNestedTeam);
+    expect(events.filter((event) => event.type === "tool.failed")).toEqual([]);
+    expect(events.filter((event) => event.type === "tool.succeeded")).toHaveLength(2);
+    expect(recovered.model.requests.at(-1)!.messages.some((message) => message.role === "tool"
+      && message.content.includes("Parent Team channel is available"))).toBe(true);
+    for (const tool of catalog.tools) expect(tool.execute).not.toHaveBeenCalled();
+    await expect(recovered.team.message({ teamId, body: "Unauthorized" }, { ...context, laneId: "team:other:reviewer" }))
+      .rejects.toThrow("not an active Team member");
+    await expect(recovered.team.history({ teamId }, { ...context, runId: "foreign-run" })).rejects.toThrow("another Run");
+  });
+
+  it.each([true, false])("repairs only parent channel access for persisted deficient assignments (nested=%s)", async (allowNestedTeam) => {
+    const catalog = workspaceCatalog();
+    const teamId = "legacy-channel";
+    const original = fixture(catalog);
+    await original.team.create({ teamId, members: [{
+      memberId: "reviewer", statement: "Review the workspace",
+      capabilities: { tools: ["read_file"], allowNestedTeam },
+    }] }, context);
+    await original.team.drain();
+    const assigned = await original.team.assign({ teamId, memberId: "reviewer", statement: "Continue after restart" }, {
+      ...context, operationId: "legacy-channel-follow-up",
+    });
+    await original.team.stop();
+
+    const originalEvents = await original.ledger.read();
+    const dispatch = originalEvents.find((event) => event.type === "message.sent"
+      && event.payload.message.payload.type === "task.request" && event.payload.message.payload.taskId === assigned.taskId)!;
+    // Reproduce the old durable assignment and envelope, stopping before the
+    // member executes. Existing records are replayed into an isolated Ledger.
+    const legacyEvents = structuredClone(originalEvents.filter((event) => event.globalOffset <= dispatch.globalOffset));
+    for (const event of legacyEvents) {
+      const assignment = (event as { type: string }).type === "team.task.assigned"
+        ? (event as unknown as { payload: TeamTaskAssignment }).payload.task : undefined;
+      const task = assignment ?? (event.type === "message.sent" && event.payload.message.payload.type === "task.request"
+        && event.payload.message.payload.taskId === assigned.taskId ? event.payload.message.payload : undefined);
+      if (task?.spawnContext === undefined) continue;
+      task.spawnContext.tools = task.spawnContext.tools.filter((tool) => !["team_message", "team_history"].includes(tool.name));
+      task.spawnContext.laneManifest.capabilities = task.spawnContext.laneManifest.capabilities.filter((tool) => !["team_message", "team_history"].includes(tool.name));
+    }
+    let sequence = 0;
+    const ledger = new MemoryLedger({ clock: original.clock, createEventId: () => legacyEvents[sequence++]?.eventId ?? `recovered-${sequence}` });
+    for (const event of legacyEvents) await ledger.append(event);
+    const durableAssignment = (await ledger.read()).find((event) => (event as { type: string }).type === "team.task.assigned")!;
+    const legacyContext = (durableAssignment as unknown as { payload: TeamTaskAssignment }).payload.task.spawnContext!;
+    expect(legacyContext.tools.some((tool) => ["team_message", "team_history"].includes(tool.name))).toBe(false);
+    const start = await ledger.watermark();
+    const recovered = fixture({
+      ...catalog, ledger, store: original.store, clock: original.clock, model: parentChannelModel(teamId),
+      inbox: A2AInbox.rehydrate(await ledger.read(), { sink: ledger, clock: original.clock }),
+    });
+    await recovered.team.restore();
+    await recovered.team.drain();
+    expect(await recovered.team.wait({ teamId, taskId: assigned.taskId }, context)).toMatchObject({ status: "review" });
+    const names = recovered.model.requests[0]!.tools.map((tool) => tool.name);
+    expect(names.toSorted()).toEqual([...legacyContext.tools.map((tool) => tool.name), "team_message", "team_history"].toSorted());
+    expect(names).toContain("read_file");
+    expect(names).not.toContain("write_file");
+    expect(names).not.toContain("bash");
+    for (const name of ["team_create", "child_team_message", "child_team_history"]) expect(names.includes(name)).toBe(allowNestedTeam);
+    const events = await ledger.read({ afterOffset: start });
+    expect(events.filter((event) => event.type === "tool.failed")).toEqual([]);
+    expect(events.filter((event) => event.type === "tool.succeeded")).toHaveLength(2);
+    expect(recovered.model.requests.at(-1)!.messages.some((message) => message.role === "tool"
+      && message.content.includes("Parent Team channel is available"))).toBe(true);
+    expect((await ledger.read()).find((event) => event.eventId === durableAssignment.eventId)).toEqual(durableAssignment);
+    for (const tool of catalog.tools) expect(tool.execute).not.toHaveBeenCalled();
   });
 
   it("retains succeeded, partial, and failed outcomes as distinct facts at join", async () => {

@@ -86,7 +86,7 @@ const MAX_TEAMS = 16;
 const MAX_BRANCHES_PER_TEAM = 16;
 const MAX_ID_LENGTH = 96;
 const NESTED_TEAM_TOOL_NAMES = [
-  "team_create", "team_assign", "task_wait", "team_status", "team_message",
+  "team_create", "team_assign", "task_wait", "team_status",
   "team_close", "team_cancel", "team_reduce", "team_present",
   "child_team_message", "child_team_history",
 ] as const;
@@ -1352,6 +1352,7 @@ export class TeamRuntime implements TeamControl {
       ...(goal === undefined ? {} : { goal }),
       workspace: this.options.workspace,
       tools: memberToolCatalog.filter((tool) => declaredToolNames === undefined || declaredToolNames.has(tool.definition.name)),
+      ...(reducer ? {} : { parentTeamTools: [createTeamMessageTool(this), createTeamHistoryTool(this)] }),
       reducer,
       ...(dynamicAssignment === undefined ? {} : { residentTask: true, residentTaskId: dynamicAssignment.taskId }),
       runTokenBudget: tokenBudget,
@@ -1500,13 +1501,8 @@ export class TeamRuntime implements TeamControl {
     if (!reducer) {
       const allowed = grant?.tools === undefined ? undefined : new Set(grant.tools);
       const inherited = this.availableBranchTools().filter((tool) => allowed === undefined || allowed.has(tool.definition.name));
-      // A nested lead still belongs to its parent Team. Keep the outer Team
-      // channel available alongside the child Team control plane, otherwise
-      // the member cannot report progress to its own lead's group.
       return [
         ...inherited,
-        createTeamMessageTool(this),
-        createTeamHistoryTool(this),
         ...(nested === undefined ? [] : createNestedTeamTools(nested)),
       ];
     }
@@ -1529,8 +1525,11 @@ export class TeamRuntime implements TeamControl {
       ? (nestedAllowed ? [...NESTED_TEAM_TOOL_NAMES] : [])
       : createNestedTeamTools(nested).map((tool) => tool.definition.name);
     const tools = [
-      ...capabilityEntriesFromTools(this.memberTools(reducer, reducer || laneId === undefined ? undefined : this.nestedRuntimes.get(laneId), grant)
+      ...capabilityEntriesFromTools(this.memberTools(reducer, undefined, grant)
         .filter((tool) => declared === undefined || declared.has(tool.definition.name))),
+      // Parent channel access comes from Team membership, not the host's
+      // workspace-tool whitelist or permission to create a nested Team.
+      ...capabilityEntriesFromTools(reducer ? [] : [createTeamMessageTool(this), createTeamHistoryTool(this)]),
       ...["agent_awareness", "agent_message", ...(reducer ? [] : ["teto_start", "teto_stop", "teto_status", ...nestedNames])]
         .map((name) => ({
           name,

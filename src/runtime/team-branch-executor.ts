@@ -66,6 +66,8 @@ export interface TeamBranchExecutorOptions {
   goal?: Goal;
   workspace: string;
   tools: readonly AgentTool[];
+  /** Membership-checked parent Team channels, including recovery of older manifests. */
+  parentTeamTools?: readonly AgentTool[];
   runTokenBudget: RunTokenBudget;
   /** Durable Run events available when a branch runtime is reconstructed. */
   events?: readonly AnyEvent[];
@@ -571,7 +573,13 @@ export class TeamBranchExecutor {
     });
     const declared = spawnContext === undefined ? undefined : new Set(spawnContext.tools.map((tool) => tool.name));
     const baseTools = this.options.tools.filter((tool) => declared === undefined || declared.has(tool.definition.name));
-    for (const tool of [...baseTools, awareness, ...controls, messaging]) {
+    const parentTeamTools = this.options.parentTeamTools ?? [];
+    for (const tool of parentTeamTools) {
+      if (tool.definition.name !== "team_message" && tool.definition.name !== "team_history") {
+        throw new Error(`Invalid parent Team channel tool: ${tool.definition.name}`);
+      }
+    }
+    for (const tool of [...baseTools, ...parentTeamTools, awareness, ...controls, messaging]) {
       if (names.has(tool.definition.name)) {
         throw new Error(`Team branch tool collides with a runtime capability: ${tool.definition.name}`);
       }
