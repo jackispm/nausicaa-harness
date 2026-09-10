@@ -39,7 +39,7 @@ function creationResponse(): ModelResponse {
   };
 }
 
-function completionModels(events: readonly AnyEvent[]) {
+function completionModels(events: readonly AnyEvent[], waitForMember: () => Promise<unknown> = () => delay(650)) {
   const main = new ScriptedModel([
     creationResponse(),
     response("Premature answer before the evidence is ready"),
@@ -60,7 +60,7 @@ function completionModels(events: readonly AnyEvent[]) {
     async complete(request) {
       memberRequests.push(request);
       expect(request.messages.map((message) => message.content).join("\n")).not.toContain("PRIVATE-MAIN-CONTEXT");
-      await delay(650);
+      await waitForMember();
       expect(events.some((event) => event.type === "run.completed")).toBe(false);
       return response("Delayed member evidence: checked authentication");
     },
@@ -103,7 +103,8 @@ describe("Team completion boundaries", () => {
   it("interactive Main can finish while Team work continues and resumes after a member report", async () => {
     const root = await temporaryDirectory();
     const events: AnyEvent[] = [];
-    const models = completionModels(events);
+    const releaseMember = deferred<void>();
+    const models = completionModels(events, () => releaseMember.promise);
     const session = await SessionController.open({
       workspace: root, dataDir: join(root, "state"), model: "scripted-main", workerModel: "scripted-member", policy,
     }, {
@@ -118,7 +119,10 @@ describe("Team completion boundaries", () => {
       // durable report later schedules a fresh Main continuation.
       expect(models.main.requests).toHaveLength(2);
       expect(events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
-      await delay(800);
+      releaseMember.resolve();
+      await vi.waitFor(() => {
+        expect(events.filter((event) => event.type === "turn.completed")).toHaveLength(2);
+      }, { timeout: 8_000 });
       await session.waitForIdle();
       expect(models.main.requests).toHaveLength(4);
       expect(models.memberRequests).toHaveLength(1);
@@ -127,6 +131,7 @@ describe("Team completion boundaries", () => {
       expect(events.some((event) => event.type === "team.presented")).toBe(true);
       expect(events.some((event) => event.type === "run.completed")).toBe(false);
     } finally {
+      releaseMember.resolve();
       await session.close();
     }
   }, 15_000);

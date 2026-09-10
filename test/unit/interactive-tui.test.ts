@@ -1305,6 +1305,7 @@ describe("interactive TUI", () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-queue-edit-"));
     const previousExitCode = process.exitCode;
     let releaseFirst = (_response: ModelResponse): void => {};
+    let unsubscribeFollowUp = (): void => {};
     const firstResponse = new Promise<ModelResponse>((resolve) => { releaseFirst = resolve; });
     try {
       const model = new ScriptedModel([
@@ -1405,12 +1406,39 @@ describe("interactive TUI", () => {
         ));
       }, "queued input lane change");
 
+      const followUp = (await session.pendingInputs()).find((item) => item.text === "newer edited")!;
+      const followUpCompleted = new Promise<void>((resolve, reject) => {
+        let followUpTurnId: string | undefined;
+        unsubscribeFollowUp = originalSubscribe((runtimeEvent) => {
+          if (runtimeEvent.kind !== "event") return;
+          const event = runtimeEvent.event;
+          if (event.type === "turn.started" && event.payload.inputId === followUp.inputId) {
+            followUpTurnId = event.payload.turnId;
+          }
+          if (followUpTurnId === undefined || event.turnId !== followUpTurnId) return;
+          if (event.type === "turn.completed") {
+            unsubscribeFollowUp();
+            resolve();
+          } else if (["turn.failed", "turn.cancelled", "turn.waiting"].includes(event.type)) {
+            unsubscribeFollowUp();
+            reject(new Error(`Edited follow-up did not complete: ${event.type}`));
+          }
+        });
+      });
       releaseFirst(response("ACTIVE_ANSWER"));
+      // The output deadline covers rendering, not multiple durable model
+      // rounds and the promotion of a queued input into its own Turn.
+      await followUpCompleted;
+      expect(model.requests[1]?.messages.some((message) => message.role === "user" && message.content.includes("older steering"))).toBe(true);
+      expect(model.requests[2]?.messages.some((message) => message.role === "user" && message.content.includes("newer edited"))).toBe(true);
+      expect(model.requests.some((request) => request.messages.some((message) => message.content.includes("untouched draft")))).toBe(false);
+      await expect(session.pendingInputs()).resolves.toEqual([]);
       await waitForOutput(terminal, "FOLLOW_UP_AFTER_EDIT");
       terminal.type("/exit");
       terminal.send("\r");
       await expect(running).resolves.toBe(0);
     } finally {
+      unsubscribeFollowUp();
       releaseFirst(response("cleanup"));
       process.exitCode = previousExitCode;
       await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
