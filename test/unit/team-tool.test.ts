@@ -88,6 +88,24 @@ describe("Team tool creation contract", () => {
     expect(() => messageTool.definition.parameters?.properties?.body).not.toBeUndefined();
   });
 
+  it("preserves lead aliases and full lane addresses in group mentions", async () => {
+    const message = vi.fn(async () => ({
+      status: "sent" as const, messageId: "group-mention", teamId: "review", channelId: "general",
+      sequence: 1, fromLane: "main", body: "Review this", mentions: [], artifactRefs: [], cursor: "tc1-cursor",
+    }));
+    const tool = createTeamMessageTool({ create: vi.fn(), message });
+    for (const address of ["nausicaa", "main", "security", "team:review:security"]) {
+      const args = { teamId: "review", body: "Review this", mentions: [` ${address} `] };
+      expect(validateArguments(tool, args).ok).toBe(true);
+      expect((await tool.execute(args, context)).isError).toBe(false);
+      expect(message).toHaveBeenLastCalledWith(expect.objectContaining({ mentions: [address] }), context);
+    }
+    for (const mentions of [[" "], ["x".repeat(513)], ["security", " security "]]) {
+      expect((await tool.execute({ teamId: "review", body: "Review this", mentions }, context)).isError).toBe(true);
+    }
+    expect(message).toHaveBeenCalledTimes(4);
+  });
+
   it("exposes member admission and assignment without model-owned budgets", async () => {
     const assign = vi.fn(async () => ({ teamId: "review", taskId: "review:security:task-1", memberId: "security", laneId: "team:review:security", assignmentVersion: 1, status: "queued" as const }));
     const wait = vi.fn(async () => ({ teamId: "review", taskId: "review:security:task-1", status: "waiting", waiting: true }));

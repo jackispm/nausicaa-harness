@@ -51,6 +51,8 @@ Team 的主管由实际创建它的 lane 决定，负责汇总和判断结果。
 团队可以逐步组建：`team_create` 只派发当前能开始的工作，之后用 `team_assign`
 给新成员或原成员派任务，并携带简短的结果与文件路径，不需要 `dependsOn`。
 成员每次任务的最终报告自动进入群里的任务线程；`team_message` 用于群协作，A2A 用于私信。
+群消息通过 `mentions` 送到成员的下一轮上下文；`nausicaa` 是根主管的地址。
+未提及成员的聊天按需翻页查看，已完成成员由 `team_assign` 派发后续任务。
 `task_wait` 真正等待结果，`team_status` 才是即时查询。主管可以安排返工和复验，
 普通调度分段结束后会自动继续，不会仅因达到默认 24 步而要求手动恢复。
 
@@ -58,7 +60,7 @@ Team 的主管由实际创建它的 lane 决定，负责汇总和判断结果。
 或“30 分钟截止”默认值。交互会话保持打开时，主管可以先结束当前轮次；成员继续工作，
 结果返回后主管自动继续协调。关闭会话或取消任务会停止相关工作。
 
-当前版本：`0.1.5` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
+当前版本：`0.1.6` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
 edge 集成仍在完善。
 
 ### 快速开始
@@ -114,7 +116,7 @@ nausicaa auth login openrouter api-key
 | `/name`、`/export`、`/import` | 会话命名、HTML/JSONL 导出、JSONL 导入 |
 | `/skills`、`/mcp`、`/reload` | 选择 Skill、管理 MCP、刷新资源 |
 | `/context`、`/compact` | 上下文用量与压缩 |
-| `/permissions`、`/plan`、`/stop` | 权限、规划模式、停止当前任务 |
+| `/permissions`、`/plan`、`/stop` | 权限、规划模式、停止当前任务（`Esc` 只打断当前回答，保留异步团队成员） |
 | `/settings`、`/system-prompt`、`/logs`、`/traces` | 会话设置、实际系统提示词、日志位置、本地 Run 事件与指标 |
 | `/btw <问题>`（`/side`） | 当前会话的无工具侧问，不写入主对话；用量计入预算 |
 | `/changelog`、`/update` | 版本记录、更新安装包（完成后重启） |
@@ -138,7 +140,11 @@ Nausicaa，也可以是有自己名字的团队成员。
 
 Teto 默认对所属 Agent 保持沉默，但可以在自己的对话记录中记下简短观察。
 只有新的高价值建议时，它才主动发 A2A；直接收到 A2A 协作请求时，可以作实质性答复。
+积压的观察事件会合并处理，完全重复的主动提醒会去重，长任务仍可收到不同的新建议。
 订阅内容是观察资料，不是交给 Teto 执行的用户任务。
+
+执行中按 `Esc` 或 `Ctrl+C` 会保留原会话上下文和异步团队，下一条输入可以继续。
+成员报告会保留，但不会自动撤销你的中断；`/stop` 则会同时取消团队工作。
 
 内置 `codebase-map`、`task-plan`、`code-review` 三个 Skill，项目或配置来源的同名 Skill 优先。
 默认发现项目内 `.agents/skills`、`.pi/skills`、`skills`；不会自动扫描
@@ -210,6 +216,9 @@ graph is required. Every task's final report enters the shared task thread;
 for the result; `team_status` is an immediate snapshot. The lead can assign
 repairs and reviews and continues across ordinary scheduling slices without
 a manual resume at the default 24-step boundary.
+Group `mentions` deliver messages at the recipient's next boundary; `nausicaa`
+addresses the root lead. Unmentioned chat is paged on demand, and completed
+members receive further work through `team_assign`.
 
 Members start with independent contexts and, by default, inherit the Team
 Lead's host-authorized workspace tool catalog. The lead can narrow a member
@@ -225,7 +234,7 @@ session, the lead may finish its current turn while members keep working;
 durable reports automatically resume coordination. Session closure or task
 cancellation stops the corresponding work.
 
-Current version: `0.1.5` beta. Core runtime contracts have offline test coverage;
+Current version: `0.1.6` beta. Core runtime contracts have offline test coverage;
 provider, daemon, RPC, and edge integrations are still evolving.
 
 ### Quick start
@@ -288,7 +297,7 @@ Use `nausicaa auth status <provider>` for local authentication status and
 | `/name`, `/export`, `/import` | Name sessions, export HTML/JSONL, import JSONL |
 | `/skills`, `/mcp`, `/reload` | Choose a Skill, manage MCP, refresh resources |
 | `/context`, `/compact` | Context usage and compaction |
-| `/permissions`, `/plan`, `/stop` | Permissions, Plan mode, stop the current task |
+| `/permissions`, `/plan`, `/stop` | Permissions, Plan mode, stop the current task (`Esc` interrupts only the current answer and leaves asynchronous Team members running) |
 | `/settings`, `/system-prompt`, `/logs`, `/traces` | Session settings, effective system prompt, log locations, local Run events and metrics |
 | `/btw <question>` (`/side`) | Tool-free side question on the attached session; separate transcript, shared budget |
 | `/changelog`, `/update` | Release notes, update the installation (then restart) |
@@ -319,6 +328,12 @@ in its own transcript. It sends unsolicited A2A advice only when it has new,
 high-value guidance. It may also give substantive replies to direct A2A
 coordination requests. Subscribed content is observation material, not
 a user task assigned to Teto.
+Queued observations are coalesced and exact repeated unsolicited notes are
+deduplicated, while distinct new findings can still arrive during long tasks.
+
+During execution, `Esc` or `Ctrl+C` preserves context and asynchronous Teams
+for your next input. Member reports remain available but do not automatically
+undo your interruption; `/stop` also cancels Team work.
 
 Three Skills are bundled: `codebase-map`, `task-plan`, and `code-review`.
 Same-name project or configured Skills take precedence. Discovery includes

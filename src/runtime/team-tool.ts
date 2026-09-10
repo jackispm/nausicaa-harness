@@ -203,7 +203,7 @@ export function createTaskWaitTool(control: Pick<TeamControl, "wait">): AgentToo
   }
   return annotateTool(createTeamCommand(
     "task_wait",
-    "Wait for one Team task to finish and return its durable report. The runtime waits without polling the model. Use this when you have no other ready work; use team_status for an immediate snapshot. You can also end your current turn and let arriving reports resume coordination. Waiting does not copy the member's full transcript.",
+    "Wait for one Team task's durable result or cancellation. This call blocks in the runtime; use it once when you have no other ready work, or end your current turn and let arriving reports resume coordination. Use team_status for an immediate snapshot. Waiting does not copy the member's full transcript.",
     { teamId: teamIdSchema, taskId: { type: "string", minLength: 1, maxLength: 128 } },
     ["teamId", "taskId"],
     (arguments_, context) => {
@@ -263,20 +263,24 @@ export function createTeamMessageTool(control: TeamControl): AgentTool {
   }
   return createTeamCommand(
     "team_message",
-    "Post one public message to a Team channel or task thread. Messages are durable and visible to authorized members, but ordinary messages do not wake every member. Use agent_message for private A2A.",
+    "Post to a shared Team channel or task thread. Mention a memberId or full laneId to deliver the message at its next boundary; mention nausicaa for the root lead. Mentions can wake an idle lead, but completed members need team_assign for new work. Unmentioned chat stays in team_history. Use agent_message for private A2A.",
     {
       teamId: teamIdSchema,
       channelId: { type: "string", minLength: 1, maxLength: 96, default: "general" },
       threadId: { type: "string", minLength: 1, maxLength: 160 },
       body: { type: "string", minLength: 1, maxLength: 8_192 },
-      mentions: { type: "array", maxItems: MAX_MEMBERS, items: memberIdSchema },
+      mentions: { type: "array", maxItems: MAX_MEMBERS, items: { type: "string", minLength: 1, maxLength: 512 } },
       artifactRefs: { type: "array", maxItems: 32, items: { type: "object" } },
     },
     ["teamId", "body"],
     (arguments_, context) => {
       exactKeys(arguments_, ["teamId", "channelId", "threadId", "body", "mentions", "artifactRefs"], "arguments");
-      const mentions = stringArray(arguments_.mentions, "mentions", MAX_MEMBERS).map((value, index) => memberIdentity(value, `mentions[${index}]`));
-      if (new Set(mentions).size !== mentions.length) throw new TypeError("mentions must contain unique member ids");
+      const mentions = stringArray(arguments_.mentions, "mentions", MAX_MEMBERS).map((value, index) => {
+        const target = requiredString(value, `mentions[${index}]`).trim();
+        if (target.length > 512) throw new RangeError(`mentions[${index}] exceeds 512 characters`);
+        return target;
+      });
+      if (new Set(mentions).size !== mentions.length) throw new TypeError("mentions must contain unique addresses");
       const artifactRefs = parseArtifactRefs(arguments_.artifactRefs);
       return control.message!({
         teamId: normalizeTeamId(arguments_.teamId),
@@ -468,7 +472,7 @@ export function createTeamTool(control: TeamControl): AgentTool {
   const tool: AgentTool = {
     definition: {
       name: "team_create",
-      description: "Create a Team with members whose work can start now. Members have independent contexts and run in parallel; give each a clear statement and concise input. For example, create a developer first; once its file exists, add a reviewer using team_assign in this same Team. Reuse members for further work. Members inherit your authorized tools unless capabilities narrows them. Final reports enter the shared Team channel; team_message is group chat and agent_message is private A2A. You own synthesis and acceptance; partial or failed outcomes are not success. When no other work is ready, task_wait awaits a report, or end your turn for automatic continuation.",
+      description: "Create a Team with members whose work can start now. Members have independent contexts and run in parallel; give each a clear statement and concise input. When later work needs an earlier result, create the first member now and add the next with team_assign after its report arrives. Reuse members for follow-up work. Members inherit your authorized tools unless capabilities narrows them. Final reports enter the shared Team channel; team_message is group chat and agent_message is private A2A. You own synthesis and acceptance; partial or failed outcomes are not success. When no other work is ready, task_wait awaits a report, or end your turn for automatic continuation.",
       parameters: {
         type: "object",
         properties: {

@@ -397,6 +397,126 @@ describe("in-Run agent_message", () => {
     expect(inbox.snapshot().records).toHaveLength(2);
   });
 
+  it("checks sender identity, target authorization, and reply provenance before suppression", async () => {
+    const { inbox, ledger, clock } = setup();
+    await inbox.send(message("unrelated-question", { from: "main", to: memberA }));
+    const before = await ledger.read({ runId });
+    const suppressMessage = vi.fn(() => "Already reported");
+    const onMessage = vi.fn();
+    const tool = createInRunAgentMessageTool({
+      inbox, runId, from: memberA, resolveTargets: () => [memberB], now: clock.now,
+      suppressMessage, onMessage,
+    });
+    const denied = [
+      await tool.execute({ text: "note", target: memberB }, { ...context, laneId: memberB }),
+      await tool.execute({ text: "note", target: memberB }, { ...context, runId: "another-run" }),
+      await tool.execute({ text: "note", target: "main" }, context),
+      await tool.execute({ text: "note", target: memberB, replyTo: "unrelated-question" }, context),
+    ];
+    expect(denied.every((result) => result.isError)).toBe(true);
+    expect(denied.map((result) => JSON.parse(result.content).error)).toEqual([
+      expect.stringContaining("another lane"), expect.stringContaining("another Run"),
+      expect.stringContaining("not authorized"), expect.stringContaining("replyTo"),
+    ]);
+    expect(suppressMessage).not.toHaveBeenCalled();
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(await ledger.read({ runId })).toEqual(before);
+  });
+
+  it("does not persist or wake for a suppressed message, leaving the operation available for a later send", async () => {
+    const { inbox, ledger, clock } = setup();
+    await inbox.send(message("peer-question", { from: memberB, to: memberA }));
+    const before = await ledger.read({ runId });
+    const suppressMessage = vi.fn<(_: A2AMessage) => string | undefined>(() => "Already reported");
+    const onMessage = vi.fn();
+    const tool = createInRunAgentMessageTool({
+      inbox, runId, from: memberA, to: memberB, now: clock.now, suppressMessage, onMessage,
+    });
+    const arguments_ = { text: "Verified report", replyTo: "peer-question" };
+    const suppressed = await tool.execute(arguments_, context);
+    expect(suppressed.isError).toBe(false);
+    expect(JSON.parse(suppressed.content)).toEqual({ queued: false, suppressed: true, reason: "Already reported" });
+    expect(suppressMessage).toHaveBeenCalledWith(expect.objectContaining({
+      from: memberA, to: memberB, runId, replyTo: "peer-question",
+      payload: { type: "message.inform", text: "Verified report" },
+    }));
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(await ledger.read({ runId })).toEqual(before);
+    expect(inbox.snapshot().records).toHaveLength(1);
+
+    suppressMessage.mockReturnValue(undefined);
+    const admitted = await tool.execute(arguments_, context);
+    expect(admitted.isError).toBe(false);
+    expect(JSON.parse(admitted.content).status).toBe("queued");
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(inbox.snapshot().records).toHaveLength(2);
+  });
+
+  it("preserves durable retries and conflicts after replay while still rechecking a revoked target grant", async () => {
+    const { inbox, ledger, clock } = setup();
+    const options = { runId, from: memberA, to: memberB, now: clock.now };
+    const first = await createInRunAgentMessageTool({ ...options, inbox }).execute({ text: "Verified report" }, context);
+    const before = await ledger.read({ runId });
+    const recovered = A2AInbox.rehydrate(before, { sink: ledger, clock });
+    const suppressMessage = vi.fn(() => "Already reported");
+    const onMessage = vi.fn();
+    let targets = [memberB];
+    const tool = createInRunAgentMessageTool({
+      ...options, inbox: recovered, resolveTargets: () => targets, suppressMessage, onMessage,
+    });
+    const retried = await tool.execute({ text: "Verified report" }, context);
+    expect(retried.isError).toBe(false);
+    expect(JSON.parse(retried.content)).toMatchObject({ status: "duplicate", messageId: JSON.parse(first.content).messageId });
+    expect(suppressMessage).not.toHaveBeenCalled();
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect((await tool.execute({ text: "Different report" }, context)).isError).toBe(true);
+    expect(suppressMessage).not.toHaveBeenCalled();
+
+    targets = [];
+    for (const operationId of [context.operationId, "new-operation"]) {
+      const denied = await tool.execute({ text: "Verified report" }, { ...context, operationId });
+      expect(denied.isError).toBe(true);
+      expect(JSON.parse(denied.content).error).toContain("not authorized");
+    }
+    expect(suppressMessage).not.toHaveBeenCalled();
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(await ledger.read({ runId })).toEqual(before);
+    expect(recovered.snapshot().records).toHaveLength(1);
+  });
+
+  it("serializes suppression and durable admission across concurrent tool instances", async () => {
+    const { inbox, ledger, clock } = setup();
+    let entered!: () => void;
+    let release!: () => void;
+    const sending = new Promise<void>((resolve) => { entered = resolve; });
+    const delayed = new Promise<void>((resolve) => { release = resolve; });
+    const send = inbox.send.bind(inbox);
+    vi.spyOn(inbox, "send").mockImplementation(async (message) => {
+      entered();
+      await delayed;
+      return send(message);
+    });
+    const suppressMessage = vi.fn((candidate: A2AMessage) => inbox.snapshot().records.some(({ message }) =>
+      message.from === candidate.from && message.to === candidate.to
+      && message.payload.type === "message.inform" && candidate.payload.type === "message.inform"
+      && message.payload.text === candidate.payload.text,
+    ) ? "Already reported" : undefined);
+    const onMessage = vi.fn();
+    const options = { inbox, runId, from: memberA, to: memberB, now: clock.now, suppressMessage, onMessage };
+    const first = createInRunAgentMessageTool(options).execute({ text: "One finding" }, context);
+    await sending;
+    const second = createInRunAgentMessageTool(options).execute({ text: "One finding" }, { ...context, operationId: "operation-2" });
+    release();
+    const receipts = await Promise.all([first, second]);
+    expect(receipts.every((result) => !result.isError)).toBe(true);
+    expect(JSON.parse(receipts[0]!.content).status).toBe("queued");
+    expect(JSON.parse(receipts[1]!.content)).toEqual({ queued: false, suppressed: true, reason: "Already reported" });
+    expect(suppressMessage).toHaveBeenCalledTimes(2);
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(inbox.snapshot().records).toHaveLength(1);
+    expect((await ledger.read({ runId })).filter((event) => event.type === "message.sent")).toHaveLength(1);
+  });
+
   it.each([0, 257, Infinity, 1.5])("rejects an invalid pending message bound %s", (maxPendingMessages) => {
     expect(() => createInRunAgentMessageTool({ inbox: new A2AInbox(), runId, maxPendingMessages })).toThrow(/maxPendingMessages/);
   });

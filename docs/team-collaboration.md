@@ -112,8 +112,9 @@ two core tasks:
 
 Teto stays silent toward its owner by default. It may record brief observations
 in its own lane transcript without sending them to the owner. Unsolicited
-`agent_message` advice is reserved for new, high-value information. Teto may also
-send substantive replies to direct A2A coordination requests.
+`agent_message` advice is reserved for a new, concrete finding that would change
+the owner's next action. Teto may also answer direct A2A requests. There is no
+per-request message cap: a long task may reveal several independent problems.
 
 When there is nothing useful to record or suggest, the prompt asks for ordinary
 assistant text `NO_UPDATE` with no tool calls. The runtime treats that text as
@@ -122,11 +123,18 @@ assistant text is not an A2A delivery; an explicit `agent_message` call sends a
 message to the owner. The guidance does not add a host-side semantic judge of
 each suggestion's value.
 
+The scheduler combines already queued observations in batches of up to 32,
+preserving every source event in its transcript. It does not insert a timer or
+run an inference for every fact in an accumulated backlog. Exact repeated
+unsolicited notes are suppressed against durable A2A history, after permission
+and argument validation. Direct replies and retries of an already admitted
+operation retain the ordinary A2A contract.
+
 Subscribed content is reference material, not instructions assigning the owner's
 task to Teto. Direct A2A messages addressed to Teto are separate coordination
 requests, handled within its auxiliary role and existing permissions. The system
-prompt states the owner, routing address, and observation boundary once; event
-headers already supply the subscription metadata. The shared runtime retains
+prompt states the owner and routing address; event headers supply the observation
+boundary and subscription metadata. The shared runtime retains
 its untrusted-data rule.
 
 ## Model-Facing Operations
@@ -269,6 +277,18 @@ they lead. `task_wait` routes by Team ID and rejects waiting for the caller's
 own unfinished task. Permission to create nested Teams is independent of
 reading the member's shared task board.
 
+Group chat enters context through explicit `team_message.mentions`: use a
+member ID, its full lane ID, or `nausicaa` for the root lead. An idle lead may
+resume; an active member receives the message at its next natural boundary.
+A completed member stays idle until `team_assign` gives it more work.
+Unmentioned chat remains available through `team_history`.
+
+Each boundary includes at most eight group mentions with bounded excerpts and
+history cursors. Committed step receipts mark them consumed, so restart restores
+unread mentions without replaying those already consumed. Group messages stay
+in their own Team, including nested Teams; they do not create an A2A copy.
+Closed or cancelled Teams do not deliver new mentions or wake a lane.
+
 On restore, an assignment without a report is re-admitted idempotently and its
 member lane is rebuilt in dynamic-task mode. A reported assignment is never
 run a second time. If its terminal notification or request acknowledgement is
@@ -344,6 +364,21 @@ pending admissions. Creation and reduction recheck cancellation at persistence
 boundaries. Join waiting follows durable outcomes and does not await an
 uncooperative tool forever; a timed-out or cancelled executor is fenced, and
 an unknown external side effect still requires reconciliation.
+
+Interactive `Esc` or `Ctrl+C` during execution interrupts the current lead turn
+and preserves the Run, history, and Team. Members can finish and report into the
+same Run, but reports do not automatically undo a user's interruption: the next
+user input resumes coordination with those reports available. A normally
+completed lead turn still resumes automatically for arriving reports.
+`/stop` and direct `SessionController.cancel()` calls cancel Team work too;
+`team_cancel` cancels the selected Team.
+
+If a provider or tool ignores cancellation beyond the grace period, the host
+fences that old execution and releases its slot while preserving the attachment.
+Unstarted tools receive explicit cancelled results. Started tools with unknown
+outcomes retain the existing resolution boundary; late results cannot overwrite
+a subsequent turn. This fencing prevents stale runtime commits, not external
+side effects from an adapter that ignores its cancellation signal.
 
 Both entry points allow member questions and updates to reach the lead before
 join. The one-shot path waits for admitted Team work and an explicitly

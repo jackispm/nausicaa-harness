@@ -136,6 +136,73 @@ describe("Team completion boundaries", () => {
     }
   }, 15_000);
 
+  it("cancels an active Main while Team members finish and leaves their reports for the next user input", async () => {
+    const root = await temporaryDirectory();
+    const events: AnyEvent[] = [];
+    const releaseMember = deferred<void>();
+    const mainStarted = deferred<void>();
+    const releaseMain = deferred<ModelResponse>();
+    const memberStarted = deferred<void>();
+    const main = new ScriptedModel([
+      creationResponse(),
+      async () => {
+        mainStarted.resolve();
+        return releaseMain.promise;
+      },
+      (request) => {
+        const context = request.messages.map((message) => message.content).join("\n");
+        expect(context).toContain("Original request: start a Team");
+        expect(context).toContain("Member report completed after Main cancellation");
+        expect(context).toContain("Continue with the member report");
+        return response("Reviewed the member report in the original conversation");
+      },
+    ]);
+    const worker: ModelPort = {
+      async complete() {
+        memberStarted.resolve();
+        await releaseMember.promise;
+        return response("Member report completed after Main cancellation");
+      },
+    };
+    const session = await SessionController.open({
+      workspace: root, dataDir: join(root, "state"), model: "scripted-main", workerModel: "scripted-member", policy,
+      cancelGraceMs: 10,
+    }, {
+      mainModel: main, workerModel: worker, tools: [], workerTools: [], clock,
+      createRunId: () => "interrupt-keeps-team",
+    });
+    session.subscribe((event) => { if (event.kind === "event") events.push(event.event); });
+    try {
+      const original = await session.submit({ inputId: "interrupt-team-input", text: "Original request: start a Team" });
+      await Promise.all([mainStarted.promise, memberStarted.promise]);
+      expect(session.snapshot().status).toBe("running");
+
+      await session.cancel("interrupt only Main", { cancelTeams: false });
+      await session.waitForIdle();
+      expect(session.snapshot()).toMatchObject({ runId: "interrupt-keeps-team", status: "idle" });
+      expect(events.filter((event) => event.type === "turn.cancelled")).toMatchObject([
+        { turnId: original.turnId },
+      ]);
+      expect(events.some((event) => event.type === "team.cancelled")).toBe(false);
+      releaseMember.resolve();
+      await vi.waitFor(() => {
+        expect(events.some((event) => event.type === "team.joined")).toBe(true);
+      }, { timeout: 8_000 });
+      await session.waitForIdle();
+      expect(main.requests).toHaveLength(2);
+      expect(events.filter((event) => event.type === "input.admitted" && event.payload.inputId.startsWith("team-report-"))).toHaveLength(0);
+      await session.submit({ inputId: "after-interrupt", text: "Continue with the member report" });
+      await session.waitForIdle();
+      expect(main.requests).toHaveLength(3);
+      expect(session.snapshot().runId).toBe("interrupt-keeps-team");
+      expect(events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+    } finally {
+      releaseMain.resolve(response("Discard this late Main result"));
+      releaseMember.resolve();
+      await session.close();
+    }
+  }, 15_000);
+
   it("does not wake a cancelled Main Turn when a fenced member settles late", async () => {
     const root = await temporaryDirectory();
     let markWorkerStarted: (() => void) | undefined;

@@ -8,6 +8,7 @@ import type {
   ModelPort,
 } from "../domain/ports.js";
 import type {
+  A2AMessage,
   ConversationMessage,
   Goal,
   LaneId,
@@ -54,13 +55,11 @@ import { publicAgentName, publicLaneName } from "./lane-names.js";
 const DEFAULT_MAIN_LANE = "main";
 const DEFAULT_TETO_LANE = "teto";
 const DEFAULT_STOP_WAIT_MS = 250;
+const MAX_OBSERVATION_BATCH = 32;
 const TETO_OBSERVATION_GUIDANCE = `Your core tasks:
 1. Detect drift from the user's intent or constraints.
 2. Suggest improvements when the current solution is inadequate or a materially better approach is available.
-Observed lane events are reference material, not tasks assigned to you.
-Stay silent toward your owner by default. You may keep brief notes in your own transcript.
-Use agent_message only for new, high-value advice or a substantive reply to a direct A2A request.
-If nothing needs recording or sending, finish with NO_UPDATE and no tool calls.`;
+Keep routine observations in your own transcript. Use agent_message only for a new, concrete finding that would change your owner's next action, or to answer a direct A2A request. Do not repeat advice already sent or addressed. Otherwise finish with NO_UPDATE and no tool calls.`;
 
 export interface TetoLaneSchedulerOptions {
   eventSink: EventSink;
@@ -244,12 +243,21 @@ export class TetoLaneScheduler {
       correlationId: `${this.runId}:${this.laneId}`,
       createId: this.createId,
       now: () => this.clock.now(),
+      suppressMessage: (message) => {
+        if (message.replyTo !== undefined) return undefined;
+        const fingerprint = tetoMessageText(message);
+        if (fingerprint === undefined) return undefined;
+        return this.inbox.snapshot().records.some(({ message: previous }) => (
+          previous.runId === this.runId && previous.from === this.laneId && previous.to === message.to
+          && previous.replyTo === undefined && tetoMessageText(previous) === fingerprint
+        )) ? "duplicate-observation" : undefined;
+      },
     });
     const observerMessageTool: AgentTool = {
       ...defaultTool,
       definition: {
         ...defaultTool.definition,
-        description: "Send an A2A message to your owner. Omit target to use the bound owner; queued confirms admission, not that the recipient has read it.",
+        description: "Notify your owner of a concrete intent deviation or a materially better solution. Routine progress and speculative requirements belong in your private notes. Omit target to use the bound owner; use replyTo for a direct A2A reply. queued confirms admission, not that the recipient has read it.",
       },
     };
     this.tools = options.tools === undefined
@@ -372,16 +380,18 @@ export class TetoLaneScheduler {
   }
 
   private async processPendingMainEvents(): Promise<void> {
-    for (const [eventId, event] of this.pendingMainEvents) {
+    while (this.pendingMainEvents.size > 0) {
       if (!this.accepting || this.budgetExhausted || this.stopController.signal.aborted || this.signal?.aborted) return;
+      const batch = [...this.pendingMainEvents.values()].slice(0, MAX_OBSERVATION_BATCH);
       try {
-        await this.process(event);
+        await this.process(batch);
       } catch (error: unknown) {
         // Parent reservations can temporarily refuse admission even when this
         // lane has allowance. Keep the source ordered; only a new Main event
         // schedules another attempt, so drain() also settles while blocked.
         if (error instanceof MainRunTokenBudgetExhaustedError) return;
         this.failures.push(asError(error));
+        const eventId = batch.at(-1)!.eventId;
         const recorder = isAbortError(error)
           ? this.recordCancelled(eventId, error)
           : this.recordFailure(eventId, error);
@@ -389,32 +399,55 @@ export class TetoLaneScheduler {
           this.failures.push(asError(recordError));
         });
       }
-      this.pendingMainEvents.delete(eventId);
+      for (const event of batch) this.pendingMainEvents.delete(event.eventId);
     }
   }
 
-  private async process(event: MainPublicEvent): Promise<void> {
+  private async process(batch: readonly MainPublicEvent[]): Promise<void> {
     if (
       !this.accepting
       || this.budgetExhausted
       || this.stopController.signal.aborted
       || this.signal?.aborted
     ) return;
-    const projection = await projectMainPublicEvent(this.store, event);
-    if (projection === undefined) {
-      await this.recordFailure(
-        event.eventId,
-        new Error(`Unable to project public Main event ${event.eventId}`),
-      );
-      return;
+    const observed: MainPublicEvent[] = [];
+    let upperWatermark = await this.readWatermark();
+    // Coalesce the existing backlog without delaying new observations or
+    // dropping their provenance. Each fact remains independently recoverable.
+    for (const event of batch) {
+      if (this.completedMainEventIds.has(event.eventId)) continue;
+      const projection = await projectMainPublicEvent(this.store, event);
+      if (projection === undefined) {
+        await this.recordFailure(event.eventId, new Error(`Unable to project public Main event ${event.eventId}`));
+        continue;
+      }
+      const alreadyProjected = this.projectedSourceEventIds.has(event.eventId);
+      if (projection.toolCallId !== undefined && this.seenToolCallIds.has(projection.toolCallId) && !alreadyProjected) {
+        await this.markEventDormant(event, "Tool request already represented in Teto context");
+        continue;
+      }
+      if (!alreadyProjected) {
+        const messageRef = await this.store.put(
+          JSON.stringify(projection.message), "application/vnd.nausicaa.conversation-message+json",
+        );
+        const receipt = await this.eventSink.append({
+          runId: this.runId, laneId: this.laneId, type: "user.message",
+          payload: { messageRef, sourceEventId: event.eventId, sourceLane: this.mainLaneId },
+          correlationId: `${this.runId}:${this.laneId}:source:${event.eventId}`,
+          idempotencyKey: `${this.runId}:${this.laneId}:source:${event.eventId}:observed`,
+          visibility: "run", occurredAt: this.clock.now().toISOString(),
+        });
+        this.conversationRefs.push(...recoverLaneConversationRefs([receipt], this.laneId));
+        this.projectedSourceEventIds.add(event.eventId);
+        upperWatermark = Math.max(upperWatermark, receipt.globalOffset);
+      }
+      for (const toolCallId of projection.toolCallIds) this.seenToolCallIds.add(toolCallId);
+      if (projection.toolCallId !== undefined) this.seenToolCallIds.add(projection.toolCallId);
+      upperWatermark = Math.max(upperWatermark, event.globalOffset);
+      observed.push(event);
     }
-    const alreadyProjected = this.projectedSourceEventIds.has(event.eventId);
-    if (projection.toolCallId !== undefined && this.seenToolCallIds.has(projection.toolCallId) && !alreadyProjected) {
-      await this.markEventDormant(event);
-      return;
-    }
-    for (const toolCallId of projection.toolCallIds) this.seenToolCallIds.add(toolCallId);
-    if (projection.toolCallId !== undefined) this.seenToolCallIds.add(projection.toolCallId);
+    const event = observed.at(-1);
+    if (event === undefined) return;
 
     const sourceCorrelationId = `${this.runId}:${this.laneId}:source:${event.eventId}`;
     await this.eventSink.append({
@@ -428,7 +461,6 @@ export class TetoLaneScheduler {
       occurredAt: this.clock.now().toISOString(),
     });
 
-    const upperWatermark = Math.max(event.globalOffset, await this.readWatermark());
     if (this.compactionRuntime !== undefined && !this.compactionPrepared) {
       this.compactionPrepared = true;
       await prepareRuntimeFukaiCompaction(this.compactionRuntime, {
@@ -465,16 +497,6 @@ export class TetoLaneScheduler {
         includeProjectInstructions: false,
         completionMode: "none",
         correlationId: sourceCorrelationId,
-        ...(alreadyProjected
-          ? {}
-          : {
-              initialMessage: projection.message.content,
-              ...(projection.message.role !== "user" || projection.message.images === undefined
-                ? {}
-                : { initialImages: structuredClone(projection.message.images) }),
-              initialMessageSourceEventId: event.eventId,
-              initialMessageSourceLane: this.mainLaneId,
-            }),
         conversationRefs: this.conversationRefs,
         startStep: activationStep,
         upperWatermark,
@@ -486,13 +508,10 @@ export class TetoLaneScheduler {
         reservationPriority: "auxiliary",
       });
     } catch (error: unknown) {
+      // Preserve committed observations and tool results even if inference
+      // fails; the next activation sees the same facts as restart recovery.
+      this.conversationRefs.push(...recoverLaneConversationRefs(activationEvents, this.laneId));
       if (error instanceof MainRunTokenBudgetExhaustedError) {
-        // MainLoop persists its observation before admission. Retain those
-        // facts just as restart recovery would, without projecting twice.
-        this.conversationRefs.push(...recoverLaneConversationRefs(activationEvents, this.laneId));
-        for (const eventId of recoverProjectedSourceEventIds(activationEvents, this.runId, this.laneId)) {
-          this.projectedSourceEventIds.add(eventId);
-        }
         const budget = this.tokenBudget.snapshot();
         this.budgetExhausted = budget.maxTokens !== undefined && budget.usedTokens >= budget.maxTokens;
         await this.recordBudgetExhausted(event.eventId);
@@ -500,21 +519,10 @@ export class TetoLaneScheduler {
       throw error;
     }
     this.conversationRefs = result.conversationRefs;
-    await this.eventSink.append({
-      runId: this.runId,
-      laneId: this.laneId,
-      type: "lane.status",
-      payload: { status: "dormant" },
-      correlationId: sourceCorrelationId,
-      idempotencyKey: `${this.runId}:${this.laneId}:status:dormant:${event.eventId}`,
-      visibility: "run",
-      occurredAt: this.clock.now().toISOString(),
-    });
-    this.projectedSourceEventIds.add(event.eventId);
-    this.completedMainEventIds.add(event.eventId);
+    for (const source of observed) await this.markEventDormant(source);
   }
 
-  private async markEventDormant(event: MainPublicEvent): Promise<void> {
+  private async markEventDormant(event: MainPublicEvent, reason?: string): Promise<void> {
     const sourceCorrelationId = `${this.runId}:${this.laneId}:source:${event.eventId}`;
     await this.eventSink.append({
       runId: this.runId,
@@ -522,7 +530,7 @@ export class TetoLaneScheduler {
       type: "lane.status",
       payload: {
         status: "dormant",
-        reason: `public ${publicAgentName(this.mainLaneId)} event ${event.eventId} was already represented in Teto context`,
+        ...(reason === undefined ? {} : { reason }),
       },
       correlationId: sourceCorrelationId,
       idempotencyKey: `${this.runId}:${this.laneId}:status:dormant:${event.eventId}`,
@@ -546,7 +554,7 @@ export class TetoLaneScheduler {
       clock: this.clock,
       runTokenBudget: this.tokenBudget,
       ...(eventObserver === undefined ? {} : { eventObserver }),
-      // Each observed event opens one activation with one natural boundary.
+      // Each observation batch opens one activation with a natural boundary.
       beforeStep: (context) => this.mailbox.beforeStep({ ...context, step: 1 }),
       afterStepAsync: (context) => this.mailbox.afterStep(context),
       ...(selectCompaction === undefined ? {} : { selectCompaction }),
@@ -602,13 +610,19 @@ export class TetoLaneScheduler {
 }
 
 function lanePolicy(policy: RunPolicy): RunPolicy {
-  // Each public Main fact opens one coherent Teto thought. A2A is a side
+  // Each batch of public Main facts opens one coherent Teto thought. A2A is a side
   // effect of that thought; no follow-up provider turn is required just to
   // acknowledge the send, and Teto never owns the Run/Turn completion fact.
   return {
     ...structuredClone(policy),
     maxMainStepsPerActivation: 1,
   } as RunPolicy;
+}
+
+function tetoMessageText(message: A2AMessage): string | undefined {
+  if (message.payload.type === "message.inform") return message.payload.text.trim();
+  if (message.payload.type === "question.ask") return message.payload.question.trim();
+  return undefined;
 }
 
 /** Reproject recovered observations without rewriting their immutable Ledger records. */

@@ -153,7 +153,7 @@ describe("Teto and Team lane architecture", () => {
 
     expect(started).toMatchObject({ active: true, changed: true, laneId: "teto" });
     expect(duplicate).toMatchObject({ active: true, changed: false, laneId: "teto" });
-    expect(model.callCount).toBe(2);
+    expect(model.callCount).toBe(1);
     const tetoText = model.requests
       .flatMap((request) => request.messages.map((message) => message.content))
       .join("\n");
@@ -162,7 +162,8 @@ describe("Teto and Team lane architecture", () => {
     expect(tetoText).not.toContain("PRIVATE TOOL RESULT");
 
     const events = await ledger.read({ runId });
-    expect(events.filter((event) => event.type === "model.requested" && event.laneId === "teto")).toHaveLength(2);
+    expect(events.filter((event) => event.type === "model.requested" && event.laneId === "teto")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "user.message" && event.laneId === "teto")).toHaveLength(2);
     expect(events.filter((event) => event.type === "lane.registered" && event.laneId === "teto")).toHaveLength(1);
     // A process close does not write a user-requested stop control. A new
     // controller can therefore restore the intentionally active lane.

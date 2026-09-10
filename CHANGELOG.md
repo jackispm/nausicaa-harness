@@ -4,6 +4,23 @@ All notable changes to Nausicaa are documented here.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-09-11
+
+- Preserve the current Run, conversation, and asynchronous Team work when
+  Escape or Ctrl+C interrupts the lead. Keep member reports for the next user
+  input; `/stop` still cancels Team work.
+- Release cancelled executions after their grace period and fence late runtime
+  writes. Distinguish unstarted tools from unknown side effects without
+  detaching the session or losing its history.
+- Deliver Team group mentions to the recipient's next context boundary and
+  wake normally idle leads. Support `nausicaa` and full lane addresses, preserve
+  nested-Team isolation, and recover unread mentions without replaying receipts.
+- Coalesce queued Teto observations, preserve each source fact, and suppress
+  exact repeated unsolicited notes. Keep its two core tasks and reserve A2A
+  for concrete new findings or direct replies.
+- Correct the compaction evaluation fixture so its control keeps full history;
+  retain the requirement that measured savings exceed summarization cost.
+
 ## [0.1.5] - 2026-09-10
 
 - Replace model-facing dependency graphs with incremental Team assignment:

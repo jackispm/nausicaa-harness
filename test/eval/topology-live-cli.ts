@@ -16,6 +16,7 @@ import { createWorkspaceTools } from "../../src/tools/index.js";
 import { inspectBetaRepository } from "../live/openrouter-beta-harness.js";
 import { TopologyLiveModel } from "./topology-live-model.js";
 import { peerEvidenceChecks, teamCancellationChecks } from "./topology-live-evidence.js";
+import { runTetoRestraintProbe } from "./teto-live-restraint.js";
 
 // Explicit opt-in; use Node's --env-file flag or the normal saved credential store.
 if (process.env.NAUSICAA_TOPOLOGY_LIVE !== "1") throw new Error("Set NAUSICAA_TOPOLOGY_LIVE=1 to authorize paid live requests");
@@ -37,7 +38,7 @@ const live = new TopologyLiveModel(createOpenRouterModelPort({ models }), {
   maxOutputTokens, timeoutMs: 120_000,
   inputPrice: Math.max(price.input, price.cacheRead, price.cacheWrite), outputPrice: price.output,
 });
-const caseIds = ["workspace", "worker", "team-sequential", "team-calendar", "team-natural-calendar", "team-peer-reducer", "resume-fork", "teto", "team-cancel"] as const;
+const caseIds = ["workspace", "worker", "team-sequential", "team-calendar", "team-natural-calendar", "team-peer-reducer", "resume-fork", "teto", "teto-restraint", "team-cancel"] as const;
 // Development, review, repair, and re-review each require real provider turns.
 const teamTurnTimeoutMs = 10 * 60_000;
 type CaseId = typeof caseIds[number];
@@ -60,6 +61,7 @@ interface CaseReport {
   elapsedMs: number;
   error?: string;
   blocker?: string;
+  evidence?: Record<string, unknown>;
 }
 
 interface Fixture {
@@ -72,6 +74,7 @@ interface Fixture {
   runIds: string[];
   finalText: string;
   blocker?: string;
+  evidence?: Record<string, unknown>;
 }
 
 try {
@@ -93,6 +96,11 @@ try {
       else if (id === "team-natural-calendar") await naturalTeamCalendarCase(f);
       else if (id === "team-peer-reducer") await teamPeerCase(f);
       else if (id === "teto") await tetoCase(f);
+      else if (id === "teto-restraint") {
+        const probe = await runTetoRestraintProbe({ live, modelName: model!, runId: f.runId, workspace: f.workspace, policy: policy(true) });
+        Object.assign(f, probe);
+        if (probe.error !== undefined) throw new Error(probe.error);
+      }
       else if (id === "resume-fork") await resumeForkCase(f);
       else await cancelCase(f);
     } catch (caught) {
@@ -102,7 +110,8 @@ try {
       && Object.values(f.checks).every(Boolean) ? "pass" : "failed";
     reports.push({ id, status, checks: f.checks, prompts: f.prompts, runIds: f.runIds,
       finalText: f.finalText, elapsedMs: Date.now() - before, ...(error === undefined ? {} : { error }),
-      ...(f.blocker === undefined ? {} : { blocker: f.blocker }) });
+      ...(f.blocker === undefined ? {} : { blocker: f.blocker }),
+      ...(f.evidence === undefined ? {} : { evidence: f.evidence }) });
     await writeFile(join(output, `${id}-events.json`), JSON.stringify(f.events, null, 2));
     await persist();
     process.stdout.write(`${status.toUpperCase()} ${id} ${JSON.stringify(f.checks)}${error === undefined ? "" : ` ${error}`}\n`);
@@ -127,7 +136,7 @@ async function persist(): Promise<void> {
     limits: live.limits, pricesSource: "Installed pi-ai OpenRouter catalog; reservations are not a billing guarantee",
     requests: live.calls.length, usage: live.usage, knownCostUsd: live.knownCostUsd,
     costComplete: !live.uncertain,
-    invocation: "Guided probes and a natural-language calendar case; tool calls and all lane responses come from the provider",
+    invocation: "Guided probes and a natural-language calendar case use provider responses. teto-restraint supplies fixed owner observation fixtures; only Teto's decisions and A2A calls come from the provider, using its production scheduler and prompt.",
     requestCounting: "ModelPort calls, not a claim about provider-internal HTTP retries",
     cases: reports,
   }, null, 2));

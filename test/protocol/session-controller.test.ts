@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { AgentTool, AnyEvent, ModelPort, ModelResponse, UserImage } from "../../src/domain/index.js";
+import type { AgentTool, AnyEvent, ModelPort, ModelRequest, ModelResponse, UserImage } from "../../src/domain/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
 import { computeEventContentHash, JsonlLedger } from "../../src/ledger/index.js";
 import {
@@ -2904,11 +2904,14 @@ describe("SessionController", () => {
         return new Promise(() => undefined);
       },
     };
-    const model = new ScriptedModel([{
-      ...response("starting tool"),
-      toolCalls: [{ id: "hang-call", name: "hang_forever", arguments: {} }],
-      stopReason: "toolUse",
-    }]);
+    const model = new ScriptedModel([
+      {
+        ...response("starting tool"),
+        toolCalls: [{ id: "hang-call", name: "hang_forever", arguments: {} }],
+        stopReason: "toolUse",
+      },
+      response("Continued after resolving the unknown effect"),
+    ]);
     const session = await SessionController.open({
       workspace: root,
       dataDir: join(root, "state"),
@@ -2921,11 +2924,31 @@ describe("SessionController", () => {
       createRunId: () => "cancel-grace-unknown",
     });
 
-    const admitted = await session.submit({ inputId: "cancel-grace-input", text: "Start" });
+    await session.submit({ inputId: "cancel-grace-input", text: "Start" });
     await started;
     expect(session.snapshot().runId).toBe("cancel-grace-unknown");
     await session.cancel("cancel hanging tool");
-    expect(session.snapshot().status).toBe("detached");
+    expect(session.snapshot()).toMatchObject({
+      runId: "cancel-grace-unknown",
+      status: "idle",
+      blocker: expect.stringMatching(/^operation-unknown:/u),
+    });
+    const operationId = session.snapshot().blocker!.slice("operation-unknown:".length);
+    await expect(session.resumeCurrent()).rejects.toThrow("Resolve");
+    await session.submit({ inputId: "after-hanging-tool", text: "Continue with the original task" });
+    expect(model.callCount).toBe(1);
+    // A permanently pending adapter does not need to settle before the
+    // operator can resolve its effect and continue in the same Run.
+    await session.resolveOperation(operationId);
+    await session.waitForIdle();
+    expect(session.snapshot()).toMatchObject({ runId: "cancel-grace-unknown", status: "idle" });
+    expect(session.snapshot().blocker).toBeUndefined();
+    expect(model.callCount).toBe(2);
+    expect(model.requests[1]?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "user", content: "Start" }),
+      expect.objectContaining({ role: "tool", toolCallId: "hang-call", isError: true }),
+      expect.objectContaining({ role: "user", content: "Continue with the original task" }),
+    ]));
     await session.close();
 
     const resumed = await SessionController.open({
@@ -2942,13 +2965,212 @@ describe("SessionController", () => {
     ));
     expect(unknown).toMatchObject([{
       operationId: expect.stringContaining("op:"),
-      status: "unknown",
+      status: "failed",
       toolCallId: "hang-call",
     }]);
-    expect(resumed.snapshot().blocker).toMatch(/^operation-unknown:/u);
-    await expect(resumed.resumeCurrent()).rejects.toThrow("Resolve");
+    expect(resumed.snapshot().blocker).toBeUndefined();
     await resumed.close();
   });
+
+  it("keeps the same Run context when cancellation outlives its grace period", async () => {
+    const root = await temporaryRoot();
+    let releaseFirst: ((value: ModelResponse) => void) | undefined;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const requests: ModelRequest[] = [];
+    let holdNextCommit = false;
+    let releaseCancellation!: () => void;
+    const cancellationGate = new Promise<void>((resolve) => { releaseCancellation = resolve; });
+    let markLateCommitSettled!: () => void;
+    const lateCommitSettled = new Promise<void>((resolve) => { markLateCommitSettled = resolve; });
+    const model: ModelPort = {
+      async complete(request) {
+        requests.push(request);
+        if (requests.length === 1) {
+          return new Promise<ModelResponse>((resolve) => {
+            releaseFirst = resolve;
+            markStarted?.();
+          });
+        }
+        return response("follow-up retained the cancelled Run context");
+      },
+    };
+    const events: SessionRuntimeEvent[] = [];
+    const session = await SessionController.open({
+      workspace: root,
+      dataDir: join(root, "state"),
+      model: "scripted",
+      policy: { maxMainStepsPerActivation: 1, maxModelTokens: 20_000, tetoEnabled: false },
+      cancelGraceMs: 10,
+    }, {
+      mainModel: model,
+      createRunId: () => "cancel-context-run",
+      async commitExecutionLease(operation) {
+        if (!holdNextCommit) return operation();
+        holdNextCommit = false;
+        await cancellationGate;
+        try {
+          return await operation();
+        } finally {
+          markLateCommitSettled();
+        }
+      },
+    });
+    session.subscribe((event) => events.push(event));
+
+    try {
+      await session.submit({ inputId: "cancel-context-input", text: "Build the requested page" });
+      await started;
+      // Main's raceAbort already detaches a non-cooperative provider. Hold
+      // its cancellation commit to exercise the actual Session grace fence.
+      holdNextCommit = true;
+      await session.cancel("stop this attempt");
+      const runId = session.snapshot().runId;
+      expect(runId).toBe("cancel-context-run");
+      expect(session.snapshot().status).toBe("idle");
+      expect(durableEvents(events).filter((event) => event.type === "model.cancelled")).toMatchObject([
+        {
+          idempotencyKey: expect.stringMatching(/:forced-cancel$/u),
+          payload: { reason: "stop this attempt" },
+        },
+      ]);
+      await session.submit({ inputId: "cancel-context-follow-up", text: "Are you done? Continue from the previous request." });
+      await session.waitForIdle();
+
+      expect(session.snapshot().runId).toBe(runId);
+      expect(requests).toHaveLength(2);
+      expect(requests[1]?.messages.map((message) => message.content)).toEqual([
+        "Build the requested page",
+        "Are you done? Continue from the previous request.",
+      ]);
+      releaseFirst?.(response("late provider result"));
+      releaseCancellation();
+      await lateCommitSettled;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect((await session.transcript()).some((entry) => entry.content.includes("late provider result"))).toBe(false);
+      expect(durableEvents(events).filter((event) => event.type === "model.completed")).toHaveLength(1);
+      expect(durableEvents(events).filter((event) => event.type === "model.cancelled")).toHaveLength(1);
+    } finally {
+      releaseFirst?.(response("late provider result"));
+      releaseCancellation();
+      await session.close();
+    }
+  });
+
+  it.each(["tool-return", "commit-entry", "before-start"] as const)(
+    "fences a cancelled execution at %s while the next Turn uses the same Run",
+    async (boundary) => {
+      const root = await temporaryRoot();
+      let releaseOld!: () => void;
+      const oldGate = new Promise<void>((resolve) => { releaseOld = resolve; });
+      let markOldBoundary!: () => void;
+      const oldBoundary = new Promise<void>((resolve) => { markOldBoundary = resolve; });
+      let releaseNext!: () => void;
+      const nextGate = new Promise<void>((resolve) => { releaseNext = resolve; });
+      let markNextStarted!: () => void;
+      const nextStarted = new Promise<void>((resolve) => { markNextStarted = resolve; });
+      let markLateCommitSettled!: () => void;
+      const lateCommitSettled = new Promise<void>((resolve) => { markLateCommitSettled = resolve; });
+      let holdNextCommit = false;
+      let effectInvocations = 0;
+      const tool: AgentTool = {
+        definition: {
+          name: "slow_effect",
+          description: "A non-cooperative effect",
+          parameters: { type: "object", additionalProperties: false },
+        },
+        async execute() {
+          effectInvocations += 1;
+          if (boundary === "tool-return") {
+            markOldBoundary();
+            await oldGate;
+          } else {
+            holdNextCommit = true;
+          }
+          return { content: "late old effect result", isError: false };
+        },
+      };
+      const model = new ScriptedModel([
+        {
+          ...response("Starting an effect"), stopReason: "toolUse",
+          toolCalls: [{ id: "old-effect", name: "slow_effect", arguments: {} }],
+        },
+        async (request) => {
+          expect(request.messages).toEqual(expect.arrayContaining([
+            expect.objectContaining({ role: "user", content: "Original request" }),
+            expect.objectContaining({ role: "tool", toolCallId: "old-effect", isError: true }),
+            expect.objectContaining({ role: "user", content: "Continue in this conversation" }),
+          ]));
+          markNextStarted();
+          await nextGate;
+          return response("New Turn completed");
+        },
+      ]);
+      const events: SessionRuntimeEvent[] = [];
+      const createRunId = vi.fn(() => `same-run-fence-${boundary}`);
+      const session = await SessionController.open({
+        workspace: root, dataDir: join(root, "state"), model: "scripted",
+        policy: { tetoEnabled: false }, cancelGraceMs: 10,
+      }, {
+        mainModel: model, tools: [tool], createRunId,
+        async commitExecutionLease(operation) {
+          if (!holdNextCommit) return operation();
+          holdNextCommit = false;
+          markOldBoundary();
+          await oldGate;
+          try {
+            return await operation();
+          } finally {
+            markLateCommitSettled();
+          }
+        },
+      });
+      session.subscribe((event) => {
+        events.push(event);
+        if (boundary === "before-start" && event.kind === "event" && event.event.type === "tool.admitted") {
+          holdNextCommit = true;
+        }
+      });
+      try {
+        const original = await session.submit({ inputId: "old-input", text: "Original request" });
+        await oldBoundary;
+        await session.cancel("interrupt the old Turn", { cancelTeams: false });
+        expect(session.snapshot().status).toBe("idle");
+        const operationId = session.snapshot().blocker?.slice("operation-unknown:".length);
+        if (boundary === "before-start") expect(operationId).toBeUndefined();
+        else expect(operationId).toBeDefined();
+        await session.submit({ inputId: "next-input", text: "Continue in this conversation" });
+        if (operationId !== undefined) await session.resolveOperation(operationId);
+        await nextStarted;
+        releaseOld();
+        if (boundary !== "tool-return") await lateCommitSettled;
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+        expect(session.snapshot().status).toBe("running");
+        expect(session.snapshot().runId).toBe(`same-run-fence-${boundary}`);
+        const durable = durableEvents(events);
+        expect(durable.filter((event) => event.type === "tool.succeeded")).toHaveLength(0);
+        expect(durable.filter((event) => event.type === "tool.failed")).toMatchObject([
+          { payload: operationId === undefined
+            ? { error: "Tool was cancelled before execution" }
+            : { operationId, resolution: "operator" } },
+        ]);
+        expect(effectInvocations).toBe(boundary === "before-start" ? 0 : 1);
+        expect(durable.filter((event) => event.type === "turn.cancelled")).toMatchObject([
+          { turnId: original.turnId },
+        ]);
+        expect(events.some((event) => event.kind === "stream" && event.event.type === "stream.failed")).toBe(false);
+        releaseNext();
+        await session.waitForIdle();
+        expect(createRunId).toHaveBeenCalledTimes(1);
+        expect(durableEvents(events).filter((event) => event.type === "turn.completed")).toHaveLength(1);
+      } finally {
+        releaseOld();
+        releaseNext();
+        await session.close();
+      }
+    },
+  );
 });
 
 async function openSession(

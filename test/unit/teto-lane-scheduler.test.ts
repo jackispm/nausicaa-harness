@@ -44,6 +44,68 @@ const response = (
 });
 
 describe("TetoLaneScheduler", () => {
+  it.each(["inform", "request"])("suppresses repeated %s findings while allowing later distinct findings in the same user turn", async (kind) => {
+    const advice = "Preserve the attachment after cancellation so the next input keeps context.";
+    const model = new ScriptedModel([
+      response("", [{ id: "first-finding", name: "agent_message", arguments: { text: advice, kind } }], "toolUse"),
+      response("", [{ id: "repeated-finding", name: "agent_message", arguments: { text: advice, kind } }], "toolUse"),
+      response("", [{ id: "teto-advice", name: "agent_message", arguments: {
+        text: "Group mentions wake the lead without delivering the message body; inject it at the next boundary.",
+      } }], "toolUse"),
+    ]);
+    const { scheduler, store, ledger, inbox, clock } = await a2aScenario(model);
+    try {
+      for (const [index, content] of ["first observation", "second observation", "third observation"].entries()) {
+        const messageRef = await store.put(JSON.stringify({
+          role: "assistant", content, toolCalls: [], createdAt: clock.now().toISOString(),
+        }), "application/vnd.nausicaa.conversation-message+json");
+        const event = await ledger.append({
+          runId: "run-a2a", laneId: "main", type: "assistant.message", payload: { messageRef },
+          correlationId: "run-a2a", idempotencyKey: `teto-gate:${index}`, visibility: "run",
+        });
+        scheduler.observeMainEvent(event);
+        await scheduler.drain();
+      }
+      const sent = inbox.snapshot().records.filter((record) => record.message.from === "teto");
+      expect(sent).toHaveLength(2);
+      expect(sent[0]?.message.payload).toMatchObject(kind === "request"
+        ? { type: "question.ask", question: advice } : { type: "message.inform", text: advice });
+      expect((await ledger.read({ runId: "run-a2a" })).filter((event) => event.type === "message.sent")).toHaveLength(2);
+    } finally {
+      await scheduler.stop();
+    }
+  });
+
+  it("deduplicates durable findings after restart while allowing a requested A2A reply", async () => {
+    const advice = "The user asked for a read-only review; writing index.html would violate that constraint.";
+    const model = new ScriptedModel([response("", [{ id: "finding", name: "agent_message", arguments: { text: advice } }], "toolUse")]);
+    const { scheduler, options, ledger, inbox, mainEvent, mainTool } = await a2aScenario(model);
+    scheduler.observeMainEvent(mainEvent);
+    await scheduler.drain();
+    await scheduler.stop();
+    const sent = await mainTool.execute({ kind: "request", text: "Please repeat the concern" }, {
+      runId: "run-a2a", laneId: "main", workspace: "/workspace", operationId: "ask-again",
+    });
+    const recoveredModel = new ScriptedModel([
+      response("", [{ id: "duplicate", name: "agent_message", arguments: { text: advice } }], "toolUse"),
+      response("", [{ id: "requested-reply", name: "agent_message", arguments: { text: advice, replyTo: JSON.parse(sent.content).messageId } }], "toolUse"),
+    ]);
+    const recovered = new TetoLaneScheduler({ ...options, model: recoveredModel, events: await ledger.read({ runId: "run-a2a" }) });
+    try {
+      for (let index = 0; index < 2; index += 1) {
+        const event = await ledger.append({
+          runId: "run-a2a", laneId: "main", type: "user.message", payload: mainEvent.payload,
+          correlationId: "run-a2a", idempotencyKey: `recovered-observation:${index}`, visibility: "run",
+        });
+        recovered.observeMainEvent(event);
+        await recovered.drain();
+        expect(inbox.snapshot().records.filter((record) => record.message.from === "teto")).toHaveLength(index + 1);
+      }
+      expect(recovered.snapshot().failures).toEqual([]);
+    } finally {
+      await recovered.stop();
+    }
+  });
   it.each(["NO_UPDATE", "Observation note: no intervention needed yet."])("keeps observer text %s in its own transcript and delivers only explicit A2A", async (observerNote) => {
     const model = new ScriptedModel([
       response(observerNote),
@@ -114,7 +176,7 @@ describe("TetoLaneScheduler", () => {
       });
       scheduler.observeMainEvent(nextEvent);
       await scheduler.drain();
-      expect(model.callCount).toBe(2);
+      expect(model.callCount).toBe(1);
       const observedInputs = (await ledger.read({ runId: "run-a2a" })).filter((event) => (
         event.laneId === "teto"
         && event.type === "user.message"
@@ -123,12 +185,58 @@ describe("TetoLaneScheduler", () => {
       expect(observedInputs.filter((event) => event.payload.sourceEventId === mainEvent.eventId)).toHaveLength(1);
       expect(observedInputs.filter((event) => event.payload.sourceEventId === nextEvent.eventId)).toHaveLength(1);
       expect(model.requests[0]?.messages.at(-1)?.content).toContain("Observed lane event");
-      expect(model.requests[1]?.messages.at(-1)?.content).toContain("Observed lane event");
+      expect(model.requests[0]?.messages.filter((message) => message.role === "user")).toHaveLength(2);
       expect(scheduler.snapshot().failures).toEqual([]);
-      expect(shared.snapshot().usedTokens).toBe(settlement === "release" ? 50 : 75);
+      expect(shared.snapshot().usedTokens).toBe(settlement === "release" ? 25 : 50);
       expect(shared.snapshot().reservedTokens).toBe(0);
     } finally {
       await scheduler.stop();
+    }
+  });
+
+  it("coalesces observations arriving during inference and recovers every fact without replay", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const model = new ScriptedModel([
+      async () => { await gate; return response("NO_UPDATE"); },
+      response("NO_UPDATE"),
+    ]);
+    const { scheduler, options, ledger, store, mainEvent, clock } = await a2aScenario(model);
+    let recovered: TetoLaneScheduler | undefined;
+    try {
+      scheduler.observeMainEvent(mainEvent);
+      await vi.waitFor(() => expect(model.callCount).toBe(1));
+      const sources: AnyEvent[] = [mainEvent];
+      for (let index = 0; index < 6; index += 1) {
+        const messageRef = await store.put(JSON.stringify({
+          role: "assistant", content: `Independent observation ${index}`, toolCalls: [], createdAt: clock.now().toISOString(),
+        }), "application/vnd.nausicaa.conversation-message+json");
+        const event = await ledger.append({
+          runId: "run-a2a", laneId: "main", type: "assistant.message", payload: { messageRef },
+          correlationId: "run-a2a", idempotencyKey: `backlog:${index}`, visibility: "run",
+        });
+        scheduler.observeMainEvent(event);
+        sources.push(event);
+      }
+      release();
+      await scheduler.drain();
+      expect(model.callCount).toBe(2);
+      const facts = model.requests[1]!.messages.filter((message) => message.role === "user");
+      expect(facts).toHaveLength(7);
+      for (const source of sources) {
+        expect(facts.filter((message) => observationBody(message.content).source.eventId === source.eventId)).toHaveLength(1);
+      }
+      expect(scheduler.snapshot().failures).toEqual([]);
+      await scheduler.stop();
+      const recoveredModel = new ScriptedModel([]);
+      recovered = new TetoLaneScheduler({ ...options, model: recoveredModel, events: await ledger.read({ runId: "run-a2a" }), replayPublicEvents: true });
+      await recovered.drain();
+      expect(recoveredModel.callCount).toBe(0);
+      expect(recovered.snapshot().failures).toEqual([]);
+    } finally {
+      release();
+      await scheduler.stop();
+      await recovered?.stop();
     }
   });
 
@@ -215,11 +323,10 @@ describe("TetoLaneScheduler", () => {
     expect(request.systemPrompt).toContain(`your owner's A2A target is ${JSON.stringify(ownerAddress)}`);
     expect(request.systemPrompt).toContain("drift from the user's intent or constraints");
     expect(request.systemPrompt).toContain("materially better approach");
-    expect(request.systemPrompt).toContain("only for new, high-value advice");
-    expect(request.systemPrompt).toContain("Stay silent toward your owner by default");
-    expect(request.systemPrompt).toContain("keep brief notes in your own transcript");
-    expect(request.systemPrompt).toContain("Observed lane events are reference material, not tasks assigned to you");
-    expect(request.systemPrompt).toContain("a substantive reply to a direct A2A request");
+    expect(request.systemPrompt).toContain("only for a new, concrete finding");
+    expect(request.systemPrompt).toContain("Keep routine observations in your own transcript");
+    expect(request.systemPrompt).toContain("Otherwise finish with NO_UPDATE and no tool calls");
+    expect(request.systemPrompt).toContain("to answer a direct A2A request");
     expect(request.messages[0]?.content).not.toBe(content);
     expect(observationBody(request.messages[0]!.content)).toMatchObject({
       type: "lane.observation", source: { laneId: ownerAddress, eventId: event.eventId, eventType: "user.message" }, content,
@@ -379,7 +486,6 @@ describe("TetoLaneScheduler", () => {
     }), "application/vnd.nausicaa.conversation-message+json");
     const argsRef = await store.put(JSON.stringify({ path: "src/app.ts" }), "application/vnd.nausicaa.tool-arguments+json");
     const model = new ScriptedModel([
-      response("Teto first thought"),
       response("I should alert Main", [{
         id: "teto-voice-1",
         name: "agent_message",
@@ -442,14 +548,13 @@ describe("TetoLaneScheduler", () => {
     scheduler.observeMainEvent(requestedEvent);
     await scheduler.drain();
 
-    expect(model.callCount).toBe(2);
+    expect(model.callCount).toBe(1);
     expect(model.requests[0]?.tools.map((tool) => tool.name)).toEqual(["agent_message"]);
-    expect(model.requests[1]?.messages.map((message) => message.content)).toEqual([
+    expect(model.requests[0]?.messages.map((message) => message.content)).toEqual([
       expect.stringContaining("Build the app"),
-      "Teto first thought",
       expect.stringContaining("I found the entry point"),
     ]);
-    expect(model.requests[1]?.messages.map((message) => message.content).join("\n"))
+    expect(model.requests[0]?.messages.map((message) => message.content).join("\n"))
       .not.toContain("PRIVATE TOOL RESULT");
     const projectedRequestedStatus = (await ledger.read({ runId: "run-1" })).find((event) => (
       event.type === "lane.status"
@@ -485,12 +590,11 @@ describe("TetoLaneScheduler", () => {
     });
     scheduler.observeMainEvent(continuationEvent);
     await scheduler.drain();
-    expect(model.callCount).toBe(3);
-    const thirdRequestContents = model.requests[2]?.messages.map((message) => message.content) ?? [];
-    expect(thirdRequestContents).toHaveLength(6);
+    expect(model.callCount).toBe(2);
+    const thirdRequestContents = model.requests[1]?.messages.map((message) => message.content) ?? [];
+    expect(thirdRequestContents).toHaveLength(5);
     expect(thirdRequestContents).toEqual(expect.arrayContaining([
       expect.stringContaining("Build the app"),
-      "Teto first thought",
       expect.stringContaining("I found the entry point"),
       "I should alert Main",
       expect.stringContaining('"status":"queued"'),
@@ -796,6 +900,7 @@ describe("TetoLaneScheduler", () => {
       clock,
     });
     scheduler.observeMainEvent(firstEvent);
+    await scheduler.drain();
     scheduler.observeMainEvent(secondEvent);
     await scheduler.drain();
 

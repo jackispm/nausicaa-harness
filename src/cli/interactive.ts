@@ -3933,7 +3933,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
           if (argument.length > 0) {
             throw new Error(enteredCommand === "/cancel" ? "Usage: /cancel" : "Usage: /stop");
           }
-          await options.session.cancel();
+          await options.session.cancel("Cancelled by user", { cancelTeams: true });
           break;
         case "/resolve":
           if (argument.length === 0 || argument.split(/\s+/u).length !== 1) {
@@ -4200,7 +4200,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
       || options.session.snapshot().status === "cancelling"
     ) {
       clearInterruptExit();
-      void options.session.cancel();
+      void options.session.cancel("Cancelled by user", { cancelTeams: false });
     } else if (editor.getText().length > 0) {
       // Pi leaves a non-empty draft untouched on Escape. This also lets the
       // caller press Enter immediately after dismissing autocomplete.
@@ -4279,7 +4279,7 @@ export async function runInteractive(options: InteractiveOptions): Promise<numbe
         || options.session.snapshot().status === "cancelling"
       ) {
         clearInterruptExit();
-        void options.session.cancel();
+        void options.session.cancel("Cancelled by user", { cancelTeams: false });
       } else if (editor.getText().length > 0) {
         clearInterruptExit();
         editor.setText("");

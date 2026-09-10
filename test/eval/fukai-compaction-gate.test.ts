@@ -18,8 +18,9 @@ import {
 
 const roots: string[] = [];
 const VERIFIED_FACT = "Verified result: sample-17 checksum is c8a21f.";
-// The filler creates pressure; correctness depends on this fact surviving projection.
-const LONG_HISTORY = `${VERIFIED_FACT}\n${"historical evidence ".repeat(500)}`;
+// Keep both raw responses inside the input window while creating pressure.
+// Otherwise the control silently drops history, undercounting compression savings.
+const LONG_HISTORY = `${VERIFIED_FACT}\n${"historical evidence ".repeat(800)}`;
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) =>
@@ -69,6 +70,10 @@ describe("Fukai compaction offline benefit gate", () => {
       AnyEvent,
       { type: "model.requested" }
     > => event.type === "model.requested" && event.laneId === "main");
+    expect(
+      controlMainRequests.flatMap((event) => event.payload.truncations ?? []),
+      "The control must retain its raw history for a valid compaction benefit comparison",
+    ).toEqual([]);
     const triggerIndex = treatmentPressures.indexOf(compactDecision!);
     const compactedRequest = treatmentMainRequests[triggerIndex];
     expect(compactedRequest?.payload.contextManifest?.slots.compaction.status).toBe("ready");
@@ -98,7 +103,9 @@ describe("Fukai compaction offline benefit gate", () => {
     );
     expect(tokenDeltas.every((delta) => delta > 0)).toBe(true);
     expect(byteDeltas.every((delta) => delta > 0)).toBe(true);
-    expect(tokenDeltas.reduce((total, delta) => total + delta, 0))
+    expect(tokenDeltas.reduce((total, delta) => total + delta, 0), JSON.stringify({
+      tokenDeltas, summaryCostTokens,
+    }))
       .toBeGreaterThan(summaryCostTokens);
     expect(byteDeltas.reduce((total, delta) => total + delta, 0)).toBeGreaterThan(0);
     expect(control.finalText).toBe("done");
@@ -160,7 +167,8 @@ async function runArm(workspace: string, enabled: boolean): Promise<ArmResult> {
           fukaiCompaction: {
             enabled: true,
             provider: "pi-ai" as const,
-            maxInputTokens: 20_000,
+            // Source admission reserves up to 6x JSON escaping overhead.
+            maxInputTokens: 32_768,
             maxOutputTokens: 1_000,
             maxWallClockMs: 5_000,
             thresholdRatio: 0.8,
@@ -213,7 +221,7 @@ class GateModel implements ModelPort {
   finalText = "";
 
   capabilities() {
-    return { imageInput: false, contextWindowTokens: 8_192 } as const;
+    return { imageInput: false, contextWindowTokens: 16_384 } as const;
   }
 
   async complete(request: ModelRequest): Promise<ModelResponse> {

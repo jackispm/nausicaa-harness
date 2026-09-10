@@ -550,6 +550,7 @@ interface ActiveTurn {
   turnId: string;
   inputId: string;
   controller: AbortController;
+  retired?: boolean;
 }
 
 export class SessionController {
@@ -1921,7 +1922,10 @@ export class SessionController {
     });
   }
 
-  async cancel(reason = "Cancelled by user"): Promise<void> {
+  async cancel(
+    reason = "Cancelled by user",
+    options: { cancelTeams?: boolean } = { cancelTeams: true },
+  ): Promise<void> {
     await this.runAdmission(async () => {
       this.assertOpen();
       const active = this.active;
@@ -1931,7 +1935,12 @@ export class SessionController {
         this.publishState();
         active.controller.abort(new Error(reason));
       }
-      await this.attached?.team?.cancelAll(reason);
+      // Cancelling the active Main Turn can be separate from cancelling a
+      // Team. Interactive Escape opts out so long-running members keep
+      // working and can report back to the same Run. Direct API callers,
+      // `/stop`, and daemon cancellation retain the historical whole-run
+      // cancellation behavior unless they explicitly opt out.
+      if (options.cancelTeams !== false) await this.attached?.team?.cancelAll(reason);
       if (execution === undefined) {
         const attached = this.attached;
         if (attached === undefined) return;
@@ -1945,13 +1954,17 @@ export class SessionController {
       }
       if (await settlesWithin(execution, this.cancelGraceMs)) return;
 
-      // A provider/tool that ignores AbortSignal cannot keep the Session's
-      // writer lease alive. Record the boundary, close this attachment, and
-      // let the next command create or explicitly attach a fresh Session.
-      if (this.attached !== undefined && active !== undefined) {
-        await this.recordForcedBoundary().catch(() => undefined);
-      }
-      await this.retireAttachment();
+      // Retire only this execution. Teams and durable context belong to the
+      // Run; a non-cooperative tool must not keep its active slot forever.
+      if (this.attached === undefined || active === undefined || this.active !== active) return;
+      active.retired = true;
+      await this.recordForcedBoundary(reason, true);
+      this.active = undefined;
+      if (this.execution === execution) this.execution = undefined;
+      this.pendingGoalSteering.delete(active.turnId);
+      this.status = "idle";
+      this.publishState();
+      await this.promoteNextPending();
     });
   }
 
@@ -3274,18 +3287,19 @@ export class SessionController {
       throw new SessionProtocolError("A Nausicaa Turn is already active");
     }
     const controller = new AbortController();
-    this.active = { ...turn, controller };
+    const active: ActiveTurn = { ...turn, controller };
+    this.active = active;
     this.status = "running";
     this.publishState();
-    const execution = this.runTurn(this.active)
+    const execution = this.runTurn(active)
       .catch((error: unknown) => {
-        if (this.status !== "closed") {
+        if (!active.retired && this.status !== "closed") {
           this.publishFailure(error);
         }
       })
       .finally(async () => {
         try {
-          if (!this.closing && this.status !== "closed" && this.status !== "detached") {
+          if (!active.retired && !this.closing && this.status !== "closed" && this.status !== "detached") {
             // An edit can arrive after the last safe Main step but before
             // runTurn settles; preserve its typed context for the next Goal
             // continuation without waiting on the admission operation that
@@ -3314,6 +3328,10 @@ export class SessionController {
 
   private async runTurn(turn: ActiveTurn): Promise<void> {
     const attached = this.requireAttached();
+    const ownsExecution = () => !turn.retired && this.attached === attached;
+    const executionSink = attached.sink.forExecution(() => {
+      if (!ownsExecution()) throw new SessionProtocolError("Main execution was retired");
+    });
     try {
       const events = await attached.ledger.read({ runId: attached.runId });
       const turnStarted = events.find((event): event is Extract<AnyEvent, {
@@ -3520,7 +3538,7 @@ export class SessionController {
         attached.policy,
         this.deps.createCompactionRuntime ?? createRuntimeFukaiCompaction,
         {
-          ledger: attached.sink,
+          ledger: executionSink,
           store: attached.store,
           modelPort: model,
           model: this.model,
@@ -3555,7 +3573,7 @@ export class SessionController {
         resolveThinkingLevel: () => this.thinkingLevel,
         contextProvider: new FukaiContextProvider(new ContentStoreFukaiSource(attached.store)),
         conversationStore: attached.store,
-        eventSink: attached.sink,
+        eventSink: executionSink,
         tools: admittedTools,
         clock: this.clock,
         runTokenBudget: attached.tokenBudget,
@@ -3624,7 +3642,9 @@ export class SessionController {
                     ),
                   }),
             }),
-        onStreamEvent: (event) => this.publish({ kind: "stream", event }),
+        onStreamEvent: (event) => {
+          if (ownsExecution()) this.publish({ kind: "stream", event });
+        },
       });
       const result = await loop.run({
         runId: attached.runId,
@@ -3653,6 +3673,7 @@ export class SessionController {
         continueAfterStepAllowance: true,
         signal: turn.controller.signal,
       });
+      if (!ownsExecution()) return;
       await this.recordThreadGoalProgress(
         attached,
         turn.turnId,
@@ -3663,6 +3684,7 @@ export class SessionController {
       );
       await settlesWithin(attached.teto?.drain() ?? Promise.resolve(), 25);
       await settlesWithin(attached.team?.drain() ?? Promise.resolve(), 25);
+      if (!ownsExecution()) return;
       // Worker work remains live after this Turn. Its terminal messages stay in
       // the Inbox until a later Main boundary accepts them.
       if (!result.completed) {
@@ -3706,8 +3728,10 @@ export class SessionController {
         );
       }
     } catch (error: unknown) {
+      if (!ownsExecution()) return;
       if (turn.controller.signal.aborted) {
         await this.accountGoalProgressAfterFailure(attached, turn.turnId).catch(() => undefined);
+        if (!ownsExecution()) return;
         await this.appendTurnCancelled(turn.turnId, persistedErrorText(
           turn.controller.signal.reason,
           "Cancelled by user",
@@ -3772,10 +3796,10 @@ export class SessionController {
         );
       }
     } finally {
-      if (this.status !== "closed") {
-        await commitRunCheckpoint(attached.sink, attached.runId).catch(() => undefined);
+      if (ownsExecution() && this.status !== "closed") {
+        await commitRunCheckpoint(executionSink, attached.runId).catch(() => undefined);
       }
-      const ownsTurn = this.active?.turnId === turn.turnId;
+      const ownsTurn = !turn.retired && this.active === turn;
       if (ownsTurn) this.active = undefined;
       if (ownsTurn && this.status !== "closed" && this.status !== "detached") {
         this.status = "idle";
@@ -4021,12 +4045,68 @@ export class SessionController {
     });
   }
 
-  private async recordForcedBoundary(): Promise<void> {
+  private async recordForcedBoundary(
+    reason = "Session close grace expired",
+    cancelTurn = false,
+  ): Promise<void> {
     const attached = this.requireAttached();
     const turn = this.active;
     if (turn === undefined) return;
     const events = await attached.ledger.read({ runId: attached.runId });
+    for (const request of events.filter((event) => (
+      event.type === "model.requested"
+      && event.laneId === "main"
+      && event.turnId === turn.turnId
+      && !events.some((candidate) => (
+        (candidate.type === "model.completed" || candidate.type === "model.failed")
+          && candidate.causationId === event.eventId
+      ) || (
+        candidate.type === "model.cancelled" && candidate.payload.requestId === event.eventId
+      ))
+    ))) {
+      await attached.sink.append({
+        runId: attached.runId,
+        turnId: turn.turnId,
+        laneId: "main",
+        type: "model.cancelled",
+        payload: { requestId: request.eventId, reason },
+        causationId: request.eventId,
+        correlationId: request.correlationId,
+        idempotencyKey: `${attached.runId}:turn:${turn.turnId}:model:${request.eventId}:forced-cancel`,
+        visibility: "run",
+      });
+    }
     const unknown = pendingStartedToolRequests(events, attached.runId, turn.turnId);
+    const terminalOperations = new Set(events.flatMap((event) => (
+      event.type === "tool.succeeded" || event.type === "tool.failed" || event.type === "tool.unknown"
+        ? [event.payload.operationId] : []
+    )));
+    const startedOperations = new Set(events.flatMap((event) => (
+      event.type === "tool.started" ? [event.payload.operationId] : []
+    )));
+    for (const request of events.filter((event): event is Extract<AnyEvent, { type: "tool.requested" }> => (
+      event.type === "tool.requested"
+      && event.laneId === "main"
+      && event.turnId === turn.turnId
+      && !terminalOperations.has(event.payload.operationId)
+      && !startedOperations.has(event.payload.operationId)
+    ))) {
+      const error = "Tool was cancelled before execution";
+      const resultRef = await attached.store.put(stableJson({
+        role: "tool", toolCallId: request.payload.toolCallId, toolName: request.payload.name,
+        content: error, isError: true, createdAt: this.clock.now().toISOString(),
+      } satisfies ConversationMessage), MESSAGE_MEDIA_TYPE);
+      await attached.sink.append({
+        runId: attached.runId, turnId: turn.turnId, laneId: "main", type: "tool.failed",
+        payload: {
+          operationId: request.payload.operationId, toolCallId: request.payload.toolCallId,
+          name: request.payload.name, error, resultRef,
+        },
+        causationId: request.eventId, correlationId: request.correlationId,
+        idempotencyKey: `${attached.runId}:turn:${turn.turnId}:tool:${request.payload.operationId}:cancelled-before-start`,
+        visibility: "run",
+      });
+    }
     for (const request of unknown) {
       await attached.sink.append({
         runId: attached.runId,
@@ -4037,7 +4117,7 @@ export class SessionController {
           operationId: request.payload.operationId,
           toolCallId: request.payload.toolCallId,
           name: request.payload.name,
-          reason: "Session closed before the tool outcome was known",
+          reason,
         },
         causationId: request.eventId,
         correlationId: request.correlationId,
@@ -4045,8 +4125,8 @@ export class SessionController {
         visibility: "run",
       });
     }
-    if (unknown.length === 0) {
-      await this.appendTurnCancelled(turn.turnId, "Session close grace expired");
+    if (cancelTurn || unknown.length === 0) {
+      await this.appendTurnCancelled(turn.turnId, reason);
     } else {
       await attached.sink.append({
         runId: attached.runId,
@@ -5033,10 +5113,27 @@ class SessionEventSink implements Ledger {
     this.active = false;
   }
 
-  async append<K extends EventType>(input: AppendEvent<K>): Promise<EventEnvelope<K>> {
+  forExecution(assertCurrent: () => void): Ledger {
+    // Collaborators keep the Run sink; only this Main's writes are fenced,
+    // including callbacks queued behind the host's execution lease.
+    return {
+      append: (input) => this.append(input, assertCurrent),
+      read: (options) => this.read(options),
+      watermark: () => this.watermark(),
+      flush: () => this.flush(),
+      close: () => this.close(),
+    };
+  }
+
+  async append<K extends EventType>(
+    input: AppendEvent<K>,
+    assertCurrent?: () => void,
+  ): Promise<EventEnvelope<K>> {
     if (!this.active) throw new SessionProtocolError("Session event sink is closed");
+    assertCurrent?.();
     const append = async (): Promise<EventEnvelope<K>> => {
       if (!this.active) throw new SessionProtocolError("Session event sink is closed");
+      assertCurrent?.();
       return this.ledger.append(input);
     };
     const event = this.commitAppend === undefined

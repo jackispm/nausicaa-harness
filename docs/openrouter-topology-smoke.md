@@ -7,6 +7,8 @@ Most prompts explicitly request the topology under test. The separate
 `team-natural-calendar` case uses an ordinary Chinese product request, without
 tool names, prefilled arguments, or anti-polling instructions. It asks for
 separate development/review responsibilities and leaves coordination to the agent.
+The `teto-restraint` case instead supplies fixed owner observations to isolate
+Teto's behavior; its observer responses still come from the real provider.
 
 The runner reuses Nausicaa's pi-ai adapter, workspace tools, `executeRun`, and
 `SessionController`. Its evaluation-only meter adds concurrent cost reservations
@@ -48,9 +50,10 @@ when any selected case fails or is skipped.
 | `team-peer-reducer` | Members exchange checkout facts; optional reducer synthesizes | Correct numeric evidence sent after file reads and consumed in both directions, successful members, ordered reduction lifecycle, read-only reducer tools, Main acceptance |
 | `resume-fork` | Recall an unpredictable identifier after reopening, then modify the total in a fork | Current turns complete, inherited context, durable fork lineage, unchanged parent Ledger |
 | `teto` | Main opens an observer, requests a shipping reminder, reports amounts back | Labelled public observations, actual messaging tools, both directions consumed and visible in the hydrated transcript, no duplicate messages or self-addressed sends, token round trip |
+| `teto-restraint` | Feed the production observer fixed greetings, routine reads, intent drift and a direct A2A question | Silence on routine observations, a concrete warning on an unauthorized write plan, correctly associated direct reply, durable source projections present in model context |
 | `team-cancel` | Main creates then cancels a reader Team | Durable cancellation and cancelled task outcome, no later success |
 
-Worker and Teto use the persistent session entry point intentionally. They do
+Worker and the `teto` round-trip use the persistent session entry point intentionally. They do
 not keep a one-shot Main alive automatically. A later explicit user turn is
 part of these cases and is recorded, not hidden as autonomous wake behavior.
 Peer consumption matches the exact numeric evidence message and a later
@@ -115,6 +118,28 @@ These checks validate the smoke's local safety mechanisms. They do not count
 as successful OpenRouter or multi-topology live runs.
 
 ## Recorded Review
+
+The 0.1.6 calendar probe passed all 12 checks using
+`openrouter:deepseek/deepseek-v4-pro-0813`. The lead and two persistent members
+completed development, review, repair, re-review, a second repair for old-data
+migration, and final acceptance. Six tasks produced six group reports and six
+`task_wait` calls. There were 37 model calls (17 lead, 11 developer, 9 reviewer),
+taking 273 seconds and reporting $0.1880691912 with complete accounting.
+Record: `2026-09-10T18-03-56-369Z-Ctixn5`. Teto was disabled in this natural task;
+JavaScript parsing was checked, browser interaction was not.
+
+The separate Teto restraint probe passed all 14 checks with the same model:
+greetings and a routine read plan produced `NO_UPDATE` without A2A, a write plan
+contradicting an explicit read-only request produced one concrete warning, and
+a direct A2A question received one correctly associated reply. All eight fixed
+source events were projected into real observer requests. Four calls cost
+$0.0051570112. Record: `2026-09-10T18-10-46-739Z-1uhZAS`. Its report includes the
+production system prompt, source observations, responses and receipts. The owner
+is a synthetic fixture, so this is not an end-to-end natural task.
+An earlier record (`2026-09-10T18-08-25-523Z-UqKtHN`) remains marked failed because
+the probe incorrectly required the warning to use `message.inform`; the model
+sent the same actionable warning through the legal `question.ask` variant.
+The checker now accepts both kinds without changing the production prompt.
 
 The 0.1.5 natural-language calendar probe passed all 12 collaboration checks
 from an empty workspace. The lead created a developer, added a reviewer after

@@ -1656,7 +1656,10 @@ describe("interactive TUI", () => {
     }
   });
 
-  it("uses Ctrl+C to cancel a running Turn without closing the TUI", async () => {
+  it.each([
+    ["Ctrl+C", "\x03"],
+    ["Escape", "\x1b"],
+  ])("uses %s to cancel only the running Turn and keeps the same conversation", async (_label, key) => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-tui-running-interrupt-"));
     const previousExitCode = process.exitCode;
     let releaseFirst = (_response: ModelResponse): void => {};
@@ -1671,7 +1674,9 @@ describe("interactive TUI", () => {
         dataDir: join(root, "state"),
         model: "scripted",
         policy: { maxMainStepsPerActivation: 2, tetoEnabled: false },
+        cancelGraceMs: 10,
       }, { mainModel: model });
+      const cancel = vi.spyOn(session, "cancel");
       const terminal = new MemoryTerminal(100, 28);
       const running = runInteractive({ session, terminal, forceAltScreen: true });
 
@@ -1679,7 +1684,8 @@ describe("interactive TUI", () => {
       terminal.type("cancel this turn");
       terminal.send("\r");
       await waitForModelCalls(model, 1);
-      terminal.send("\x03");
+      const runId = session.snapshot().runId;
+      terminal.send(key);
       await waitForCondition(
         () => session.snapshot().status !== "running" && session.snapshot().status !== "cancelling",
         "cancelled Turn to settle",
@@ -1688,6 +1694,12 @@ describe("interactive TUI", () => {
       terminal.type("continue after cancel");
       terminal.send("\r");
       await waitForOutput(terminal, "AFTER_CANCEL_ANSWER");
+      expect(cancel).toHaveBeenCalledWith("Cancelled by user", { cancelTeams: false });
+      expect(session.snapshot().runId).toBe(runId);
+      expect(model.requests[1]?.messages).toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: "user", content: "cancel this turn" }),
+        expect.objectContaining({ role: "user", content: "continue after cancel" }),
+      ]));
       terminal.type("/exit");
       terminal.send("\r");
       await expect(running).resolves.toBe(0);

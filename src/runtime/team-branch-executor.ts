@@ -17,7 +17,7 @@ import {
   ContentStoreFukaiSource,
   FukaiContextProvider,
 } from "../fukai/index.js";
-import { MainLoop, type MainLoopInput } from "./main-loop.js";
+import { MainLoop, type MainBoundaryMessage, type MainLoopInput } from "./main-loop.js";
 import { RunTokenBudget } from "./run-token-budget.js";
 import type { RuntimeFukaiCompaction, RuntimeFukaiCompactionFactory } from "./fukai-compaction-runtime.js";
 import {
@@ -92,6 +92,7 @@ export interface TeamBranchExecutorOptions {
   /** Called after the durable settlement and terminal reply are both visible. */
   onTaskSettled?: () => void;
   readTaskTerminal?: () => Promise<TaskResult | TaskFailed | undefined>;
+  readGroupMessages?: () => Promise<readonly MainBoundaryMessage[]>;
   resolveMessageTargets?: () => readonly string[] | Promise<readonly string[]>;
   resolveMessageSenders?: () => readonly string[] | Promise<readonly string[]>;
   onMessage?: (message: A2AMessage) => void | Promise<void>;
@@ -398,7 +399,7 @@ export class TeamBranchExecutor {
           if (summary.trim().length === 0) {
             return { kind: "failed", payload: failed(task, "Recovered Team member model completed without a non-empty report") };
           }
-          if (!await mailbox.hasReadyMessages({ step: startStep })) {
+          if (!await mailbox.hasReadyMessages({ step: startStep }) && (await this.options.readGroupMessages?.() ?? []).length === 0) {
             return { kind: "result", payload: {
               type: "task.result", taskId: task.taskId, status: "completed", summary,
               evidenceRefs: task.inputRefs.map((ref) => ref.contentHash), artifactRefs: [completedModel.payload.responseRef], openQuestions: [],
@@ -448,10 +449,12 @@ export class TeamBranchExecutor {
         eventObserver: (event) => this.teto.observeMainEvent(event),
         beforeStep: async ({ step }) => {
           currentStep = step;
-          return [...await this.teto.beforeMainStep({ step }), ...await mailbox.beforeStep({ step })];
+          return [...await this.teto.beforeMainStep({ step }), ...await mailbox.beforeStep({ step }),
+            ...(await this.options.readGroupMessages?.() ?? [])];
         },
         afterStep: (context) => { this.teto.afterMainStep(context); void mailbox.afterStep(context); },
-        beforeCompletion: () => mailbox.hasReadyMessages({ step: currentStep + 1 }),
+        beforeCompletion: async () => await mailbox.hasReadyMessages({ step: currentStep + 1 })
+          || (await this.options.readGroupMessages?.() ?? []).length > 0,
         ...(selectCompaction === undefined ? {} : { selectCompaction }),
         ...(compactForPressure === undefined ? {} : { compactForPressure }),
         includeProjectInstructions: false,

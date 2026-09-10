@@ -58,7 +58,7 @@ import {
   createTeamTool,
 } from "./team-tool.js";
 import { normalizeTeamCreateRequest, teamGoal } from "./team-tool.js";
-import type { TeamBoard } from "./team-board.js";
+import { projectTeamBoards, type TeamBoard } from "./team-board.js";
 import type { TeamRunReport, TeamTaskAssignment } from "../domain/team.js";
 import { capabilityEntriesFromTools, createScopedSpawnContext } from "./lane-context.js";
 import { FIRST_PARTY_MOWE_METADATA, MoweCatalog } from "../mowe/catalog.js";
@@ -66,7 +66,7 @@ import type { MoweAgentTool } from "../mowe/types.js";
 import { TeamLifecycle } from "./team-lifecycle.js";
 import { LaneMailbox } from "./lane-mailbox.js";
 import { createInRunAgentMessageTool } from "./in-run-agent-message-tool.js";
-import { publicAgentName, publicLaneName } from "./lane-names.js";
+import { publicAgentName, publicLaneName, resolveLaneTarget } from "./lane-names.js";
 import {
   appendTeamChannelMessage,
   readTeamChannelHistory,
@@ -1044,9 +1044,10 @@ export class TeamRuntime implements TeamControl {
       const board = (await this.lifecycle.boards()).find((item) => item.teamId === teamId);
       if (board === undefined) throw new Error(`Unknown Team ${teamId}`);
       const sender = this.assertTeamAccess(board, context);
-      if (board.cancellationRequested || this.closedTeams.has(teamId)) throw new Error(`Team ${teamId} is closed`);
+      if (board.lifecycleState === "closed" || board.cancellationRequested || this.closedTeams.has(teamId)) throw new Error(`Team ${teamId} is closed`);
       const mentions = [...new Set((request.mentions ?? []).map((mention) => {
-        if (mention === this.parentLaneId) return mention;
+        const target = resolveLaneTarget(mention, [this.parentLaneId]);
+        if (target === this.parentLaneId) return target;
         const member = board.members.find((item) => item.memberId === mention || item.laneId === mention);
         if (member === undefined) throw new Error(`Unknown Team mention ${mention}`);
         return member.laneId;
@@ -1070,8 +1071,10 @@ export class TeamRuntime implements TeamControl {
       const event = candidate.duplicate
         ? candidate.event as Extract<AnyEvent, { type: "team.message.sent" }>
         : await this.options.eventSink.append(candidate.event);
-      if (!candidate.duplicate) {
+      const current = (await this.lifecycle.boards()).find((item) => item.teamId === teamId);
+      if (!candidate.duplicate && !this.stopped && current?.lifecycleState === "open" && !current.cancellationRequested) {
         for (const mention of mentions) {
+          if (mention === sender) continue;
           if (mention === this.parentLaneId) this.options.onWake?.();
           else this.branches.get(mention)?.scheduler.enqueue();
         }
@@ -1124,7 +1127,7 @@ export class TeamRuntime implements TeamControl {
     if (this.teams.size === 0) return [];
     await this.lifecycle.reconcile();
     this.mailbox ??= this.createMailbox(await this.options.readEvents());
-    const messages = [...await this.mailbox.beforeStep({ step: context?.step ?? 1 })];
+    const messages = [...await this.groupBoundaryMessages(this.parentLaneId), ...await this.mailbox.beforeStep({ step: context?.step ?? 1 })];
     const runtimes = [...this.branches.values(), ...this.reducers.values()];
     const boards = await this.lifecycle.boards();
     for (let visited = 0; visited < runtimes.length && messages.length < 64; visited += 1) {
@@ -1147,6 +1150,72 @@ export class TeamRuntime implements TeamControl {
       }
     }
     return messages;
+  }
+
+  /** Group mentions share the ordinary committed-step receipt boundary. */
+  private async groupBoundaryMessages(laneId: LaneId): Promise<readonly import("./main-loop.js").MainBoundaryMessage[]> {
+    if (this.stopped || this.options.signal?.aborted) return [];
+    const events = await this.options.readEvents();
+    const consumed = new Set(projectCommittedBoundaryMessageIds(events, this.runId, laneId));
+    const candidates = events.filter((event): event is Extract<AnyEvent, { type: "team.message.sent" }> => (
+      event.runId === this.runId && event.type === "team.message.sent"
+      && event.payload.mentions.includes(laneId) && event.payload.fromLane !== laneId
+      && event.laneId === event.payload.fromLane
+      && !consumed.has(`team-channel:${event.eventId}`)
+    ));
+    if (candidates.length === 0) return [];
+    const boards = projectTeamBoards(events, { runId: this.runId, inbox: this.inbox.snapshot() });
+    const admitted = new Map<string, Map<LaneId, number>>();
+    for (const board of boards) {
+      const ownsGroup = board.leadLaneId === laneId;
+      const belongsToGroup = board.leadLaneId === this.parentLaneId && board.members.some((member) => member.laneId === laneId);
+      if ((!ownsGroup && !belongsToGroup) || board.lifecycleState === "closed" || board.cancellationRequested) continue;
+      const created = events.find((event) => event.runId === this.runId && event.type === "team.created"
+        && event.laneId === board.leadLaneId && event.payload.teamId === board.teamId
+        && stableJson(event.payload) === stableJson(board.definition));
+      if (created?.type !== "team.created") continue;
+      const members = new Map<LaneId, number>([[board.leadLaneId, created.globalOffset],
+        ...created.payload.members.map((member): [LaneId, number] => [member.laneId, created.globalOffset])]);
+      for (const event of events) {
+        if (event.runId !== this.runId || event.type !== "team.member.added" || event.payload.teamId !== board.teamId
+          || event.laneId !== board.leadLaneId || event.payload.addedBy !== board.leadLaneId) continue;
+        const definition = board.memberDefinitions?.find((member) => member.laneId === event.payload.member.laneId);
+        if (definition !== undefined && stableJson(definition) === stableJson(event.payload.member) && !members.has(definition.laneId)) {
+          members.set(definition.laneId, event.globalOffset);
+        }
+      }
+      admitted.set(board.teamId, members);
+    }
+    return candidates.filter((event) => (
+      event.globalOffset > (admitted.get(event.payload.teamId)?.get(event.payload.fromLane) ?? Infinity)
+      && event.globalOffset > (admitted.get(event.payload.teamId)?.get(laneId) ?? Infinity)
+    )).sort((left, right) => left.globalOffset - right.globalOffset).slice(0, 8).map((event) => {
+      const previous = events.filter((candidate): candidate is Extract<AnyEvent, { type: "team.message.sent" }> => (
+        candidate.runId === this.runId && candidate.type === "team.message.sent"
+        && candidate.payload.teamId === event.payload.teamId && candidate.payload.channelId === event.payload.channelId
+        && candidate.payload.sequence < event.payload.sequence
+      )).sort((left, right) => right.payload.sequence - left.payload.sequence)[0];
+      const readFullMessage: TeamHistoryRequest = {
+        teamId: event.payload.teamId, channelId: event.payload.channelId,
+        ...(event.payload.threadId === undefined ? {} : { threadId: event.payload.threadId }), limit: 1,
+        ...(previous === undefined ? {} : { after: teamChannelCursor(previous) }),
+      };
+      const nestedLead = laneId !== DEFAULT_PARENT_LANE && boards.some((board) => board.teamId === event.payload.teamId && board.leadLaneId === laneId);
+      const messageTool = nestedLead ? "child_team_message" : "team_message";
+      const historyTool = nestedLead ? "child_team_history" : "team_history";
+      return {
+        kind: "runtime-notice" as const,
+        source: event.payload.fromLane,
+        messageId: `team-channel:${event.eventId}`,
+        content: [
+          `Team channel mention. Use ${messageTool} to reply; call ${historyTool} with readFullMessage for this message, or after:cursor for later messages.`,
+          JSON.stringify({ teamId: event.payload.teamId, channelId: event.payload.channelId,
+            threadId: event.payload.threadId, sequence: event.payload.sequence, cursor: teamChannelCursor(event), readFullMessage }),
+          event.payload.body.slice(0, 2_048),
+          ...(event.payload.body.length > 2_048 ? ["[Excerpt; readFullMessage retrieves the full message.]"] : []),
+        ].join("\n"),
+      };
+    });
   }
 
   enqueue(context?: import("./main-loop.js").MainAfterStepContext): void {
@@ -1191,6 +1260,7 @@ export class TeamRuntime implements TeamControl {
       // durable report invokes onWake and starts a fresh Main boundary.
       const boards = await this.lifecycle.boards();
       if (!boards.some((board) => board.lifecycleState !== "closed" && !board.cancellationRequested)) return false;
+      if ((await this.groupBoundaryMessages(this.parentLaneId)).length > 0) return true;
       const collected = boards.every(isCollectedTeam);
       const consumed = new Set(projectCommittedBoundaryMessageIds(await this.options.readEvents(), this.runId, this.parentLaneId));
       const sources = new Set([this.parentLaneId, ...this.branches.keys(), ...[...this.reducers.values()].map((item) => item.laneId)]);
@@ -1216,6 +1286,7 @@ export class TeamRuntime implements TeamControl {
       await this.lifecycle.reconcile();
       this.lifecycle.checkFailure();
       const boards = await this.lifecycle.boards();
+      if ((await this.groupBoundaryMessages(this.parentLaneId)).length > 0) return true;
       const collected = boards.every(isCollectedTeam);
       const consumed = new Set(projectCommittedBoundaryMessageIds(await this.options.readEvents(), this.runId, this.parentLaneId));
       const sources = new Set([this.parentLaneId, ...this.branches.keys(), ...[...this.reducers.values()].map((item) => item.laneId)]);
@@ -1481,6 +1552,7 @@ export class TeamRuntime implements TeamControl {
       readEvents: this.options.readEvents,
       readWatermark: this.options.readWatermark,
       readAwareness: this.options.readAwareness,
+      ...(reducer ? {} : { readGroupMessages: () => this.groupBoundaryMessages(laneId) }),
       policy: branchPolicy,
       ...(member === undefined ? {} : {
         taskDefinition: member.task,

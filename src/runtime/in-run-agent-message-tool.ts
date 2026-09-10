@@ -46,6 +46,8 @@ export interface InRunAgentMessageToolOptions {
   maxPendingMessages?: number;
   /** A wake hint after durable send; failure cannot undo an accepted message. */
   onMessage?: (message: A2AMessage) => void | Promise<void>;
+  /** Optional admission filter, after validation and before a new durable send. */
+  suppressMessage?: (message: A2AMessage) => string | undefined;
   createId?: () => string;
   now?: () => Date;
 }
@@ -226,8 +228,15 @@ export function createInRunAgentMessageTool(
           payload,
         };
         if (context.signal?.aborted) throw new Error("agent_message was cancelled before send");
+        const suppression = existing === undefined ? options.suppressMessage?.(message) : undefined;
+        if (suppression !== undefined) {
+          return { message, result: { status: "suppressed" as const, reason: suppression } };
+        }
         return { message, result: await inbox.send(message) };
       });
+      if (result.status === "suppressed") {
+        return { content: JSON.stringify({ queued: false, suppressed: true, reason: result.reason }), isError: false };
+      }
       let wakePending = false;
       if (onMessage !== undefined && result.status !== "expired") {
         try {
