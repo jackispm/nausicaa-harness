@@ -55,12 +55,10 @@ import { publicAgentName, publicLaneName } from "./lane-names.js";
 const DEFAULT_MAIN_LANE = "main";
 const DEFAULT_TETO_LANE = "teto";
 const DEFAULT_STOP_WAIT_MS = 250;
-const MAX_OBSERVATION_BATCH = 32;
-const TETO_OBSERVATION_GUIDANCE = `Your core tasks:
+const TETO_OBSERVATION_GUIDANCE = `Observe your owner's completed steps. Your core tasks:
 1. Detect drift from the user's intent or constraints.
-2. Suggest a materially better approach when observed evidence supports it.
-Missing or truncated observations are not evidence that your owner skipped work.
-Keep routine observations in your own transcript. Use agent_message only for a new, concrete finding that would change your owner's next action, or to answer a direct A2A request. Do not repeat advice already sent or addressed. Otherwise finish with NO_UPDATE and no tool calls.`;
+2. Suggest a materially better approach when evidence supports it.
+Judge completed work; work still in progress is not drift. Keep routine observations private. Use agent_message only for a new finding that would change your owner's next action, or to answer a direct A2A request. Otherwise output NO_UPDATE with no tool calls.`;
 
 export interface TetoLaneSchedulerOptions {
   eventSink: EventSink;
@@ -126,8 +124,12 @@ export class TetoLaneScheduler {
   private readonly stopController = new AbortController();
   private readonly systemPrompt: string;
   private readonly stopWaitMs: number;
+  private readonly dispatchPromise: Promise<boolean>;
+  private dispatchResolve: ((dispatched: boolean) => void) | undefined;
+  private dispatchSettled = false;
   private readonly seenMainEventIds = new Set<string>();
   private readonly pendingMainEvents = new Map<string, MainPublicEvent>();
+  private readonly readyMainBatches: MainPublicEvent[][] = [];
   private readonly completedMainEventIds = new Set<string>();
   private readonly projectedSourceEventIds = new Set<string>();
   private readonly seenToolCallIds = new Set<string>();
@@ -138,6 +140,8 @@ export class TetoLaneScheduler {
   private compactionPrepared = false;
   private budgetExhausted = false;
   private accepting = true;
+  private mainStepOpen = false;
+  private observedMainStep = false;
   private tail: Promise<void> = Promise.resolve();
   private receiptTail: Promise<void> = Promise.resolve();
 
@@ -189,6 +193,9 @@ export class TetoLaneScheduler {
     if (!Number.isSafeInteger(this.stopWaitMs) || this.stopWaitMs < 1) {
       throw new RangeError("stopWaitMs must be a positive integer");
     }
+    this.dispatchPromise = new Promise<boolean>((resolve) => {
+      this.dispatchResolve = resolve;
+    });
     this.contextProvider = options.contextProvider
       ?? new FukaiContextProvider(observationContextSource(
         this.store, options.events ?? [], this.runId, this.laneId, this.mainLaneId,
@@ -299,24 +306,37 @@ export class TetoLaneScheduler {
       || this.stopController.signal.aborted
       || this.signal?.aborted
     ) return;
+    if (event.runId !== this.runId || event.laneId !== this.mainLaneId) return;
+    if (event.type === "step.started") {
+      this.mainStepOpen = true;
+      this.observedMainStep = true;
+      return;
+    }
+    if (isObservationBoundary(event.type)) {
+      this.mainStepOpen = false;
+      this.releasePendingObservations();
+      return;
+    }
     if (!isMainPublicEvent(event, this.mainLaneId)) return;
     if (
-      event.runId !== this.runId
-      || this.completedMainEventIds.has(event.eventId)
+      this.completedMainEventIds.has(event.eventId)
       || this.seenMainEventIds.has(event.eventId)
     ) return;
     this.seenMainEventIds.add(event.eventId);
     this.pendingMainEvents.set(event.eventId, event);
-    const operation = this.tail.then(() => this.processPendingMainEvents());
-    this.tail = operation.catch((error: unknown) => {
-      this.failures.push(asError(error));
-    });
   }
 
   /** Compatibility name for hosts that enqueue sibling-lane work. */
   enqueue(_context?: MainAfterStepContext): void {
-    // Public observations arrive through eventObserver. This hook only repairs
-    // A2A receipts after Main commits a boundary.
+    // Main calls this after step.completed. It is also a compatibility fence
+    // for hosts that provide the after-step hook without the event observer.
+    if (_context !== undefined && _context.runId === this.runId && _context.laneId === this.mainLaneId) {
+      this.mainStepOpen = false;
+      this.observedMainStep = true;
+      this.releasePendingObservations();
+      this.afterMainStep(_context);
+      return;
+    }
     if (_context !== undefined) this.afterMainStep(_context);
   }
 
@@ -353,6 +373,12 @@ export class TetoLaneScheduler {
   }
 
   async drain(): Promise<void> {
+    // Unit hosts and older embedders may only provide public events and call
+    // drain at their explicit boundary. Never use this fallback after a Main
+    // step has been observed; live execution is released by step.completed.
+    if (!this.observedMainStep && !this.mainStepOpen && this.pendingMainEvents.size > 0) {
+      this.releasePendingObservations();
+    }
     while (true) {
       const observedTail = this.tail;
       const observedReceipts = this.receiptTail;
@@ -361,8 +387,18 @@ export class TetoLaneScheduler {
     }
   }
 
+  /**
+   * Resolve when the first released observation reaches the provider boundary.
+   * One-shot hosts use this small handshake before closing the lane so a
+   * completed Main step is not discarded while context is being assembled.
+   */
+  waitForDispatch(): Promise<boolean> {
+    return this.dispatchPromise;
+  }
+
   async stop(): Promise<void> {
     this.accepting = false;
+    this.resolveDispatch(false);
     if (!this.stopController.signal.aborted) {
       this.stopController.abort(new DOMException("Teto lane stopped", "AbortError"));
     }
@@ -394,16 +430,31 @@ export class TetoLaneScheduler {
   }
 
   private async processPendingMainEvents(): Promise<void> {
-    while (this.pendingMainEvents.size > 0) {
+    while (this.readyMainBatches.length > 0) {
       if (!this.accepting || this.budgetExhausted || this.stopController.signal.aborted || this.signal?.aborted) return;
-      const batch = [...this.pendingMainEvents.values()].slice(0, MAX_OBSERVATION_BATCH);
+      // Keep completed steps intact, including every tool's terminal fact.
+      // Coalesce a slow observer's backlog before opening its next inference.
+      const batch = this.readyMainBatches.splice(0).flat();
       try {
         await this.process(batch);
       } catch (error: unknown) {
         // Parent reservations can temporarily refuse admission even when this
         // lane has allowance. Keep the source ordered; only a new Main event
         // schedules another attempt, so drain() also settles while blocked.
-        if (error instanceof MainRunTokenBudgetExhaustedError) return;
+        if (error instanceof MainRunTokenBudgetExhaustedError) {
+          // The batch was removed from the ready queue before processing. Move
+          // it back to the boundary queue, together with any later chunks, so
+          // a new Main boundary retries the whole ordered backlog in one
+          // activation. This avoids both dropped observations and an extra
+          // inference for an already projected chunk.
+          const retry = [
+            ...batch,
+            ...this.readyMainBatches.flat(),
+          ].sort((left, right) => left.globalOffset - right.globalOffset);
+          this.readyMainBatches.length = 0;
+          for (const event of retry) this.pendingMainEvents.set(event.eventId, event);
+          return;
+        }
         this.failures.push(asError(error));
         const eventId = batch.at(-1)!.eventId;
         const recorder = isAbortError(error)
@@ -413,8 +464,20 @@ export class TetoLaneScheduler {
           this.failures.push(asError(recordError));
         });
       }
-      for (const event of batch) this.pendingMainEvents.delete(event.eventId);
     }
+  }
+
+  /** Release exactly the public facts seen since the previous Main boundary. */
+  private releasePendingObservations(): void {
+    if (this.pendingMainEvents.size === 0) return;
+    const batch = [...this.pendingMainEvents.values()]
+      .sort((left, right) => left.globalOffset - right.globalOffset);
+    this.pendingMainEvents.clear();
+    this.readyMainBatches.push(batch);
+    const operation = this.tail.then(() => this.processPendingMainEvents());
+    this.tail = operation.catch((error: unknown) => {
+      this.failures.push(asError(error));
+    });
   }
 
   private async process(batch: readonly MainPublicEvent[]): Promise<void> {
@@ -498,15 +561,13 @@ export class TetoLaneScheduler {
     const activationEvents: AnyEvent[] = [];
     let result: Awaited<ReturnType<MainLoop["run"]>>;
     try {
-      result = await this.loop((committed) => activationEvents.push(committed)).run({
+      const loopPromise = this.loop((committed) => activationEvents.push(committed)).run({
         runId: this.runId,
         laneId: this.laneId,
         sessionId: `${this.runId}:${this.laneId}:${this.modelName}`,
         model: this.modelName,
         workspace: this.workspace,
         goal: this.goal,
-        // Pin Teto's own task after the owner's observed request and activity.
-        activeObjective: "Evaluate the observed behavior and any direct A2A request; if no response is needed, output NO_UPDATE as plain assistant text with no tool calls.",
         policy: this.policy,
         systemPrompt: this.systemPrompt,
         laneKind: "intent-navigator",
@@ -523,6 +584,7 @@ export class TetoLaneScheduler {
           : { signal: AbortSignal.any([this.signal, this.stopController.signal]) }),
         reservationPriority: "auxiliary",
       });
+      result = await loopPromise;
     } catch (error: unknown) {
       // Preserve committed observations and tool results even if inference
       // fails; the next activation sees the same facts as restart recovery.
@@ -570,13 +632,24 @@ export class TetoLaneScheduler {
       clock: this.clock,
       runTokenBudget: this.tokenBudget,
       ...(eventObserver === undefined ? {} : { eventObserver }),
+      modelDispatchObserver: () => this.resolveDispatch(true),
       // Each observation batch opens one activation with a natural boundary.
-      beforeStep: (context) => this.mailbox.beforeStep({ ...context, step: 1 }),
+      beforeStep: async (context) => {
+        const messages = await this.mailbox.beforeStep({ ...context, step: 1 });
+        return messages;
+      },
       afterStepAsync: (context) => this.mailbox.afterStep(context),
       ...(selectCompaction === undefined ? {} : { selectCompaction }),
       ...(compactForPressure === undefined ? {} : { compactForPressure }),
       includeProjectInstructions: false,
     });
+  }
+
+  private resolveDispatch(dispatched: boolean): void {
+    if (this.dispatchSettled) return;
+    this.dispatchSettled = true;
+    this.dispatchResolve?.(dispatched);
+    this.dispatchResolve = undefined;
   }
 
   private async recordFailure(sourceEventId: string, error: unknown): Promise<void> {
@@ -753,6 +826,11 @@ function highestStep(events: readonly AnyEvent[], runId: RunId, laneId: LaneId):
       ? Math.max(highest, event.payload.step)
       : highest
   ), 0);
+}
+
+function isObservationBoundary(type: AnyEvent["type"]): boolean {
+  return type === "step.completed"
+    || type === "step.failed";
 }
 
 function totalTokens(usage: TokenUsage): number {

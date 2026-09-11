@@ -5,17 +5,25 @@ import type { ContentAddressedStore } from "../store/index.js";
 import { MESSAGE_MEDIA_TYPE, TOOL_ARGUMENTS_MEDIA_TYPE } from "./session-artifacts.js";
 import { publicLaneName } from "./lane-names.js";
 
-/** The only Main facts that are projected into the Teto lane. */
+/** The bounded Main facts that are projected into the Teto lane. */
 export type MainPublicEvent = {
   eventId: string;
   globalOffset: number;
   runId: string;
   laneId: LaneId;
   visibility?: Visibility;
-  type: "user.message" | "assistant.message" | "tool.requested";
+  type: "user.message"
+    | "assistant.message"
+    | "tool.requested"
+    | "tool.succeeded"
+    | "tool.failed"
+    | "tool.unknown";
   payload: EventPayloadMap["user.message"]
     | EventPayloadMap["assistant.message"]
-    | EventPayloadMap["tool.requested"];
+    | EventPayloadMap["tool.requested"]
+    | EventPayloadMap["tool.succeeded"]
+    | EventPayloadMap["tool.failed"]
+    | EventPayloadMap["tool.unknown"];
 };
 
 export interface MainPublicProjection {
@@ -32,10 +40,13 @@ export function isMainPublicEvent(
     && isObserverVisible(event.visibility)
     && (event.type === "user.message"
       || event.type === "assistant.message"
-      || event.type === "tool.requested");
+      || event.type === "tool.requested"
+      || event.type === "tool.succeeded"
+      || event.type === "tool.failed"
+      || event.type === "tool.unknown");
 }
 
-/** Build a bounded, user-visible projection without tool results or Main context. */
+/** Build a bounded projection without raw tool results or Main context. */
 export async function projectMainPublicEvent(
   store: Pick<ContentAddressedStore, "get">,
   event: MainPublicEvent,
@@ -74,18 +85,43 @@ export async function projectMainPublicEvent(
     };
   }
 
-  const payload = event.payload as EventPayloadMap["tool.requested"];
-  const arguments_ = await readArguments(store, payload.argumentsRef);
+  if (event.type === "tool.requested") {
+    const payload = event.payload as EventPayloadMap["tool.requested"];
+    const arguments_ = await readArguments(store, payload.argumentsRef);
+    return {
+      message: {
+        role: "user",
+        content: renderObservation(event, renderToolRequest(payload.name, arguments_)),
+        sourceEventId: event.eventId,
+        sourceLane: event.laneId,
+        createdAt: new Date(0).toISOString(),
+      },
+      toolCallIds: [],
+      toolCallId: payload.toolCallId,
+    };
+  }
+
+  return projectToolTerminalEvent(event);
+}
+
+async function projectToolTerminalEvent(
+  event: MainPublicEvent,
+): Promise<MainPublicProjection> {
+  const payload = event.payload as EventPayloadMap["tool.succeeded"]
+    | EventPayloadMap["tool.failed"]
+    | EventPayloadMap["tool.unknown"];
+  const status = event.type === "tool.succeeded"
+    ? "succeeded"
+    : event.type === "tool.failed" ? "failed" : "ended with unknown outcome";
   return {
     message: {
       role: "user",
-      content: renderObservation(event, renderToolRequest(payload.name, arguments_)),
+      content: renderObservation(event, `Tool ${boundedRedactedText(payload.name, 256)} ${status}.`),
       sourceEventId: event.eventId,
       sourceLane: event.laneId,
       createdAt: new Date(0).toISOString(),
     },
     toolCallIds: [],
-    toolCallId: payload.toolCallId,
   };
 }
 

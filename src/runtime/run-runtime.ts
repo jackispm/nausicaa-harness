@@ -128,6 +128,11 @@ import {
   createTetoCapabilityManifest,
 } from "./lane-context.js";
 
+// A one-shot host closes its auxiliary lanes as soon as Main returns. Give an
+// already released Teto batch a short handoff window to reach the provider;
+// the provider call itself remains fully non-blocking after dispatch.
+const OBSERVER_DISPATCH_GRACE_MS = 250;
+
 export interface RunExecutionRequest {
   workspace: string;
   dataDir: string;
@@ -1082,8 +1087,12 @@ export const executeRun = async (
   }
 
   async function closeScheduler(): Promise<void> {
-    if (scheduler instanceof TetoLaneController) await scheduler.close();
-    else await scheduler?.stop();
+    if (scheduler instanceof TetoLaneController) {
+      await settlesWithin(scheduler.waitForDispatch(), OBSERVER_DISPATCH_GRACE_MS);
+      await scheduler.close();
+      return;
+    }
+    await scheduler?.stop();
   }
 };
 

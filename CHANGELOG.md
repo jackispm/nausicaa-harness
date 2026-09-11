@@ -4,6 +4,25 @@ All notable changes to Nausicaa are documented here.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-09-11
+
+- Make ordinary Teto observe only after a complete Main step or terminal
+  failure, preventing premature A2A reminders while the owner is acting.
+- Include bounded tool terminal status in Teto's public observation stream while
+  keeping raw tool results out of its context.
+- Coalesce observations by completed step, simplify the observer prompt, and
+  update the operator documentation to describe the actual timing contract.
+- Keep observer instructions in Teto's system prompt instead of repeating them
+  as a user request that could prompt an unnecessary A2A reply.
+- Preserve queued observations across temporary auxiliary admission pressure.
+  Keep completed steps intact even with large parallel tool batches.
+- Validate provider responses before billing or persistence, harden usage
+  recovery against unsafe integer overflow, narrow dispatch admission locks, and
+  enforce a single web timeout across redirects.
+- Forward stream closure to the provider after rejected responses and recheck
+  cancellation immediately before committing a workspace file replacement.
+- Require successful CI for the tagged commit before publishing release assets.
+
 ## [0.1.7] - 2026-09-11
 
 - Show Team member phases, current tools, and time since activity in both TUI

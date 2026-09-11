@@ -45,6 +45,83 @@ const response = (
 });
 
 describe("TetoLaneScheduler", () => {
+  it("waits for a completed Main step before starting an observation", async () => {
+    const model = new ScriptedModel([response("NO_UPDATE")]);
+    const { scheduler, ledger, mainEvent } = await a2aScenario(model);
+    try {
+      scheduler.observeMainEvent(mainEvent);
+      await Promise.resolve();
+      expect(model.callCount).toBe(0);
+
+      const started = await ledger.append({
+        runId: "run-a2a", laneId: "main", type: "step.started", payload: { step: 1 },
+        correlationId: "run-a2a", idempotencyKey: "main:step:1:started", visibility: "run",
+      });
+      scheduler.observeMainEvent(started);
+      const completed = await ledger.append({
+        runId: "run-a2a", laneId: "main", type: "step.completed",
+        payload: { step: 1, hasToolCalls: false },
+        correlationId: "run-a2a", idempotencyKey: "main:step:1:completed", visibility: "run",
+      });
+      scheduler.observeMainEvent(completed);
+      await scheduler.drain();
+      expect(model.callCount).toBe(1);
+    } finally {
+      await scheduler.stop();
+    }
+  });
+
+  it.each(["step.completed", "step.failed"] as const)("keeps large tool steps intact at %s and excludes the next open step", async (boundary) => {
+    const model = new ScriptedModel([response("NO_UPDATE")]);
+    const { scheduler, ledger, store, mainEvent } = await a2aScenario(model, {
+      policy: { ...policy, maxModelTokens: 100_000 },
+    });
+    const append = {
+      runId: "run-a2a", laneId: "main", correlationId: "large-step", visibility: "run" as const,
+    };
+    try {
+      scheduler.observeMainEvent(mainEvent);
+      scheduler.observeMainEvent(await ledger.append({
+        ...append, type: "step.started", payload: { step: 1 }, idempotencyKey: "large:started",
+      }));
+      const argumentsRef = await store.put('{"teamId":"flight"}', "application/json");
+      const resultRef = await store.put("PRIVATE RESULT", "text/plain");
+      for (let index = 0; index < 40; index += 1) {
+        const payload = { operationId: `op-${index}`, toolCallId: `call-${index}`, name: `close_team_${index}` };
+        scheduler.observeMainEvent(await ledger.append({
+          ...append, type: "tool.requested", payload: { ...payload, argumentsRef }, idempotencyKey: `large:request:${index}`,
+        }));
+        scheduler.observeMainEvent(await ledger.append({
+          ...append, type: "tool.succeeded", payload: { ...payload, resultRef }, idempotencyKey: `large:result:${index}`,
+        }));
+      }
+      await scheduler.drain();
+      expect(model.callCount).toBe(0);
+      const boundaryEvent = boundary === "step.completed"
+        ? await ledger.append({ ...append, type: boundary, payload: { step: 1, hasToolCalls: true }, idempotencyKey: "large:boundary" })
+        : await ledger.append({ ...append, type: boundary, payload: { step: 1, error: "Owner interrupted" }, idempotencyKey: "large:boundary" });
+      scheduler.observeMainEvent(boundaryEvent);
+      scheduler.observeMainEvent(await ledger.append({
+        ...append, type: "step.started", payload: { step: 2 }, idempotencyKey: "next:started",
+      }));
+      const messageRef = await store.put(JSON.stringify({
+        role: "assistant", content: "NEXT_STEP_STILL_RUNNING", toolCalls: [], createdAt: new Date().toISOString(),
+      }), "application/vnd.nausicaa.conversation-message+json");
+      scheduler.observeMainEvent(await ledger.append({
+        ...append, type: "assistant.message", payload: { messageRef }, idempotencyKey: "next:assistant",
+      }));
+      await scheduler.drain();
+      expect(model.callCount).toBe(1);
+      const content = model.requests[0]!.messages.map((message) => message.content).join("\n");
+      expect(content).toContain("Tool close_team_39 succeeded");
+      expect(content).not.toContain("NEXT_STEP_STILL_RUNNING");
+      expect(content).not.toContain("PRIVATE RESULT");
+      expect(scheduler.snapshot().failures).toEqual([]);
+    } finally {
+      await scheduler.stop();
+    }
+  });
+
   it("rejects observer progress across the five flight-game phases while preserving scoped evidence and private notes", async () => {
     const model = new ScriptedModel([
       response("Initial observation noted", [{ id: "routine-progress", name: "agent_message",
@@ -76,7 +153,7 @@ describe("TetoLaneScheduler", () => {
         const voice = request.tools.find((tool) => tool.name === "agent_message")!;
         expect(voice.parameters.properties?.kind).toMatchObject({ enum: ["inform", "request"] });
         expect(JSON.stringify(voice.parameters)).not.toContain("progress");
-        expect(request.systemPrompt).toContain("Missing or truncated observations are not evidence that your owner skipped work");
+        expect(request.systemPrompt).toContain("Observe your owner's completed steps");
         expect(request.systemPrompt.match(/^\d\./gm)).toHaveLength(2);
       }
       const events = await ledger.read({ runId: "run-a2a" });
@@ -264,7 +341,7 @@ describe("TetoLaneScheduler", () => {
       )) as Array<Extract<AnyEvent, { type: "user.message" }>>;
       expect(observedInputs.filter((event) => event.payload.sourceEventId === mainEvent.eventId)).toHaveLength(1);
       expect(observedInputs.filter((event) => event.payload.sourceEventId === nextEvent.eventId)).toHaveLength(1);
-      expect(model.requests[0]?.messages.at(-1)?.content).toContain("Current Turn objective");
+      expect(model.requests[0]?.messages.some((message) => message.content.includes("Current Turn objective"))).toBe(false);
       expect(observedMessages(model.requests[0]!)).toHaveLength(2);
       expect(scheduler.snapshot().failures).toEqual([]);
       expect(shared.snapshot().usedTokens).toBe(settlement === "release" ? 25 : 50);
@@ -285,6 +362,7 @@ describe("TetoLaneScheduler", () => {
     let recovered: TetoLaneScheduler | undefined;
     try {
       scheduler.observeMainEvent(mainEvent);
+      scheduler.enqueue(mainBoundary([]));
       await vi.waitFor(() => expect(model.callCount).toBe(1));
       const sources: AnyEvent[] = [mainEvent];
       for (let index = 0; index < 6; index += 1) {
@@ -297,8 +375,10 @@ describe("TetoLaneScheduler", () => {
         });
         scheduler.observeMainEvent(event);
         sources.push(event);
+        scheduler.enqueue(mainBoundary([]));
       }
       release();
+      scheduler.enqueue(mainBoundary([]));
       await scheduler.drain();
       expect(model.callCount).toBe(2);
       const facts = observedMessages(model.requests[1]!);
@@ -403,20 +483,16 @@ describe("TetoLaneScheduler", () => {
     expect(request.systemPrompt).toContain(`your owner's A2A target is ${JSON.stringify(ownerAddress)}`);
     expect(request.systemPrompt).toContain("drift from the user's intent or constraints");
     expect(request.systemPrompt).toContain("materially better approach");
-    expect(request.systemPrompt).toContain("only for a new, concrete finding");
-    expect(request.systemPrompt).toContain("Keep routine observations in your own transcript");
-    expect(request.systemPrompt).toContain("Otherwise finish with NO_UPDATE and no tool calls");
+    expect(request.systemPrompt).toContain("only for a new finding");
+    expect(request.systemPrompt).toContain("Keep routine observations private");
+    expect(request.systemPrompt).toContain("Otherwise output NO_UPDATE with no tool calls");
     expect(request.systemPrompt).toContain("to answer a direct A2A request");
     expect(request.messages[0]?.content).not.toBe(content);
     expect(observationBody(request.messages[0]!.content)).toMatchObject({
       type: "lane.observation", source: { laneId: ownerAddress, eventId: event.eventId, eventType: "user.message" }, content,
     });
-    const objective = request.messages.at(-1)!;
-    expect(objective.role).toBe("user");
-    expect(objective.content).toContain("Current Turn objective");
-    expect(objective.content).toContain("plain assistant text with no tool calls");
-    expect(objective.content).toContain("direct A2A request");
-    expect(objective.content).not.toContain(content);
+    // Observer instructions must not appear as a fabricated request to reply.
+    expect(request.messages.every((message) => message.content.startsWith("Observed lane event"))).toBe(true);
     await scheduler.stop();
   });
 
@@ -468,7 +544,7 @@ describe("TetoLaneScheduler", () => {
     await recovered.stop();
   });
 
-  it("projects only the public Main surface and omits tool results", async () => {
+  it("projects public Main intent and bounded tool terminal status", async () => {
     const store = new MemoryContentAddressedStore();
     const userRef = await store.put(JSON.stringify({
       role: "user",
@@ -541,7 +617,7 @@ describe("TetoLaneScheduler", () => {
     expect(isMainPublicEvent(userEvent)).toBe(true);
     expect(isMainPublicEvent(assistantEvent)).toBe(true);
     expect(isMainPublicEvent(toolRequested)).toBe(true);
-    expect(isMainPublicEvent(terminal)).toBe(false);
+    expect(isMainPublicEvent(terminal)).toBe(true);
 
     const projected = await projectMainPublicEvent(store, assistantEvent);
     expect(projected?.message.content).toContain("I will inspect the entry point");
@@ -552,6 +628,10 @@ describe("TetoLaneScheduler", () => {
     const requestedProjection = await projectMainPublicEvent(store, toolRequested);
     expect(observationBody(requestedProjection!.message.content).content).toContain('"src/app.ts"');
     expect(requestedProjection?.message.content).not.toContain("PRIVATE TOOL RESULT");
+
+    const terminalProjection = await projectMainPublicEvent(store, terminal);
+    expect(observationBody(terminalProjection!.message.content).content).toContain("Tool read_file succeeded");
+    expect(terminalProjection!.message.content).not.toContain("PRIVATE TOOL RESULT");
   });
 
   it("keeps one transcript, deduplicates tool intent, and speaks through message.inform", async () => {
@@ -639,7 +719,6 @@ describe("TetoLaneScheduler", () => {
     expect(model.requests[0]?.messages.map((message) => message.content)).toEqual([
       expect.stringContaining("Build the app"),
       expect.stringContaining("I found the entry point"),
-      expect.stringContaining("Current Turn objective"),
     ]);
     expect(model.requests[0]?.messages.map((message) => message.content).join("\n"))
       .not.toContain("PRIVATE TOOL RESULT");
@@ -679,8 +758,8 @@ describe("TetoLaneScheduler", () => {
     await scheduler.drain();
     expect(model.callCount).toBe(2);
     const thirdRequestContents = model.requests[1]?.messages.map((message) => message.content) ?? [];
-    expect(thirdRequestContents).toHaveLength(6);
-    expect(thirdRequestContents.filter((content) => content.startsWith("Current Turn objective"))).toHaveLength(1);
+    expect(thirdRequestContents).toHaveLength(5);
+    expect(thirdRequestContents.filter((content) => content.startsWith("Current Turn objective"))).toHaveLength(0);
     expect(thirdRequestContents).toEqual(expect.arrayContaining([
       expect.stringContaining("Build the app"),
       expect.stringContaining("I found the entry point"),
@@ -861,7 +940,7 @@ describe("TetoLaneScheduler", () => {
       && event.payload.sourceEventId === userEvent.eventId
     ))).toHaveLength(1);
     expect(recoveringModel.requests[0]?.messages.map((message) => message.content))
-      .toEqual([expect.stringContaining("Build the app"), expect.stringContaining("Current Turn objective")]);
+      .toEqual([expect.stringContaining("Build the app")]);
   });
 
   it("recovers tool-intent deduplication when the request event follows a completed activation", async () => {

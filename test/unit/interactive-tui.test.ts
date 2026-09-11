@@ -1005,7 +1005,7 @@ describe("interactive TUI", () => {
       releaseTeto();
       await vi.waitFor(() => {
         expect(tetoEvents.filter((event) => event.type === "step.completed"), laneDiagnostics())
-          .toHaveLength(2);
+          .toHaveLength(1);
       }, { timeout: 5_000, interval: 10 });
 
       const visible = normalizeTerminalOutput(terminal.output);

@@ -120,9 +120,11 @@ and `teto_start` controls. A Team member may start its own Teto for its assigned
 task.
 
 Teto receives bounded public projections of subscribed `user.message`,
-`assistant.message`, and `tool.requested` events. These reveal part of the owner's
-activity, not the owner's complete context or every action. Its prompt assigns
-two core tasks:
+`assistant.message`, tool requests, and bounded tool terminal states. These reveal
+part of the owner's activity, not the owner's complete context or every action.
+The scheduler releases the queued projection only after the owner's Main step
+commits, so an incoming user request cannot trigger an observation before the
+owner has had a chance to act. Its prompt assigns two core tasks:
 
 1. Notice deviations from the user's intent or constraints.
 2. Offer improvements when the current solution is inadequate or a
@@ -134,8 +136,7 @@ in its own lane transcript without sending them to the owner. Unsolicited
 the owner's next action. Teto may also answer direct A2A requests. There is no
 per-request message cap: a long task may reveal several independent problems.
 Its observer-specific message schema accepts `inform` and `request`, including
-direct replies, and rejects `progress`. Missing or truncated observations are
-not evidence that the owner skipped work. Other lanes retain generic A2A kinds.
+direct replies, and rejects `progress`. Other lanes retain generic A2A kinds.
 
 When there is nothing useful to record or suggest, the prompt asks for ordinary
 assistant text `NO_UPDATE` with no tool calls. The runtime treats that text as
@@ -144,14 +145,14 @@ assistant text is not an A2A delivery; an explicit `agent_message` call sends a
 message to the owner. The guidance does not add a host-side semantic judge of
 each suggestion's value.
 
-Each observer request ends with a separate current-turn objective: evaluate
-the observations and direct A2A requests; when no response is needed, output
-`NO_UPDATE` as plain assistant text with no tool calls. This keeps the actual
-observation task distinct from quoted owner requests and from private A2A.
+Teto's observation task belongs in its own system prompt. The runtime does not
+repeat it as a user request to evaluate or reply; owner observations remain
+labelled reference data, and direct A2A requests arrive through the mailbox.
 
-The scheduler combines already queued observations in batches of up to 32,
-preserving every source event in its transcript. It does not insert a timer or
-run an inference for every fact in an accumulated backlog. Exact repeated
+The scheduler preserves each completed Main step intact and combines any queued
+completed steps before the next inference, retaining each source event in its transcript. Tool terminal
+events carry status only; raw tool results stay outside the observer projection.
+It does not insert a timer or run an inference for every fact in an accumulated backlog. Exact repeated
 unsolicited notes are suppressed against durable A2A history, after permission
 and argument validation. Direct replies and retries of an already admitted
 operation retain the ordinary A2A contract.

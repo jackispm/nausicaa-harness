@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { A2AInbox } from "../../src/a2a/index.js";
 import type { EventSink } from "../../src/a2a/index.js";
@@ -25,6 +25,51 @@ import type { ContentAddressedStore } from "../../src/store/index.js";
 type AnyAppendEvent = { [K in EventType]: AppendEvent<K> }[EventType];
 
 describe("Worker terminal boundaries", () => {
+  it.each([
+    { field: "stopReason", invalid: { stopReason: " \t" } },
+    { field: "toolCalls", invalid: { toolCalls: undefined } },
+    { field: "usage total", invalid: { usage: { input: Number.MAX_SAFE_INTEGER, output: 1, cacheRead: 0, cacheWrite: 0 } } },
+    { field: "non-JSON arguments", invalid: { toolCalls: [
+      { id: "invalid", name: "read_file", arguments: { value: 1n } },
+    ] } },
+    { field: "non-cloneable arguments", invalid: { toolCalls: [
+      { id: "invalid", name: "read_file", arguments: { value: () => "not JSON" } },
+    ] } },
+    { field: "non-plain arguments", invalid: { toolCalls: [
+      { id: "invalid", name: "read_file", arguments: { value: new Map() } },
+    ] } },
+    { field: "id", invalid: { toolCalls: [
+      calls()[0]!, { id: " \t", name: "read_file", arguments: { index: 1 } },
+    ] } },
+    { field: "name", invalid: { toolCalls: [
+      calls()[0]!, { id: "invalid", name: " \t", arguments: { index: 1 } },
+    ] } },
+  ])("rejects invalid $field before billing, persistence, or tool execution", async ({ invalid }) => {
+    const execute = vi.fn(async () => ({ content: "read", isError: false }));
+    const store = new MemoryContentAddressedStore();
+    const writes = vi.spyOn(store, "put");
+    const runTokenBudget = new RunTokenBudget(2_000);
+    const untrusted = { ...response(calls()), content: "untrusted provider content", ...invalid };
+    const fixture = await setup({
+      model: { complete: async () => untrusted as ModelResponse },
+      tools: [readTool(execute)],
+      store,
+      runTokenBudget,
+    });
+
+    await expect(fixture.executor.runOnce()).resolves.toMatchObject({ status: "failed" });
+
+    const events = await fixture.ledger.read();
+    expect(events.filter((event) => event.type.startsWith("model.")).map((event) => event.type))
+      .toEqual(["model.requested", "model.failed"]);
+    expect(events.some((event) => event.type === "budget.charged"
+      || event.type === "assistant.message" || event.type.startsWith("tool."))).toBe(false);
+    expect(writes.mock.calls.some(([data]) => typeof data === "string"
+      && data.includes("untrusted provider content"))).toBe(false);
+    expect(runTokenBudget.snapshot()).toMatchObject({ usedTokens: 0, reservedTokens: 0 });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it.each([
     { concurrencySafe: false },
     { concurrencySafe: true, maxConcurrency: 1 },

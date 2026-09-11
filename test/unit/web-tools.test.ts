@@ -230,6 +230,41 @@ describe("web tools", () => {
     })).rejects.toMatchObject({ code: "WEB_REDIRECT_BLOCKED" });
   });
 
+  it("keeps one total timeout across same-origin redirect hops", async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    try {
+      const signals: AbortSignal[] = [];
+      const fetch = vi.fn<WebFetchFunction>((_input, init) => new Promise((resolve, reject) => {
+        const signal = init!.signal!;
+        signals.push(signal);
+        const hop = signals.length;
+        const timer = setTimeout(() => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(hop === 1 ? response("", { status: 302, headers: { location: "/slow" } }) : response("done"));
+        }, 60);
+        const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }));
+      const provider = new HttpWebFetchProvider({ fetch, limits: { timeoutMs: 100 } });
+      let outcome: unknown;
+      void provider.fetch({ url: "https://example.test/start" }, controller.signal)
+        .then((result) => { outcome = result; }, (error: unknown) => { outcome = error; });
+
+      await vi.advanceTimersByTimeAsync(60);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(39);
+      expect(outcome).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(outcome).toMatchObject({ code: "WEB_TIMEOUT" });
+      expect(signals[1]?.aborted).toBe(true);
+    } finally {
+      controller.abort();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("returns structured cancellation and unsupported-content errors", async () => {
     const unsupported = new HttpWebFetchProvider({
       fetch: async () => response("binary", { headers: { "content-type": "application/octet-stream" } }),

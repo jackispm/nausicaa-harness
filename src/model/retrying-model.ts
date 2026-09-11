@@ -156,12 +156,10 @@ export class RetryingModelPort implements ModelPort {
           // after abort. Treat any late event as cancellation and discard it.
           if (request.signal?.aborted) {
             terminalError = abortError(request.signal);
-            void closeIterator(iterator);
             break;
           }
           if (event.type === "error") {
             terminalError = event.error;
-            void closeIterator(iterator);
             break;
           }
 
@@ -184,6 +182,8 @@ export class RetryingModelPort implements ModelPort {
         }
       } catch (error: unknown) {
         terminalError = asError(error);
+      } finally {
+        // Also release the provider when a consumer stops at a yielded event.
         void closeIterator(iterator);
       }
 

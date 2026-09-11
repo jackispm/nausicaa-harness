@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { EventPayloadMap, EventType } from "../../src/domain/events.js";
-import type { AgentTool, ModelResponse } from "../../src/domain/ports.js";
+import type { AgentTool, ModelPort, ModelResponse, ModelStreamEvent } from "../../src/domain/ports.js";
 import type { ArtifactRef, ConversationMessage } from "../../src/domain/types.js";
 import { ContentStoreFukaiSource, FukaiContextProvider } from "../../src/fukai/index.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
@@ -19,6 +19,7 @@ import {
   recoverRun,
 } from "../../src/runtime/recovery.js";
 import { pendingToolOperations } from "../../src/runtime/tool-operation-recovery.js";
+import { RunTokenBudget } from "../../src/runtime/run-token-budget.js";
 import { MemoryContentAddressedStore } from "../../src/store/index.js";
 
 describe("Main completion admission", () => {
@@ -101,6 +102,86 @@ describe("Main completion admission", () => {
       signal: controller.signal,
     })).rejects.toBe(cancellation);
     expect((await fixture.ledger.read()).some((event) => event.type === "run.completed")).toBe(false);
+  });
+});
+
+describe("Main provider response admission", () => {
+  it.each([
+    { field: "stopReason", invalid: { stopReason: " \t" } },
+    { field: "toolCalls", invalid: { toolCalls: undefined } },
+    { field: "usage total", invalid: { usage: { input: Number.MAX_SAFE_INTEGER, output: 1, cacheRead: 0, cacheWrite: 0 } } },
+    { field: "non-JSON arguments", invalid: { toolCalls: [
+      { id: "invalid", name: "read_file", arguments: { value: 1n } },
+    ] } },
+    { field: "non-cloneable arguments", invalid: { toolCalls: [
+      { id: "invalid", name: "read_file", arguments: { value: () => "not JSON" } },
+    ] } },
+    { field: "non-plain arguments", invalid: { toolCalls: [
+      { id: "invalid", name: "read_file", arguments: { value: new Map() } },
+    ] } },
+    { field: "id", invalid: { toolCalls: [
+      { id: "valid", name: "read_file", arguments: {} },
+      { id: " \t", name: "read_file", arguments: {} },
+    ] } },
+    { field: "name", invalid: { toolCalls: [
+      { id: "valid", name: "read_file", arguments: {} },
+      { id: "invalid", name: " \t", arguments: {} },
+    ] } },
+  ])("rejects invalid $field before billing, persistence, or tool execution", async ({ invalid }) => {
+    const execute = vi.fn(async () => ({ content: "read", isError: false }));
+    const runTokenBudget = new RunTokenBudget(100_000);
+    const untrusted = { ...response("untrusted provider content", ["read_file"]), ...invalid };
+    const model: ModelPort = { complete: async () => untrusted as ModelResponse };
+    const fixture = setup([], { model, runTokenBudget, tools: [tool("read_file", execute)] });
+    const writes = vi.spyOn(fixture.store, "put");
+
+    await expect(fixture.loop.run(input("invalid-response"))).rejects.toThrow();
+
+    const events = await fixture.ledger.read();
+    expect(events.filter((event) => event.type.startsWith("model.")).map((event) => event.type))
+      .toEqual(["model.requested", "model.failed"]);
+    expect(events.some((event) => event.type === "budget.charged"
+      || event.type === "assistant.message" || event.type.startsWith("tool."))).toBe(false);
+    expect(writes.mock.calls.some(([data]) => typeof data === "string"
+      && data.includes("untrusted provider content"))).toBe(false);
+    expect(runTokenBudget.snapshot()).toMatchObject({ usedTokens: 0, reservedTokens: 0 });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { type: "unexpected-provider-event", delta: "invalid stream text" },
+    { type: "done", response: { ...response("untrusted provider content", ["read_file"]), toolCalls: undefined } },
+  ])("records model.failed for a malformed stream envelope ($type)", async (invalid) => {
+    const execute = vi.fn(async () => ({ content: "read", isError: false }));
+    let closed = false;
+    const model: ModelPort = {
+      complete: vi.fn(async () => response("complete must not be selected")),
+      async *stream() {
+        try {
+          yield { type: "text-delta", delta: "partial stream" };
+          yield invalid as unknown as ModelStreamEvent;
+          yield { type: "done", response: response("must not reach completion", ["read_file"]) };
+        } finally {
+          closed = true;
+        }
+      },
+    };
+    const fixture = setup([], { model, tools: [tool("read_file", execute)], onStreamEvent: () => {} });
+    const writes = vi.spyOn(fixture.store, "put");
+
+    await expect(fixture.loop.run(input("invalid-stream"))).rejects.toThrow();
+
+    expect(model.complete).not.toHaveBeenCalled();
+    const events = await fixture.ledger.read();
+    expect(events.filter((event) => event.type.startsWith("model.")).map((event) => event.type))
+      .toEqual(["model.requested", "model.failed"]);
+    expect(events.some((event) => event.type === "budget.charged"
+      || event.type === "assistant.message" || event.type.startsWith("tool."))).toBe(false);
+    expect(writes.mock.calls.some(([data]) => typeof data === "string"
+      && data.includes("untrusted provider content"))).toBe(false);
+    expect(execute).not.toHaveBeenCalled();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(closed).toBe(true);
   });
 });
 

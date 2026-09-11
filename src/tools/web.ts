@@ -167,8 +167,13 @@ export class HttpWebFetchProvider implements WebFetchProvider {
     if (signal?.aborted) throw new WebToolError("WEB_ABORTED", "Web fetch was aborted");
     let current = validateWebUrl(request.url, this.limits.maxUrlLength);
     let redirects = 0;
+    const deadline = Date.now() + this.limits.timeoutMs;
     for (;;) {
-      const attempt = timeoutSignal(signal, this.limits.timeoutMs);
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new WebToolError("WEB_TIMEOUT", `Web fetch timed out after ${this.limits.timeoutMs}ms`);
+      }
+      const attempt = timeoutSignal(signal, remainingMs);
       try {
         const response = await this.fetchImpl(current, {
           method: "GET",

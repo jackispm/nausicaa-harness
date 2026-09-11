@@ -328,7 +328,7 @@ export function createTetoCapabilityManifest(
     {
       name: "observe-owner-public-events",
       kind: "observation",
-      description: "Observes subscribed portions of its owner's user messages, outputs, and tool requests.",
+      description: "Observes completed-step projections of its owner's messages, tool requests, and bounded tool terminal states.",
     },
     {
       name: "advise-owner",

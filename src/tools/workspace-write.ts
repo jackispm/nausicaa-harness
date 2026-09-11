@@ -58,6 +58,7 @@ export async function writeResolvedWorkspaceFile(
     await revalidateWorkspaceParent(resolved);
     assertSameFile(temporaryStat, await lstat(temporaryPath));
     await revalidateWorkspaceWritePath(resolved);
+    throwIfAborted(signal);
     await rename(temporaryPath, resolved.absolute);
     temporaryStat = undefined;
     await revalidateWorkspaceParent(resolved);

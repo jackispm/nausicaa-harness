@@ -800,19 +800,35 @@ function laneUsage(
 }
 
 function totalTokens(usage: { input: number; output: number; cacheRead: number; cacheWrite: number }): number {
-  return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+  return safeUsageAdd(
+    safeUsageAdd(usage.input, usage.output, "model tokens"),
+    safeUsageAdd(usage.cacheRead, usage.cacheWrite, "model tokens"),
+    "model tokens",
+  );
 }
 
 function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
   return {
-    input: left.input + right.input,
-    output: left.output + right.output,
-    cacheRead: left.cacheRead + right.cacheRead,
-    cacheWrite: left.cacheWrite + right.cacheWrite,
+    input: safeUsageAdd(left.input, right.input, "input tokens"),
+    output: safeUsageAdd(left.output, right.output, "output tokens"),
+    cacheRead: safeUsageAdd(left.cacheRead, right.cacheRead, "cache-read tokens"),
+    cacheWrite: safeUsageAdd(left.cacheWrite, right.cacheWrite, "cache-write tokens"),
     ...(left.costUsd === undefined && right.costUsd === undefined ? {} : {
-      costUsd: (left.costUsd ?? 0) + (right.costUsd ?? 0),
+      costUsd: safeCostAdd(left.costUsd ?? 0, right.costUsd ?? 0),
     }),
   };
+}
+
+function safeUsageAdd(left: number, right: number, label: string): number {
+  const result = left + right;
+  if (!Number.isSafeInteger(result)) throw new Error(`${label} exceed the safe integer range`);
+  return result;
+}
+
+function safeCostAdd(left: number, right: number): number {
+  const result = left + right;
+  if (!Number.isFinite(result)) throw new Error("model cost exceeds the finite number range");
+  return result;
 }
 
 function highestLaneStep(

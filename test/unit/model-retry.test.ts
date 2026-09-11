@@ -255,6 +255,66 @@ describe("RetryingModelPort", () => {
     ]);
   });
 
+  it.each(["return", "throw"] as const)("closes the provider exactly once when a consumer calls %s after a delta", async (method) => {
+    let closeCount = 0;
+    let streamCalls = 0;
+    const delegate: ModelPort = {
+      complete: async () => response,
+      stream: () => {
+        streamCalls += 1;
+        return {
+          [Symbol.asyncIterator]: () => ({
+            next: async () => ({ done: false, value: { type: "text-delta", delta: "visible" } } as const),
+            return: async () => {
+              closeCount += 1;
+              return { done: true, value: undefined };
+            },
+          }),
+        };
+      },
+    };
+    const iterator = retrying(delegate).stream!(request())[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toMatchObject({ value: { type: "text-delta" } });
+    await iterator[method]?.(new Error("consumer rejected output"));
+    await iterator.return?.();
+
+    expect(closeCount).toBe(1);
+    expect(streamCalls).toBe(1);
+  });
+
+  it("closes each failed and successful stream attempt once without changing retry results", async () => {
+    const failure = new ProviderModelError({ category: "network", retryable: true });
+    const closed: number[] = [];
+    let attempts = 0;
+    const delegate: ModelPort = {
+      complete: async () => response,
+      stream: () => {
+        const attempt = ++attempts;
+        return {
+          [Symbol.asyncIterator]: () => ({
+            next: async () => ({
+              done: false,
+              value: attempt === 1
+                ? { type: "error", error: failure }
+                : { type: "done", response },
+            } as IteratorResult<ModelStreamEvent>),
+            return: async () => {
+              closed.push(attempt);
+              return { done: true, value: undefined };
+            },
+          }),
+        };
+      },
+    };
+
+    const events = await collect(retrying(delegate).stream!(request()));
+
+    expect(events).toEqual([{ type: "done", response }]);
+    expect(attempts).toBe(2);
+    expect(closed).toEqual([1, 2]);
+  });
+
   it.each(["text-delta", "thinking-delta"] as const)(
     "does not retry a stream after publishing a %s",
     async (deltaType) => {

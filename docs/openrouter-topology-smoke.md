@@ -50,7 +50,7 @@ when any selected case fails or is skipped.
 | `team-peer-reducer` | Members exchange checkout facts; optional reducer synthesizes | Correct numeric evidence sent after file reads and consumed in both directions, successful members, ordered reduction lifecycle, read-only reducer tools, Main acceptance |
 | `resume-fork` | Recall an unpredictable identifier after reopening, then modify the total in a fork | Current turns complete, inherited context, durable fork lineage, unchanged parent Ledger |
 | `teto` | Main opens an observer, requests a shipping reminder, reports amounts back | Labelled public observations, actual messaging tools, both directions consumed and visible in the hydrated transcript, no duplicate messages or self-addressed sends, token round trip |
-| `teto-restraint` | Feed the production observer fixed greetings, routine reads, intent drift and a direct A2A question | Silence on routine observations, a concrete warning on an unauthorized write plan, correctly associated direct reply, durable source projections present in model context |
+| `teto-restraint` | Feed the production observer fixed greetings, routine reads, completed team closure, intent drift and a direct A2A question | No inference before the owner step ends; silence on routine observations and completed closure, a concrete warning on an unauthorized write plan, correctly associated direct reply, durable projections in model context |
 | `teto-flight-replay` | Replay five public observation phases from the reported flight-game session with sanitized paths and IDs | Silence without failed tool attempts during the first three routine phases; later Team-phase messages retained for human review; real observer inference and source projection |
 | `team-cancel` | Main creates then cancels a reader Team | Durable cancellation and cancelled task outcome, no later success |
 
@@ -68,6 +68,11 @@ The Teto token check proves that a token-bearing observer message was consumed
 and the token appeared in Main's answer. It does not prove that Main adopted a
 suggestion: even a negative acknowledgement may mention the token. Inspect the
 transcript separately before claiming useful observer intervention.
+
+The fixed Teto probes emit owner step boundaries. They verify that even an
+explicit drain cannot trigger inference during an open owner step, then drain
+the completed observation before advancing. The `team_close` success is a
+synthetic tool outcome; it tests observer restraint without changing a real Team.
 
 Cancellation can interrupt a paid call without final usage. The meter then
 disables further paid calls, which can also prevent Main's cancellation answer.
@@ -284,6 +289,22 @@ budgets, and empty reducer summaries. Those probes used the old per-task control
 As of 0.1.4, live prompts use the same compact tool contract as production, with
 no per-task budget arguments. The smoke's outer cost/request guards remain
 test-only controls.
+
+## Completed-step observer validation (0.1.8)
+
+The production Teto scheduler and prompt passed `teto-restraint` and
+`teto-flight-replay` with `openrouter:deepseek/deepseek-v4-pro-0813` on
+2026-09-11. Both cases passed 27 checks. Greetings, normal reads, completed
+Team closure, and all five flight phases sent no A2A; the explicit read-only
+violation produced one warning, and a direct question received one linked reply.
+The ten real provider requests reported $0.0163353476 total cost.
+
+Evidence is retained in
+`.local/live-topology/2026-09-11T01-45-13-611Z-o26G4P/report.json` and `calls.json`.
+The owner observations are fixtures, not a new flight-game execution. This
+tests actual observer inference and transport on those inputs, not a guarantee
+of silence or advice quality for every model and task. The runtime guarantees
+the completed-step boundary; the model still decides whether advice is useful.
 
 The earlier September 7-8 peer/reducer probe completed reduction and Main acceptance with the correct
 total, but remains failed overall: one model used `grand_total` instead of the

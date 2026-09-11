@@ -767,7 +767,7 @@ describe("WorkerTaskExecutor", () => {
     ))).toBe(true);
   });
 
-  it("charges valid provider usage before rejecting malformed tool calls", async () => {
+  it("rejects malformed tool calls before billing or persistence", async () => {
     const runTokenBudget = new RunTokenBudget(600);
     const model = new ScriptedModel([{
       content: "invalid duplicate calls",
@@ -788,15 +788,15 @@ describe("WorkerTaskExecutor", () => {
 
     await expect(executor.runOnce()).resolves.toMatchObject({
       status: "failed",
-      reason: expect.stringContaining("Duplicate Worker tool call id"),
+      reason: expect.stringContaining("Duplicate tool call id"),
     });
     expect(runTokenBudget.snapshot()).toMatchObject({
-      usedTokens: 35,
+      usedTokens: 0,
       reservedTokens: 0,
-      availableTokens: 565,
+      availableTokens: 600,
     });
     const events = await ledger.read({ runId: "run-1" });
-    expect(events.filter((event) => event.type === "budget.charged")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "budget.charged")).toHaveLength(0);
     expect(events.filter((event) => event.type === "model.failed")).toHaveLength(1);
     expect(events.filter((event) => event.type === "model.completed")).toHaveLength(0);
     expect(events.filter((event) => event.type === "tool.requested")).toHaveLength(0);

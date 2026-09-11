@@ -45,8 +45,7 @@ describe("Teto host activation recovery", () => {
       try {
         const initialObserver = observer();
         await run(new ScriptedModel([
-          async () => {
-            await initialObserver.started;
+          () => {
             return toolCall("initial-status", "teto_status");
           },
           (request) => {
@@ -58,7 +57,9 @@ describe("Teto host activation recovery", () => {
             return { ...response("Pause at a resumable boundary"), stopReason: "length" };
           },
         ]), initialObserver.model, false);
-        expect(initialObserver.requests.length).toBeGreaterThan(0);
+        // The first Main activation opens and closes Teto before a completed
+        // step can be handed off, so no observation request is expected.
+        expect(initialObserver.requests).toHaveLength(0);
         const before = await readEvents(options.dataDir, runId);
         expect(controls(before)).toEqual(["start", "stop"]);
         expect(before.find((event) => event.type === "run.created")?.payload)
@@ -75,9 +76,8 @@ describe("Teto host activation recovery", () => {
             expect(resumedObserver.requests).toHaveLength(0);
             return toolCall("restart-observer", "teto_start");
           },
-          async (request) => {
+          (request) => {
             expectToolResult(request, "restart-observer", { active: true, changed: true });
-            await resumedObserver.started;
             return response("Teto restarted explicitly");
           },
         ]), resumedObserver.model, true);

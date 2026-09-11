@@ -8,6 +8,7 @@ import type {
   ToolResult,
 } from "../domain/ports.js";
 import type { ConversationMessage, TokenUsage, ToolCall } from "../domain/types.js";
+import { validateModelResponse, validateModelStreamEvent } from "./model-response-validation.js";
 
 /** Default bound for a standalone kernel invocation. */
 export const DEFAULT_L0_MAX_STEPS = 16;
@@ -145,7 +146,6 @@ export class L0AgentLoop {
       throwIfAborted(input.signal);
 
       steps += 1;
-      validateModelResponse(response);
       usage = addUsage(usage, response.usage);
       finalText = response.content;
       stopReason = response.stopReason;
@@ -205,7 +205,9 @@ export class L0AgentLoop {
   private async requestModel(request: ModelRequest, step: number): Promise<ModelResponse> {
     throwIfAborted(request.signal);
     if (this.model.stream === undefined) {
-      return raceAbort(this.model.complete(request), request.signal);
+      const response = await raceAbort(this.model.complete(request), request.signal);
+      validateL0ModelResponse(response);
+      return response;
     }
 
     const stream = this.model.stream(request);
@@ -216,6 +218,7 @@ export class L0AgentLoop {
         const next = await raceAbort(iterator.next(), request.signal);
         if (next.done) break;
         const event = next.value;
+        validateL0ModelStreamEvent(event);
         this.emit({ type: "model.stream", step, event: cloneStreamEvent(event) });
         try {
           // Keep observers from mutating the provider event consumed below.
@@ -240,6 +243,7 @@ export class L0AgentLoop {
     if (response === undefined) {
       throw new L0ProtocolError("Model stream ended without a final response");
     }
+    validateL0ModelResponse(response);
     return response;
   }
 
@@ -396,35 +400,20 @@ function validateInput(input: L0AgentLoopInput): void {
   }
 }
 
-function validateToolCalls(calls: readonly ToolCall[]): void {
-  const ids = new Set<string>();
-  for (const call of calls) {
-    if (call.id.trim().length === 0 || call.name.trim().length === 0) {
-      throw new L0ProtocolError("Tool calls require non-empty id and name");
-    }
-    if (call.arguments === null || typeof call.arguments !== "object" || Array.isArray(call.arguments)) {
-      throw new L0ProtocolError(`Tool call arguments must be an object: ${call.id}`);
-    }
-    if (ids.has(call.id)) throw new L0ProtocolError(`Duplicate tool call id: ${call.id}`);
-    ids.add(call.id);
+function validateL0ModelResponse(value: unknown): asserts value is ModelResponse {
+  try {
+    validateModelResponse(value);
+  } catch (error: unknown) {
+    throw new L0ProtocolError(errorMessage(error));
   }
 }
 
-function validateModelResponse(response: ModelResponse): void {
-  if (typeof response.content !== "string") {
-    throw new L0ProtocolError("Model response content must be a string");
+function validateL0ModelStreamEvent(value: unknown): asserts value is ModelStreamEvent {
+  try {
+    validateModelStreamEvent(value);
+  } catch (error: unknown) {
+    throw new L0ProtocolError(errorMessage(error));
   }
-  if (typeof response.stopReason !== "string" || response.stopReason.length === 0) {
-    throw new L0ProtocolError("Model response stopReason must be a non-empty string");
-  }
-  if (!Array.isArray(response.toolCalls)) {
-    throw new L0ProtocolError("Model response toolCalls must be an array");
-  }
-  if (response.usage === null || typeof response.usage !== "object") {
-    throw new L0ProtocolError("Model response usage must be an object");
-  }
-  validateUsage(response.usage);
-  validateToolCalls(response.toolCalls);
 }
 
 function validateArguments(definition: ToolDefinition, value: Record<string, unknown>): string | undefined {
@@ -546,28 +535,32 @@ function emptyUsage(): TokenUsage {
 
 function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
   return {
-    input: left.input + right.input,
-    output: left.output + right.output,
-    cacheRead: left.cacheRead + right.cacheRead,
-    cacheWrite: left.cacheWrite + right.cacheWrite,
-    costUsd: (left.costUsd ?? 0) + (right.costUsd ?? 0),
+    input: safeUsageAdd(left.input, right.input, "input tokens"),
+    output: safeUsageAdd(left.output, right.output, "output tokens"),
+    cacheRead: safeUsageAdd(left.cacheRead, right.cacheRead, "cache-read tokens"),
+    cacheWrite: safeUsageAdd(left.cacheWrite, right.cacheWrite, "cache-write tokens"),
+    costUsd: safeCostAdd(left.costUsd ?? 0, right.costUsd ?? 0),
   };
 }
 
 function chargedTokens(usage: TokenUsage): number {
-  return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+  return safeUsageAdd(
+    safeUsageAdd(usage.input, usage.output, "model tokens"),
+    safeUsageAdd(usage.cacheRead, usage.cacheWrite, "model tokens"),
+    "model tokens",
+  );
 }
 
-function validateUsage(usage: TokenUsage): void {
-  for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
-    if (!Number.isFinite(usage[field]) || usage[field] < 0) {
-      throw new L0ProtocolError(`Model usage.${field} must be a non-negative finite number`);
-    }
-  }
-  if (usage.costUsd !== undefined
-    && (!Number.isFinite(usage.costUsd) || usage.costUsd < 0)) {
-    throw new L0ProtocolError("Model usage.costUsd must be a non-negative finite number");
-  }
+function safeUsageAdd(left: number, right: number, label: string): number {
+  const result = left + right;
+  if (!Number.isSafeInteger(result)) throw new L0ProtocolError(`${label} exceed the safe integer range`);
+  return result;
+}
+
+function safeCostAdd(left: number, right: number): number {
+  const result = left + right;
+  if (!Number.isFinite(result)) throw new L0ProtocolError("model cost exceeds the finite number range");
+  return result;
 }
 
 function errorMessage(error: unknown): string {

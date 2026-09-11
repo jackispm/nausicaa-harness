@@ -33,6 +33,15 @@ execution state. A session heartbeat proves host presence, not new progress on
 every lane. Main's task summary follows Main's Turn lifecycle, not an auxiliary
 lane's later legacy Turn events. Historical checkpoint serialization is unchanged.
 
+An active Teto observes Main in completed-step order. User messages, assistant
+outputs, tool requests, and bounded tool terminal states are queued while a Main
+step is running; the queue is released when `step.completed` or `step.failed`
+is durable. Completed steps stay intact and queued completed steps are coalesced
+before the next inference. Teto never blocks Main, and a user message alone
+does not start an observation. A one-shot host gives a released batch a short
+dispatch handoff before closing the auxiliary lane; it does not wait for a slow
+Teto response. Raw tool results remain outside the projection.
+
 `/list-agents` displays a point-in-time snapshot with a timestamp. Each session
 also displays its loaded build ID, or `unknown` for older/source-mode hosts.
 The build pipeline hashes emitted JavaScript and dependency metadata into a

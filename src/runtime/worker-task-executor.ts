@@ -55,6 +55,7 @@ import {
   MAX_WORKER_TOOL_RESULT_BYTES,
   WorkerToolExecutor,
 } from "./worker-tool-executor.js";
+import { validateModelResponse } from "./model-response-validation.js";
 
 export { WorkerTaskExecutorError, WorkerTaskTimeoutError } from "./worker-task-errors.js";
 
@@ -628,7 +629,7 @@ export class WorkerTaskExecutor {
           }
 
           try {
-            validateUsage(response.usage);
+            validateModelResponse(response);
           } catch (error: unknown) {
             this.runTokenBudget?.cancel(runReservationId);
             const reason = persistedErrorText(error, "Worker model usage was invalid");
@@ -665,27 +666,6 @@ export class WorkerTaskExecutor {
           } catch (error: unknown) {
             this.runTokenBudget?.cancel(runReservationId);
             const reason = persistedErrorText(error, "Worker model usage could not be admitted");
-            const retryable = isRetryable(error);
-            await this.append({
-              runId: this.runId,
-              laneId: this.laneId,
-              type: "model.failed",
-              payload: { model: this.modelName, error: reason, retryable },
-              correlationId: request.correlationId,
-              idempotencyKey: `${prefix}:model:failed`,
-              visibility: request.visibility,
-              occurredAt: this.clock.now().toISOString(),
-            });
-            return {
-              kind: "failed",
-              payload: failed(task.taskId, reason, retryable, evidenceRefs),
-            };
-          }
-
-          try {
-            validateToolCalls(response.toolCalls);
-          } catch (error: unknown) {
-            const reason = persistedErrorText(error, "Worker model response was invalid");
             const retryable = isRetryable(error);
             await this.append({
               runId: this.runId,
@@ -1168,32 +1148,14 @@ function terminalResult(payload: TerminalPayload): WorkerTaskRunResult {
     : { status: "failed", taskId: payload.taskId, reason: payload.reason };
 }
 
-function validateUsage(usage: TokenUsage): void {
-  for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
-    if (!Number.isSafeInteger(usage[field]) || usage[field] < 0) {
-      throw new WorkerTaskExecutorError(`Model usage ${field} must be a non-negative integer`);
-    }
-  }
-  if (usage.costUsd !== undefined && (!Number.isFinite(usage.costUsd) || usage.costUsd < 0)) {
-    throw new WorkerTaskExecutorError("Model usage costUsd must be non-negative");
-  }
-}
-
 function totalTokens(usage: TokenUsage): number {
-  return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
-}
-
-function validateToolCalls(calls: readonly ToolCall[]): void {
-  const ids = new Set<string>();
-  for (const call of calls) {
-    if (!isToolCall(call)) {
-      throw new WorkerTaskExecutorError("Worker tool calls must have valid ids, names, and arguments");
-    }
-    if (ids.has(call.id)) {
-      throw new WorkerTaskExecutorError(`Duplicate Worker tool call id: ${call.id}`);
-    }
-    ids.add(call.id);
+  const first = usage.input + usage.output;
+  const second = usage.cacheRead + usage.cacheWrite;
+  const total = first + second;
+  if (!Number.isSafeInteger(first) || !Number.isSafeInteger(second) || !Number.isSafeInteger(total)) {
+    throw new WorkerTaskExecutorError("Model usage exceeds the safe integer range");
   }
+  return total;
 }
 
 function estimateWorkerInputTokens(
@@ -1292,14 +1254,26 @@ function emptyExecutionState(): WorkerExecutionState {
 
 function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
   return {
-    input: left.input + right.input,
-    output: left.output + right.output,
-    cacheRead: left.cacheRead + right.cacheRead,
-    cacheWrite: left.cacheWrite + right.cacheWrite,
+    input: safeUsageAdd(left.input, right.input, "input tokens"),
+    output: safeUsageAdd(left.output, right.output, "output tokens"),
+    cacheRead: safeUsageAdd(left.cacheRead, right.cacheRead, "cache-read tokens"),
+    cacheWrite: safeUsageAdd(left.cacheWrite, right.cacheWrite, "cache-write tokens"),
     ...(left.costUsd === undefined && right.costUsd === undefined
       ? {}
-      : { costUsd: (left.costUsd ?? 0) + (right.costUsd ?? 0) }),
+      : { costUsd: safeCostAdd(left.costUsd ?? 0, right.costUsd ?? 0) }),
   };
+}
+
+function safeUsageAdd(left: number, right: number, label: string): number {
+  const result = left + right;
+  if (!Number.isSafeInteger(result)) throw new WorkerTaskExecutorError(`${label} exceed the safe integer range`);
+  return result;
+}
+
+function safeCostAdd(left: number, right: number): number {
+  const result = left + right;
+  if (!Number.isFinite(result)) throw new WorkerTaskExecutorError("model cost exceeds the finite number range");
+  return result;
 }
 
 function cacheOutcome(usage: TokenUsage): "hit" | "write" | "hit-write" | "unknown" {
@@ -1329,12 +1303,4 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
-}
-
-function isToolCall(value: unknown): boolean {
-  return isRecord(value)
-    && typeof value.id === "string"
-    && typeof value.name === "string"
-    && isRecord(value.arguments)
-    && !Array.isArray(value.arguments);
 }

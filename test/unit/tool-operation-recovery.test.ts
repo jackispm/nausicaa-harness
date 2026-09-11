@@ -75,4 +75,18 @@ describe("pendingStartedToolRequests", () => {
       state.phase,
     ])).toEqual([["request-only", "requested"]]);
   });
+
+  it("does not hide a legacy request in a mixed lifecycle Run", () => {
+    const mixed = [
+      fact("tool.requested", "legacy"),
+      fact("tool.requested", "modern"),
+      fact("tool.admitted", "modern"),
+      fact("tool.started", "modern"),
+      fact("tool.succeeded", "modern"),
+    ];
+    expect(pendingToolOperations(mixed).map((state) => [
+      state.request.payload.operationId,
+      state.phase,
+    ])).toEqual([["legacy", "requested"]]);
+  });
 });

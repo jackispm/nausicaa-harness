@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 env:
   NODE_VERSION: "22.19.0"
@@ -38,6 +39,30 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Require successful CI for the release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          release_commit=$(git rev-parse HEAD)
+          ci_passed=false
+          for attempt in $(seq 1 80); do
+            ci_state=$(gh run list --workflow ci.yml --commit "$release_commit" \
+              --branch main --event push --limit 1 --json status,conclusion \
+              --jq '.[0] | if . == null then "missing" elif .status != "completed" then .status else .conclusion end')
+            case "$ci_state" in
+              success) ci_passed=true; break ;;
+              missing|queued|in_progress|requested|pending|waiting)
+                echo "Waiting for CI on $release_commit ($ci_state)"
+                sleep 15 ;;
+              *) echo "Release blocked by CI: $ci_state"; exit 1 ;;
+            esac
+          done
+          if [ "$ci_passed" != true ]; then
+            echo "Release blocked: no successful CI for $release_commit"
+            exit 1
+          fi
 
       - name: Verify and test release
         run: |

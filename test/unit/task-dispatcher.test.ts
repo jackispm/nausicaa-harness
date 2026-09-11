@@ -380,6 +380,49 @@ describe("TaskDispatcher", () => {
     expect(inbox.snapshot().records).toHaveLength(1);
   });
 
+  it.each([
+    { label: "another destination", runId: "run-1", to: "worker-2" },
+    { label: "another Run", runId: "run-2", to: "worker-1" },
+  ])("admits $label while a same-destination send holds capacity", async ({ runId, to }) => {
+    const inbox = new A2AInbox();
+    const first = new TaskDispatcher({ inbox, runId: "run-1", to: "worker-1", maxOutstandingTasks: 1 });
+    const sameDestination = new TaskDispatcher({ inbox, runId: "run-1", to: "unused-default", maxOutstandingTasks: 1 });
+    const independent = new TaskDispatcher({ inbox, runId, to: "unused-default", maxOutstandingTasks: 1 });
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const send = inbox.send.bind(inbox);
+    const sendSpy = vi.spyOn(inbox, "send").mockImplementation(async (message) => {
+      if (message.payload.type === "task.request" && message.payload.taskId === "first") {
+        entered.resolve();
+        await release.promise;
+      }
+      return send(message);
+    });
+    const admitted = first.dispatch({ taskId: "first", goal: baseGoal, budget: {} });
+    await entered.promise;
+    let overflowFinished = false;
+    const overflow = sameDestination.dispatch({ taskId: "overflow", goal: baseGoal, budget: {}, to: "worker-1" })
+      .then((result) => { overflowFinished = true; return result; }, (error: unknown) => { overflowFinished = true; return error; });
+    let independentResult: unknown;
+    const separate = independent.dispatch({ taskId: "independent", goal: baseGoal, budget: {}, to })
+      .then((result) => { independentResult = result; }, (error: unknown) => { independentResult = error; });
+    try {
+      await expect.poll(() => independentResult).toMatchObject({ status: "queued", taskId: "independent" });
+      expect(overflowFinished).toBe(false);
+      expect(sendSpy).toHaveBeenCalledTimes(2);
+      release.resolve();
+      await expect(admitted).resolves.toMatchObject({ status: "queued", taskId: "first" });
+      await expect(overflow).resolves.toBeInstanceOf(TaskBackpressureError);
+      expect(inbox.snapshot().records.filter((record) => (
+        record.message.runId === "run-1" && record.message.to === "worker-1"
+      ))).toHaveLength(1);
+    } finally {
+      release.resolve();
+      await Promise.allSettled([admitted, overflow, separate]);
+      sendSpy.mockRestore();
+    }
+  });
+
   it("rejects an already aborted dispatch without publishing a request", async () => {
     const inbox = new A2AInbox();
     const dispatcher = new TaskDispatcher({ inbox, runId: "run-1" });

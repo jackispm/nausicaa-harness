@@ -200,6 +200,11 @@ export class TetoLaneController implements TetoControl {
     await this.scheduler?.drain();
   }
 
+  /** Allow one-shot hosts to wait until released work reaches the provider. */
+  waitForDispatch(): Promise<boolean> {
+    return this.scheduler?.waitForDispatch() ?? Promise.resolve(false);
+  }
+
   async close(): Promise<void> {
     await this.enqueueLifecycle(async () => {
       this.closed = true;

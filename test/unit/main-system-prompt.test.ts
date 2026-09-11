@@ -7,7 +7,7 @@ describe("Nausicaa identity and collaboration guidance", () => {
     const prompt = effectiveSystemPrompt({});
     expect(prompt).toMatch(/^You are Nausicaa, a next-generation general-purpose task agent\./u);
     expect(prompt).toContain("Teto is your auxiliary observer lane");
-    expect(prompt).toContain("public messages and tool requests");
+    expect(prompt).toContain("completed steps");
     expect(prompt).toContain("advice through A2A");
     expect(prompt).toContain("starts automatically by default");
     expect(prompt).toContain("teto_stop to stop it");

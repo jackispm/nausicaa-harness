@@ -28,9 +28,11 @@ const DEFAULT_DELIVERY: DeliveryMode = "next-step";
 const DEFAULT_VISIBILITY: Visibility = "run";
 const DEFAULT_MAX_OUTSTANDING_TASKS = 8;
 const MAX_OUTSTANDING_TASKS = 64;
-// One Inbox is the single-process admission boundary. A multi-process runtime
-// must move this check into its transactional Inbox repository.
-const admissionTails = new WeakMap<A2AInbox, Promise<void>>();
+// Admission is serialized per destination lane within a Run. A slow send to
+// one lane must not delay independent Teams or Runs sharing the Inbox. A
+// multi-process runtime must move this check into its transactional Inbox
+// repository.
+const admissionTails = new WeakMap<A2AInbox, Map<string, Promise<void>>>();
 
 export interface TaskDispatcherOptions {
   inbox: A2AInbox;
@@ -163,7 +165,12 @@ export class TaskDispatcher {
     const signal = options.signal;
     signal?.throwIfAborted();
     const input = structuredClone(request);
-    return runInboxAdmission(this.inbox, () => this.dispatchCommand(input, signal));
+    const destination = input.to ?? this.defaults.to;
+    return runInboxAdmission(
+      this.inbox,
+      `${this.runId}\u0000${destination}`,
+      () => this.dispatchCommand(input, signal),
+    );
   }
 
   private async dispatchCommand(request: TaskDispatchRequest, signal?: AbortSignal): Promise<TaskDispatchResult> {
@@ -281,10 +288,24 @@ export class TaskDispatcher {
   }
 }
 
-function runInboxAdmission<T>(inbox: A2AInbox, operation: () => Promise<T>): Promise<T> {
-  const tail = admissionTails.get(inbox) ?? Promise.resolve();
+function runInboxAdmission<T>(
+  inbox: A2AInbox,
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  let tails = admissionTails.get(inbox);
+  if (tails === undefined) {
+    tails = new Map();
+    admissionTails.set(inbox, tails);
+  }
+  const tail = tails.get(key) ?? Promise.resolve();
   const result = tail.then(operation);
-  admissionTails.set(inbox, result.then(() => undefined, () => undefined));
+  const settled = result.then(() => undefined, () => undefined);
+  tails.set(key, settled);
+  void settled.then(() => {
+    if (tails?.get(key) === settled) tails.delete(key);
+    if (tails?.size === 0) admissionTails.delete(inbox);
+  });
   return result;
 }
 

@@ -17,19 +17,23 @@ export interface PendingToolOperation {
  * Reconcile tool lifecycle facts without treating the lifecycle itself as a
  * second state machine. Modern records can distinguish an admitted call from
  * an effect that crossed the adapter boundary. Legacy records only have the
- * request fact, so they remain conservatively pending when no lifecycle facts
- * exist anywhere in the replay.
+ * request fact, so they remain conservatively pending when that operation has
+ * no lifecycle facts in the replay.
  */
 export function pendingToolOperations(
   events: readonly AnyEvent[],
   runId?: string,
 ): PendingToolOperation[] {
   const states = new Map<string, PendingToolOperation>();
-  const lifecycleRuns = new Set<string>();
+  // Lifecycle support is determined per operation. A Run may contain both
+  // legacy request-only records and modern admitted/started records while an
+  // older host is being upgraded; a modern sibling must not hide a legacy
+  // operation that still needs reconciliation.
+  const lifecycleOperations = new Set<string>();
   for (const event of events) {
     if (runId !== undefined && event.runId !== runId) continue;
     if (event.type === "tool.admitted" || event.type === "tool.started") {
-      lifecycleRuns.add(event.runId);
+      lifecycleOperations.add(operationScope(event.runId, event.payload.operationId));
     }
     if (event.type === "tool.requested") {
       states.set(operationScope(event.runId, event.payload.operationId), {
@@ -63,7 +67,8 @@ export function pendingToolOperations(
   return [...states.values()].filter((state) => (
     state.unknown
     || state.phase === "started"
-    || (!lifecycleRuns.has(state.request.runId) && state.phase === "requested")
+    || (!lifecycleOperations.has(operationScope(state.request.runId, state.request.payload.operationId))
+      && state.phase === "requested")
   ));
 }
 

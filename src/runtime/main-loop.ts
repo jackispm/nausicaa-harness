@@ -91,13 +91,14 @@ import {
   RunArtifactAuthorization,
   type ArtifactReadStore,
 } from "../tools/artifact-read.js";
+import { validateModelResponse, validateModelStreamEvent } from "./model-response-validation.js";
 
 const DEFAULT_SYSTEM_PROMPT = `You are Nausicaa, a next-generation general-purpose task agent.
 Handle the current user request with the runtime-provided context and tools.
 The tools attached to this request are the complete tool-call interface; runtime results are authoritative.
 For action requests, carry out the authorized work with tools before ending the turn; a plan or promise alone is not completion. If blocked, state the concrete blocker.
 Return a grounded result when the current request is complete.`;
-const TETO_OVERVIEW = "Teto is your auxiliary observer lane: it follows your public messages and tool requests and can send advice through A2A.";
+const TETO_OVERVIEW = "Teto is your auxiliary observer lane: it reviews completed steps and can send advice through A2A.";
 
 /** Conservative per-request input ceiling for custom ports without model metadata. */
 export const UNKNOWN_MODEL_REQUEST_INPUT_FALLBACK_TOKENS = 32_768;
@@ -245,6 +246,8 @@ export interface MainLoopDeps {
   onStreamEvent?: (event: MainStreamEvent) => void;
   /** Lightweight event tap used by sibling lanes; never blocks the owner lane. */
   eventObserver?: (event: AnyEvent) => void;
+  /** Called immediately before a provider request is dispatched. */
+  modelDispatchObserver?: (request: ModelRequest) => void;
   /** Whether this lane may load workspace project instructions. */
   includeProjectInstructions?: boolean;
 }
@@ -393,6 +396,7 @@ export class MainLoop {
   private readonly approve: MainLoopDeps["approve"];
   private readonly onStreamEvent: MainLoopDeps["onStreamEvent"];
   private readonly eventObserver: MainLoopDeps["eventObserver"];
+  private readonly modelDispatchObserver: MainLoopDeps["modelDispatchObserver"];
   private readonly includeProjectInstructions: boolean;
   private readonly edgeContext: readonly FukaiEdgeContextContribution[];
   private readonly skillCatalog: FukaiSkillCatalog | undefined;
@@ -458,6 +462,7 @@ export class MainLoop {
     this.approve = deps.approve;
     this.onStreamEvent = deps.onStreamEvent;
     this.eventObserver = deps.eventObserver;
+    this.modelDispatchObserver = deps.modelDispatchObserver;
     this.includeProjectInstructions = deps.includeProjectInstructions ?? true;
     this.edgeContext = deps.edgeContext === undefined
       ? []
@@ -956,8 +961,12 @@ export class MainLoop {
             streamProgress,
             deadline.signal,
             modelCapabilities,
-            () => { providerDispatched = true; },
+            () => {
+              providerDispatched = true;
+              this.modelDispatchObserver?.({ ...modelRequest, signal: deadline.signal });
+            },
           );
+          validateModelResponse(response);
           // A provider promise and the runtime timer can settle in the same
           // turn of the event loop. Once the deadline has fired, the response
           // is no longer admissible even if the promise won the race.
@@ -1092,7 +1101,6 @@ export class MainLoop {
             : `${input.runId}:turn:${input.turnId}:step:${step}`,
         });
 
-        validateToolCalls(response.toolCalls);
         await this.emit(input, laneId, correlationId, eventState, {
           type: "model.completed",
           payload: {
@@ -1329,6 +1337,7 @@ export class MainLoop {
     throwIfAborted(input.signal);
     const preparedCalls: MoweCall[] = [];
     for (const call of calls) {
+      throwIfAborted(input.signal);
       const operationId = `op:${hashStable({
         runId: input.runId,
         turnId: input.turnId,
@@ -1341,6 +1350,7 @@ export class MainLoop {
         stableJson(call.arguments),
         TOOL_ARGUMENTS_MEDIA_TYPE,
       );
+      throwIfAborted(input.signal);
       await this.emit(input, laneId, correlationId, eventState, {
         type: "tool.requested",
         payload: {
@@ -1351,6 +1361,7 @@ export class MainLoop {
         },
         idempotencyKey: `${eventPrefix}:step:${step}:tool:${call.id}:requested`,
       });
+      throwIfAborted(input.signal);
       const callForcedError = forcedError ?? (
         requestToolNames.has(call.name)
           ? undefined
@@ -1623,6 +1634,7 @@ export class MainLoop {
           throw new Error("Model stream ended without a final response");
         }
         const event: ModelStreamEvent = next.value;
+        validateModelStreamEvent(event);
         switch (event.type) {
           case "start":
             break;
@@ -2041,42 +2053,38 @@ function validateInput(input: MainLoopInput): void {
   }
 }
 
-function validateToolCalls(calls: readonly ToolCall[]): void {
-  const ids = new Set<string>();
-  for (const call of calls) {
-    if (call.id.length === 0 || call.name.length === 0) {
-      throw new Error("Tool calls require non-empty id and name");
-    }
-    if (
-      call.arguments === null
-      || typeof call.arguments !== "object"
-      || Array.isArray(call.arguments)
-    ) {
-      throw new Error(`Tool call arguments must be an object: ${call.id}`);
-    }
-    if (ids.has(call.id)) {
-      throw new Error(`Duplicate tool call id: ${call.id}`);
-    }
-    ids.add(call.id);
-  }
-}
-
 function emptyUsage(): TokenUsage {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 };
 }
 
 function addUsage(left: TokenUsage, right: TokenUsage): TokenUsage {
   return {
-    input: left.input + right.input,
-    output: left.output + right.output,
-    cacheRead: left.cacheRead + right.cacheRead,
-    cacheWrite: left.cacheWrite + right.cacheWrite,
-    costUsd: (left.costUsd ?? 0) + (right.costUsd ?? 0),
+    input: safeUsageAdd(left.input, right.input, "input tokens"),
+    output: safeUsageAdd(left.output, right.output, "output tokens"),
+    cacheRead: safeUsageAdd(left.cacheRead, right.cacheRead, "cache-read tokens"),
+    cacheWrite: safeUsageAdd(left.cacheWrite, right.cacheWrite, "cache-write tokens"),
+    costUsd: safeCostAdd(left.costUsd ?? 0, right.costUsd ?? 0),
   };
 }
 
+function safeUsageAdd(left: number, right: number, label: string): number {
+  const result = left + right;
+  if (!Number.isSafeInteger(result)) throw new Error(`${label} exceed the safe integer range`);
+  return result;
+}
+
+function safeCostAdd(left: number, right: number): number {
+  const result = left + right;
+  if (!Number.isFinite(result)) throw new Error("model cost exceeds the finite number range");
+  return result;
+}
+
 function chargedTokens(usage: TokenUsage): number {
-  return usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+  return safeUsageAdd(
+    safeUsageAdd(usage.input, usage.output, "model tokens"),
+    safeUsageAdd(usage.cacheRead, usage.cacheWrite, "model tokens"),
+    "model tokens",
+  );
 }
 
 function providerRetryability(error: unknown): boolean | undefined {
