@@ -173,7 +173,7 @@ export function createAgentMessageTool(options: AgentMessageToolOptions): MoweAg
   const tool: AgentTool = {
     definition: {
       name: TOOL_NAME,
-      description: "Send one message to an explicitly selected parent, sibling, child, or directly reachable agent. For a normal note, use the simple `text` field (for example {target:{relationship:'direct',id:'run-id'},text:'Please inspect this repository'}). Use `payload` only for typed A2A messages: message.inform has {type:'message.inform',text:'...'}; task.request requires a structured goal object and budget object. Sender identity and permissions are fixed by the host; queued is a delivery receipt, not proof the message was handled.",
+      description: "Send one message to an explicitly selected parent, sibling, child, or directly reachable agent. For another session's Nausicaa, use its exact sessionId from agent_awareness: {target:{relationship:'direct',id:'session-id'},text:'Please inspect this repository'}. Use `payload` only for typed A2A messages: message.inform has {type:'message.inform',text:'...'}; task.request requires a structured goal object and budget object. Sender identity and permissions are fixed by the host; queued is a delivery receipt, not proof the message was handled.",
       parameters: {
         type: "object",
         properties: {
@@ -186,7 +186,10 @@ export function createAgentMessageTool(options: AgentMessageToolOptions): MoweAg
                 enum: ["parent", "sibling", "child", "direct"],
               },
               name: { type: "string", minLength: 1, maxLength: 512 },
-              id: { type: "string", minLength: 1, maxLength: 512 },
+              id: {
+                type: "string", minLength: 1, maxLength: 512,
+                description: "Exact sessionId or unique runId from the reachable roster. Prefer sessionId across sessions and copy the full value from agent_awareness; shortened TUI labels cannot be used.",
+              },
             },
             required: ["relationship"],
             additionalProperties: false,
@@ -560,6 +563,7 @@ function safeProtocolMessage(code: CrossRunProtocolErrorCode): string {
     case "idempotency-conflict":
       return "Agent message request was rejected";
     case "identity-forged":
+      return "Agent message host identity validation failed for the sender or resolved target";
     case "authorization-denied":
     case "cross-workspace-denied":
       return "Agent message authorization was denied";

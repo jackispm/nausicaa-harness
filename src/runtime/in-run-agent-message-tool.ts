@@ -296,7 +296,7 @@ export function composeAgentMessageTools(
           // Mowe's supported schema subset has no unions. Each original tool
           // still validates its complete branch before it can send anything.
           target: {
-            description: "An in-Run lane ID string, or a cross-Run selector object {relationship:'parent'|'sibling'|'child'|'direct', name?:string, id?:string}.",
+            description: "An in-Run lane ID string, or a cross-Run selector object {relationship:'parent'|'sibling'|'child'|'direct', name?:string, id?:string}. For another session's Nausicaa use {relationship:'direct',id:'exact-sessionId-from-agent_awareness'}.",
           },
         },
         additionalProperties: false,

@@ -14,6 +14,7 @@ import type {
 } from "../a2a/cross-run-contract.js";
 import {
   CrossRunProtocolError,
+  matchesCrossRunTargetId,
   sameEndpoint,
   type CrossRunAuthorizer,
   type CrossRunTargetAdmission,
@@ -282,9 +283,7 @@ function matchesSelector(
 ): boolean {
   if (selector.relationship !== entry.relationship) return false;
   if ("id" in selector && selector.id !== undefined) {
-    return selector.id === entry.endpoint.runId
-      || selector.id === entry.endpoint.sessionId
-      || selector.id === entry.endpoint.laneId;
+    return matchesCrossRunTargetId(entry.endpoint, selector.id);
   }
   if ("endpoint" in selector && selector.endpoint !== undefined) {
     return sameEndpoint(entry.endpoint, selector.endpoint);

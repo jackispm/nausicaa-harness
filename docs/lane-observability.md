@@ -11,7 +11,13 @@ Team members use their host-issued spawn identity.
 Discovery does not grant messaging permission. A string target such as `teto`
 addresses the current Run. A cross-Run selector such as
 `{ "relationship": "direct", "id": "session-id" }` addresses another reachable
-session's Main, subject to the existing router's admission and authorization.
+session's Nausicaa, subject to the existing router's admission and authorization.
+Use the exact `endpoint.sessionId` returned by `agent_awareness`; shortened TUI
+labels are not addresses. Discovery and route verification accept the same
+exact session, Run, or lane IDs. Ambiguous selectors require a more specific
+address, and a session selector does not grant cross-workspace access.
+An `identity-forged` error reports a host identity mismatch; permission denials
+use `authorization-denied`.
 Seeing a foreign Teto does not make it the caller's observer or a direct target.
 
 Live workspace observations are timestamped after disk reads, so a heartbeat

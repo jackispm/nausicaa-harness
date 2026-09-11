@@ -32,6 +32,7 @@ import {
   createCrossRunRouteId,
   endpointKey,
   envelopeToA2AMessage,
+  matchesCrossRunTargetId,
   normalizeCrossRunSendRequest,
   normalizeCrossRunFact,
   normalizeEndpoint,
@@ -656,7 +657,7 @@ export class CrossRunRouter {
       const item = selector as Exclude<CrossRunTargetSelector, { relationship: "parent" }>;
       const endpoint = "endpoint" in item ? item.endpoint : undefined;
       return (item.name === undefined || entry.name === item.name)
-        && (item.id === undefined || entry.endpoint.runId === item.id || entry.endpoint.laneId === item.id)
+        && (item.id === undefined || matchesCrossRunTargetId(entry.endpoint, item.id))
         && (endpoint === undefined || sameEndpoint(entry.endpoint, endpoint));
     });
     if (bySelector.length !== 1) {
@@ -1300,8 +1301,7 @@ function assertResolvedTargetMatchesSelector(
     );
   }
   if ("id" in selector && selector.id !== undefined
-    && target.endpoint.runId !== selector.id
-    && target.endpoint.laneId !== selector.id) {
+    && !matchesCrossRunTargetId(target.endpoint, selector.id)) {
     throw new CrossRunProtocolError(
       "resolver target id does not match the requested selector",
       "identity-forged",

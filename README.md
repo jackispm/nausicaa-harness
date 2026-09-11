@@ -64,7 +64,7 @@ TUI 的成员状态区显示正在等模型、执行的工具、等待任务，�
 或“30 分钟截止”默认值。交互会话保持打开时，主管可以先结束当前轮次；成员继续工作，
 结果返回后主管自动继续协调。关闭会话或取消任务会停止相关工作。
 
-当前版本：`0.1.8` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
+当前版本：`0.1.9` beta。核心运行时有离线测试覆盖，provider、daemon、RPC 和
 edge 集成仍在完善。
 
 ### 快速开始
@@ -245,7 +245,7 @@ session, the lead may finish its current turn while members keep working;
 durable reports automatically resume coordination. Session closure or task
 cancellation stops the corresponding work.
 
-Current version: `0.1.8` beta. Core runtime contracts have offline test coverage;
+Current version: `0.1.9` beta. Core runtime contracts have offline test coverage;
 provider, daemon, RPC, and edge integrations are still evolving.
 
 ### Quick start

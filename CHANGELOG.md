@@ -4,6 +4,15 @@ All notable changes to Nausicaa are documented here.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-11
+
+- Fix cross-session `agent_message` delivery by exact `sessionId`: discovery
+  and router identity checks now agree, preventing legitimate messages from
+  being rejected as `identity-forged`.
+- Clarify exact session addressing and distinguish host identity failures
+  from permission denials. Preserve ambiguity checks, authorization, and
+  duplicate-delivery protection.
+
 ## [0.1.8] - 2026-09-11
 
 - Make ordinary Teto observe only after a complete Main step or terminal

@@ -324,14 +324,15 @@ describe("CrossRunRouter", () => {
     await expect(queued.send(request("busy"), sender)).resolves.toMatchObject({ status: "queued" });
   });
 
-  it("denies cross-workspace routes unless the authorizer explicitly reauthenticates", async () => {
+  it.each(["runId", "sessionId"] as const)("requires cross-workspace reauthentication when addressing by %s", async (field) => {
     const remote: CrossRunEndpoint = { ...child, workspaceId: "workspace-b" };
+    const selector = { relationship: "direct" as const, id: remote[field] };
     const denied = new CrossRunRouter({
       clock: new FixedClock(),
       resolver: { resolve: async () => ({ endpoint: remote, relationship: "direct" }) },
       targetAdmission: { admit: async () => ({ status: "queued" }) },
     });
-    await expect(denied.send(request(), sender)).resolves.toMatchObject({
+    await expect(denied.send(request("denied", selector), sender)).resolves.toMatchObject({
       status: "rejected",
       reason: "cross-workspace-reauthentication-required",
     });
@@ -342,7 +343,7 @@ describe("CrossRunRouter", () => {
       authorizer: { authorize: async () => ({ allowed: true, reauthenticated: true }) },
       targetAdmission: { admit: async () => ({ status: "accepted" }) },
     });
-    await expect(allowed.send(request("remote"), sender)).resolves.toMatchObject({ status: "accepted" });
+    await expect(allowed.send(request("remote", selector), sender)).resolves.toMatchObject({ status: "accepted" });
   });
 
   it("fails closed for ArtifactRefs without a relay, even within one workspace", async () => {
@@ -408,6 +409,63 @@ describe("CrossRunRouter", () => {
     });
     await expect(ambiguous.send(request("ambiguous", { relationship: "sibling", name: "same" }), sender))
       .rejects.toMatchObject({ code: "selector-ambiguous" });
+  });
+
+  it.each([child.sessionId, child.runId, child.laneId])("verifies a resolved target selected by exact ID %s", async (id) => {
+    const admitted: CrossRunEndpoint[] = [];
+    const r = router({
+      targetAdmission: { admit: async ({ envelope }) => {
+        admitted.push(envelope.target);
+        return { status: "queued", messageId: envelope.messageId };
+      } },
+    });
+    const input = request("exact-target-id", { relationship: "direct", id });
+    await expect(r.send(input, sender)).resolves.toMatchObject({ status: "queued", target: child });
+    await expect(r.send(input, sender)).resolves.toMatchObject({ status: "duplicate", target: child });
+    expect(admitted).toEqual([child]);
+  });
+
+  it("resolves exact session IDs from a roster and rejects missing or ambiguous selectors", async () => {
+    const otherSession = { ...child, sessionId: "session-child-2" };
+    const endpoints = [child, otherSession];
+    const admitted: CrossRunEndpoint[] = [];
+    const r = new CrossRunRouter({
+      roster: { list: async () => ({
+        current: source,
+        entries: endpoints.map((endpoint) => ({
+          endpoint, relationship: "direct", status: "idle", reachable: true,
+        })),
+      }) },
+      targetAdmission: { admit: async ({ envelope }) => {
+        admitted.push(envelope.target);
+        return { status: "queued", messageId: envelope.messageId };
+      } },
+    });
+    await expect(r.send(request("shared-run", { relationship: "direct", id: child.runId }), sender))
+      .rejects.toMatchObject({ code: "selector-ambiguous" });
+    await expect(r.send(request("short-id", { relationship: "direct", id: "session-ch" }), sender))
+      .rejects.toMatchObject({ code: "target-unavailable" });
+    await expect(r.send(request("session-id", { relationship: "direct", id: otherSession.sessionId }), sender))
+      .resolves.toMatchObject({ status: "queued", target: otherSession });
+
+    endpoints.push({ ...otherSession, laneId: "reviewer" });
+    await expect(r.send(request("shared-session", { relationship: "direct", id: otherSession.sessionId }), sender))
+      .rejects.toMatchObject({ code: "selector-ambiguous" });
+    expect(admitted).toEqual([otherSession]);
+  });
+
+  it("rejects a resolver returning a different session before persisting or admitting a message", async () => {
+    const calls: string[] = [];
+    const store = new MemoryCrossRunFactStore();
+    const r = router({
+      factStore: store,
+      authorizer: { authorize: async () => { calls.push("authorize"); return { allowed: true }; } },
+      targetAdmission: { admit: async () => { calls.push("admit"); return { status: "queued" }; } },
+    });
+    await expect(r.send(request("wrong-session", { relationship: "direct", id: sibling.sessionId }), sender))
+      .rejects.toMatchObject({ code: "identity-forged" });
+    expect(calls).toEqual([]);
+    expect(await store.read({ runId: source.runId })).toEqual([]);
   });
 
   it("preserves batch order, bounds explicit broadcast, and isolates failures", async () => {

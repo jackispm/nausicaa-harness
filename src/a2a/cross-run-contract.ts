@@ -104,12 +104,14 @@ export type CrossRunTargetSelector =
   | {
       readonly relationship: "sibling" | "child";
       readonly name?: string;
+      /** Exact session, Run, or lane ID; the host must resolve a unique endpoint. */
       readonly id?: string;
     }
   | {
       readonly relationship: "direct";
       readonly endpoint?: CrossRunEndpoint;
       readonly name?: string;
+      /** Exact session, Run, or lane ID; the host must resolve a unique endpoint. */
       readonly id?: string;
     };
 
@@ -907,6 +909,11 @@ export function endpointKey(endpoint: CrossRunEndpoint): string {
 
 export function sameEndpoint(left: CrossRunEndpoint, right: CrossRunEndpoint): boolean {
   return endpointKey(left) === endpointKey(right);
+}
+
+/** Shared by discovery and route verification so accepted selectors stay valid. */
+export function matchesCrossRunTargetId(endpoint: CrossRunEndpoint, id: string): boolean {
+  return endpoint.sessionId === id || endpoint.runId === id || endpoint.laneId === id;
 }
 
 export function sameLogicalEnvelope(left: CrossRunEnvelope, right: CrossRunEnvelope): boolean {

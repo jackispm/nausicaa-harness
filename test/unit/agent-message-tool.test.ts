@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CrossRunProtocolError,
   createCrossRunMessageId,
   createCrossRunReceiptId,
   createCrossRunRouteId,
@@ -277,6 +278,24 @@ describe("agent_message tool", () => {
       diagnostic: "delivery-diagnostic-redacted",
     });
     expect(result.content).not.toContain(diagnostic);
+    expect(result.content).not.toContain(sender.proof.token);
+  });
+
+  it.each([
+    ["identity-forged", "Agent message host identity validation failed for the sender or resolved target"],
+    ["authorization-denied", "Agent message authorization was denied"],
+  ] as const)("reports %s distinctly without exposing host details", async (code, message) => {
+    const tool = createAgentMessageTool({
+      router: { send: async () => {
+        throw new CrossRunProtocolError(`private host detail ${sender.proof.token}`, code);
+      } },
+      sender,
+    });
+    const result = await tool.execute({
+      target: { relationship: "direct", id: target.sessionId }, text: "hello",
+    }, context);
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toEqual({ status: "error", error: { code, message } });
     expect(result.content).not.toContain(sender.proof.token);
   });
 });

@@ -4,6 +4,8 @@ import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
+import type { AnyEvent } from "../../src/domain/events.js";
+import { createCrossRunRuntimeTool } from "../../src/runtime/cross-run-runtime.js";
 import { createLocalCrossRunComposition } from "../../src/runtime/local-cross-run-composition.js";
 import { executeRun } from "../../src/runtime/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
@@ -156,7 +158,7 @@ describe("local CLI Cross-Run composition", () => {
     expect(targetLedger).not.toContain("must not route");
   });
 
-  it("keeps every live session in the roster and resolves by session endpoint", async () => {
+  it("keeps same-Run sessions distinct through roster lookup and message admission", async () => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-local-a2a-roster-sessions-"));
     roots.push(root);
     const dataDir = join(root, ".nausicaa");
@@ -211,14 +213,15 @@ describe("local CLI Cross-Run composition", () => {
       });
       const senderFactory = composition.sender;
       if (typeof senderFactory !== "function") throw new Error("expected sender factory");
-      const sender = await senderFactory({
+      const senderContext = {
         runId: source.runId,
         laneId: "main",
         sessionId: "source-session",
         workspace: root,
         ledger: new MemoryLedger(),
         store: new MemoryContentAddressedStore(),
-      });
+      };
+      const sender = await senderFactory(senderContext);
       const roster = await composition.routerOptions?.roster?.list(sender);
       const targetEntries = roster?.entries.filter((entry) => entry.endpoint.runId === target.runId) ?? [];
       expect(targetEntries.map((entry) => entry.endpoint.sessionId)).toEqual([
@@ -248,12 +251,49 @@ describe("local CLI Cross-Run composition", () => {
         },
         sender,
       )).resolves.toMatchObject({ endpoint: { sessionId: "target-session-b", runId: target.runId } });
+
+      const tool = await createCrossRunRuntimeTool(composition, senderContext);
+      const ledgerPath = join(target.stateDir, "ledger.jsonl");
+      const before = await readFile(ledgerPath, "utf8");
+      for (const [id, code] of [
+        [target.runId, "selector-ambiguous"],
+        ["missing-session", "target-unavailable"],
+      ] as const) {
+        const result = await tool.execute({
+          target: { relationship: "direct", id },
+          text: "must not reach either session",
+        }, { runId: source.runId, workspace: root, operationId: `invalid:${id}` });
+        expect(result.isError).toBe(true);
+        expect(JSON.parse(result.content)).toMatchObject({ error: { code } });
+      }
+      expect(await readFile(ledgerPath, "utf8")).toBe(before);
+
+      const request = {
+        target: { relationship: "direct", id: "target-session-b" },
+        text: "hello to session B",
+      };
+      const context = { runId: source.runId, workspace: root, operationId: "session-b-message" };
+      const result = await tool.execute(request, context);
+      expect(result.isError).toBe(false);
+      expect(JSON.parse(result.content)).toMatchObject({
+        status: "queued",
+        target: { sessionId: "target-session-b", runId: target.runId, laneId: "nausicaa" },
+      });
+      expect((await tool.execute(request, context)).isError).toBe(false);
+      const events = (await readFile(ledgerPath, "utf8")).trim().split("\n")
+        .map((line): AnyEvent => JSON.parse(line));
+      const messages = events.filter((event) => event.type === "message.sent");
+      expect(messages).toHaveLength(1);
+      expect(messages[0]?.payload.message).toMatchObject({
+        targetEndpoint: { sessionId: "target-session-b", runId: target.runId, laneId: "main" },
+        payload: { type: "message.inform", text: "hello to session B" },
+      });
     } finally {
       await Promise.all([sessionA.close(), sessionB.close()]);
     }
   });
 
-  it("queues through the local transport while the target Session owns its Ledger lock", async () => {
+  it.each(["runId", "sessionId"] as const)("delivers once by %s while the idle target Session owns its Ledger lock", async (selectorField) => {
     const root = await mkdtemp(join(tmpdir(), "nausicaa-local-a2a-live-"));
     roots.push(root);
     const dataDir = join(root, ".nausicaa");
@@ -287,18 +327,16 @@ describe("local CLI Cross-Run composition", () => {
       dataDir,
       model: "scripted",
       runId: target.runId,
+      sessionId: "live-target-session",
     }, {
       mainModel: targetModel,
     });
-    const received = new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("timed out waiting for live A2A message")), 4_000);
-      targetSession.subscribe((runtimeEvent) => {
-        if (runtimeEvent.kind !== "event" || runtimeEvent.event.type !== "message.sent") return;
-        if (runtimeEvent.event.payload.message.payload.type !== "message.inform") return;
-        if (runtimeEvent.event.payload.message.payload.text !== "hello while live") return;
-        clearTimeout(timeout);
-        resolve();
-      });
+    let received = 0;
+    targetSession.subscribe((runtimeEvent) => {
+      if (runtimeEvent.kind !== "event" || runtimeEvent.event.type !== "message.sent") return;
+      if (runtimeEvent.event.payload.message.payload.type !== "message.inform") return;
+      if (runtimeEvent.event.payload.message.payload.text !== "hello while live") return;
+      received += 1;
     });
 
     try {
@@ -310,7 +348,10 @@ describe("local CLI Cross-Run composition", () => {
             id: "source-live-message",
             name: "agent_message",
             arguments: {
-              target: { relationship: "direct", id: target.runId },
+              target: {
+                relationship: "direct",
+                id: selectorField === "runId" ? target.runId : "live-target-session",
+              },
               payload: { type: "message.inform", text: "hello while live" },
             },
           }],
@@ -335,9 +376,16 @@ describe("local CLI Cross-Run composition", () => {
         crossRun: createLocalCrossRunComposition({ workspace: root, dataDir }),
       });
       expect(source).toMatchObject({ completed: true, finalText: "sent" });
-      await received;
+      const receipt = sourceModel.requests[1]?.messages.findLast((message) => (
+        message.role === "tool" && message.toolName === "agent_message"
+      ));
+      expect(JSON.parse(receipt?.content ?? "null")).toMatchObject({
+        status: "queued",
+        target: { sessionId: "live-target-session", runId: target.runId, laneId: "nausicaa" },
+      });
       await waitFor(() => targetModel.callCount === 1);
       await targetSession.waitForIdle();
+      expect(received).toBe(1);
       expect(targetModel.requests).toHaveLength(1);
       expect(targetModel.requests[0]?.messages.at(-1)).toMatchObject({
         role: "user",
