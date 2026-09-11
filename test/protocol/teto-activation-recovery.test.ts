@@ -19,8 +19,8 @@ describe("Teto host activation recovery", () => {
         workspace, dataDir: join(workspace, "state"), model: "scripted-main", tetoModel: "scripted-teto",
         policy: { maxMainStepsPerActivation: 3, maxModelTokens: 100_000, tetoMaxOutputTokens: 64, workerEnabled: false },
       };
-      const run = async (mainModel: ScriptedModel, tetoModel: ModelPort, resume: boolean) => {
-        const deps = { mainModel, tetoModel, tools: [], createRunId: () => runId };
+      const run = async (mainModel: ScriptedModel, observation: ReturnType<typeof observer>, resume: boolean) => {
+        const deps = { mainModel, tetoModel: observation.model, tools: [], createRunId: () => runId };
         if (host === "executeRun") {
           const result = await executeRun({
             ...options,
@@ -35,6 +35,9 @@ describe("Teto host activation recovery", () => {
             else await session.submit({ inputId: "first", text: "Check Teto, then pause its observation" });
             await session.waitForIdle();
             expect(session.snapshot().blocker).toBe(resume ? undefined : "model-output-limit");
+            // Main idleness is not auxiliary idleness. Keep the session open
+            // until the explicitly restarted observer reaches its provider.
+            if (resume) await observation.started;
           } finally {
             await session.close();
           }
@@ -56,10 +59,9 @@ describe("Teto host activation recovery", () => {
             expectToolResult(request, "stop-observer", { active: false, changed: true });
             return { ...response("Pause at a resumable boundary"), stopReason: "length" };
           },
-        ]), initialObserver.model, false);
-        // The first Main activation opens and closes Teto before a completed
-        // step can be handed off, so no observation request is expected.
-        expect(initialObserver.requests).toHaveLength(0);
+        ]), initialObserver, false);
+        // The first completed step may be observed before the explicit stop.
+        // Persisted controls, not a timing-dependent call count, govern resume.
         const before = await readEvents(options.dataDir, runId);
         expect(controls(before)).toEqual(["start", "stop"]);
         expect(before.find((event) => event.type === "run.created")?.payload)
@@ -80,7 +82,7 @@ describe("Teto host activation recovery", () => {
             expectToolResult(request, "restart-observer", { active: true, changed: true });
             return response("Teto restarted explicitly");
           },
-        ]), resumedObserver.model, true);
+        ]), resumedObserver, true);
         expect(resumedObserver.requests.length).toBeGreaterThan(0);
         expect(controls(await readEvents(options.dataDir, runId)))
           .toEqual(["start", "stop", "start"]);
