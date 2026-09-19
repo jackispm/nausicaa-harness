@@ -382,9 +382,9 @@ function projectRunBoards(
       inbox.apply(event);
       applyTaskMessage(teams, recordFromEvent(event));
     } else if (event.type === "message.claimed" || event.type === "message.handled") {
-      if (inbox.get(event.payload.messageId) !== undefined) inbox.apply(event);
+      if (inbox.get(event.payload.messageId, event.runId) !== undefined) inbox.apply(event);
       if (event.type === "message.claimed") {
-        const message = inbox.get(event.payload.messageId)?.message;
+        const message = inbox.get(event.payload.messageId, event.runId)?.message;
         if (message?.payload.type === "task.request") {
           for (const candidate of teams.values()) {
             const task = (candidate.tasks ?? new Map()).get(message.payload.taskId);
@@ -605,7 +605,7 @@ function applySettlement(
   member.lastOffset = Math.max(member.lastOffset, event.globalOffset);
   const settlement = event.payload;
   const requestId = member.request?.message.messageId;
-  const claim = requestId === undefined ? undefined : inbox.get(requestId)?.claim;
+  const claim = requestId === undefined ? undefined : inbox.get(requestId, member.request?.message.runId)?.claim;
   const host = event.laneId === team.coordinator;
   const controlOutcome = settlement.outcome === "cancelled" || settlement.outcome === "abandoned" || settlement.outcome === "failed";
   if ((!host && event.laneId !== member.definition.laneId)
@@ -784,7 +784,7 @@ function finalizeTeam(runId: RunId, team: DraftTeam, inbox: InboxProjector, lega
 function finalizeMember(team: DraftTeam, member: DraftMember, inbox: InboxProjector): TeamBoardMember {
   const { definition, settlement, laneStatus } = member;
   const requestId = member.request?.message.messageId;
-  const lease = requestId === undefined ? undefined : inbox.get(requestId)?.claim ?? member.request?.claim;
+  const lease = requestId === undefined ? undefined : inbox.get(requestId, member.request?.message.runId)?.claim ?? member.request?.claim;
   const terminal = settlement !== undefined;
   const ended = laneStatus === "completed" || laneStatus === "failed" || laneStatus === "cancelled";
   const execution: TeamMemberExecution = terminal || ended ? "terminal"

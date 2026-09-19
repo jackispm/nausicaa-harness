@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { A2AInbox } from "../../src/a2a/index.js";
-import type { AnyEvent, Goal, ModelResponse } from "../../src/domain/index.js";
+import type { A2AMessage, AnyEvent, Goal, ModelResponse } from "../../src/domain/index.js";
 import type { AgentTool, ModelPort, ModelRequest } from "../../src/domain/ports.js";
 import { MemoryLedger } from "../../src/ledger/index.js";
 import { ScriptedModel } from "../../src/model/index.js";
@@ -45,6 +45,33 @@ const response = (
 });
 
 describe("TetoLaneScheduler", () => {
+  it("keeps pending voice IDs when only another Run handled the same message ID", async () => {
+    const { scheduler, inbox, clock } = await a2aScenario(new ScriptedModel([]));
+    const voice: A2AMessage = {
+      messageId: "shared-voice", runId: "run-a2a", conversationId: "run-a2a",
+      threadId: "run-a2a:main", from: "teto", to: "main",
+      createdAt: clock.now().toISOString(), correlationId: "run-a2a",
+      idempotencyKey: "shared-voice", visibility: "run", priority: 1,
+      delivery: "next-step", payload: { type: "message.inform", text: "Inspect the result" },
+    };
+    try {
+      await inbox.send(voice);
+      expect((await scheduler.beforeMainStep({ step: 2 })).map((item) => item.messageId)).toEqual(["shared-voice"]);
+      await inbox.send({ ...voice, runId: "other-run" });
+      await inbox.claim("main", "main", { runId: "other-run", claimId: "other-claim" });
+      await inbox.handle("shared-voice", "main", "other-run");
+
+      scheduler.afterMainStep(mainBoundary([]));
+      await scheduler.drain();
+      expect(scheduler.snapshot().pendingVoiceIds).toEqual(["shared-voice"]);
+      scheduler.afterMainStep(mainBoundary(["shared-voice"]));
+      await scheduler.drain();
+      expect(scheduler.snapshot().pendingVoiceIds).toEqual([]);
+    } finally {
+      await scheduler.stop();
+    }
+  });
+
   it("waits for a completed Main step before starting an observation", async () => {
     const model = new ScriptedModel([response("NO_UPDATE")]);
     const { scheduler, ledger, mainEvent } = await a2aScenario(model);

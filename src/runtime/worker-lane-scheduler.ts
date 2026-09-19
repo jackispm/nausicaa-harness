@@ -218,7 +218,7 @@ export class WorkerLaneScheduler {
         if (record.message.payload.type === "task.accept") {
           // Acceptance is a transport status, not model context.
           try {
-            await this.inbox.handle(record.message.messageId, this.mainLaneId);
+            await this.inbox.handle(record.message.messageId, this.mainLaneId, this.runId);
           } catch (error: unknown) {
             // Keep a failed receipt leased so the Inbox can redeliver it.
             this.failures.push(asError(error));
@@ -362,7 +362,7 @@ export class WorkerLaneScheduler {
   }
 
   private async acknowledgeCommitted(messageIds: readonly string[]): Promise<void> {
-    const records = new Map(this.inbox.snapshot().records.map((record) => [
+    const records = new Map(this.inbox.snapshot().records.filter((record) => record.message.runId === this.runId).map((record) => [
       record.message.messageId,
       record,
     ]));
@@ -385,7 +385,7 @@ export class WorkerLaneScheduler {
         continue;
       }
       try {
-        await this.inbox.handle(messageId, this.mainLaneId);
+        await this.inbox.handle(messageId, this.mainLaneId, this.runId);
         this.committedBoundaryMessageIds.delete(messageId);
       } catch (error: unknown) {
         // Keep the committed receipt for replay; do not block or reinject Main.

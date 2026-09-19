@@ -21,6 +21,7 @@ describe("built CLI", () => {
     );
 
     expect(stderr).toBe("");
+    expect(stdout).toContain(`Nausicaa ${VERSION}`);
     expect(stdout).toContain("Usage:");
     expect(stdout).toContain("nausicaa [options] [@image ...] [message]");
   });
@@ -28,6 +29,15 @@ describe("built CLI", () => {
   it("reports a stable version", async () => {
     const { stdout } = await execFileAsync(builtCli, ["--version"]);
     expect(stdout.trim()).toBe(VERSION);
+  });
+
+  it("redacts credentials in utility command errors", async () => {
+    const credential = "sk-ABCDEFGHIJKLMNOPQRSTUV";
+    await expect(execFileAsync(builtCli, ["auth", "status", credential]))
+      .rejects.toMatchObject({
+        code: 2,
+        stderr: expect.stringContaining("Unknown provider [REDACTED]"),
+      });
   });
 
   it.each([

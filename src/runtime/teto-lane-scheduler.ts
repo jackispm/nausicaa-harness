@@ -361,7 +361,7 @@ export class TetoLaneScheduler {
     const operation = this.receiptTail.then(async () => {
       await this.mainMailbox.afterStep(context);
       for (const record of this.inbox.snapshot().records) {
-        if (record.status === "handled") {
+        if (record.message.runId === this.runId && record.status === "handled") {
           const messageId = record.message.messageId;
           this.pendingVoiceIds.delete(messageId);
         }

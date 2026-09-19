@@ -97,7 +97,7 @@ export class TeamLifecycle {
       if (this.stopped) throw new Error("Team runtime stopped before settlement");
       const board = await this.requireBoard(teamId);
       if (board.cancellationRequested || board.lifecycleState === "closed" || this.closingTeams.has(teamId)) throw new Error("Team is no longer accepting settlement");
-      const current = this.options.inbox.snapshot().records.find((record) => record.message.messageId === request.messageId);
+      const current = this.options.inbox.snapshot().records.find((record) => record.message.runId === this.options.runId && record.message.messageId === request.messageId);
       if (current?.claim?.claimId !== claim.claimId || current.claim.attempt !== claim.attempt) throw new Error("Team task claim was superseded");
       if (payload.taskId !== member.task.taskId || request.to !== member.laneId || request.from !== this.options.leadLaneId) throw new Error("Team task settlement does not match admission");
       const taskDeadline = member.task.budget.deadline === undefined
@@ -306,7 +306,7 @@ export class TeamLifecycle {
 
   private async notify(teamId: string, kind: string, text: string): Promise<void> {
     const messageId = `${this.options.runId}:team:${teamId}:${kind}:notice`;
-    const existing = this.options.inbox.snapshot().records.find((record) => record.message.messageId === messageId);
+    const existing = this.options.inbox.snapshot().records.find((record) => record.message.runId === this.options.runId && record.message.messageId === messageId);
     if (existing !== undefined) return;
     const sent = await this.options.inbox.send({
       messageId, runId: this.options.runId, from: this.options.leadLaneId, to: this.options.leadLaneId,

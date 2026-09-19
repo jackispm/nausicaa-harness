@@ -4,6 +4,7 @@ import {
   encodeSearchCursor,
   searchQueryFingerprint,
 } from "./search-cursor.js";
+import { boundedJsonArrayLength } from "./search-output.js";
 import {
   boundedInteger,
   discoverSearchFiles,
@@ -106,25 +107,21 @@ function boundOutput(
   query: string,
 ): FindOutput {
   const paths = files.map((file) => file.path);
-  let pageTruncated = hasMore;
-  while (true) {
-    const truncated = discoveryTruncated || pageTruncated;
-    const output: FindOutput = {
+  const outputFor = (length: number, selected: string[]): FindOutput => {
+    const pageTruncated = hasMore || length < paths.length;
+    return {
       path: searchPath,
       pattern,
-      files: paths,
-      count: paths.length,
-      truncated,
-      ...(pageTruncated && paths.length > 0
-        ? { nextCursor: encodeSearchCursor("find", query, { path: paths.at(-1)! }) }
+      files: selected,
+      count: length,
+      truncated: discoveryTruncated || pageTruncated,
+      ...(pageTruncated && length > 0
+        ? { nextCursor: encodeSearchCursor("find", query, { path: paths[length - 1]! }) }
         : {}),
     };
-    if (Buffer.byteLength(JSON.stringify(output), "utf8") <= MAX_RESULT_BYTES || paths.length === 0) {
-      return output;
-    }
-    paths.pop();
-    pageTruncated = true;
-  }
+  };
+  const length = boundedJsonArrayLength(paths, MAX_RESULT_BYTES, (item) => item, (count) => outputFor(count, []));
+  return outputFor(length, paths.slice(0, length));
 }
 
 function firstPathAfter(files: readonly SearchFile[], anchor: string): number {

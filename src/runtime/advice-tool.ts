@@ -28,10 +28,11 @@ export const createAdviceResponseTool = (inbox: A2AInbox): AgentTool => ({
       const disposition = adviceDisposition(arguments_.disposition);
       const reason = requiredString(arguments_.reason, "reason");
       const record = inbox.snapshot().records.find((candidate) =>
-        candidate.message.payload.type === "advice.propose"
+        candidate.message.runId === context.runId
+        && candidate.message.payload.type === "advice.propose"
         && candidate.message.payload.advice.adviceId === adviceId,
       );
-      if (record === undefined || record.message.runId !== context.runId) {
+      if (record === undefined) {
         throw new Error(`Advice ${adviceId} is not available in this Run`);
       }
 
@@ -40,6 +41,7 @@ export const createAdviceResponseTool = (inbox: A2AInbox): AgentTool => ({
         disposition,
         "main",
         reason.slice(0, 1_024),
+        context.runId,
       );
       return {
         content: JSON.stringify({ adviceId, disposition, status: result.status }),

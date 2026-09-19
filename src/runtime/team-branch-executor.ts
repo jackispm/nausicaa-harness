@@ -245,12 +245,12 @@ export class TeamBranchExecutor {
     const request = record.message as TaskRequestMessage;
     if (this.options.residentTask && this.options.residentTaskId !== undefined
       && request.payload.taskId !== this.options.residentTaskId) {
-      await this.options.inbox.handle(request.messageId, this.options.branchLaneId).catch(() => undefined);
+      await this.options.inbox.handle(request.messageId, this.options.branchLaneId, this.options.runId).catch(() => undefined);
       return { status: "failed", taskId: request.payload.taskId, reason: "Stale resident Task request fenced" };
     }
     this.activeClaim = { messageId: request.messageId, claim: record.claim! };
     if (request.from !== this.options.parentLaneId || (this.options.taskDefinition !== undefined && stableJson(request.payload) !== stableJson(this.options.taskDefinition))) {
-      await this.options.inbox.handle(request.messageId, this.options.branchLaneId);
+      await this.options.inbox.handle(request.messageId, this.options.branchLaneId, this.options.runId);
       return { status: "failed", taskId: request.payload.taskId, reason: "Task request does not match the host-admitted Team member" };
     }
     if (request.payload.spawnContext !== undefined) {
@@ -273,7 +273,7 @@ export class TeamBranchExecutor {
         };
         await this.options.settleTask?.({ request, claim: record.claim!, payload: failedPayload });
         await this.sendReply(request, failedPayload).catch(() => undefined);
-        await this.options.inbox.handle(request.messageId, this.options.branchLaneId).catch(() => undefined);
+        await this.options.inbox.handle(request.messageId, this.options.branchLaneId, this.options.runId).catch(() => undefined);
         return { status: "failed", taskId: request.payload.taskId, reason: failedPayload.reason };
       }
     }
@@ -285,7 +285,7 @@ export class TeamBranchExecutor {
     if (existingTerminal !== undefined) {
       if (this.stopped || this.options.signal?.aborted) return { status: "idle", reason: "stopped" };
       await this.sendReply(request, existingTerminal);
-      await this.options.inbox.handle(request.messageId, this.options.branchLaneId);
+      await this.options.inbox.handle(request.messageId, this.options.branchLaneId, this.options.runId);
       return terminalRunResult(existingTerminal);
     }
     let terminalPayload: TaskResult | TaskFailed | undefined;
@@ -299,7 +299,7 @@ export class TeamBranchExecutor {
       terminalPayload = result.payload;
       const reply = await this.sendReply(request, result.payload);
       if (this.stopped || this.options.signal?.aborted) return { status: "idle", reason: "stopped" };
-      await this.options.inbox.handle(request.messageId, this.options.branchLaneId);
+      await this.options.inbox.handle(request.messageId, this.options.branchLaneId, this.options.runId);
       await this.appendStatus(result.kind === "result" ? "completed" : "failed", `Team member finished ${request.payload.taskId}: ${result.kind === "result" ? result.payload.status : "failed"}`);
       this.options.onTaskSettled?.();
       return {
@@ -327,7 +327,7 @@ export class TeamBranchExecutor {
       this.assertCurrentClaim();
       await this.options.settleTask?.({ request, claim: record.claim!, payload: failed });
       await this.sendReply(request, failed).catch(() => undefined);
-      await this.options.inbox.handle(request.messageId, this.options.branchLaneId).catch(() => undefined);
+      await this.options.inbox.handle(request.messageId, this.options.branchLaneId, this.options.runId).catch(() => undefined);
       await this.appendStatus("failed", failed.reason).catch(() => undefined);
       this.options.onTaskSettled?.();
       return { status: "failed", taskId: request.payload.taskId, reason: failed.reason };
@@ -663,7 +663,7 @@ export class TeamBranchExecutor {
     this.assertCurrentClaim();
     const message = teamTaskReplyMessage(request, payload, this.clock.now().toISOString());
     const messageId = message.messageId;
-    const existing = this.options.inbox.snapshot().records.find((record) => record.message.messageId === messageId);
+    const existing = this.options.inbox.snapshot().records.find((record) => record.message.runId === this.options.runId && record.message.messageId === messageId);
     if (existing !== undefined) {
       if (stableJson(existing.message.payload) !== stableJson(payload)) throw new Error("Conflicting Team terminal reply");
       return { messageId };
@@ -676,7 +676,7 @@ export class TeamBranchExecutor {
     if (this.stopped || this.stopController.signal.aborted || this.options.signal?.aborted) throw new DOMException("Team member stopped", "AbortError");
     const active = this.activeClaim;
     if (active === undefined) return;
-    const current = this.options.inbox.snapshot().records.find((record) => record.message.messageId === active.messageId);
+    const current = this.options.inbox.snapshot().records.find((record) => record.message.runId === this.options.runId && record.message.messageId === active.messageId);
     if (current?.claim?.claimId !== active.claim.claimId || current.claim.attempt !== active.claim.attempt) throw new Error("Team member task claim was superseded");
   }
 

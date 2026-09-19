@@ -40,7 +40,7 @@ export async function discoverSearchFiles(
   if (rootStats.isFile()) {
     assertPrivateRegularFile(rootStats);
     return {
-      files: [{
+      files: glob !== undefined && !path.matchesGlob(path.basename(root.absolute), glob) ? [] : [{
         argument: path.basename(root.absolute),
         path: root.relative,
         resolved: root,
@@ -72,8 +72,11 @@ export async function discoverSearchFiles(
     throw new Error(ripgrepError(result.stderr, result.exitCode));
   }
   await revalidateExistingWorkspacePath(root);
+  if (result.outputTruncated) {
+    throw new Error("File discovery exceeds the 4 MiB limit; narrow the search path");
+  }
 
-  const entries = splitNullTerminated(result.stdout, result.outputTruncated)
+  const entries = splitNullTerminated(result.stdout)
     .map((entry) => entry.startsWith("./") ? entry.slice(2) : entry)
     .filter((entry) => glob === undefined || path.matchesGlob(entry, glob));
   const files: SearchFile[] = [];
@@ -174,10 +177,9 @@ function assertPrivateRegularFile(stats: Stats): void {
   }
 }
 
-function splitNullTerminated(output: Buffer, truncated: boolean): string[] {
+function splitNullTerminated(output: Buffer): string[] {
   const parts = output.toString("utf8").split("\0");
   if (parts.at(-1) === "") parts.pop();
-  else if (truncated) parts.pop();
   return parts.filter((entry) => entry.length > 0);
 }
 

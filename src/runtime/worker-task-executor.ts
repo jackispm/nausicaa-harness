@@ -251,7 +251,7 @@ export class WorkerTaskExecutor {
     const terminal = this.findTerminal(request);
     if (terminal !== undefined) {
       if (this.isStopping()) return { status: "idle", reason: "stopped" };
-      await this.inbox.handle(request.messageId, this.laneId);
+      await this.inbox.handle(request.messageId, this.laneId, this.runId);
       return terminalResult(terminal);
     }
 
@@ -263,7 +263,7 @@ export class WorkerTaskExecutor {
       }
       const reply = await this.sendReply(request, execution.payload, execution.kind);
       if (this.isStopping()) return { status: "idle", reason: "stopped" };
-      await this.inbox.handle(request.messageId, this.laneId);
+      await this.inbox.handle(request.messageId, this.laneId, this.runId);
       return {
         status: execution.kind === "result" ? execution.payload.status : "failed",
         taskId: task.taskId,
@@ -967,7 +967,7 @@ export class WorkerTaskExecutor {
     if (this.isStopping()) throw new WorkerTaskCancelledError("Worker lane is stopping");
     const messageId = `${this.runId}:${this.laneId}:task:${request.payload.taskId}:${suffix}`;
     const existing = this.inbox.snapshot().records.find((record) => (
-      record.message.messageId === messageId
+      record.message.runId === this.runId && record.message.messageId === messageId
     ));
     const sent = await this.inbox.send({
       messageId,

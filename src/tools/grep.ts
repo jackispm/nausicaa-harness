@@ -7,6 +7,7 @@ import {
   encodeSearchCursor,
   searchQueryFingerprint,
 } from "./search-cursor.js";
+import { boundedJsonArrayLength } from "./search-output.js";
 import {
   boundedInteger,
   compareText,
@@ -507,28 +508,29 @@ function boundOutput(
   discoveryTruncated: boolean,
   query: string | undefined,
 ): GrepOutput {
-  const selected = [...matches];
-  let hasRecoverableNextPage = pageTruncated;
-  while (true) {
-    const visibleMatches = selected.map(({ ordinal: _, ...match }) => match);
-    const truncated = discoveryTruncated || hasRecoverableNextPage;
-    const output: GrepOutput = {
+  const visibleMatches = matches.map(({ ordinal: _, ...match }) => match);
+  const filesMatched = [0];
+  const seenFiles = new Set<string>();
+  for (const match of matches) {
+    seenFiles.add(match.path);
+    filesMatched.push(seenFiles.size);
+  }
+  const outputFor = (length: number, selected: GrepMatch[]): GrepOutput => {
+    const hasRecoverableNextPage = pageTruncated || length < matches.length;
+    return {
       path: searchPath,
       pattern,
-      matches: visibleMatches,
-      matchCount: visibleMatches.length,
-      filesMatched: new Set(visibleMatches.map((match) => match.path)).size,
-      truncated,
-      ...(query !== undefined && hasRecoverableNextPage && selected.length > 0
-        ? { nextCursor: encodeSearchCursor("grep", query, grepAnchor(selected.at(-1)!)) }
+      matches: selected,
+      matchCount: length,
+      filesMatched: filesMatched[length]!,
+      truncated: discoveryTruncated || hasRecoverableNextPage,
+      ...(query !== undefined && hasRecoverableNextPage && length > 0
+        ? { nextCursor: encodeSearchCursor("grep", query, grepAnchor(matches[length - 1]!)) }
         : {}),
     };
-    if (Buffer.byteLength(JSON.stringify(output), "utf8") <= MAX_RESULT_BYTES || selected.length === 0) {
-      return output;
-    }
-    selected.pop();
-    hasRecoverableNextPage = true;
-  }
+  };
+  const length = boundedJsonArrayLength(visibleMatches, MAX_RESULT_BYTES, (item) => item, (count) => outputFor(count, []));
+  return outputFor(length, visibleMatches.slice(0, length));
 }
 
 function boundFilesOutput(
@@ -539,26 +541,21 @@ function boundFilesOutput(
   discoveryTruncated: boolean,
   query: string | undefined,
 ): GrepFilesOutput {
-  const selected = [...files];
-  let hasRecoverableNextPage = pageTruncated;
-  while (true) {
-    const truncated = discoveryTruncated || hasRecoverableNextPage;
-    const output: GrepFilesOutput = {
+  const outputFor = (length: number, selected: string[]): GrepFilesOutput => {
+    const hasRecoverableNextPage = pageTruncated || length < files.length;
+    return {
       path: searchPath,
       pattern,
       files: selected,
-      count: selected.length,
-      truncated,
-      ...(query !== undefined && hasRecoverableNextPage && selected.length > 0
-        ? { nextCursor: encodeSearchCursor("grep", query, { path: selected.at(-1)! }) }
+      count: length,
+      truncated: discoveryTruncated || hasRecoverableNextPage,
+      ...(query !== undefined && hasRecoverableNextPage && length > 0
+        ? { nextCursor: encodeSearchCursor("grep", query, { path: files[length - 1]! }) }
         : {}),
     };
-    if (Buffer.byteLength(JSON.stringify(output), "utf8") <= MAX_RESULT_BYTES || selected.length === 0) {
-      return output;
-    }
-    selected.pop();
-    hasRecoverableNextPage = true;
-  }
+  };
+  const length = boundedJsonArrayLength(files, MAX_RESULT_BYTES, (item) => item, (count) => outputFor(count, []));
+  return outputFor(length, files.slice(0, length));
 }
 
 function firstFileAtOrAfter(files: readonly SearchFile[], anchor: string): number {
@@ -656,7 +653,7 @@ function boundLine(text: string): { text: string; truncated: boolean } {
 }
 
 function normalizeResultPath(value: string): string {
-  const normalized = path.posix.normalize(value.replaceAll("\\", "/"));
+  const normalized = path.posix.normalize(value);
   return normalized.startsWith("./") ? normalized.slice(2) : normalized;
 }
 

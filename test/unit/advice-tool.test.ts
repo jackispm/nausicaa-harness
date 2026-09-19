@@ -76,4 +76,25 @@ describe("respond_to_advice", () => {
     expect(result.isError).toBe(true);
     expect(inbox.snapshot().records[0]?.status).toBe("claimed");
   });
+
+  it("acknowledges the current Run when two Runs reuse an Advice ID", async () => {
+    const inbox = new A2AInbox({
+      clock: { now: () => new Date("2026-08-25T12:01:00.000Z") },
+    });
+    await inbox.send(message());
+    await inbox.send({ ...message(), messageId: "message-2", runId: "run-2" });
+    await inbox.claim("main", "main", { runId: "run-1", claimId: "claim-1" });
+    await inbox.claim("main", "main", { runId: "run-2", claimId: "claim-2" });
+
+    const result = await createAdviceResponseTool(inbox).execute(
+      { adviceId: "advice-1", disposition: "accept", reason: "In scope." },
+      { runId: "run-2", workspace: "/tmp", operationId: "operation-2" },
+    );
+
+    expect(result.isError).toBe(false);
+    expect(inbox.snapshot().records.find((record) => record.message.runId === "run-1"))
+      .toMatchObject({ status: "claimed" });
+    expect(inbox.snapshot().records.find((record) => record.message.runId === "run-2"))
+      .toMatchObject({ status: "handled", acknowledgement: { disposition: "accept" } });
+  });
 });

@@ -443,7 +443,7 @@ export class TeamRuntime implements TeamControl {
           // The previous process may have claimed the request and crashed
           // before acknowledging it. Reclaiming is durable and fences that
           // process instead of waiting for the normal Inbox lease to expire.
-          await this.inbox.reclaim(requestRecord.message.messageId, this.parentLaneId, "runtime-restart");
+          await this.inbox.reclaim(requestRecord.message.messageId, this.parentLaneId, "runtime-restart", this.runId);
         }
         const oldRuntime = this.branches.get(assignment.laneId);
         if (oldRuntime !== undefined) {
@@ -1024,7 +1024,7 @@ export class TeamRuntime implements TeamControl {
       if (this.stopped || this.fencedLanes.has(assignment.laneId)) throw new DOMException("Team assignment was fenced", "AbortError");
       const board = (await this.lifecycle.boards()).find((item) => item.teamId === teamId);
       if (board === undefined || board.lifecycleState === "closed" || board.cancellationRequested) throw new DOMException("Team is closed", "AbortError");
-      const current = this.inbox.snapshot().records.find((record) => record.message.messageId === input.request.messageId);
+      const current = this.inbox.snapshot().records.find((record) => record.message.runId === this.runId && record.message.messageId === input.request.messageId);
       if (current?.claim?.claimId !== input.claim.claimId || current.claim.attempt !== input.claim.attempt) throw new DOMException("Team assignment claim was superseded", "AbortError");
     };
     await assertReportStillOwned();
@@ -1075,7 +1075,7 @@ export class TeamRuntime implements TeamControl {
         if (request?.message.payload.type !== "task.request") continue;
         this.assertAdmissionActive();
         const reply = teamTaskReplyMessage({ ...request.message, payload: request.message.payload }, payload, this.clock.now().toISOString());
-        const previous = this.inbox.snapshot().records.find((record) => record.message.messageId === reply.messageId);
+        const previous = this.inbox.snapshot().records.find((record) => record.message.runId === this.runId && record.message.messageId === reply.messageId);
         if (previous === undefined) await this.inbox.send(reply);
         else if (stableJson(previous.message.payload) !== stableJson(payload)) throw new Error("Conflicting recovered Team terminal reply");
         if (request.status === "pending") {
@@ -1084,8 +1084,8 @@ export class TeamRuntime implements TeamControl {
             messageIds: [request.message.messageId], types: ["task.request"],
           });
         }
-        const current = this.inbox.snapshot().records.find((record) => record.message.messageId === request.message.messageId);
-        if (current?.status === "claimed" && current.claim?.claimedBy === report.laneId) await this.inbox.handle(request.message.messageId, report.laneId);
+        const current = this.inbox.snapshot().records.find((record) => record.message.runId === this.runId && record.message.messageId === request.message.messageId);
+        if (current?.status === "claimed" && current.claim?.claimedBy === report.laneId) await this.inbox.handle(request.message.messageId, report.laneId, this.runId);
         const status = payload.type === "task.result" ? "completed" : "failed";
         const scope = report.assignmentVersion === 0 ? "member" : `task:${report.taskId}`;
         const statusKey = `${this.runId}:${report.laneId}:${scope}:status:${status}`;
@@ -1211,12 +1211,12 @@ export class TeamRuntime implements TeamControl {
       // claiming, so a fresh durable report cannot be discarded as untrusted.
       const board = (await this.lifecycle.boards()).find((item) => item.teamId === runtime.teamId);
       for (const reply of replies) {
-        const record = this.inbox.snapshot().records.find((item) => item.message.messageId === reply.messageId);
+        const record = this.inbox.snapshot().records.find((item) => item.message.runId === this.runId && item.message.messageId === reply.messageId);
         const payload = record?.message.payload;
         const matches = board !== undefined && (payload?.type === "task.result" || payload?.type === "task.failed")
           && teamReplyMatches(board, runtime.laneId, payload);
         if (matches) messages.push(reply);
-        else await this.inbox.handle(reply.messageId, this.parentLaneId);
+        else await this.inbox.handle(reply.messageId, this.parentLaneId, this.runId);
       }
     }
     this.waitCoordinator.delivered(this.parentLaneId, messages.map((message) => message.messageId));
@@ -1524,7 +1524,7 @@ export class TeamRuntime implements TeamControl {
       for (const member of board.members) {
         if (member.terminal || this.fencedLanes.has(member.laneId) || member.dependsOn.length === 0) continue;
         if (!member.dependsOn.every((id) => board.members.some((item) => item.memberId === id && item.outcome === "succeeded"))) continue;
-        const request = this.inbox.snapshot().records.find((record) => record.message.messageId === member.requestMessageId);
+        const request = this.inbox.snapshot().records.find((record) => record.message.runId === this.runId && record.message.messageId === member.requestMessageId);
         const runtime = this.branches.get(member.laneId);
         if (request?.status === "pending" && runtime?.scheduler.pendingActivations === 0) {
           runtime.scheduler.enqueue();

@@ -136,7 +136,7 @@ export class LaneMailbox {
   afterStep(context: AfterStepContext): Promise<void> {
     return this.exclusive(async () => {
       this.assertScope(context);
-      const records = new Map(this.inbox.snapshot().records.map((record) => [record.message.messageId, record]));
+      const records = new Map(this.inbox.snapshot().records.filter((record) => this.isLocalRecord(record)).map((record) => [record.message.messageId, record]));
       for (const id of context.boundaryMessageIds) {
         const record = records.get(id);
         if (record !== undefined && this.isLocalRecord(record)) this.committed.add(id);
@@ -150,7 +150,7 @@ export class LaneMailbox {
   }
 
   private async repairCommitted(): Promise<void> {
-    const records = new Map(this.inbox.snapshot().records.map((record) => [record.message.messageId, record]));
+    const records = new Map(this.inbox.snapshot().records.filter((record) => this.isLocalRecord(record)).map((record) => [record.message.messageId, record]));
     for (const id of this.committed) {
       const record = records.get(id);
       if (record === undefined) continue;
@@ -160,7 +160,7 @@ export class LaneMailbox {
       }
       if (record.status !== "claimed" || record.claim?.claimedBy !== this.laneId) continue;
       try {
-        await this.inbox.handle(id, this.laneId);
+        await this.inbox.handle(id, this.laneId, this.runId);
         this.committed.delete(id);
       } catch (error: unknown) {
         // The durable Step is authoritative even if its transport receipt

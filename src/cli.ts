@@ -109,7 +109,7 @@ const main = async (): Promise<number> => {
     try {
       return await runUtilityCommand(options.command);
     } catch (error: unknown) {
-      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      process.stderr.write(`${persistedErrorText(error, "Utility command failed")}\n`);
       return 2;
     }
   }

@@ -221,6 +221,31 @@ describe("A2AInbox", () => {
     expect(handledAgain).toEqual(handled);
   });
 
+  it("keeps the same message ID independent across Runs and recovery", async () => {
+    const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
+    const ledger = new MemoryLedger({ clock });
+    const inbox = new A2AInbox({ sink: ledger, clock });
+    const first = taskMessage({ type: "task.accept", taskId: "first" });
+    const second = taskMessage({ type: "task.accept", taskId: "second" }, { runId: "run-2" });
+
+    await expect(inbox.send(first)).resolves.toMatchObject({ status: "queued" });
+    await expect(inbox.send(second)).resolves.toMatchObject({ status: "queued" });
+    expect(inbox.snapshot().records).toHaveLength(2);
+    const claims = await inbox.claim("worker-1", "worker-1", { runId: "run-2", claimId: "second-claim" });
+    expect(claims[0]?.message.runId).toBe("run-2");
+    await expect(inbox.handle(first.messageId, "worker-1")).rejects.toThrow(/requires a runId/u);
+    await inbox.handle(second.messageId, "worker-1", "run-2");
+
+    const recovered = A2AInbox.rehydrate(await ledger.read(), { sink: ledger, clock });
+    expect(recovered.snapshot()).toEqual(inbox.snapshot());
+    expect(recovered.snapshot().records.find((record) => record.message.runId === "run-1")?.status)
+      .toBe("pending");
+    expect(recovered.snapshot().records.find((record) => record.message.runId === "run-2")?.status)
+      .toBe("handled");
+    expect(await recovered.claim("worker-1", "worker-1", { runId: "run-1", claimId: "first-claim" }))
+      .toMatchObject([{ message: { runId: "run-1" }, claim: { attempt: 1 } }]);
+  });
+
   it("resets the ephemeral sink together with the projection on rehydrate", async () => {
     const inbox = new A2AInbox();
     await inbox.send(taskMessage(
@@ -659,6 +684,20 @@ describe("A2AInbox", () => {
       ).rejects.toBeInstanceOf(A2AProtocolError);
     },
   );
+
+  it("returns duplicate for a previously acknowledged Advice after it expires", async () => {
+    const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));
+    const inbox = new A2AInbox({ clock });
+    await inbox.send(adviceMessage());
+    await inbox.claim("main", "main", { claimId: "claim-1" });
+    await inbox.acknowledgeAdvice("advice-1", "accept", "main", "agreed");
+
+    clock.advance(10 * 60_000 + 1);
+    await expect(inbox.acknowledgeAdvice("advice-1", "accept", "main", "agreed"))
+      .resolves.toEqual({ status: "duplicate", messageId: "message-1" });
+    await expect(inbox.acknowledgeAdvice("advice-1", "reject", "main", "different"))
+      .rejects.toThrow(/different ack/u);
+  });
 
   it("uses Ledger events as the rehydratable source of truth", async () => {
     const clock = new MutableClock(new Date("2026-08-25T12:00:00.000Z"));

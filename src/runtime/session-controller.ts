@@ -4838,7 +4838,7 @@ export class SessionController {
     const inbox = attached.inbox;
     if (inbox === undefined) return false;
     const current = inbox.snapshot().records.find((record) => (
-      record.message.messageId === messageId
+      record.message.runId === attached.runId && record.message.messageId === messageId
     ));
     if (current === undefined) return false;
     if (current.status === "handled") return true;
@@ -4856,11 +4856,11 @@ export class SessionController {
     });
 
     const afterAdmission = inbox.snapshot().records.find((record) => (
-      record.message.messageId === messageId
+      record.message.runId === attached.runId && record.message.messageId === messageId
     ));
     if (afterAdmission?.status === "handled") return true;
     if (afterAdmission?.status === "claimed" && afterAdmission.claim?.claimedBy === "main") {
-      await inbox.handle(messageId, "main");
+      await inbox.handle(messageId, "main", attached.runId);
       return true;
     }
     const claimed = await inbox.claim("main", "main", {
@@ -4870,7 +4870,7 @@ export class SessionController {
       messageIds: [messageId],
     });
     if (claimed.length === 0) return false;
-    await inbox.handle(messageId, "main");
+    await inbox.handle(messageId, "main", attached.runId);
     return true;
   }
 

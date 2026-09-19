@@ -85,6 +85,56 @@ describe("workspace search tools", () => {
     });
   });
 
+  it("applies globs to explicitly requested files in find and grep", async () => {
+    const workspace = await temporaryDirectory("nausicaa-search-file-glob-");
+    await writeFile(path.join(workspace, "input.ts"), "needle");
+    const find = createFindTool();
+    const grep = createGrepTool();
+
+    expect(JSON.parse((await find.execute({ path: "input.ts", pattern: "*.md" }, context(workspace))).content))
+      .toMatchObject({ files: [], count: 0 });
+    expect(JSON.parse((await grep.execute({ path: "input.ts", pattern: "needle", glob: "*.md" }, context(workspace))).content))
+      .toMatchObject({ matches: [], matchCount: 0 });
+    expect(JSON.parse((await find.execute({ path: "input.ts", pattern: "*.ts" }, context(workspace))).content))
+      .toMatchObject({ files: ["input.ts"] });
+    expect(JSON.parse((await grep.execute({ path: "input.ts", pattern: "needle", glob: "*.ts" }, context(workspace))).content))
+      .toMatchObject({ matchCount: 1 });
+  });
+
+  it("keeps byte-bounded pages complete across alternating UTF-8 and escaped paths", async () => {
+    const workspace = await temporaryDirectory("nausicaa-search-size-");
+    const names = Array.from({ length: 800 }, (_, index) => (
+      `f${String(index).padStart(4, "0")}-${index % 2 === 0
+        ? "x".repeat(199)
+        : `${"界".repeat(8)}${"y".repeat(168)}\\\"`}.txt`
+    ));
+    for (const name of names) await writeFile(path.join(workspace, name), "hit");
+
+    for (const [tool, arguments_, field] of [
+      [createFindTool(), { pattern: "*.txt", limit: 5_000 }, "files"],
+      [createGrepTool(), { pattern: "hit", outputMode: "files", limit: 1_000 }, "files"],
+      [createGrepTool(), { pattern: "hit", limit: 1_000 }, "matches"],
+    ] as const) {
+      const seen: string[] = [];
+      let cursor: string | undefined;
+      for (let pageNumber = 0; pageNumber < 4; pageNumber += 1) {
+        const result = await tool.execute({ ...arguments_, ...(cursor === undefined ? {} : { cursor }) }, context(workspace));
+        expect(result.isError).toBe(false);
+        expect(Buffer.byteLength(result.content, "utf8")).toBeLessThanOrEqual(128 * 1024);
+        const page = JSON.parse(result.content) as {
+          files?: string[];
+          matches?: Array<{ path: string }>;
+          nextCursor?: string;
+        };
+        seen.push(...(field === "files" ? page.files! : page.matches!.map((match) => match.path)));
+        cursor = page.nextCursor;
+        if (cursor === undefined) break;
+      }
+      expect(seen).toEqual(names);
+      expect(cursor).toBeUndefined();
+    }
+  });
+
   it("normalizes ripgrep paths before path globs and scopes nested ignores", async () => {
     const workspace = await temporaryDirectory("nausicaa-find-ignore-scope-");
     await mkdir(path.join(workspace, "a"), { recursive: true });

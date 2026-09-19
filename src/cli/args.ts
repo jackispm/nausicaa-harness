@@ -1,4 +1,5 @@
 import { MAX_MAIN_OUTPUT_TOKENS } from "../domain/types.js";
+import { VERSION } from "../version.js";
 import type {
   EdgeSettings,
   FukaiCompactionProviderCapability,
@@ -527,7 +528,7 @@ function parseUtilityCommand(args: string[], cwd: string): CliOptions {
   };
 }
 
-export const usage = `Nausicaa 0.1
+export const usage = `Nausicaa ${VERSION}
 
 Usage:
   nausicaa [options] [@image ...] [message]

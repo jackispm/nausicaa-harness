@@ -4,6 +4,16 @@ All notable changes to Nausicaa are documented here.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-20
+
+- Keep A2A message identity and Advice acknowledgements scoped to their Run,
+  including replay, claims, and idempotent retries after Advice expiry.
+- Apply globs to explicit file searches, preserve literal backslashes in grep
+  paths, and bound search output in linear time. Reject incomplete file discovery
+  instead of returning pages with no usable continuation.
+- Align CLI help with the package version, redact utility-command failures,
+  and require npm publication from the tested release tag and its verified asset.
+
 ## [0.1.9] - 2026-09-11
 
 - Fix cross-session `agent_message` delivery by exact `sessionId`: discovery

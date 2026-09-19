@@ -104,6 +104,7 @@ export class MessageExpiredError extends A2AProtocolError {
 
 export class InboxProjector {
   private records = new Map<string, InboxRecord>();
+  private runsByMessageId = new Map<string, Set<RunId>>();
   /** Claim attempts survive a reclaim while the public record is pending. */
   private attempts = new Map<string, number>();
   private idempotency = new Map<string, string>();
@@ -116,6 +117,7 @@ export class InboxProjector {
 
   rehydrate(events: readonly AnyEvent[]): void {
     this.records = new Map();
+    this.runsByMessageId = new Map();
     this.attempts = new Map();
     this.idempotency = new Map();
     this.appliedEventIds = new Set();
@@ -153,8 +155,15 @@ export class InboxProjector {
     this.offset = Math.max(this.offset, event.globalOffset);
   }
 
-  get(messageId: string): InboxRecord | undefined {
-    const record = this.records.get(messageId);
+  get(messageId: string, runId?: RunId): InboxRecord | undefined {
+    const runs = this.runsByMessageId.get(messageId);
+    if (runId === undefined && runs !== undefined && runs.size > 1) {
+      throw new A2AProtocolError(`Message ${messageId} requires a runId`);
+    }
+    const scopedRunId = runId ?? runs?.values().next().value;
+    const record = scopedRunId === undefined
+      ? undefined
+      : this.records.get(messageScope(scopedRunId, messageId));
     return record === undefined ? undefined : clone(record);
   }
 
@@ -166,7 +175,7 @@ export class InboxProjector {
     const messageId = this.idempotency.get(
       messageIdempotencyScope(runId, idempotencyKey, routeId),
     );
-    return messageId === undefined ? undefined : this.get(messageId);
+    return messageId === undefined ? undefined : this.get(messageId, runId);
   }
 
   list(to?: LaneId): InboxRecord[] {
@@ -182,7 +191,8 @@ export class InboxProjector {
 
   private applySent(event: Extract<AnyEvent, { type: "message.sent" }>): void {
     const message = event.payload.message;
-    const existing = this.records.get(message.messageId);
+    const key = messageScope(message.runId, message.messageId);
+    const existing = this.records.get(key);
     if (existing !== undefined) {
       if (!sameJson(existing.message, message)) {
         throw new A2AProtocolError(`Conflicting messageId ${message.messageId}`);
@@ -197,7 +207,7 @@ export class InboxProjector {
     );
     const duplicateId = this.idempotency.get(scope);
     if (duplicateId !== undefined && duplicateId !== message.messageId) {
-      const duplicate = this.records.get(duplicateId);
+      const duplicate = this.records.get(messageScope(message.runId, duplicateId));
       if (duplicate === undefined || !sameLogicalSend(duplicate.message, message)) {
         throw new A2AProtocolError(
           `Conflicting idempotencyKey ${message.idempotencyKey}`,
@@ -206,18 +216,22 @@ export class InboxProjector {
       return;
     }
 
-    this.records.set(message.messageId, {
+    this.records.set(key, {
       message: clone(message),
       status: "pending",
       sentAtOffset: event.globalOffset,
       sentAt: event.occurredAt,
     });
-    this.attempts.set(message.messageId, 0);
+    const runs = this.runsByMessageId.get(message.messageId) ?? new Set<RunId>();
+    runs.add(message.runId);
+    this.runsByMessageId.set(message.messageId, runs);
+    this.attempts.set(key, 0);
     this.idempotency.set(scope, message.messageId);
   }
 
   private applyClaimed(event: Extract<AnyEvent, { type: "message.claimed" }>): void {
-    const record = this.records.get(event.payload.messageId);
+    const key = messageScope(event.runId, event.payload.messageId);
+    const record = this.records.get(key);
     if (record === undefined) {
       throw new A2AProtocolError(
         `Claim references unknown message ${event.payload.messageId}`,
@@ -237,8 +251,8 @@ export class InboxProjector {
       return;
     }
     record.status = "claimed";
-    const attempt = (this.attempts.get(record.message.messageId) ?? record.claim?.attempt ?? 0) + 1;
-    this.attempts.set(record.message.messageId, attempt);
+    const attempt = (this.attempts.get(key) ?? record.claim?.attempt ?? 0) + 1;
+    this.attempts.set(key, attempt);
     record.claim = {
       claimId: claimIdFromEvent(event),
       claimedBy: event.payload.claimedBy,
@@ -248,7 +262,7 @@ export class InboxProjector {
   }
 
   private applyHandled(event: Extract<AnyEvent, { type: "message.handled" }>): void {
-    const record = this.records.get(event.payload.messageId);
+    const record = this.records.get(messageScope(event.runId, event.payload.messageId));
     if (record === undefined) {
       throw new A2AProtocolError(
         `Handle references unknown message ${event.payload.messageId}`,
@@ -274,7 +288,7 @@ export class InboxProjector {
   }
 
   private applyReclaimed(event: Extract<AnyEvent, { type: "message.reclaimed" }>): void {
-    const record = this.records.get(event.payload.messageId);
+    const record = this.records.get(messageScope(event.runId, event.payload.messageId));
     if (record === undefined) {
       throw new A2AProtocolError(`Reclaim references unknown message ${event.payload.messageId}`);
     }
@@ -503,15 +517,15 @@ export class A2AInbox {
   }
 
   /** Reopen an unfinished delivery during runtime recovery. */
-  reclaim(messageId: string, reclaimedBy: LaneId, reason = "runtime-restart"): Promise<InboxRecord> {
-    return this.runExclusive(() => this.reclaimCommand(messageId, reclaimedBy, reason));
+  reclaim(messageId: string, reclaimedBy: LaneId, reason = "runtime-restart", runId?: RunId): Promise<InboxRecord> {
+    return this.runExclusive(() => this.reclaimCommand(messageId, reclaimedBy, reason, runId));
   }
 
-  private async reclaimCommand(messageId: string, reclaimedBy: LaneId, reason: string): Promise<InboxRecord> {
+  private async reclaimCommand(messageId: string, reclaimedBy: LaneId, reason: string, runId?: RunId): Promise<InboxRecord> {
     nonEmpty(messageId, "messageId");
     nonEmpty(reclaimedBy, "reclaimedBy");
     nonEmpty(reason, "reason");
-    const record = this.requireRecord(messageId);
+    const record = this.requireRecord(messageId, runId);
     if (record.status === "handled") return record;
     if (record.status !== "claimed" || record.claim === undefined) return record;
     const claim = record.claim;
@@ -533,7 +547,7 @@ export class A2AInbox {
       idempotencyKey: `a2a:reclaim:${messageId}:${claim.claimId}`,
       visibility: record.message.visibility,
     });
-    return this.requireRecord(messageId);
+    return this.requireRecord(messageId, record.message.runId);
   }
 
   private async claimCommand(
@@ -555,7 +569,8 @@ export class A2AInbox {
     }
 
     const repeated = this.projector.list().filter(
-      (record) => record.claim?.claimId === claimId,
+      (record) => record.claim?.claimId === claimId
+        && (options.runId === undefined || record.message.runId === options.runId),
     );
     if (repeated.length > 0) {
       if (repeated.some((record) => (
@@ -602,7 +617,7 @@ export class A2AInbox {
         visibility: record.message.visibility,
         occurredAt: now.toISOString(),
       });
-      const projected = this.projector.get(record.message.messageId);
+      const projected = this.projector.get(record.message.messageId, record.message.runId);
       if (projected !== undefined) {
         claimed.push(projected);
       }
@@ -610,15 +625,16 @@ export class A2AInbox {
     return claimed;
   }
 
-  handle(messageId: string, claimedBy: LaneId): Promise<InboxRecord> {
-    return this.runExclusive(() => this.handleCommand(messageId, claimedBy));
+  handle(messageId: string, claimedBy: LaneId, runId?: RunId): Promise<InboxRecord> {
+    return this.runExclusive(() => this.handleCommand(messageId, claimedBy, runId));
   }
 
   private async handleCommand(
     messageId: string,
     claimedBy: LaneId,
+    runId?: RunId,
   ): Promise<InboxRecord> {
-    const record = this.requireRecord(messageId);
+    const record = this.requireRecord(messageId, runId);
     if (record.status === "handled") {
       return record;
     }
@@ -638,7 +654,7 @@ export class A2AInbox {
       idempotencyKey: `a2a:handle:${messageId}`,
       visibility: record.message.visibility,
     });
-    return this.requireRecord(messageId);
+    return this.requireRecord(messageId, record.message.runId);
   }
 
   acknowledgeAdvice(
@@ -646,12 +662,14 @@ export class A2AInbox {
     disposition: AdviceDisposition,
     claimedBy: LaneId,
     reason?: string,
+    runId?: RunId,
   ): Promise<AdviceAckResult> {
     return this.runExclusive(() => this.acknowledgeAdviceCommand(
       adviceId,
       disposition,
       claimedBy,
       reason,
+      runId,
     ));
   }
 
@@ -660,16 +678,20 @@ export class A2AInbox {
     disposition: AdviceDisposition,
     claimedBy: LaneId,
     reason?: string,
+    runId?: RunId,
   ): Promise<AdviceAckResult> {
-    const record = this.projector.list().find((candidate) => (
+    const matching = this.projector.list().filter((candidate) => (
+      (runId === undefined || candidate.message.runId === runId)
+      &&
       candidate.message.payload.type === "advice.propose"
       && candidate.message.payload.advice.adviceId === adviceId
     ));
+    if (runId === undefined && new Set(matching.map((candidate) => candidate.message.runId)).size > 1) {
+      throw new A2AProtocolError(`Advice ${adviceId} requires a runId`);
+    }
+    const record = matching[0];
     if (record === undefined) {
       throw new A2AProtocolError(`Unknown Advice ${adviceId}`);
-    }
-    if (isExpired(record.message, this.clock.now())) {
-      throw new MessageExpiredError(`Advice ${adviceId} has expired`);
     }
     if (record.acknowledgement !== undefined) {
       if (
@@ -679,9 +701,12 @@ export class A2AInbox {
         throw new A2AProtocolError(`Advice ${adviceId} already has a different ack`);
       }
       if (record.status !== "handled") {
-        await this.handleCommand(record.message.messageId, claimedBy);
+        await this.handleCommand(record.message.messageId, claimedBy, record.message.runId);
       }
       return { status: "duplicate", messageId: record.message.messageId };
+    }
+    if (isExpired(record.message, this.clock.now())) {
+      throw new MessageExpiredError(`Advice ${adviceId} has expired`);
     }
     if (record.status !== "claimed" || record.claim?.claimedBy !== claimedBy) {
       throw new A2AProtocolError(
@@ -703,7 +728,7 @@ export class A2AInbox {
       idempotencyKey: `a2a:ack:${adviceId}`,
       visibility: record.message.visibility,
     });
-    await this.handleCommand(record.message.messageId, claimedBy);
+    await this.handleCommand(record.message.messageId, claimedBy, record.message.runId);
     return { status: "acknowledged", messageId: record.message.messageId };
   }
 
@@ -717,8 +742,8 @@ export class A2AInbox {
     return Date.parse(record.claim.claimedAt) + this.claimLeaseMs <= now.getTime();
   }
 
-  private requireRecord(messageId: string): InboxRecord {
-    const record = this.projector.get(messageId);
+  private requireRecord(messageId: string, runId?: RunId): InboxRecord {
+    const record = this.projector.get(messageId, runId);
     if (record === undefined) {
       throw new A2AProtocolError(`Unknown message ${messageId}`);
     }
@@ -734,7 +759,7 @@ export class A2AInbox {
       const committed = stored as AnyEvent;
       const message = committed.type === "message.sent" ? committed.payload.message
         : "messageId" in committed.payload && typeof committed.payload.messageId === "string"
-          ? this.projector.get(committed.payload.messageId)?.message : undefined;
+          ? this.projector.get(committed.payload.messageId, committed.runId)?.message : undefined;
       if (message !== undefined) this.notify(message.to);
     }
     return stored;
@@ -1077,6 +1102,10 @@ function sameJson(left: unknown, right: unknown): boolean {
 
 function idempotencyScope(runId: string, key: string): string {
   return `${runId}\u0000${key}`;
+}
+
+function messageScope(runId: RunId, messageId: string): string {
+  return JSON.stringify([runId, messageId]);
 }
 
 function messageIdempotencyScope(

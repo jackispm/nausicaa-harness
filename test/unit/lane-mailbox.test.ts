@@ -786,6 +786,19 @@ describe("LaneMailbox", () => {
     expect((await mailbox(inbox, { events: await ledger.read({ runId }) }).beforeStep({ step: 1 })).map((item) => item.messageId)).toEqual(["not-consumed-here"]);
   });
 
+  it("handles only its Run when another Run uses the same message ID", async () => {
+    const { inbox } = setup();
+    await inbox.send(message("shared"));
+    await inbox.send(message("shared", { runId: "run-2" }));
+    const lane = mailbox(inbox);
+
+    expect((await lane.beforeStep({ step: 1 })).map((item) => item.messageId)).toEqual(["shared"]);
+    await lane.afterStep({ runId, laneId: memberB, boundaryMessageIds: ["shared"] });
+
+    expect(inbox.snapshot().records.find((record) => record.message.runId === runId)?.status).toBe("handled");
+    expect(inbox.snapshot().records.find((record) => record.message.runId === "run-2")?.status).toBe("pending");
+  });
+
   it("bounds boundary count and text while sanitizing control characters", async () => {
     const { inbox } = setup();
     await inbox.send(message("large", { payload: { type: "message.inform", text: `Visible\u0001 ${"x".repeat(1_000)}` } }));
