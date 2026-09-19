@@ -8,10 +8,17 @@ on:
         required: false
         default: latest
         type: string
+      release_tag:
+        description: Existing version tag to publish (required when dispatched from main)
+        required: false
+        type: string
 
 permissions:
   contents: read
   actions: read
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
 jobs:
   publish:
@@ -21,7 +28,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ inputs.release_tag || github.ref }}
           fetch-depth: 0
 
       - name: Require a matching release tag and successful main CI
@@ -29,11 +36,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          case "$GITHUB_REF" in
-            refs/tags/v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "Publish must be dispatched from a version tag" >&2; exit 1 ;;
+          case "$RELEASE_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "Publish requires an existing version tag" >&2; exit 1 ;;
           esac
-          version="${GITHUB_REF_NAME#v}"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" || { echo "Checkout does not match the version tag" >&2; exit 1; }
+          version="${RELEASE_TAG#v}"
           node -e 'const v = process.argv[1]; const p = require("./package.json"); const l = require("./package-lock.json"); if (p.version !== v || l.version !== v || l.packages[""].version !== v) process.exit(1)' "$version"
           git fetch origin main
           git merge-base --is-ancestor HEAD origin/main || { echo "Tag commit is not on main" >&2; exit 1; }
@@ -68,10 +76,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           package_file="nausicaa-harness-${version}.tgz"
           mkdir -p release
-          gh release download "$GITHUB_REF_NAME" --dir release --pattern "$package_file" --pattern SHA256SUMS
+          gh release download "$RELEASE_TAG" --dir release --pattern "$package_file" --pattern SHA256SUMS
           test -f "release/$package_file"
           (cd release && sha256sum --check --ignore-missing SHA256SUMS)
           tar -xOf "release/$package_file" package/package.json | node -e 'const fs = require("node:fs"); if (JSON.parse(fs.readFileSync(0, "utf8")).version !== process.argv[1]) process.exit(1)' "$version"
@@ -82,7 +90,7 @@ jobs:
           case "$NPM_DIST_TAG" in
             ''|*[!a-zA-Z0-9._-]*) echo "Invalid npm dist-tag" >&2; exit 1 ;;
           esac
-          npm publish "release/nausicaa-harness-${GITHUB_REF_NAME#v}.tgz" --access public --tag "$NPM_DIST_TAG" --ignore-scripts
+          npm publish "./release/nausicaa-harness-${RELEASE_TAG#v}.tgz" --access public --tag "$NPM_DIST_TAG" --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_DIST_TAG: ${{ inputs.tag }}
