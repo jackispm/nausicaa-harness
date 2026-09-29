@@ -22,9 +22,7 @@ Nausicaa 让模型在不同职责、上下文和节奏的 Lane 之间协作，�
 团队成员使用自己的名字；辅助观察者的身份是 **Teto**。
 
 - **Teto**：默认开启的辅助观察 Lane，只观察订阅到的部分行为，关注用户意图偏离
-  和可改进的方案；默认不打扰所属 Agent，仅在新的高价值建议能影响
-  下一步决策时主动通过 A2A 提醒。
-  所属 Agent 可通过已授权的控制工具关闭或重新开启 Teto。
+  和可改进的方案。
 - **Lane**：每个 Agent 都是可寻址、可恢复、拥有独立上下文和生命周期的执行单位。
 - **多拓扑**：主 Agent、Teto、Worker、Team member 以及跨 Run A2A 可以按任务自然组合；
   Team member 也可以按需开启自己的 Teto。
@@ -97,7 +95,7 @@ Ctrl+Left/Right 切页时保留搜索、选择和 MCP 草稿；聊天内容暂�
   `default` 使用服务商默认值，不把所有模型的默认值假定为 medium。
 - `/logout [provider]` 移除本地保存的凭据，不会删除环境变量中的密钥。
 
-也可在终端指定登录入口；以下是可选示例，不必全部执行：
+也可在终端指定登录入口，以下为可选示例：
 
 ```bash
 nausicaa auth login openai api-key
@@ -186,10 +184,7 @@ use their own names; the auxiliary observer's identity is **Teto**.
 
 - **Teto**: an auxiliary observer enabled by default. It follows subscribed
   portions of its owner's activity, watching for intent drift and improvements
-  to the current solution. It is quiet toward its owner
-  by default, sending unsolicited A2A advice only when new, high-value guidance
-  could affect the next decision. Its owner may stop or restart it
-  through the authorized controls.
+  to the current solution.
 - **Lane**: an addressable, resumable execution unit with its own context and
   lifecycle.
 - **Multi-topology**: the primary Agent, Teto, Worker, Team members, and cross-Run
@@ -284,7 +279,7 @@ searches, selections, or MCP drafts. The conversation is hidden until you leave.
   it does not assume every model defaults to medium.
 - `/logout [provider]` removes a saved credential without changing environment keys.
 
-You can also select a login route from the shell. These are alternatives:
+You can also select a login route from the shell:
 
 ```bash
 nausicaa auth login openai api-key
