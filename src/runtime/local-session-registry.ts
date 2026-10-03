@@ -37,6 +37,8 @@ export interface LocalSessionRegistryEntry {
   readonly sessionId: string;
   readonly workspace: string;
   readonly runId?: string;
+  /** Host-reserved first/next Run; no Ledger exists until an input arrives. */
+  readonly pendingRunId?: string;
   readonly laneId: string;
   readonly state: LocalSessionState;
   readonly startedAt: string;
@@ -64,6 +66,7 @@ export interface LocalSessionRegistryOptions {
 export interface LocalSessionPresenceUpdate {
   /** `null` clears the currently attached Run. */
   readonly runId?: string | null;
+  readonly pendingRunId?: string | null;
   readonly laneId?: string;
   readonly state?: LocalSessionState;
   readonly activitySummary?: string;
@@ -159,6 +162,11 @@ export class LocalSessionRegistry {
     const nextSummary = update.activitySummary === undefined
       ? this.current.activitySummary
       : boundedSummary(update.activitySummary);
+    const pendingRunId = update.pendingRunId === null
+      ? undefined
+      : update.pendingRunId === undefined
+        ? this.current.pendingRunId
+        : validatePendingRunId(update.pendingRunId);
     const next: LocalSessionRegistryEntry = {
       version: LOCAL_SESSION_REGISTRY_VERSION,
       sessionId: this.sessionId,
@@ -171,6 +179,7 @@ export class LocalSessionRegistry {
       lastSeen: this.nowIso(),
       ...(this.current.runtimeBuildId === undefined ? {} : { runtimeBuildId: this.current.runtimeBuildId }),
       ...(nextRunId === undefined ? {} : { runId: nextRunId }),
+      ...(pendingRunId === undefined ? {} : { pendingRunId }),
       ...(nextSummary === undefined ? {} : { activitySummary: nextSummary }),
     };
     this.current = next;
@@ -319,6 +328,7 @@ function parseRegistryRecord(value: unknown): ParsedRegistryRecord | undefined {
       sessionId: item.sessionId,
       workspace: resolve(item.workspace),
       ...(item.runId === undefined ? {} : { runId: boundedLabel(item.runId, "runId") }),
+      ...(item.pendingRunId === undefined ? {} : { pendingRunId: validatePendingRunId(item.pendingRunId) }),
       laneId: boundedLabel(item.laneId, "laneId"),
       state: validateState(item.state),
       startedAt: new Date(Date.parse(item.startedAt)).toISOString(),
@@ -334,6 +344,13 @@ function parseRegistryRecord(value: unknown): ParsedRegistryRecord | undefined {
 
 function validRuntimeBuildId(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{12}$/u.test(value);
+}
+
+function validatePendingRunId(value: unknown): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value)) {
+    throw new TypeError("session registry pendingRunId is invalid");
+  }
+  return value;
 }
 
 function validateState(value: string): LocalSessionState {

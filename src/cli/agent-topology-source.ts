@@ -70,6 +70,7 @@ export async function readWorkspaceAgentAwareness(
     sessionSources.set(session.sessionId, {
       sessionId: session.sessionId,
       ...(session.runId === undefined ? {} : { runId: session.runId }),
+      ...(session.pendingRunId === undefined ? {} : { pendingRunId: session.pendingRunId }),
       laneId: session.laneId,
       state: session.state,
       lastSeen: session.lastSeen,
@@ -167,6 +168,7 @@ export async function readWorkspaceAgentAwareness(
 function withoutRunId(source: AgentAwarenessSessionSource): AgentAwarenessSessionSource {
   return {
     sessionId: source.sessionId,
+    ...(source.pendingRunId === undefined ? {} : { pendingRunId: source.pendingRunId }),
     ...(source.laneId === undefined ? {} : { laneId: source.laneId }),
     ...(source.state === undefined ? {} : { state: source.state }),
     ...(source.lastSeen === undefined ? {} : { lastSeen: source.lastSeen }),

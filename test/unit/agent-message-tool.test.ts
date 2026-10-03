@@ -92,6 +92,89 @@ describe("agent_message tool", () => {
     expect(tool.definition.parameters.required).toEqual(["target"]);
   });
 
+  it.each([
+    ["LF", "当前工作区为空。\n请提供项目内容，我再创建 README.md。"],
+    ["CRLF", "README status:\r\nThe workspace is empty."],
+    ["tab", "File\tStatus\nREADME.md\tpending"],
+    ["the UTF-8 byte boundary", "x".repeat(16 * 1024)],
+  ])("preserves %s in the plain message body", async (_label, text) => {
+    const calls: CrossRunSendRequest[] = [];
+    const tool = createAgentMessageTool({
+      router: {
+        send: async (request) => {
+          calls.push(request);
+          return receiptFor(request);
+        },
+      },
+      sender,
+    });
+
+    const result = await tool.execute({
+      target: { relationship: "direct", id: target.sessionId }, text,
+    }, context);
+
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content)).toMatchObject({ status: "queued" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.payload).toEqual({ type: "message.inform", text });
+  });
+
+  it.each([
+    ["NUL", "private /workspace/path\u0000opaque-secret-proof"],
+    ["another unsafe control character", "hello\u000bthere"],
+    ["a non-string", { text: "opaque-secret-proof" }],
+    ["whitespace only", "\r\n\t "],
+    ["more than 16 KiB of ASCII", "x".repeat(16 * 1024 + 1)],
+    ["more than 16 KiB of UTF-8", "你".repeat(5_462)],
+  ])("rejects %s in the plain message body as invalid-request", async (_label, text) => {
+    let sends = 0;
+    const tool = createAgentMessageTool({
+      router: {
+        send: async (request) => {
+          sends += 1;
+          return receiptFor(request);
+        },
+      },
+      sender,
+    });
+
+    const result = await tool.execute({
+      target: { relationship: "direct", id: target.sessionId }, text,
+    }, context);
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({
+      status: "error", error: { code: "invalid-request" },
+    });
+    expect(sends).toBe(0);
+    expect(result.content).not.toContain("/workspace/path");
+    expect(result.content).not.toContain(sender.proof.token);
+  });
+
+  it.each(["conversationId", "threadId", "correlationId", "idempotencyKey"])(
+    "keeps body whitespace out of %s metadata",
+    async (field) => {
+      let sends = 0;
+      const tool = createAgentMessageTool({
+        router: {
+          send: async (request) => {
+            sends += 1;
+            return receiptFor(request);
+          },
+        },
+        sender,
+      });
+
+      const result = await tool.execute({
+        target: { relationship: "direct", id: target.sessionId },
+        text: "hello\nthere", [field]: "metadata\n\tvalue",
+      }, context);
+
+      expect(result.isError).toBe(true);
+      expect(sends).toBe(0);
+    },
+  );
+
   it("rejects mixing the plain text shorthand with a typed payload", async () => {
     const tool = createAgentMessageTool({
       router: { send: async (request) => receiptFor(request) },

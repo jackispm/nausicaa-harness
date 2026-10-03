@@ -9,6 +9,7 @@ import type {
 import { annotateTool } from "../mowe/catalog.js";
 import type { MoweAgentTool } from "../mowe/types.js";
 import {
+  CROSS_RUN_MAX_INLINE_BYTES,
   CrossRunProtocolError,
   type CrossRunProtocolErrorCode,
   type CrossRunSenderIdentity,
@@ -201,8 +202,8 @@ export function createAgentMessageTool(options: AgentMessageToolOptions): MoweAg
           text: {
             type: "string",
             minLength: 1,
-            maxLength: MAX_BOUND_STRING_LENGTH,
-            description: "Plain message shorthand; normalized to payload {type:'message.inform',text}. Mutually exclusive with payload.",
+            maxLength: CROSS_RUN_MAX_INLINE_BYTES,
+            description: "Plain message shorthand; normalized to payload {type:'message.inform',text}. Allows line breaks and tabs, up to 16 KiB of UTF-8 text. Mutually exclusive with payload.",
           },
           conversationId: {
             type: "string",
@@ -587,6 +588,17 @@ function boundedString(value: unknown, field: string): string {
   return value;
 }
 
+function messageText(value: unknown): string {
+  // Body whitespace is data; identity and metadata keep boundedString's stricter contract.
+  if (typeof value !== "string" || value.trim().length === 0
+    || value.length > CROSS_RUN_MAX_INLINE_BYTES * 4
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)
+    || Buffer.byteLength(value, "utf8") > CROSS_RUN_MAX_INLINE_BYTES) {
+    throw new CrossRunProtocolError("agent_message text must be bounded message text", "invalid-request");
+  }
+  return value;
+}
+
 /** Normalize the ergonomic plain-message form into the typed wire payload. */
 function normalizeMessagePayload(
   value: Record<string, unknown>,
@@ -616,7 +628,7 @@ function normalizeMessagePayload(
   }
   return {
     type: "message.inform",
-    text: boundedString(text, "text"),
+    text: messageText(text),
   };
 }
 

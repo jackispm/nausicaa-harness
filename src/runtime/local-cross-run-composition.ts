@@ -233,6 +233,13 @@ async function localRosterEntries(
   }
 
   const entries: CrossRunRosterEntry[] = [];
+  for (const session of sessions) {
+    if (!isAddressableSession(session) || session.runId !== undefined || session.pendingRunId === undefined) continue;
+    const endpoint = endpointFor(session.pendingRunId, workspaceId, session.sessionId);
+    if (!sameEndpoint(endpoint, source)) {
+      entries.push({ endpoint, relationship: "direct", status: "idle", reachable: true });
+    }
+  }
   for (const run of runs) {
     const relationships = relationshipFor(sourceRun.parentRunId, run.runId, sourceRun.runId, run.parentRunId);
     const liveSessions = sessions.filter((candidate) => (
@@ -308,18 +315,18 @@ async function authorizeLocalRoute(
   ) {
     return { allowed: false, reason: "authorization-denied" };
   }
-  const runs = await listWorkspaceRuns(dataDir, workspace);
-  const target = runs.find((run) => run.runId === input.target.runId);
-  if (target === undefined) return { allowed: false, reason: "target-unavailable" };
   const sessions = await readLocalSessionRegistry(dataDir, workspace);
-  return sessions.some((session) => (
+  const session = sessions.find((session) => (
     isAddressableSession(session)
-    && session.runId === input.target.runId
+    && (session.runId ?? session.pendingRunId) === input.target.runId
     && session.sessionId === input.target.sessionId
     && session.laneId === input.target.laneId
-  ))
-    ? { allowed: true }
-    : { allowed: false, reason: "target-unavailable" };
+  ));
+  if (session === undefined) return { allowed: false, reason: "target-unavailable" };
+  if (session.runId === undefined) return { allowed: true };
+  const runs = await listWorkspaceRuns(dataDir, workspace);
+  return runs.some((run) => run.runId === input.target.runId)
+    ? { allowed: true } : { allowed: false, reason: "target-unavailable" };
 }
 
 async function admitLocalTarget(
@@ -332,6 +339,29 @@ async function admitLocalTarget(
 ) {
   if (input.envelope.target.workspaceId !== workspaceId) {
     throw new CrossRunProtocolError("target is outside the local A2A scope", "authorization-denied");
+  }
+  const sessions = await readLocalSessionRegistry(dataDir, workspace);
+  const detached = sessions.find((session) => (
+    isAddressableSession(session)
+    && session.runId === undefined
+    && session.pendingRunId === input.envelope.target.runId
+    && session.sessionId === input.envelope.target.sessionId
+    && session.laneId === input.envelope.target.laneId
+  ));
+  if (detached !== undefined) {
+    const normalized = await normalizeTargetAdmission(input, input.envelope.target, async (sender) => (
+      sender.proof.token === proofToken && sender.endpoint.workspaceId === workspaceId
+    ));
+    // Reserve the same endpoint that the recipient will use at its first
+    // input, so user input racing delivery cannot strand the queued message.
+    const queued = await enqueueLocalSessionMessage({ dataDir, targetRunId: detached.pendingRunId!,
+      message: normalized.message, queuedAt: clock.now().toISOString() });
+    if (!(await hasAddressableTargetSession(dataDir, workspace, input.envelope.target))) {
+      // The write may have taken effect before navigation withdrew the
+      // endpoint. Preserve the router's uncertain-outcome receipt semantics.
+      throw new CrossRunProtocolError("target Session changed during admission", "target-unavailable");
+    }
+    return queued;
   }
   const runs = await listWorkspaceRuns(dataDir, workspace);
   if (!runs.some((run) => run.runId === input.envelope.target.runId)) {
@@ -396,7 +426,7 @@ async function hasAddressableTargetSession(
   const sessions = await readLocalSessionRegistry(dataDir, workspace);
   return sessions.some((session) => (
     isAddressableSession(session)
-    && session.runId === target.runId
+    && (session.runId ?? session.pendingRunId) === target.runId
     && session.sessionId === target.sessionId
     && session.laneId === target.laneId
   ));

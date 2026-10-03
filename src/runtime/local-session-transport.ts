@@ -8,6 +8,7 @@ import {
 import { isAbsolute, relative, resolve, join } from "node:path";
 
 import type { A2AMessage } from "../domain/types.js";
+import { envelopeToA2AMessage, normalizeEnvelope } from "../a2a/cross-run-contract.js";
 import { sha256, stableJson } from "../ledger/hash.js";
 import {
   assertNoSymlinkComponents,
@@ -184,10 +185,21 @@ async function readQueueEntry(path: string, targetRunId: string): Promise<LocalS
         || Array.isArray(item.message)) return undefined;
       const message = item.message as Partial<A2AMessage>;
       if (typeof message.messageId !== "string" || message.runId !== targetRunId) return undefined;
+      // Validate content identity before a first message can create a Run.
+      const canonical = envelopeToA2AMessage(normalizeEnvelope({
+        protocolVersion: 1, messageId: message.messageId, routeId: message.routeId,
+        source: message.sourceEndpoint, target: message.targetEndpoint,
+        relationship: message.routeRelationship, artifacts: message.routeArtifacts,
+        conversationId: message.conversationId, threadId: message.threadId,
+        correlationId: message.correlationId, idempotencyKey: message.idempotencyKey,
+        createdAt: message.createdAt, expiresAt: message.expiresAt, causationId: message.causationId,
+        visibility: message.visibility, priority: message.priority, payload: message.payload,
+      }));
+      if (stableJson(canonical) !== stableJson(message)) return undefined;
       return {
         version: LOCAL_SESSION_TRANSPORT_VERSION,
         queuedAt: new Date(Date.parse(item.queuedAt)).toISOString(),
-        message: structuredClone(message as A2AMessage),
+        message: canonical,
       };
     } finally {
       await handle.close();

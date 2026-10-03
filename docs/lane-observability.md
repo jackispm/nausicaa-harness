@@ -20,6 +20,13 @@ An `identity-forged` error reports a host identity mismatch; permission denials
 use `authorization-denied`.
 Seeing a foreign Teto does not make it the caller's observer or a direct target.
 
+A newly opened local session reserves its next Run identity and accepts ordinary
+Main messages before its first user conversation. Awareness exposes that same
+endpoint before and after the first input. Reserving an identity creates no
+Ledger and makes no model request; the first valid local or remote input creates
+the Run. Queued first messages remain recoverable when the session changes Runs
+or closes before consuming them.
+
 Live workspace observations are timestamped after disk reads, so a heartbeat
 written during those reads is not mistaken for a future timestamp. Explicit
 replay times retain strict clock semantics. Stale, invalid, inaccessible, and
@@ -72,6 +79,13 @@ parent/child labels are interpreted from the local participant's perspective.
 Main's derived input wrapper is deduplicated against the original message.
 Legacy task/advice messages retain their live notices and are outside this
 ordinary-message resume contract.
+
+A busy Main can admit incoming messages while streaming an answer or executing
+a tool. They enter its ordinary steering queue and reach the model at the next
+safe step boundary. A `queued` receipt confirms admission to the transport queue;
+it does not confirm that Main has read or completed the request. Message bodies
+accept line breaks and tabs, with a 16 KiB UTF-8 limit; routing metadata keeps
+its stricter validation.
 
 Private cross-Run messages remain available to their intended Main, but their
 derived input admission, replacement, queue display, and replay remain private.

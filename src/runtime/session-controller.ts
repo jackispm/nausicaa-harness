@@ -572,6 +572,7 @@ export class SessionController {
   private readonly closeEdgeCompositionOnClose: boolean;
   private readonly cancelGraceMs: number;
   private readonly sessionRegistry: LocalSessionRegistry;
+  private pendingRunId: string | undefined;
   private presenceUpdateTail: Promise<void> = Promise.resolve();
   private externalPollTimer: ReturnType<typeof setInterval> | undefined;
   private externalPollTail: Promise<void> = Promise.resolve();
@@ -701,9 +702,12 @@ export class SessionController {
     const dataDir = resolve(options.dataDir);
     const controller = new SessionController(workspace, dataDir, options, deps);
     try {
-      await controller.sessionRegistry.start({ state: "idle" });
+      if (options.runId === undefined) controller.reserveNextRun();
+      await controller.sessionRegistry.start({ state: "idle", pendingRunId: controller.pendingRunId ?? null });
       if (options.runId !== undefined) {
         await controller.attachRun(options.runId);
+      } else {
+        controller.startExternalObservation();
       }
     } catch (error: unknown) {
       await controller.sessionRegistry.close().catch(() => undefined);
@@ -1864,8 +1868,15 @@ export class SessionController {
   }
 
   async submit(request: SessionSubmitRequest): Promise<SessionSubmitResult> {
+    return this.submitInput(request);
+  }
+
+  private async submitInput(request: SessionSubmitRequest, expectedAttachment?: AttachedRun): Promise<SessionSubmitResult> {
     return this.runAdmission(async () => {
       this.assertOpen();
+      if (expectedAttachment !== undefined && this.attached !== expectedAttachment) {
+        throw new SessionProtocolError("Agent message belongs to a different attached Run");
+      }
       validateSubmit(request);
       if (this.attached === undefined) {
         await this.createRun();
@@ -2136,9 +2147,12 @@ export class SessionController {
       if (this.active !== undefined || this.execution !== undefined) {
         throw new SessionProtocolError("Cancel the active Turn before starting a new Run");
       }
+      await this.preservePendingRunMessages();
       await this.detach();
+      this.reserveNextRun();
       this.status = "detached";
       this.publishState();
+      this.startExternalObservation();
     });
   }
 
@@ -2362,7 +2376,13 @@ export class SessionController {
         throw new SessionProtocolError("Cancel the active Turn before attaching another Run");
       }
       validateRunId(runId);
-      await this.attachRunInternal(runId);
+      await this.preservePendingRunMessages();
+      try {
+        await this.attachRunInternal(runId);
+      } catch (error: unknown) {
+        this.publishState();
+        throw error;
+      }
     });
   }
 
@@ -2388,8 +2408,8 @@ export class SessionController {
   async reconcileExternalMessages(): Promise<void> {
     this.assertOpen();
     const attached = this.attached;
-    if (attached === undefined) return;
-    const operation = this.externalPollTail.then(() => this.pollExternalEvents(attached));
+    const operation = this.externalPollTail.then(() => attached === undefined
+      ? this.pollDetachedSessionMessages() : this.pollExternalEvents(attached));
     this.externalPollTail = operation.then(() => undefined, () => undefined);
     await operation;
   }
@@ -2419,6 +2439,10 @@ export class SessionController {
     this.teamWakeRequested = false;
     const closePromise = this.runAdmission(async () => {
       await this.cancelSideQuestion();
+      if (this.attached === undefined) {
+        await this.markPresenceTerminal().catch(() => undefined);
+        await this.materializePendingRunMessages();
+      }
       const execution = this.execution;
       if (this.active !== undefined) {
         this.status = "cancelling";
@@ -2477,6 +2501,7 @@ export class SessionController {
     }
     const previous = this.attached;
     this.attached = candidate;
+    this.pendingRunId = undefined;
     this.selectedMainModel = candidate.mainModel;
     this.selectedThinkingLevel = candidate.mainThinkingLevel;
     candidate.worker?.scheduler.enqueue();
@@ -2678,7 +2703,7 @@ export class SessionController {
   }
 
   private async createRun(goalStatement = INTERNAL_INTERACTIVE_TASK): Promise<void> {
-    const runId = (this.deps.createRunId ?? randomUUID)();
+    const runId = this.pendingRunId ?? (this.deps.createRunId ?? randomUUID)();
     validateRunId(runId);
     const stateDir = resolve(this.dataDir, "runs", runId);
     const ledger = await JsonlLedger.open(resolve(stateDir, "ledger.jsonl"));
@@ -2785,6 +2810,7 @@ export class SessionController {
       }
       await this.initializeLaneRuntimes(attached);
       this.attached = attached;
+      this.pendingRunId = undefined;
       attached.worker?.scheduler.enqueue();
       this.startExternalObservation(attached);
       this.status = "idle";
@@ -4688,10 +4714,12 @@ export class SessionController {
 
   private publishState(): void {
     const snapshot = this.snapshot();
+    const pendingRunId = snapshot.runId === undefined ? this.pendingRunId ?? null : null;
     this.publish({ kind: "state", snapshot });
     const state = presenceState(snapshot.status);
     const update = this.presenceUpdateTail.then(() => this.sessionRegistry.update({
       runId: snapshot.runId ?? null,
+      pendingRunId,
       state,
       activitySummary: snapshot.blocker === undefined
         ? state
@@ -4703,6 +4731,7 @@ export class SessionController {
   private async markPresenceTerminal(): Promise<void> {
     const operation = this.presenceUpdateTail.then(() => this.sessionRegistry.update({
       runId: null,
+      pendingRunId: null,
       state: "terminal",
       activitySummary: "terminal",
     }));
@@ -4710,12 +4739,18 @@ export class SessionController {
     await operation;
   }
 
-  /** Start a read-only Ledger tail so another process can reach this Session. */
-  private startExternalObservation(attached: AttachedRun): void {
+  private reserveNextRun(): void {
+    this.pendingRunId = (this.deps.createRunId ?? randomUUID)();
+    validateRunId(this.pendingRunId);
+  }
+
+  /** Poll even before a Run exists so a new Session can receive its first input. */
+  private startExternalObservation(attached?: AttachedRun): void {
     this.stopExternalObservation();
-    this.observedEventIds = new Set(attached.sink.cachedEvents.map((event) => event.eventId));
+    this.observedEventIds = new Set(attached?.sink.cachedEvents.map((event) => event.eventId));
     this.externalPollTimer = setInterval(() => {
-      const operation = this.externalPollTail.then(() => this.pollExternalEvents(attached));
+      const operation = this.externalPollTail.then(() => attached === undefined
+        ? this.pollDetachedSessionMessages() : this.pollExternalEvents(attached));
       this.externalPollTail = operation.then(() => undefined, () => undefined);
     }, 500);
     this.externalPollTimer.unref?.();
@@ -4725,6 +4760,54 @@ export class SessionController {
     if (this.externalPollTimer !== undefined) clearInterval(this.externalPollTimer);
     this.externalPollTimer = undefined;
     this.observedEventIds.clear();
+  }
+
+  private async pollDetachedSessionMessages(): Promise<void> {
+    if (this.closing || this.attached !== undefined || this.pendingRunId === undefined) return;
+    const runId = this.pendingRunId;
+    await this.runAdmission(async () => {
+      if (this.closing || this.attached !== undefined || this.pendingRunId !== runId) return;
+      await this.materializePendingRunMessages();
+      if (this.attached !== undefined) this.publishState();
+    });
+    if (this.snapshot().runId === runId) await this.pollLocalSessionMessages(this.requireAttached());
+  }
+
+  /** Persist accepted first messages before changing or closing their reservation. */
+  private async preservePendingRunMessages(): Promise<void> {
+    if (this.attached !== undefined || this.pendingRunId === undefined) return;
+    // Withdraw before the snapshot. Senders recheck presence after syncing
+    // their queue write, so a late write cannot receive a queued receipt.
+    try {
+      await this.markPresenceTerminal();
+      await this.materializePendingRunMessages();
+    } catch (error: unknown) {
+      this.publishState();
+      throw error;
+    }
+  }
+
+  private async materializePendingRunMessages(): Promise<void> {
+    if (this.attached !== undefined || this.pendingRunId === undefined) return;
+    const runId = this.pendingRunId;
+    const queued = await readLocalSessionMessageQueue(this.dataDir, runId);
+    const messages: A2AMessage[] = [];
+    for (const record of queued) {
+      // Validate the wire message before creating any conversation state.
+      const validation = await new A2AInbox({ clock: this.clock }).send(record.message).catch(() => undefined);
+      if (validation === undefined) continue;
+      if (record.message.targetEndpoint?.sessionId !== this.sessionId
+        || !isExternalMainA2AMessage(record.message, runId)) continue;
+      if (validation.status === "expired") {
+        await removeLocalSessionMessage(record);
+        continue;
+      }
+      messages.push(record.message);
+    }
+    if (messages.length === 0) return;
+    await this.createRun();
+    const attached = this.requireAttached();
+    for (const message of messages) await attached.inbox!.send(message);
   }
 
   private async pollExternalEvents(attached: AttachedRun): Promise<void> {
@@ -4850,10 +4933,10 @@ export class SessionController {
     // `submit` chooses new-turn vs steering at its serialized admission
     // boundary, exactly like a local user input. Reusing this input ID makes
     // retries after a process crash idempotent.
-    await this.submit({
+    await this.submitInput({
       inputId: `a2a:${current.message.messageId}`,
       text,
-    });
+    }, attached);
 
     const afterAdmission = inbox.snapshot().records.find((record) => (
       record.message.runId === attached.runId && record.message.messageId === messageId

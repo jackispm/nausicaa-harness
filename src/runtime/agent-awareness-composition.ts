@@ -55,6 +55,7 @@ export interface AgentAwarenessSessionSource {
   readonly sessionId: string;
   readonly runtimeBuildId?: string;
   readonly runId?: string;
+  readonly pendingRunId?: string;
   readonly laneId?: string;
   readonly state?: AgentAwarenessState | string;
   readonly activitySummary?: string;
@@ -169,7 +170,7 @@ export function composeAgentAwarenessProjectionInput(
       runScopes,
     );
     addRecord(records, {
-      endpoint: endpoint(scope, `session:${session.sessionId}`, session.laneId ?? "main"),
+      endpoint: endpoint(scope, session.pendingRunId ?? `session:${session.sessionId}`, session.laneId ?? "main"),
       role: "main",
       state: session.state ?? "idle",
       ...(session.activitySummary === undefined ? {} : { activitySummary: session.activitySummary }),
